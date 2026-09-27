@@ -810,6 +810,18 @@ def bootstrap_fixture_snapshot_once(fixture_id: int) -> Dict[str, Any]:
         return {"fixture": fixture_id, "status": "skipped", "reason": "history_exists", "saved_stage_count": len(history)}
     data = collect_prematch_data(fixture_id, include_raw=False)
     fx = data.get("fixture") or {}
+    # collect_prematch_data can degrade when the fixture-detail provider returns no row.
+    # Resolve status/kickoff from the normal date fixture list when needed.
+    if not fx.get("status") or not fx.get("date"):
+        today_utc = datetime.now(timezone.utc).date()
+        candidates = []
+        for day_delta in [-1, 0, 1, 2]:
+            date_str = (today_utc + timedelta(days=day_delta)).isoformat()
+            batch = target_fixtures_for_date(date_str, "UTC")
+            candidates.extend(batch.get("fixtures", []) or [])
+        resolved = next((x for x in candidates if int(x.get("fixture_id") or 0) == fixture_id), None)
+        if resolved:
+            fx = {**fx, **resolved}
     if fx.get("status") != "NS":
         return {"fixture": fixture_id, "status": "skipped", "reason": "fixture_not_ns", "fixture_status": fx.get("status")}
     kickoff = fixture_datetime_utc(fx)
