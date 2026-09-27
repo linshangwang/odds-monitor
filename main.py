@@ -26,6 +26,7 @@ AUTO_SNAPSHOT_POLL_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_POLL_SECONDS",
 AUTO_SNAPSHOT_WINDOW_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_WINDOW_SECONDS", "600")))
 AUTO_SNAPSHOT_DAYS_AHEAD = max(1, int(os.getenv("AUTO_SNAPSHOT_DAYS_AHEAD", "2")))
 AUTO_SNAPSHOT_THREAD_STARTED = False
+API_FOOTBALL_RATE_LIMIT_UNTIL = 0
 
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
 API_FOOTBALL_BASE_URL = os.getenv("API_FOOTBALL_BASE_URL", "https://v3.football.api-sports.io").rstrip("/")
@@ -95,14 +96,21 @@ def safe_json_response(resp: requests.Response) -> Any:
 
 
 def call_api_football(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    global API_FOOTBALL_RATE_LIMIT_UNTIL
     if not API_FOOTBALL_KEY:
         return {"ok": False, "error": "Missing API_FOOTBALL_KEY"}
+    now_ts = int(time.time())
+    if now_ts < API_FOOTBALL_RATE_LIMIT_UNTIL:
+        return {"ok": False, "status_code": 429, "error": "api_football_rate_limit_cooldown", "retry_after_seconds": API_FOOTBALL_RATE_LIMIT_UNTIL - now_ts}
     if not path.startswith("/"):
         path = "/" + path
     url = f"{API_FOOTBALL_BASE_URL}{path}"
     headers = {"x-apisports-key": API_FOOTBALL_KEY, "Accept": "application/json"}
     try:
         resp = requests.get(url, params=params or {}, headers=headers, timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 429:
+            API_FOOTBALL_RATE_LIMIT_UNTIL = int(time.time()) + 3600
+            print("[API_FOOTBALL] 429 received; cooldown_seconds=3600")
         return {"ok": resp.ok, "status_code": resp.status_code, "request_url": mask_secret(resp.url), "data": safe_json_response(resp)}
     except requests.RequestException as exc:
         return {"ok": False, "error": str(exc), "request_url": mask_secret(url)}
@@ -875,19 +883,8 @@ def startup_ai_packet_selfcheck() -> None:
 
 @app.on_event("startup")
 def startup_fetch():
-    global STARTUP_FIXTURES, STARTUP_COLLECT
+    # Production startup is intentionally API-light. The background scheduler owns
+    # fixture discovery and stage collection; startup only validates local persistence.
     start_auto_snapshot_worker()
     startup_ai_packet_selfcheck()
-    try:
-        bootstrap = bootstrap_current_snapshot_once()
-        print("[BASELINE_BOOTSTRAP] " + json.dumps(bootstrap, ensure_ascii=False))
-    except Exception as exc:
-        print("[BASELINE_BOOTSTRAP] failed: " + str(exc))
-    try:
-        STARTUP_FIXTURES = target_fixtures_for_date(AUTO_FETCH_DATE, AUTO_FETCH_TIMEZONE)
-        print("[AUTO_PREMATCH] target_fixtures: " + json.dumps(STARTUP_FIXTURES, ensure_ascii=False)[:6000])
-        if AUTO_FETCH_FIXTURE_ID.strip().isdigit():
-            STARTUP_COLLECT = collect_prematch_data(int(AUTO_FETCH_FIXTURE_ID), include_raw=False)
-            print("[AUTO_PREMATCH] shadow_collect_summary: " + json.dumps({"fixture": STARTUP_COLLECT.get("fixture"), "data_quality": STARTUP_COLLECT.get("data_quality"), "shadow_summary": STARTUP_COLLECT.get("shadow_summary"), "coverage": STARTUP_COLLECT.get("coverage"), "odds_market_snapshot": get_nested(STARTUP_COLLECT, ["structured_inputs", "odds_market_snapshot"])}, ensure_ascii=False)[:6000])
-    except Exception as exc:
-        print("[AUTO_PREMATCH] startup fetch failed: " + str(exc))
+    print("[STARTUP] API-light mode enabled; no duplicate prematch/bootstrap fetches")
