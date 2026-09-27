@@ -27,6 +27,7 @@ AUTO_SNAPSHOT_WINDOW_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_WINDOW_SECON
 AUTO_SNAPSHOT_DAYS_AHEAD = max(1, int(os.getenv("AUTO_SNAPSHOT_DAYS_AHEAD", "2")))
 AUTO_SNAPSHOT_THREAD_STARTED = False
 API_FOOTBALL_RATE_LIMIT_UNTIL = 0
+SNAPSHOT_STORE_LOCK = threading.RLock()
 
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
 API_FOOTBALL_BASE_URL = os.getenv("API_FOOTBALL_BASE_URL", "https://v3.football.api-sports.io").rstrip("/")
@@ -488,21 +489,25 @@ def tracking_plan_for_fixture(summary: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def load_snapshot_store() -> Dict[str, Any]:
-    try:
-        p = Path(SNAPSHOT_STORE_PATH)
-        if p.exists():
-            return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return {"version": VERSION, "fixtures": {}}
+    with SNAPSHOT_STORE_LOCK:
+        try:
+            p = Path(SNAPSHOT_STORE_PATH)
+            if p.exists():
+                return json.loads(p.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print("[SNAPSHOT_STORE] read failed: " + str(exc))
+        return {"version": VERSION, "fixtures": {}}
 
 
 def write_snapshot_store(store: Dict[str, Any]) -> None:
-    try:
-        p = Path(SNAPSHOT_STORE_PATH); p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as exc:
-        print("[SNAPSHOT_STORE] write failed: " + str(exc))
+    with SNAPSHOT_STORE_LOCK:
+        try:
+            p = Path(SNAPSHOT_STORE_PATH); p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(p.suffix + ".tmp")
+            tmp.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(p)
+        except Exception as exc:
+            print("[SNAPSHOT_STORE] write failed: " + str(exc))
 
 
 def get_fixture_snapshots(fixture: int) -> List[Dict[str, Any]]:
@@ -511,11 +516,12 @@ def get_fixture_snapshots(fixture: int) -> List[Dict[str, Any]]:
 
 
 def save_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
-    store = load_snapshot_store(); store.setdefault("fixtures", {}).setdefault(str(record["fixture"]), [])
-    rows = [r for r in store["fixtures"][str(record["fixture"])] if r.get("stage") != record.get("stage")]
-    rows.append(record)
-    store["fixtures"][str(record["fixture"])] = sorted(rows, key=lambda x: (STAGE_ORDER.index(x.get("stage")) if x.get("stage") in STAGE_ORDER else 999, x.get("snapshot_at", 0)))
-    write_snapshot_store(store)
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store(); store.setdefault("fixtures", {}).setdefault(str(record["fixture"]), [])
+        rows = [r for r in store["fixtures"][str(record["fixture"])] if r.get("stage") != record.get("stage")]
+        rows.append(record)
+        store["fixtures"][str(record["fixture"])] = sorted(rows, key=lambda x: (STAGE_ORDER.index(x.get("stage")) if x.get("stage") in STAGE_ORDER else 999, x.get("snapshot_at", 0)))
+        write_snapshot_store(store)
     return {"saved": True, "path": SNAPSHOT_STORE_PATH, "fixture": record["fixture"], "stage": record["stage"]}
 
 
@@ -668,8 +674,10 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
     latest_ah = line_from_primary(get_nested(latest or {}, ["market_snapshot", "primary", "asian_handicap"]))
     total_ah_move = latest_ah - first_ah if first_ah is not None and latest_ah is not None else None
     si = data.get("structured_inputs") or {}
+    upstream_ok = bool(data.get("ok")) and bool(data.get("fixture"))
     return {
-        "ok": True,
+        "ok": upstream_ok,
+        "status": "ready" if upstream_ok else "upstream_unavailable_or_data_missing",
         "version": VERSION,
         "generated_at": int(time.time()),
         "fixture": data.get("fixture"),
@@ -753,9 +761,25 @@ def auto_snapshot_cycle() -> None:
                         continue
                     due = kickoff + stage["offset"]
                     delta = (now - due).total_seconds()
-                    if 0 <= delta <= AUTO_SNAPSHOT_WINDOW_SECONDS:
+                    # Catch up a missed stage until the next stage becomes due. This prevents
+                    # deploys/rate-limit cooldowns from permanently losing a checkpoint.
+                    stage_index = STAGE_ORDER.index(key)
+                    next_due = None
+                    for later in TRACKING_STAGES[stage_index + 1:]:
+                        if later["key"] != "FT":
+                            next_due = kickoff + later["offset"]
+                            break
+                    catchup_open = delta >= 0 and (next_due is None or now < next_due)
+                    if catchup_open:
                         try:
                             data = collect_stage_snapshot_data(int(fx["fixture_id"]), key)
+                            if not data.get("ok"):
+                                print("[AUTO_SNAPSHOT] skipped invalid collection " + json.dumps({"fixture": fx["fixture_id"], "stage": key, "reason": data.get("error")}, ensure_ascii=False))
+                                continue
+                            odds_cov = get_nested(data, ["coverage", "odds_prematch"], {}) or {}
+                            if not odds_cov.get("ok") or not odds_cov.get("has_data"):
+                                print("[AUTO_SNAPSHOT] skipped missing odds " + json.dumps({"fixture": fx["fixture_id"], "stage": key, "status_code": odds_cov.get("status_code")}, ensure_ascii=False))
+                                continue
                             history = get_fixture_snapshots(int(fx["fixture_id"]))
                             market_snapshot = get_nested(data, ["structured_inputs", "odds_market_snapshot"], empty_market_snapshot())
                             dynamics = compare_market_snapshots(history, market_snapshot, key)
