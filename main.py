@@ -778,10 +778,41 @@ def start_auto_snapshot_worker() -> None:
     print("[AUTO_SNAPSHOT] worker started poll_seconds=" + str(AUTO_SNAPSHOT_POLL_SECONDS) + " window_seconds=" + str(AUTO_SNAPSHOT_WINDOW_SECONDS))
 
 
+
+def validate_ai_packet_structure(fixture: int) -> Dict[str, Any]:
+    """Local structural self-check; does not call external APIs."""
+    history = get_fixture_snapshots(fixture)
+    required_stages = [x for x in STAGE_ORDER if x != "FT"]
+    checks = {
+        "snapshot_store_persistent": str(SNAPSHOT_STORE_PATH).startswith("/data/"),
+        "history_readable": isinstance(history, list),
+        "stage_values_valid": all(x.get("stage") in STAGE_ORDER or x.get("stage") == "manual" for x in history),
+        "market_snapshot_present": all("market_snapshot" in x for x in history),
+        "market_dynamics_present": all("market_dynamics" in x for x in history),
+    }
+    saved_stages = [x.get("stage") for x in history]
+    return {
+        "fixture": fixture,
+        "pass": all(checks.values()),
+        "checks": checks,
+        "saved_stage_count": len(history),
+        "saved_stages": saved_stages,
+        "missing_scheduled_stages": [x for x in required_stages if x not in saved_stages],
+        "snapshot_store_path": SNAPSHOT_STORE_PATH,
+    }
+
+
+def startup_ai_packet_selfcheck() -> None:
+    fixture = int(AUTO_FETCH_FIXTURE_ID) if AUTO_FETCH_FIXTURE_ID.strip().isdigit() else 1528900
+    result = validate_ai_packet_structure(fixture)
+    print("[AI_PACKET_SELFCHECK] " + json.dumps(result, ensure_ascii=False))
+
+
 @app.on_event("startup")
 def startup_fetch():
     global STARTUP_FIXTURES, STARTUP_COLLECT
     start_auto_snapshot_worker()
+    startup_ai_packet_selfcheck()
     try:
         STARTUP_FIXTURES = target_fixtures_for_date(AUTO_FETCH_DATE, AUTO_FETCH_TIMEZONE)
         print("[AUTO_PREMATCH] target_fixtures: " + json.dumps(STARTUP_FIXTURES, ensure_ascii=False)[:6000])
