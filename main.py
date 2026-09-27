@@ -554,7 +554,7 @@ def compare_market_snapshots(history: List[Dict[str, Any]], current: Dict[str, A
 
 @app.get("/")
 def root():
-    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots"]}
+    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet"]}
 
 
 @app.get("/health")
@@ -634,6 +634,70 @@ def shadow_snapshots(fixture: int, token: Optional[str] = None):
     require_shadow_token(token)
     rows = get_fixture_snapshots(fixture)
     return JSONResponse({"ok": True, "version": VERSION, "fixture": fixture, "stage_order": STAGE_ORDER, "count": len(rows), "snapshots": rows})
+
+
+
+def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
+    """Build one AI-ready prematch packet from persisted market history + one current fundamentals fetch."""
+    data = collect_prematch_data(fixture, include_raw=False)
+    history = get_fixture_snapshots(fixture)
+    timeline = []
+    for row in history:
+        ms = row.get("market_snapshot") or {}
+        primary = ms.get("primary") or {}
+        timeline.append({
+            "stage": row.get("stage"),
+            "snapshot_at": row.get("snapshot_at"),
+            "asian_handicap": primary.get("asian_handicap"),
+            "over_under": primary.get("over_under"),
+            "1x2": primary.get("1x2"),
+            "market_dynamics": row.get("market_dynamics"),
+            "collection_profile": get_nested(row, ["coverage"], {})
+        })
+    latest = history[-1] if history else None
+    first = history[0] if history else None
+    first_ah = line_from_primary(get_nested(first or {}, ["market_snapshot", "primary", "asian_handicap"]))
+    latest_ah = line_from_primary(get_nested(latest or {}, ["market_snapshot", "primary", "asian_handicap"]))
+    total_ah_move = latest_ah - first_ah if first_ah is not None and latest_ah is not None else None
+    si = data.get("structured_inputs") or {}
+    return {
+        "ok": True,
+        "version": VERSION,
+        "generated_at": int(time.time()),
+        "fixture": data.get("fixture"),
+        "data_quality": data.get("data_quality"),
+        "coverage": data.get("coverage"),
+        "fundamentals": {
+            "standings": si.get("standings"),
+            "recent_form_last_10": si.get("recent_form_last_10"),
+            "season_stats": si.get("season_stats"),
+            "injuries": si.get("injuries"),
+            "lineups_available": si.get("lineups_available"),
+            "prediction": si.get("prediction")
+        },
+        "market": {
+            "current": si.get("odds_market_snapshot"),
+            "saved_stage_count": len(history),
+            "saved_stages": [x.get("stage") for x in history],
+            "timeline": timeline,
+            "total_asian_handicap_move": total_ah_move,
+            "latest_dynamics": latest.get("market_dynamics") if latest else None,
+            "latest_saturation": get_nested(latest or {}, ["market_dynamics", "market_saturation"])
+        },
+        "analysis_rules": {
+            "order": ["data_integrity", "fundamentals", "recent_form", "motivation", "lineup_injuries", "market_timeline", "model_market_conflict", "market_saturation", "remaining_edge", "risk", "final_shadow_lean"],
+            "missing_data_rule": "Any unavailable injuries, lineups, odds, standings or other inputs must be marked 数据缺失; never infer missing facts.",
+            "prematch_only": True,
+            "line_move_is_not_edge": True
+        },
+        "shadow_summary": data.get("shadow_summary")
+    }
+
+
+@app.get("/shadow/ai-packet")
+def shadow_ai_packet(fixture: int, token: Optional[str] = None):
+    require_shadow_token(token)
+    return JSONResponse(build_shadow_ai_packet(fixture))
 
 
 @app.get("/shadow/report", response_class=PlainTextResponse)
