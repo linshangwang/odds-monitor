@@ -803,54 +803,73 @@ def validate_ai_packet_structure(fixture: int) -> Dict[str, Any]:
 
 
 
-def bootstrap_fixture_snapshot_once(fixture_id: int) -> Dict[str, Any]:
-    """Seed one persisted baseline only when this fixture has no saved history."""
+
+def choose_bootstrap_candidate() -> Optional[Dict[str, Any]]:
+    """Find the nearest real NS target fixture inside the active tracking window."""
+    now = datetime.now(timezone.utc)
+    candidates: List[Dict[str, Any]] = []
+    for day_delta in range(0, AUTO_SNAPSHOT_DAYS_AHEAD + 2):
+        date_str = (now.date() + timedelta(days=day_delta)).isoformat()
+        batch = target_fixtures_for_date(date_str, "UTC")
+        for fx in batch.get("fixtures", []) or []:
+            if fx.get("status") != "NS":
+                continue
+            kickoff = fixture_datetime_utc(fx)
+            if not kickoff or kickoff <= now:
+                continue
+            hours = (kickoff - now).total_seconds() / 3600
+            if 0 < hours <= 24.25:
+                candidates.append({**fx, "_hours_to_kickoff": hours})
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x["_hours_to_kickoff"])
+    return candidates[0]
+
+
+def bootstrap_current_snapshot_once() -> Dict[str, Any]:
+    """Seed one truthful persisted baseline for the nearest real NS target fixture."""
+    fx = choose_bootstrap_candidate()
+    if not fx:
+        return {"status": "skipped", "reason": "no_real_ns_fixture_inside_24h"}
+    fixture_id = int(fx["fixture_id"])
     history = get_fixture_snapshots(fixture_id)
     if history:
-        return {"fixture": fixture_id, "status": "skipped", "reason": "history_exists", "saved_stage_count": len(history)}
-    data = collect_prematch_data(fixture_id, include_raw=False)
-    fx = data.get("fixture") or {}
-    # collect_prematch_data can degrade when the fixture-detail provider returns no row.
-    # Resolve status/kickoff from the normal date fixture list when needed.
-    if not fx.get("status") or not fx.get("date"):
-        today_utc = datetime.now(timezone.utc).date()
-        candidates = []
-        for day_delta in [-1, 0, 1, 2]:
-            date_str = (today_utc + timedelta(days=day_delta)).isoformat()
-            batch = target_fixtures_for_date(date_str, "UTC")
-            candidates.extend(batch.get("fixtures", []) or [])
-        resolved = next((x for x in candidates if int(x.get("fixture_id") or 0) == fixture_id), None)
-        if resolved:
-            fx = {**fx, **resolved}
-    if fx.get("status") != "NS":
-        return {"fixture": fixture_id, "status": "skipped", "reason": "fixture_not_ns", "fixture_status": fx.get("status")}
+        return {"fixture": fixture_id, "match": f"{fx.get('home')} vs {fx.get('away')}", "status": "skipped", "reason": "history_exists", "saved_stage_count": len(history)}
     kickoff = fixture_datetime_utc(fx)
-    if not kickoff:
-        return {"fixture": fixture_id, "status": "skipped", "reason": "kickoff_missing"}
     now = datetime.now(timezone.utc)
     prematch_stages = [x for x in TRACKING_STAGES if x["key"] != "FT"]
     due = [x for x in prematch_stages if now >= kickoff + x["offset"]]
     if not due:
         return {"fixture": fixture_id, "status": "skipped", "reason": "before_t24h"}
-    chosen = due[-1]
-    if now >= kickoff:
-        return {"fixture": fixture_id, "status": "skipped", "reason": "kickoff_passed"}
-    stage = chosen["key"]
+    stage = due[-1]["key"]
+    data = collect_stage_snapshot_data(fixture_id, stage)
     market_snapshot = get_nested(data, ["structured_inputs", "odds_market_snapshot"], empty_market_snapshot())
     dynamics = compare_market_snapshots([], market_snapshot, stage)
     record = {
-        "version": VERSION, "fixture": fixture_id, "stage": stage, "requested_stage": "bootstrap_once",
+        "version": VERSION, "fixture": fixture_id, "stage": stage, "requested_stage": "bootstrap_current_once",
         "snapshot_at": int(time.time()), "fixture_info": fx, "data_quality": data.get("data_quality"),
         "coverage": data.get("coverage"), "market_snapshot": market_snapshot,
         "market_dynamics": dynamics, "shadow_summary": data.get("shadow_summary")
     }
     saved = save_snapshot(record)
-    return {"fixture": fixture_id, "status": "saved", "stage": stage, "saved": saved}
+    return {"fixture": fixture_id, "match": f"{fx.get('home')} vs {fx.get('away')}", "status": "saved", "stage": stage, "hours_to_kickoff": round(fx.get("_hours_to_kickoff", 0), 2), "saved": saved}
+
+
+def validate_persistent_system() -> Dict[str, Any]:
+    store = load_snapshot_store()
+    fixtures = store.get("fixtures", {}) if isinstance(store, dict) else {}
+    total = sum(len(v or []) for v in fixtures.values())
+    return {
+        "pass": str(SNAPSHOT_STORE_PATH).startswith("/data/") and isinstance(fixtures, dict),
+        "snapshot_store_path": SNAPSHOT_STORE_PATH,
+        "fixture_count": len(fixtures),
+        "snapshot_count": total,
+        "fixtures": {k: [x.get("stage") for x in (v or [])] for k, v in fixtures.items()}
+    }
 
 
 def startup_ai_packet_selfcheck() -> None:
-    fixture = int(AUTO_FETCH_FIXTURE_ID) if AUTO_FETCH_FIXTURE_ID.strip().isdigit() else 1528900
-    result = validate_ai_packet_structure(fixture)
+    result = validate_persistent_system()
     print("[AI_PACKET_SELFCHECK] " + json.dumps(result, ensure_ascii=False))
 
 
@@ -860,7 +879,7 @@ def startup_fetch():
     start_auto_snapshot_worker()
     startup_ai_packet_selfcheck()
     try:
-        bootstrap = bootstrap_fixture_snapshot_once(1528900)
+        bootstrap = bootstrap_current_snapshot_once()
         print("[BASELINE_BOOTSTRAP] " + json.dumps(bootstrap, ensure_ascii=False))
     except Exception as exc:
         print("[BASELINE_BOOTSTRAP] failed: " + str(exc))
