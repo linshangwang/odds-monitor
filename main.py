@@ -1,7 +1,6 @@
 import json
 import os
 import time
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -23,10 +22,36 @@ THESTATS_BASE_URL = os.getenv("THESTATS_BASE_URL", "https://api.thestatsapi.com/
 ISPORTS_API_KEY = os.getenv("ISPORTS_API_KEY", "")
 ISPORTS_BASE_URL = os.getenv("ISPORTS_BASE_URL", "http://isports.feijing88.com").rstrip("/")
 
+# 只保留甲级 / 一级联赛 + 大型赛事。可在 Railway Variables 用逗号覆盖。
+# API-Football 常用 League IDs：
+# 2 UCL, 3 UEL, 5 UEFA Nations League, 39 EPL, 61 Ligue 1, 78 Bundesliga,
+# 88 Eredivisie, 94 Portugal Primeira Liga, 135 Serie A, 140 La Liga,
+# 144 Belgium Pro League, 203 Turkey Super Lig, 848 UEFA Conference League.
+DEFAULT_TARGET_LEAGUES: Dict[int, str] = {
+    2: "UEFA Champions League",
+    3: "UEFA Europa League",
+    5: "UEFA Nations League",
+    39: "England Premier League",
+    61: "France Ligue 1",
+    78: "Germany Bundesliga",
+    88: "Netherlands Eredivisie",
+    94: "Portugal Primeira Liga",
+    135: "Italy Serie A",
+    140: "Spain La Liga",
+    144: "Belgium Pro League",
+    203: "Turkey Super Lig",
+    848: "UEFA Conference League",
+}
+TARGET_LEAGUE_IDS_RAW = os.getenv("TARGET_LEAGUE_IDS", "")
+if TARGET_LEAGUE_IDS_RAW.strip():
+    TARGET_LEAGUE_IDS = {int(x.strip()) for x in TARGET_LEAGUE_IDS_RAW.split(",") if x.strip().isdigit()}
+else:
+    TARGET_LEAGUE_IDS = set(DEFAULT_TARGET_LEAGUES.keys())
+
 app = FastAPI(
     title="Football Data Monitor",
     description="Railway service for pre-match football analysis data collection.",
-    version="0.3.1",
+    version="0.3.2",
 )
 
 LAST_PUSH_EVENTS: List[Dict[str, Any]] = []
@@ -138,11 +163,13 @@ def fixture_summary(row: Dict[str, Any]) -> Dict[str, Any]:
     away = teams.get("away", {}) or {}
     status = fixture.get("status", {}) or {}
     goals = row.get("goals", {}) or {}
+    league_id = league.get("id")
     return {
         "fixture_id": fixture.get("id"),
         "date": fixture.get("date"),
-        "league_id": league.get("id"),
+        "league_id": league_id,
         "league": league.get("name"),
+        "league_target_name": DEFAULT_TARGET_LEAGUES.get(league_id),
         "country": league.get("country"),
         "season": league.get("season"),
         "home_id": home.get("id"),
@@ -153,6 +180,16 @@ def fixture_summary(row: Dict[str, Any]) -> Dict[str, Any]:
         "elapsed": status.get("elapsed"),
         "goals": goals,
     }
+
+
+def is_target_fixture(row: Dict[str, Any]) -> bool:
+    league = row.get("league", {}) or {}
+    league_id = league.get("id")
+    return league_id in TARGET_LEAGUE_IDS
+
+
+def filter_target_fixtures(rows: List[Any]) -> List[Dict[str, Any]]:
+    return [r for r in rows if isinstance(r, dict) and is_target_fixture(r)]
 
 
 def parse_fixture_context(fixture_id: int) -> Dict[str, Any]:
@@ -244,14 +281,19 @@ def startup_auto_fetch() -> None:
     if AUTO_FETCH_DATE:
         result = call_api_football("/fixtures", {"date": AUTO_FETCH_DATE, "timezone": AUTO_FETCH_TIMEZONE})
         rows = response_list(result)
-        summaries = [fixture_summary(r) for r in rows if isinstance(r, dict)]
+        target_rows = filter_target_fixtures(rows)
+        all_summaries = [fixture_summary(r) for r in rows if isinstance(r, dict)]
+        target_summaries = [fixture_summary(r) for r in target_rows]
         STARTUP_FIXTURES = {
             "date": AUTO_FETCH_DATE,
             "timezone": AUTO_FETCH_TIMEZONE,
-            "count": len(summaries),
-            "fixtures": summaries[:80],
+            "mode": "target_major_leagues_only",
+            "target_league_ids": sorted(TARGET_LEAGUE_IDS),
+            "all_count": len(all_summaries),
+            "target_count": len(target_summaries),
+            "fixtures": target_summaries[:80],
         }
-        log_json("fixtures", STARTUP_FIXTURES, 30000)
+        log_json("target_fixtures", STARTUP_FIXTURES, 30000)
     if AUTO_FETCH_FIXTURE_ID:
         try:
             fixture_id = int(AUTO_FETCH_FIXTURE_ID)
@@ -266,7 +308,14 @@ def root():
     return {
         "service": "football-data-monitor",
         "status": "running",
-        "main_urls": ["/health", "/prematch/fixtures?date=YYYY-MM-DD", "/prematch/collect?fixture=FIXTURE_ID", "/debug/startup-fixtures", "/debug/startup-collect"],
+        "main_urls": [
+            "/health",
+            "/prematch/target-fixtures?date=YYYY-MM-DD",
+            "/prematch/fixtures?date=YYYY-MM-DD&target_only=true",
+            "/prematch/collect?fixture=FIXTURE_ID",
+            "/debug/startup-fixtures",
+            "/debug/startup-collect",
+        ],
     }
 
 
@@ -281,9 +330,11 @@ def health():
         "has_api_football_key": bool(API_FOOTBALL_KEY),
         "has_thestats_key": bool(THESTATS_API_KEY),
         "has_isports_key": bool(ISPORTS_API_KEY),
-        "version": "0.3.1",
+        "version": "0.3.2",
         "auto_fetch_date": AUTO_FETCH_DATE,
         "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID,
+        "target_league_ids": sorted(TARGET_LEAGUE_IDS),
+        "target_leagues": DEFAULT_TARGET_LEAGUES,
     }
 
 
@@ -298,7 +349,13 @@ def debug_startup_collect():
 
 
 @app.get("/prematch/fixtures")
-def prematch_fixtures(date: str = Query(...), league: Optional[int] = None, season: Optional[int] = None, timezone: Optional[str] = "Asia/Shanghai"):
+def prematch_fixtures(
+    date: str = Query(...),
+    league: Optional[int] = None,
+    season: Optional[int] = None,
+    timezone: Optional[str] = "Asia/Shanghai",
+    target_only: bool = True,
+):
     params: Dict[str, Any] = {"date": date}
     if league is not None:
         params["league"] = league
@@ -306,7 +363,26 @@ def prematch_fixtures(date: str = Query(...), league: Optional[int] = None, seas
         params["season"] = season
     if timezone:
         params["timezone"] = timezone
-    return JSONResponse(call_api_football("/fixtures", params))
+    result = call_api_football("/fixtures", params)
+    if not target_only:
+        return JSONResponse(result)
+    rows = response_list(result)
+    target_rows = filter_target_fixtures(rows)
+    return JSONResponse({
+        "ok": result.get("ok"),
+        "status_code": result.get("status_code"),
+        "request_url": result.get("request_url"),
+        "mode": "target_major_leagues_only",
+        "target_league_ids": sorted(TARGET_LEAGUE_IDS),
+        "all_count": len(rows),
+        "target_count": len(target_rows),
+        "fixtures": [fixture_summary(r) for r in target_rows],
+    })
+
+
+@app.get("/prematch/target-fixtures")
+def prematch_target_fixtures(date: str = Query(...), timezone: Optional[str] = "Asia/Shanghai"):
+    return prematch_fixtures(date=date, timezone=timezone, target_only=True)
 
 
 @app.get("/prematch/collect")
