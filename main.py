@@ -1,10 +1,10 @@
 import json
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from fastapi import FastAPI, Request, Query
+from fastapi import FastAPI, Request, Query, HTTPException
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 
@@ -14,6 +14,7 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-27")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
 AUTO_FETCH_FIXTURE_ID = os.getenv("AUTO_FETCH_FIXTURE_ID", "")
+SHADOW_ACCESS_TOKEN = os.getenv("SHADOW_ACCESS_TOKEN", "")
 
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
 API_FOOTBALL_BASE_URL = os.getenv("API_FOOTBALL_BASE_URL", "https://v3.football.api-sports.io").rstrip("/")
@@ -22,11 +23,10 @@ THESTATS_BASE_URL = os.getenv("THESTATS_BASE_URL", "https://api.thestatsapi.com/
 ISPORTS_API_KEY = os.getenv("ISPORTS_API_KEY", "")
 ISPORTS_BASE_URL = os.getenv("ISPORTS_BASE_URL", "http://isports.feijing88.com").rstrip("/")
 
-# 只保留甲级 / 一级联赛 + 大型赛事。可在 Railway Variables 用逗号覆盖。
-# API-Football 常用 League IDs：
-# 2 UCL, 3 UEL, 5 UEFA Nations League, 39 EPL, 61 Ligue 1, 78 Bundesliga,
-# 88 Eredivisie, 94 Portugal Primeira Liga, 135 Serie A, 140 La Liga,
-# 144 Belgium Pro League, 203 Turkey Super Lig, 848 UEFA Conference League.
+# 只保留甲级 / 一级联赛 + 大型赛事。可在 Railway Variables 用 TARGET_LEAGUE_IDS 覆盖。
+# API-Football 常用 League IDs：2 UCL, 3 UEL, 5 Nations League, 39 EPL, 61 Ligue 1,
+# 78 Bundesliga, 88 Eredivisie, 94 Primeira Liga, 135 Serie A, 140 La Liga,
+# 144 Belgium Pro League, 203 Turkey Super Lig, 848 Conference League.
 DEFAULT_TARGET_LEAGUES: Dict[int, str] = {
     2: "UEFA Champions League",
     3: "UEFA Europa League",
@@ -50,8 +50,8 @@ else:
 
 app = FastAPI(
     title="Football Data Monitor",
-    description="Railway service for pre-match football analysis data collection.",
-    version="0.3.2",
+    description="Railway service for football pre-match data and shadow analysis inputs.",
+    version="0.4.0",
 )
 
 LAST_PUSH_EVENTS: List[Dict[str, Any]] = []
@@ -60,10 +60,16 @@ STARTUP_FIXTURES: Dict[str, Any] = {}
 STARTUP_COLLECT: Dict[str, Any] = {}
 
 
+def require_shadow_token(token: Optional[str]) -> None:
+    """If SHADOW_ACCESS_TOKEN is set in Railway, require it on shadow endpoints."""
+    if SHADOW_ACCESS_TOKEN and token != SHADOW_ACCESS_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid or missing token")
+
+
 def mask_secret(text: str) -> str:
-    for key in [API_FOOTBALL_KEY, THESTATS_API_KEY, ISPORTS_API_KEY]:
+    for key in [API_FOOTBALL_KEY, THESTATS_API_KEY, ISPORTS_API_KEY, SHADOW_ACCESS_TOKEN]:
         if key:
-            text = text.replace(key, "YOUR_API_KEY")
+            text = text.replace(key, "YOUR_SECRET")
     return text
 
 
@@ -265,6 +271,240 @@ def collect_prematch_data(fixture_id: int, include_raw: bool = True) -> Dict[str
     return output
 
 
+def get_nested(d: Any, path: List[Any], default: Any = None) -> Any:
+    cur = d
+    for p in path:
+        if isinstance(cur, dict):
+            cur = cur.get(p)
+        elif isinstance(cur, list) and isinstance(p, int) and 0 <= p < len(cur):
+            cur = cur[p]
+        else:
+            return default
+    return cur if cur is not None else default
+
+
+def recent_form(rows: List[Any], team_id: Optional[int]) -> Dict[str, Any]:
+    if not team_id:
+        return {"available": False}
+    summary = {"available": True, "played": 0, "wins": 0, "draws": 0, "losses": 0, "goals_for": 0, "goals_against": 0, "last_results": []}
+    for row in rows[:10]:
+        if not isinstance(row, dict):
+            continue
+        teams = row.get("teams", {}) or {}
+        goals = row.get("goals", {}) or {}
+        home = teams.get("home", {}) or {}
+        away = teams.get("away", {}) or {}
+        home_id = home.get("id")
+        away_id = away.get("id")
+        gh = goals.get("home")
+        ga = goals.get("away")
+        if gh is None or ga is None:
+            continue
+        is_home = home_id == team_id
+        is_away = away_id == team_id
+        if not (is_home or is_away):
+            continue
+        gf = gh if is_home else ga
+        gc = ga if is_home else gh
+        result = "D"
+        if gf > gc:
+            result = "W"
+            summary["wins"] += 1
+        elif gf < gc:
+            result = "L"
+            summary["losses"] += 1
+        else:
+            summary["draws"] += 1
+        summary["played"] += 1
+        summary["goals_for"] += gf
+        summary["goals_against"] += gc
+        summary["last_results"].append(result)
+    summary["goal_diff"] = summary["goals_for"] - summary["goals_against"]
+    return summary
+
+
+def standings_for_team(standings_result: Dict[str, Any], team_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    if not team_id:
+        return None
+    response = response_list(standings_result)
+    groups = get_nested(response, [0, "league", "standings"], [])
+    for group in groups:
+        if isinstance(group, list):
+            for row in group:
+                if get_nested(row, ["team", "id"]) == team_id:
+                    return {
+                        "rank": row.get("rank"),
+                        "team": get_nested(row, ["team", "name"]),
+                        "points": row.get("points"),
+                        "goalsDiff": row.get("goalsDiff"),
+                        "form": row.get("form"),
+                        "description": row.get("description"),
+                        "all": row.get("all"),
+                    }
+    return None
+
+
+def season_stats_digest(stats_result: Dict[str, Any]) -> Dict[str, Any]:
+    data = stats_result.get("data") or {}
+    resp = data.get("response") if isinstance(data, dict) else None
+    if not isinstance(resp, dict):
+        return {"available": False}
+    fixtures = resp.get("fixtures", {}) or {}
+    goals = resp.get("goals", {}) or {}
+    return {
+        "available": True,
+        "played_total": get_nested(fixtures, ["played", "total"]),
+        "wins_total": get_nested(fixtures, ["wins", "total"]),
+        "draws_total": get_nested(fixtures, ["draws", "total"]),
+        "loses_total": get_nested(fixtures, ["loses", "total"]),
+        "goals_for_avg": get_nested(goals, ["for", "average", "total"]),
+        "goals_against_avg": get_nested(goals, ["against", "average", "total"]),
+        "clean_sheet": get_nested(resp, ["clean_sheet", "total"]),
+        "failed_to_score": get_nested(resp, ["failed_to_score", "total"]),
+    }
+
+
+def count_response(result: Dict[str, Any]) -> int:
+    return len(response_list(result))
+
+
+def first_prediction(predictions_result: Dict[str, Any]) -> Dict[str, Any]:
+    row = response_first(predictions_result)
+    if not row:
+        return {"available": False}
+    predictions = row.get("predictions", {}) or {}
+    return {
+        "available": True,
+        "winner": predictions.get("winner"),
+        "win_or_draw": predictions.get("win_or_draw"),
+        "advice": predictions.get("advice"),
+        "percent": predictions.get("percent"),
+    }
+
+
+def odds_digest(odds_result: Dict[str, Any]) -> Dict[str, Any]:
+    rows = response_list(odds_result)
+    if not rows:
+        return {"available": False}
+    bookmakers = get_nested(rows, [0, "bookmakers"], []) or []
+    markets = []
+    for bm in bookmakers[:5]:
+        for bet in (bm.get("bets") or [])[:8]:
+            markets.append({"bookmaker": bm.get("name"), "market": bet.get("name"), "values": bet.get("values")})
+    return {"available": True, "bookmaker_count": len(bookmakers), "sample_markets": markets[:10]}
+
+
+def build_shadow_analysis(pack: Dict[str, Any]) -> Dict[str, Any]:
+    fixture = pack.get("fixture", {}) or {}
+    raw = pack.get("raw", {}) or {}
+    home_id = fixture.get("home_id")
+    away_id = fixture.get("away_id")
+    home_name = fixture.get("home")
+    away_name = fixture.get("away")
+
+    home_recent = recent_form(response_list(raw.get("home_recent_10", {})), home_id)
+    away_recent = recent_form(response_list(raw.get("away_recent_10", {})), away_id)
+    h2h_rows = response_list(raw.get("head_to_head_last_10", {}))
+
+    standing_home = standings_for_team(raw.get("standings", {}), home_id)
+    standing_away = standings_for_team(raw.get("standings", {}), away_id)
+    home_season = season_stats_digest(raw.get("home_team_season_stats", {}))
+    away_season = season_stats_digest(raw.get("away_team_season_stats", {}))
+    prediction = first_prediction(raw.get("predictions", {}))
+    odds = odds_digest(raw.get("odds_prematch", {}))
+
+    injuries_home = []
+    injuries_away = []
+    for row in response_list(raw.get("injuries", {})):
+        tid = get_nested(row, ["team", "id"])
+        item = {"team": get_nested(row, ["team", "name"]), "player": get_nested(row, ["player", "name"]), "reason": row.get("reason"), "type": row.get("type")}
+        if tid == home_id:
+            injuries_home.append(item)
+        elif tid == away_id:
+            injuries_away.append(item)
+
+    risk_flags = []
+    coverage = pack.get("coverage", {}) or {}
+    for k in ["standings", "home_recent_10", "away_recent_10", "home_team_season_stats", "away_team_season_stats"]:
+        if not coverage.get(k, {}).get("has_data"):
+            risk_flags.append(f"missing_{k}")
+    if not coverage.get("odds_prematch", {}).get("has_data"):
+        risk_flags.append("missing_odds")
+    if not coverage.get("lineups", {}).get("has_data"):
+        risk_flags.append("lineups_not_available_yet")
+    if injuries_home or injuries_away:
+        risk_flags.append("injury_info_available_check_manually")
+
+    # 这是给影子分析使用的“数据倾向摘要”，不是投注建议。
+    directional_notes = []
+    if home_recent.get("available") and away_recent.get("available"):
+        if home_recent.get("goal_diff", 0) - away_recent.get("goal_diff", 0) >= 5:
+            directional_notes.append(f"近期状态差偏向 {home_name}")
+        elif away_recent.get("goal_diff", 0) - home_recent.get("goal_diff", 0) >= 5:
+            directional_notes.append(f"近期状态差偏向 {away_name}")
+    if standing_home and standing_away:
+        if (standing_home.get("points") or 0) - (standing_away.get("points") or 0) >= 6:
+            directional_notes.append(f"积分基本面偏向 {home_name}")
+        elif (standing_away.get("points") or 0) - (standing_home.get("points") or 0) >= 6:
+            directional_notes.append(f"积分基本面偏向 {away_name}")
+    if prediction.get("available") and prediction.get("advice"):
+        directional_notes.append(f"官方预测提示：{prediction.get('advice')}")
+    if not directional_notes:
+        directional_notes.append("暂未形成明显单边数据倾向，需要结合盘口变化")
+
+    ai_prompt = f"""你是足球AI影子分析。请只基于下面 JSON 数据做赛前分析，不要凭空补充。
+分析比赛：{home_name} vs {away_name}
+要求输出：基本面、近期状态、主客场/积分战意、伤停阵容、赔率盘口、风险项、影子倾向。
+注意：如果某项数据缺失，必须写明缺失，不要臆测。"""
+
+    return {
+        "fixture": fixture,
+        "coverage": coverage,
+        "structured_inputs": {
+            "standings": {"home": standing_home, "away": standing_away},
+            "recent_form_last_10": {"home": home_recent, "away": away_recent},
+            "season_stats": {"home": home_season, "away": away_season},
+            "head_to_head_count": len(h2h_rows),
+            "injuries": {"home_count": len(injuries_home), "away_count": len(injuries_away), "home": injuries_home[:10], "away": injuries_away[:10]},
+            "prediction": prediction,
+            "odds": odds,
+        },
+        "shadow_summary": {
+            "directional_notes": directional_notes,
+            "risk_flags": risk_flags,
+            "data_quality": "high" if len(risk_flags) <= 2 else "medium" if len(risk_flags) <= 5 else "low",
+        },
+        "football_ai_prompt": ai_prompt,
+    }
+
+
+def collect_shadow_analysis(fixture_id: int, include_raw: bool = False) -> Dict[str, Any]:
+    pack = collect_prematch_data(fixture_id, include_raw=True)
+    if pack.get("error"):
+        return pack
+    analysis = build_shadow_analysis(pack)
+    if include_raw:
+        analysis["raw_data_pack"] = pack
+    return analysis
+
+
+def list_target_fixtures(date: str, timezone: str = "Asia/Shanghai") -> Dict[str, Any]:
+    result = call_api_football("/fixtures", {"date": date, "timezone": timezone})
+    rows = response_list(result)
+    target_rows = filter_target_fixtures(rows)
+    return {
+        "ok": result.get("ok"),
+        "date": date,
+        "timezone": timezone,
+        "mode": "target_major_leagues_only",
+        "target_league_ids": sorted(TARGET_LEAGUE_IDS),
+        "all_count": len(rows),
+        "target_count": len(target_rows),
+        "fixtures": [fixture_summary(r) for r in target_rows],
+        "source_status_code": result.get("status_code"),
+    }
+
+
 def log_json(label: str, payload: Any, max_chars: int = 12000) -> None:
     text = json.dumps(payload, ensure_ascii=False, default=str)
     if len(text) > max_chars:
@@ -279,26 +519,13 @@ def startup_auto_fetch() -> None:
         print("[AUTO_PREMATCH] skipped: missing API_FOOTBALL_KEY", flush=True)
         return
     if AUTO_FETCH_DATE:
-        result = call_api_football("/fixtures", {"date": AUTO_FETCH_DATE, "timezone": AUTO_FETCH_TIMEZONE})
-        rows = response_list(result)
-        target_rows = filter_target_fixtures(rows)
-        all_summaries = [fixture_summary(r) for r in rows if isinstance(r, dict)]
-        target_summaries = [fixture_summary(r) for r in target_rows]
-        STARTUP_FIXTURES = {
-            "date": AUTO_FETCH_DATE,
-            "timezone": AUTO_FETCH_TIMEZONE,
-            "mode": "target_major_leagues_only",
-            "target_league_ids": sorted(TARGET_LEAGUE_IDS),
-            "all_count": len(all_summaries),
-            "target_count": len(target_summaries),
-            "fixtures": target_summaries[:80],
-        }
+        STARTUP_FIXTURES = list_target_fixtures(AUTO_FETCH_DATE, AUTO_FETCH_TIMEZONE)
         log_json("target_fixtures", STARTUP_FIXTURES, 30000)
     if AUTO_FETCH_FIXTURE_ID:
         try:
             fixture_id = int(AUTO_FETCH_FIXTURE_ID)
-            STARTUP_COLLECT = collect_prematch_data(fixture_id, include_raw=True)
-            log_json("collect", STARTUP_COLLECT, 50000)
+            STARTUP_COLLECT = collect_shadow_analysis(fixture_id, include_raw=True)
+            log_json("shadow_collect", STARTUP_COLLECT, 50000)
         except Exception as exc:
             log_json("collect_error", {"fixture_id": AUTO_FETCH_FIXTURE_ID, "error": str(exc)})
 
@@ -308,13 +535,14 @@ def root():
     return {
         "service": "football-data-monitor",
         "status": "running",
+        "version": "0.4.0",
         "main_urls": [
             "/health",
-            "/prematch/target-fixtures?date=YYYY-MM-DD",
-            "/prematch/fixtures?date=YYYY-MM-DD&target_only=true",
+            "/shadow/target-fixtures?date=YYYY-MM-DD",
+            "/shadow/analyze-fixture?fixture=FIXTURE_ID",
+            "/shadow/analyze?date=YYYY-MM-DD&max_games=3",
             "/prematch/collect?fixture=FIXTURE_ID",
             "/debug/startup-fixtures",
-            "/debug/startup-collect",
         ],
     }
 
@@ -324,18 +552,44 @@ def health():
     return {
         "ok": True,
         "timestamp": int(time.time()),
+        "version": "0.4.0",
         "api_football_base_url": API_FOOTBALL_BASE_URL,
         "thestats_base_url": THESTATS_BASE_URL,
         "isports_base_url": ISPORTS_BASE_URL,
         "has_api_football_key": bool(API_FOOTBALL_KEY),
         "has_thestats_key": bool(THESTATS_API_KEY),
         "has_isports_key": bool(ISPORTS_API_KEY),
-        "version": "0.3.2",
+        "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN),
         "auto_fetch_date": AUTO_FETCH_DATE,
         "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID,
         "target_league_ids": sorted(TARGET_LEAGUE_IDS),
         "target_leagues": DEFAULT_TARGET_LEAGUES,
     }
+
+
+@app.get("/shadow/target-fixtures")
+def shadow_target_fixtures(date: str = Query(...), timezone: str = "Asia/Shanghai", token: Optional[str] = None):
+    require_shadow_token(token)
+    return JSONResponse(list_target_fixtures(date, timezone))
+
+
+@app.get("/shadow/analyze-fixture")
+def shadow_analyze_fixture(fixture: int, raw: bool = False, token: Optional[str] = None):
+    require_shadow_token(token)
+    return JSONResponse(collect_shadow_analysis(fixture, include_raw=raw))
+
+
+@app.get("/shadow/analyze")
+def shadow_analyze(date: str = Query(...), timezone: str = "Asia/Shanghai", max_games: int = 3, raw: bool = False, token: Optional[str] = None):
+    require_shadow_token(token)
+    target = list_target_fixtures(date, timezone)
+    fixtures = target.get("fixtures", [])[: max(1, min(max_games, 8))]
+    analyses = []
+    for f in fixtures:
+        fixture_id = f.get("fixture_id")
+        if fixture_id:
+            analyses.append(collect_shadow_analysis(int(fixture_id), include_raw=raw))
+    return JSONResponse({"ok": True, "date": date, "target_count": target.get("target_count"), "analyzed_count": len(analyses), "fixtures": fixtures, "analyses": analyses})
 
 
 @app.get("/debug/startup-fixtures")
@@ -349,13 +603,7 @@ def debug_startup_collect():
 
 
 @app.get("/prematch/fixtures")
-def prematch_fixtures(
-    date: str = Query(...),
-    league: Optional[int] = None,
-    season: Optional[int] = None,
-    timezone: Optional[str] = "Asia/Shanghai",
-    target_only: bool = True,
-):
+def prematch_fixtures(date: str = Query(...), league: Optional[int] = None, season: Optional[int] = None, timezone: Optional[str] = "Asia/Shanghai", target_only: bool = False):
     params: Dict[str, Any] = {"date": date}
     if league is not None:
         params["league"] = league
@@ -364,25 +612,15 @@ def prematch_fixtures(
     if timezone:
         params["timezone"] = timezone
     result = call_api_football("/fixtures", params)
-    if not target_only:
-        return JSONResponse(result)
-    rows = response_list(result)
-    target_rows = filter_target_fixtures(rows)
-    return JSONResponse({
-        "ok": result.get("ok"),
-        "status_code": result.get("status_code"),
-        "request_url": result.get("request_url"),
-        "mode": "target_major_leagues_only",
-        "target_league_ids": sorted(TARGET_LEAGUE_IDS),
-        "all_count": len(rows),
-        "target_count": len(target_rows),
-        "fixtures": [fixture_summary(r) for r in target_rows],
-    })
+    if target_only:
+        rows = filter_target_fixtures(response_list(result))
+        return JSONResponse({"ok": result.get("ok"), "date": date, "target_count": len(rows), "fixtures": [fixture_summary(r) for r in rows]})
+    return JSONResponse(result)
 
 
 @app.get("/prematch/target-fixtures")
-def prematch_target_fixtures(date: str = Query(...), timezone: Optional[str] = "Asia/Shanghai"):
-    return prematch_fixtures(date=date, timezone=timezone, target_only=True)
+def prematch_target_fixtures(date: str = Query(...), timezone: str = "Asia/Shanghai"):
+    return JSONResponse(list_target_fixtures(date, timezone))
 
 
 @app.get("/prematch/collect")
