@@ -1,6 +1,7 @@
 import json
 import os
 import time
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -19,6 +20,11 @@ AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
 AUTO_FETCH_FIXTURE_ID = os.getenv("AUTO_FETCH_FIXTURE_ID", "")
 SHADOW_ACCESS_TOKEN = os.getenv("SHADOW_ACCESS_TOKEN", "")
 SNAPSHOT_STORE_PATH = os.getenv("SNAPSHOT_STORE_PATH", "/tmp/shadow_snapshots.json")
+AUTO_SNAPSHOT_ENABLED = os.getenv("AUTO_SNAPSHOT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+AUTO_SNAPSHOT_POLL_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_POLL_SECONDS", "300")))
+AUTO_SNAPSHOT_WINDOW_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_WINDOW_SECONDS", "600")))
+AUTO_SNAPSHOT_DAYS_AHEAD = max(1, int(os.getenv("AUTO_SNAPSHOT_DAYS_AHEAD", "2")))
+AUTO_SNAPSHOT_THREAD_STARTED = False
 
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
 API_FOOTBALL_BASE_URL = os.getenv("API_FOOTBALL_BASE_URL", "https://v3.football.api-sports.io").rstrip("/")
@@ -612,9 +618,63 @@ async def sportradar_push_statistics(request: Request):
     return {"ok": True, "received": "statistics", "count": len(LAST_PUSH_STATISTICS)}
 
 
+def auto_snapshot_cycle() -> None:
+    now = datetime.now(timezone.utc)
+    dates = sorted({(now + timedelta(days=i)).astimezone(ZoneInfo(AUTO_FETCH_TIMEZONE)).date().isoformat() for i in range(AUTO_SNAPSHOT_DAYS_AHEAD + 1)})
+    for date_str in dates:
+        try:
+            fixtures = target_fixtures_for_date(date_str, AUTO_FETCH_TIMEZONE)
+            for fx in fixtures.get("fixtures", []):
+                if fx.get("status") != "NS" or not fx.get("fixture_id"):
+                    continue
+                kickoff = fixture_datetime_utc(fx)
+                if not kickoff:
+                    continue
+                history = get_fixture_snapshots(int(fx["fixture_id"]))
+                saved_stages = {r.get("stage") for r in history}
+                for stage in TRACKING_STAGES:
+                    key = stage["key"]
+                    if key == "FT" or key in saved_stages:
+                        continue
+                    due = kickoff + stage["offset"]
+                    delta = (now - due).total_seconds()
+                    if 0 <= delta <= AUTO_SNAPSHOT_WINDOW_SECONDS:
+                        try:
+                            data = collect_prematch_data(int(fx["fixture_id"]), include_raw=False)
+                            history = get_fixture_snapshots(int(fx["fixture_id"]))
+                            market_snapshot = get_nested(data, ["structured_inputs", "odds_market_snapshot"], empty_market_snapshot())
+                            dynamics = compare_market_snapshots(history, market_snapshot, key)
+                            record = {"version": VERSION, "fixture": int(fx["fixture_id"]), "stage": key, "requested_stage": "auto", "snapshot_at": int(time.time()), "fixture_info": data.get("fixture"), "data_quality": data.get("data_quality"), "coverage": data.get("coverage"), "market_snapshot": market_snapshot, "market_dynamics": dynamics, "shadow_summary": data.get("shadow_summary")}
+                            save_snapshot(record)
+                            print("[AUTO_SNAPSHOT] saved " + json.dumps({"fixture": fx["fixture_id"], "stage": key, "due": due.isoformat()}, ensure_ascii=False))
+                        except Exception as exc:
+                            print("[AUTO_SNAPSHOT] fixture failed: " + str(exc))
+        except Exception as exc:
+            print("[AUTO_SNAPSHOT] date failed: " + date_str + " " + str(exc))
+
+
+def auto_snapshot_worker() -> None:
+    while True:
+        try:
+            auto_snapshot_cycle()
+        except Exception as exc:
+            print("[AUTO_SNAPSHOT] cycle failed: " + str(exc))
+        time.sleep(AUTO_SNAPSHOT_POLL_SECONDS)
+
+
+def start_auto_snapshot_worker() -> None:
+    global AUTO_SNAPSHOT_THREAD_STARTED
+    if not AUTO_SNAPSHOT_ENABLED or AUTO_SNAPSHOT_THREAD_STARTED:
+        return
+    AUTO_SNAPSHOT_THREAD_STARTED = True
+    threading.Thread(target=auto_snapshot_worker, name="shadow-auto-snapshot", daemon=True).start()
+    print("[AUTO_SNAPSHOT] worker started poll_seconds=" + str(AUTO_SNAPSHOT_POLL_SECONDS) + " window_seconds=" + str(AUTO_SNAPSHOT_WINDOW_SECONDS))
+
+
 @app.on_event("startup")
 def startup_fetch():
     global STARTUP_FIXTURES, STARTUP_COLLECT
+    start_auto_snapshot_worker()
     try:
         STARTUP_FIXTURES = target_fixtures_for_date(AUTO_FETCH_DATE, AUTO_FETCH_TIMEZONE)
         print("[AUTO_PREMATCH] target_fixtures: " + json.dumps(STARTUP_FIXTURES, ensure_ascii=False)[:6000])
