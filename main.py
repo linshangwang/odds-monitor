@@ -802,6 +802,40 @@ def validate_ai_packet_structure(fixture: int) -> Dict[str, Any]:
     }
 
 
+
+def bootstrap_fixture_snapshot_once(fixture_id: int) -> Dict[str, Any]:
+    """Seed one persisted baseline only when this fixture has no saved history."""
+    history = get_fixture_snapshots(fixture_id)
+    if history:
+        return {"fixture": fixture_id, "status": "skipped", "reason": "history_exists", "saved_stage_count": len(history)}
+    data = collect_prematch_data(fixture_id, include_raw=False)
+    fx = data.get("fixture") or {}
+    if fx.get("status") != "NS":
+        return {"fixture": fixture_id, "status": "skipped", "reason": "fixture_not_ns", "fixture_status": fx.get("status")}
+    kickoff = fixture_datetime_utc(fx)
+    if not kickoff:
+        return {"fixture": fixture_id, "status": "skipped", "reason": "kickoff_missing"}
+    now = datetime.now(timezone.utc)
+    prematch_stages = [x for x in TRACKING_STAGES if x["key"] != "FT"]
+    due = [x for x in prematch_stages if now >= kickoff + x["offset"]]
+    if not due:
+        return {"fixture": fixture_id, "status": "skipped", "reason": "before_t24h"}
+    chosen = due[-1]
+    if now >= kickoff:
+        return {"fixture": fixture_id, "status": "skipped", "reason": "kickoff_passed"}
+    stage = chosen["key"]
+    market_snapshot = get_nested(data, ["structured_inputs", "odds_market_snapshot"], empty_market_snapshot())
+    dynamics = compare_market_snapshots([], market_snapshot, stage)
+    record = {
+        "version": VERSION, "fixture": fixture_id, "stage": stage, "requested_stage": "bootstrap_once",
+        "snapshot_at": int(time.time()), "fixture_info": fx, "data_quality": data.get("data_quality"),
+        "coverage": data.get("coverage"), "market_snapshot": market_snapshot,
+        "market_dynamics": dynamics, "shadow_summary": data.get("shadow_summary")
+    }
+    saved = save_snapshot(record)
+    return {"fixture": fixture_id, "status": "saved", "stage": stage, "saved": saved}
+
+
 def startup_ai_packet_selfcheck() -> None:
     fixture = int(AUTO_FETCH_FIXTURE_ID) if AUTO_FETCH_FIXTURE_ID.strip().isdigit() else 1528900
     result = validate_ai_packet_structure(fixture)
@@ -813,6 +847,11 @@ def startup_fetch():
     global STARTUP_FIXTURES, STARTUP_COLLECT
     start_auto_snapshot_worker()
     startup_ai_packet_selfcheck()
+    try:
+        bootstrap = bootstrap_fixture_snapshot_once(1528900)
+        print("[BASELINE_BOOTSTRAP] " + json.dumps(bootstrap, ensure_ascii=False))
+    except Exception as exc:
+        print("[BASELINE_BOOTSTRAP] failed: " + str(exc))
     try:
         STARTUP_FIXTURES = target_fixtures_for_date(AUTO_FETCH_DATE, AUTO_FETCH_TIMEZONE)
         print("[AUTO_PREMATCH] target_fixtures: " + json.dumps(STARTUP_FIXTURES, ensure_ascii=False)[:6000])
