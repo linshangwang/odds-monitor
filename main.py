@@ -368,6 +368,48 @@ def collect_prematch_data(fixture_id: int, include_raw: bool = False) -> Dict[st
     return {"ok": True, "version": VERSION, "generated_at": int(time.time()), "fixture": {k: v for k, v in ctx.items() if k not in ["fixture_detail", "fixture_row"]}, "coverage": coverage, "data_quality": quality, "structured_inputs": structured, "shadow_summary": make_shadow_summary(ctx, structured, quality), "football_ai_prompt": make_prompt(ctx), "raw_data_pack": {"fixture_detail": ctx.get("fixture_detail"), **{k: compact_result(v) for k, v in calls.items()}} if include_raw else None}
 
 
+
+def collect_stage_snapshot_data(fixture_id: int, stage: str) -> Dict[str, Any]:
+    """Low-cost collection for automatic market snapshots.
+    Early stages collect fixture context + odds only. Late stages add injuries/lineups.
+    Full fundamentals remain available through /shadow/analyze-fixture.
+    """
+    ctx = parse_fixture_context(fixture_id)
+    if ctx.get("error"):
+        return {"ok": False, **ctx}
+    calls: Dict[str, Dict[str, Any]] = {
+        "odds_prematch": call_api_football("/odds", {"fixture": fixture_id})
+    }
+    if stage in ("T-1h", "T-15m", "Closing"):
+        calls["injuries"] = call_api_football("/injuries", {"fixture": fixture_id})
+        calls["lineups"] = call_api_football("/fixtures/lineups", {"fixture": fixture_id})
+    coverage = {}
+    for name, result in calls.items():
+        data = result.get("data") or {}
+        response = data.get("response") if isinstance(data, dict) else None
+        coverage[name] = {"ok": result.get("ok"), "status_code": result.get("status_code"), "results": data.get("results") if isinstance(data, dict) else None, "has_data": bool(response), "request_url": result.get("request_url")}
+    market_snapshot = extract_market_snapshot(calls.get("odds_prematch", {}))
+    home_id, away_id = ctx.get("home_id"), ctx.get("away_id")
+    return {
+        "ok": True,
+        "version": VERSION,
+        "generated_at": int(time.time()),
+        "fixture": {k: v for k, v in ctx.items() if k not in ["fixture_detail", "fixture_row"]},
+        "coverage": coverage,
+        "data_quality": {"level": "market_snapshot", "missing_must": [], "missing_strong": []},
+        "structured_inputs": {
+            "odds_market_snapshot": market_snapshot,
+            "injuries": injuries_summary(calls.get("injuries", {}), home_id, away_id) if "injuries" in calls else {"available": False, "reason": "not_requested_at_this_stage"},
+            "lineups_available": coverage.get("lineups", {}).get("has_data", False),
+            "collection_profile": "late_market_plus_team_news" if stage in ("T-1h", "T-15m", "Closing") else "market_only"
+        },
+        "shadow_summary": {
+            "directional_notes": ["自动阶段快照：仅采集该阶段必要数据"],
+            "risk_flags": [],
+            "data_quality": "market_snapshot"
+        }
+    }
+
 def make_shadow_summary(ctx: Dict[str, Any], structured: Dict[str, Any], quality: Dict[str, Any]) -> Dict[str, Any]:
     notes, risks = [], []
     home, away = ctx.get("home"), ctx.get("away")
@@ -640,7 +682,7 @@ def auto_snapshot_cycle() -> None:
                     delta = (now - due).total_seconds()
                     if 0 <= delta <= AUTO_SNAPSHOT_WINDOW_SECONDS:
                         try:
-                            data = collect_prematch_data(int(fx["fixture_id"]), include_raw=False)
+                            data = collect_stage_snapshot_data(int(fx["fixture_id"]), key)
                             history = get_fixture_snapshots(int(fx["fixture_id"]))
                             market_snapshot = get_nested(data, ["structured_inputs", "odds_market_snapshot"], empty_market_snapshot())
                             dynamics = compare_market_snapshots(history, market_snapshot, key)
