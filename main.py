@@ -997,4 +997,6 @@ def startup_fetch():
     # fixture discovery and stage collection; startup only validates local persistence.
     start_auto_snapshot_worker()
     startup_ai_packet_selfcheck()
+    odds_check = historical_odds_selfcheck()
+    print("[HISTORICAL_ODDS_SELFCHECK] " + json.dumps(odds_check, ensure_ascii=False))
     print("[STARTUP] API-light mode enabled; no duplicate prematch/bootstrap fetches")
