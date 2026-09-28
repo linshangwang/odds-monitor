@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -33,6 +33,8 @@ API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
 API_FOOTBALL_BASE_URL = os.getenv("API_FOOTBALL_BASE_URL", "https://v3.football.api-sports.io").rstrip("/")
 THESTATS_API_KEY = os.getenv("THESTATS_API_KEY", "")
 THESTATS_BASE_URL = os.getenv("THESTATS_BASE_URL", "https://api.thestatsapi.com/api").rstrip("/")
+THE_ODDS_API_KEY = os.getenv("THE_ODDS_API_KEY", "")
+THE_ODDS_API_BASE_URL = "https://api.the-odds-api.com/v4"
 ISPORTS_API_KEY = os.getenv("ISPORTS_API_KEY", "")
 ISPORTS_BASE_URL = os.getenv("ISPORTS_BASE_URL", "http://isports.feijing88.com").rstrip("/")
 
@@ -129,6 +131,29 @@ def call_thestats(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
         return {"ok": resp.ok, "status_code": resp.status_code, "request_url": mask_secret(resp.url), "data": safe_json_response(resp)}
     except requests.RequestException as exc:
         return {"ok": False, "error": str(exc), "request_url": mask_secret(url)}
+
+def call_the_odds_api(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if not THE_ODDS_API_KEY:
+        return {"ok": False, "error": "Missing THE_ODDS_API_KEY"}
+
+    if not path.startswith("/"):
+        path = "/" + path
+
+    url = f"{THE_ODDS_API_BASE_URL}{path}"
+    query = dict(params or {})
+    query["apiKey"] = THE_ODDS_API_KEY
+
+    try:
+        resp = requests.get(url, params=query, timeout=REQUEST_TIMEOUT)
+        return {
+            "ok": resp.ok,
+            "status_code": resp.status_code,
+            "data": safe_json_response(resp),
+            "quota_remaining": resp.headers.get("x-requests-remaining"),
+            "quota_used": resp.headers.get("x-requests-used")
+        }
+    except requests.RequestException as exc:
+        return {"ok": False, "error": type(exc).__name__}
 
 
 def response_list(result: Dict[str, Any]) -> List[Any]:
@@ -590,6 +615,43 @@ def api_football_fixtures(date: str, timezone_name: str = Query("Asia/Shanghai",
 def thestats_raw(path: str, token: Optional[str] = None):
     require_shadow_token(token)
     return JSONResponse(call_thestats(path))
+
+@app.get("/shadow/historical-odds-test")
+def shadow_historical_odds_test(token: Optional[str] = None):
+    require_shadow_token(token)
+
+    auth = call_the_odds_api("/sports")
+
+    result = {
+        "ok": False,
+        "auth_valid": auth.get("status_code") == 200,
+        "historical_access": False,
+        "sports_status": auth.get("status_code"),
+        "historical_status": None,
+        "quota_remaining": auth.get("quota_remaining"),
+        "quota_used": auth.get("quota_used")
+    }
+
+    if not result["auth_valid"]:
+        return JSONResponse(result)
+
+    historical = call_the_odds_api(
+        "/historical/sports/soccer_epl/odds",
+        {
+            "regions": "eu",
+            "markets": "h2h",
+            "oddsFormat": "decimal",
+            "date": "2024-01-01T12:00:00Z"
+        }
+    )
+
+    result["historical_status"] = historical.get("status_code")
+    result["historical_access"] = historical.get("status_code") == 200
+    result["ok"] = result["historical_access"]
+    result["quota_remaining"] = historical.get("quota_remaining")
+    result["quota_used"] = historical.get("quota_used")
+
+    return JSONResponse(result)
 
 
 @app.get("/prematch/target-fixtures")
