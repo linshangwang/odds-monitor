@@ -635,6 +635,30 @@ def shadow_historical_odds_test(token: Optional[str] = None):
     if not result["auth_valid"]:
         return JSONResponse(result)
 
+# One-time startup-safe historical odds self-check helper.
+def historical_odds_selfcheck() -> Dict[str, Any]:
+    auth = call_the_odds_api("/sports")
+    result = {
+        "auth_valid": auth.get("status_code") == 200,
+        "historical_access": False,
+        "sports_status": auth.get("status_code"),
+        "historical_status": None,
+        "quota_remaining": auth.get("quota_remaining"),
+        "quota_used": auth.get("quota_used"),
+    }
+    if not result["auth_valid"]:
+        return result
+    historical = call_the_odds_api("/historical/sports/soccer_epl/odds", {
+        "regions": "eu", "markets": "h2h", "oddsFormat": "decimal",
+        "date": "2024-01-01T12:00:00Z"
+    })
+    result["historical_status"] = historical.get("status_code")
+    result["historical_access"] = historical.get("status_code") == 200
+    result["quota_remaining"] = historical.get("quota_remaining")
+    result["quota_used"] = historical.get("quota_used")
+    return result
+
+
     historical = call_the_odds_api(
         "/historical/sports/soccer_epl/odds",
         {
