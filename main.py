@@ -618,7 +618,7 @@ def thestats_raw(path: str, token: Optional[str] = None):
 
 @app.get("/shadow/historical-odds-test")
 def shadow_historical_odds_test(token: Optional[str] = None):
-    
+    require_shadow_token(token)
 
     auth = call_the_odds_api("/sports")
 
