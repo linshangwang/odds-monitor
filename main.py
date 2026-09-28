@@ -35,6 +35,8 @@ THESTATS_API_KEY = os.getenv("THESTATS_API_KEY", "")
 THESTATS_BASE_URL = os.getenv("THESTATS_BASE_URL", "https://api.thestatsapi.com/api").rstrip("/")
 THE_ODDS_API_KEY = os.getenv("THE_ODDS_API_KEY", "")
 THE_ODDS_API_BASE_URL = "https://api.the-odds-api.com/v4"
+SPORTRADAR_API_KEY = os.getenv("SPORTRADAR_API_KEY", "")
+SPORTRADAR_SOCCER_BASE_URL = "https://api.sportradar.com/soccer/trial/v4/en"
 ISPORTS_API_KEY = os.getenv("ISPORTS_API_KEY", "")
 ISPORTS_BASE_URL = os.getenv("ISPORTS_BASE_URL", "http://isports.feijing88.com").rstrip("/")
 
@@ -635,6 +637,37 @@ def shadow_historical_odds_test(token: Optional[str] = None):
     if not result["auth_valid"]:
         return JSONResponse(result)
 
+def sportradar_live_selfcheck() -> Dict[str, Any]:
+    if not SPORTRADAR_API_KEY:
+        return {"ok": False, "error": "Missing SPORTRADAR_API_KEY"}
+    try:
+        resp = requests.get(
+            f"{SPORTRADAR_SOCCER_BASE_URL}/schedules/live/schedules.json",
+            headers={"x-api-key": SPORTRADAR_API_KEY},
+            timeout=REQUEST_TIMEOUT,
+        )
+        data = safe_json_response(resp) if resp.ok else None
+        events = data.get("schedules", []) if isinstance(data, dict) else []
+        sample = None
+        if events:
+            event = events[0] if isinstance(events[0], dict) else {}
+            sport_event = event.get("sport_event", {}) if isinstance(event, dict) else {}
+            status = event.get("sport_event_status", {}) if isinstance(event, dict) else {}
+            competitors = sport_event.get("competitors", []) if isinstance(sport_event, dict) else []
+            sample = {
+                "sport_event_id": sport_event.get("id"),
+                "start_time": sport_event.get("start_time"),
+                "status": status.get("status"),
+                "match_status": status.get("match_status"),
+                "home_score": status.get("home_score"),
+                "away_score": status.get("away_score"),
+                "competitors": [{"name": x.get("name"), "qualifier": x.get("qualifier")} for x in competitors[:2] if isinstance(x, dict)],
+            }
+        return {"ok": resp.ok, "status_code": resp.status_code, "live_event_count": len(events), "sample": sample}
+    except requests.RequestException as exc:
+        return {"ok": False, "error": type(exc).__name__}
+
+
 # One-time startup-safe historical odds self-check helper.
 def historical_odds_selfcheck() -> Dict[str, Any]:
     auth = call_the_odds_api("/sports")
@@ -997,6 +1030,6 @@ def startup_fetch():
     # fixture discovery and stage collection; startup only validates local persistence.
     start_auto_snapshot_worker()
     startup_ai_packet_selfcheck()
-    odds_check = historical_odds_selfcheck()
-    print("[HISTORICAL_ODDS_SELFCHECK] " + json.dumps(odds_check, ensure_ascii=False))
+    live_check = sportradar_live_selfcheck()
+    print("[SPORTRADAR_LIVE_SELFCHECK] " + json.dumps(live_check, ensure_ascii=False))
     print("[STARTUP] API-light mode enabled; no duplicate prematch/bootstrap fetches")
