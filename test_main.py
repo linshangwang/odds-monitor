@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import main
 
@@ -67,6 +68,22 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("probability_change", row)
         self.assertIn("best_market_change", row)
         self.assertEqual(len(main.get_fundamental_versions(1)), 1)
+
+    def test_nami_call_never_returns_credentials_in_endpoint(self):
+        original_user, original_secret = main.NAMI_API_USER, main.NAMI_API_SECRET
+        main.NAMI_API_USER, main.NAMI_API_SECRET = "user-value", "secret-value"
+        response = unittest.mock.Mock()
+        response.ok, response.status_code = True, 200
+        response.json.return_value = {"results": [{"id": 1}]}
+        try:
+            with patch("main.requests.get", return_value=response):
+                result = main.call_nami("/api/v4/football/competition/list", {"limit": 1})
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["endpoint"], "/api/v4/football/competition/list")
+            self.assertNotIn("secret-value", str(result))
+            self.assertNotIn("user-value", str(result))
+        finally:
+            main.NAMI_API_USER, main.NAMI_API_SECRET = original_user, original_secret
 
 
 if __name__ == "__main__":
