@@ -121,6 +121,13 @@ SNAPSHOT_STORE_PATH=/data/shadow_snapshots.json
 
 存储格式向后兼容原 `fixtures` 快照；新增的 `fundamental_versions` 与其并列保存。
 
+## Nami 可选数据源
+
+Nami 只用于补充数据，不是主流程依赖。未配置、IP 未授权、限流、超时、非 JSON
+响应或其他上游异常都会返回 `degraded=true` 和
+`fallback=continue_without_nami`；服务健康状态、既有数据源和影子分析流程继续运行。
+可通过 `NAMI_REQUEST_TIMEOUT` 单独限制等待时间，默认最多 10 秒。
+
 ## 测试
 
 ```bash

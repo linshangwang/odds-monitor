@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -40,6 +40,7 @@ THE_ODDS_API_BASE_URL = "https://api.the-odds-api.com/v4"
 NAMI_API_USER = os.getenv("NAMI_API_USER", "")
 NAMI_API_SECRET = os.getenv("NAMI_API_SECRET", "")
 NAMI_API_BASE_URL = os.getenv("NAMI_API_BASE_URL", "https://open.sportnanoapi.com").rstrip("/")
+NAMI_REQUEST_TIMEOUT = max(1, int(os.getenv("NAMI_REQUEST_TIMEOUT", str(min(REQUEST_TIMEOUT, 10)))))
 SPORTRADAR_API_KEY = os.getenv("SPORTRADAR_API_KEY", "")
 SPORTRADAR_SOCCER_BASE_URL = "https://api.sportradar.com/soccer/trial/v4/en"
 ISPORTS_API_KEY = os.getenv("ISPORTS_API_KEY", "")
@@ -166,27 +167,37 @@ def call_the_odds_api(path: str, params: Optional[Dict[str, Any]] = None) -> Dic
 
 
 def call_nami(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Call Nami without ever exposing credentials in returned URLs or logs."""
+    """Call optional Nami safely; any failure degrades only this data source."""
     if not NAMI_API_USER or not NAMI_API_SECRET:
-        return {"ok": False, "error": "Missing NAMI_API_USER or NAMI_API_SECRET"}
+        return {
+            "ok": False, "available": False, "degraded": True, "required": False,
+            "error": "nami_not_configured", "fallback": "continue_without_nami",
+        }
     if not path.startswith("/"):
         path = "/" + path
     query = dict(params or {})
     query.update({"user": NAMI_API_USER, "secret": NAMI_API_SECRET})
     try:
-        response = requests.get(f"{NAMI_API_BASE_URL}{path}", params=query, timeout=REQUEST_TIMEOUT)
+        response = requests.get(f"{NAMI_API_BASE_URL}{path}", params=query, timeout=NAMI_REQUEST_TIMEOUT)
         try:
             payload = response.json()
         except Exception:
             payload = {"error": "non_json_response"}
         upstream_error = payload.get("err") if isinstance(payload, dict) else None
+        ok = bool(response.ok and not upstream_error)
         return {
-            "ok": bool(response.ok and not upstream_error), "status_code": response.status_code,
+            "ok": ok, "available": ok, "degraded": not ok, "required": False,
+            "status_code": response.status_code,
             "data": payload, "error": upstream_error,
             "endpoint": path,  # deliberately excludes query credentials
+            "fallback": None if ok else "continue_without_nami",
         }
-    except requests.RequestException as exc:
-        return {"ok": False, "error": type(exc).__name__, "endpoint": path}
+    except Exception as exc:
+        return {
+            "ok": False, "available": False, "degraded": True, "required": False,
+            "error": type(exc).__name__, "endpoint": path,
+            "fallback": "continue_without_nami",
+        }
 
 
 def nami_capability_check() -> Dict[str, Any]:
@@ -195,6 +206,8 @@ def nami_capability_check() -> Dict[str, Any]:
     error = str(check.get("error") or "")
     return {
         "configured": bool(NAMI_API_USER and NAMI_API_SECRET), "ok": check.get("ok", False),
+        "available": check.get("available", False), "degraded": check.get("degraded", True),
+        "required": False, "fallback": "continue_without_nami" if not check.get("ok") else None,
         "status_code": check.get("status_code"),
         "ip_whitelist_required": "ip" in error.lower() and ("授权" in error or "unauthor" in error.lower()),
         "error_category": "ip_not_authorized" if "ip" in error.lower() else ("upstream_error" if error else None),
@@ -859,7 +872,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "has_thestats_key": bool(THESTATS_API_KEY), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}}
+    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "has_thestats_key": bool(THESTATS_API_KEY), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}}
 
 
 @app.get("/shadow/nami-capabilities")

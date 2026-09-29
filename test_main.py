@@ -85,6 +85,36 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         finally:
             main.NAMI_API_USER, main.NAMI_API_SECRET = original_user, original_secret
 
+    def test_nami_failure_is_optional_and_degraded(self):
+        original_user, original_secret = main.NAMI_API_USER, main.NAMI_API_SECRET
+        main.NAMI_API_USER, main.NAMI_API_SECRET = "user-value", "secret-value"
+        try:
+            with patch("main.requests.get", side_effect=RuntimeError("unexpected client failure")):
+                result = main.call_nami("/api/v4/football/competition/list")
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["degraded"])
+            self.assertFalse(result["required"])
+            self.assertEqual(result["fallback"], "continue_without_nami")
+            self.assertTrue(main.health()["ok"])
+            self.assertEqual(main.health()["nami_failure_policy"], "continue_without_nami")
+        finally:
+            main.NAMI_API_USER, main.NAMI_API_SECRET = original_user, original_secret
+
+    def test_nami_upstream_error_does_not_become_available_data(self):
+        original_user, original_secret = main.NAMI_API_USER, main.NAMI_API_SECRET
+        main.NAMI_API_USER, main.NAMI_API_SECRET = "user-value", "secret-value"
+        response = unittest.mock.Mock()
+        response.ok, response.status_code = True, 200
+        response.json.return_value = {"err": "ip未授权访问", "results": [{"id": 1}]}
+        try:
+            with patch("main.requests.get", return_value=response):
+                result = main.call_nami("/api/v4/football/competition/list")
+            self.assertFalse(result["ok"])
+            self.assertFalse(result["available"])
+            self.assertTrue(result["degraded"])
+        finally:
+            main.NAMI_API_USER, main.NAMI_API_SECRET = original_user, original_secret
+
 
 if __name__ == "__main__":
     unittest.main()
