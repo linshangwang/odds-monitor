@@ -165,7 +165,22 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(missing["import_status"], "data_missing")
         packet = main.build_imported_ai_packet("uuid-1")
         self.assertIn("T-15m", packet["market"]["missing_stages"])
+        self.assertNotIn("company_market_array", packet["market"]["timeline"][0])
+        self.assertIsNone(packet["fundamentals"]["lineup_history"])
+        self.assertNotIn("markets", packet["market"]["current"])
+        expanded = main.build_imported_ai_packet("uuid-1", include_companies=True, include_lineups=True)
+        self.assertIn("company_market_array", expanded["market"]["timeline"][0])
+        self.assertEqual(len(expanded["fundamentals"]["lineup_history"]), 1)
         self.assertEqual(packet["decision_layer"]["decision"], "PASS")
+
+    def test_snapshot_store_is_gzip_and_reads_plain_legacy_json(self):
+        main.write_snapshot_store({"version": "test", "fixtures": {}})
+        with open(main.SNAPSHOT_STORE_PATH, "rb") as handle:
+            self.assertEqual(handle.read(2), b"\x1f\x8b")
+        self.assertEqual(main.load_snapshot_store()["version"], "test")
+        with open(main.SNAPSHOT_STORE_PATH, "wb") as handle:
+            handle.write(b'{"version":"legacy","fixtures":{}}')
+        self.assertEqual(main.load_snapshot_store()["version"], "legacy")
 
     def test_import_is_idempotent_per_stage(self):
         packet = self.prematch_packet()

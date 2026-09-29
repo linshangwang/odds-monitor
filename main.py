@@ -1,4 +1,5 @@
 import json
+import gzip
 import os
 import time
 import threading
@@ -16,13 +17,14 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
 AUTO_FETCH_FIXTURE_ID = os.getenv("AUTO_FETCH_FIXTURE_ID", "")
 SHADOW_ACCESS_TOKEN = os.getenv("SHADOW_ACCESS_TOKEN", "")
 SNAPSHOT_STORE_PATH = os.getenv("SNAPSHOT_STORE_PATH", "/tmp/shadow_snapshots.json")
+SNAPSHOT_STORE_GZIP = os.getenv("SNAPSHOT_STORE_GZIP", "true").lower() in ("1", "true", "yes", "on")
 AUTO_SNAPSHOT_ENABLED = os.getenv("AUTO_SNAPSHOT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 AUTO_SNAPSHOT_POLL_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_POLL_SECONDS", "300")))
 AUTO_SNAPSHOT_WINDOW_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_WINDOW_SECONDS", "600")))
@@ -660,7 +662,10 @@ def load_snapshot_store() -> Dict[str, Any]:
         try:
             p = Path(SNAPSHOT_STORE_PATH)
             if p.exists():
-                return json.loads(p.read_text(encoding="utf-8"))
+                raw = p.read_bytes()
+                if raw.startswith(b"\x1f\x8b"):
+                    raw = gzip.decompress(raw)
+                return json.loads(raw.decode("utf-8"))
         except Exception as exc:
             print("[SNAPSHOT_STORE] read failed: " + str(exc))
         return {"version": VERSION, "fixtures": {}}
@@ -671,7 +676,8 @@ def write_snapshot_store(store: Dict[str, Any]) -> None:
         try:
             p = Path(SNAPSHOT_STORE_PATH); p.parent.mkdir(parents=True, exist_ok=True)
             tmp = p.with_suffix(p.suffix + ".tmp")
-            tmp.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
+            raw = json.dumps(store, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            tmp.write_bytes(gzip.compress(raw, compresslevel=6) if SNAPSHOT_STORE_GZIP else raw)
             tmp.replace(p)
         except Exception as exc:
             print("[SNAPSHOT_STORE] write failed: " + str(exc))
@@ -1019,7 +1025,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "has_thestats_key": bool(THESTATS_API_KEY), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}}
+    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "has_thestats_key": bool(THESTATS_API_KEY), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}}
 
 
 @app.get("/shadow/nami-capabilities")
@@ -1206,7 +1212,19 @@ def shadow_snapshots(fixture: int, token: Optional[str] = None):
 async def shadow_import_prematch_packets(request: Request, token: Optional[str] = None):
     """Import canonical prematch packets without calling or changing upstream providers."""
     require_shadow_token(token)
-    payload = await request.json()
+    body = await request.body()
+    if len(body) > 30 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="request_body_too_large")
+    try:
+        if request.headers.get("content-encoding", "").lower() == "gzip":
+            body = gzip.decompress(body)
+            if len(body) > 150 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="decompressed_body_too_large")
+        payload = json.loads(body.decode("utf-8"))
+    except HTTPException:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(status_code=400, detail="invalid_json_or_gzip_body")
     packets = payload.get("packets") if isinstance(payload, dict) and "packets" in payload else payload
     if isinstance(packets, dict):
         packets = [packets]
@@ -1218,7 +1236,7 @@ async def shadow_import_prematch_packets(request: Request, token: Optional[str] 
     return JSONResponse({"ok": True, "version": VERSION, "imported_count": len(results), "results": results})
 
 
-def build_imported_ai_packet(fixture: str) -> Dict[str, Any]:
+def build_imported_ai_packet(fixture: str, include_companies: bool = False, include_lineups: bool = False) -> Dict[str, Any]:
     store = load_snapshot_store()
     metadata = store.get("external_prematch", {}).get(str(fixture))
     if not metadata:
@@ -1237,15 +1255,18 @@ def build_imported_ai_packet(fixture: str) -> Dict[str, Any]:
         market = row.get("market_snapshot") or empty_market_snapshot()
         timeline.append({
             "stage": stage, "status": "available", "snapshot_at": row.get("snapshot_at"),
-            "consensus_main_line": market.get("consensus_main_line"), "company_market_array": market.get("markets"),
+            "consensus_main_line": market.get("consensus_main_line"),
+            **({"company_market_array": market.get("markets")} if include_companies else {}),
             "market_dynamics": row.get("market_dynamics"), "collection_profile": row.get("coverage"),
         })
     available = [row for row in history if row.get("import_status") == "available"]
     latest = available[-1] if available else None
     match = metadata.get("match") or {}
+    lineup_history = metadata.get("lineup_history") or []
     fundamentals = {
         "status": "partial" if metadata.get("lineup_history") else "data_missing",
-        "lineup_history": metadata.get("lineup_history") or [],
+        "lineup_history_count": len(lineup_history),
+        "lineup_history": lineup_history if include_lineups else None,
         "result_utility": {"status": "data_missing"}, "tactical_risk_appetite": {"status": "data_missing"},
         "rotation_quality": {"status": "partial" if metadata.get("lineup_history") else "data_missing"},
         "execution_ability": {"status": "data_missing"}, "tactical_matchup": {"status": "data_missing"},
@@ -1254,6 +1275,7 @@ def build_imported_ai_packet(fixture: str) -> Dict[str, Any]:
         "goal_conversion": {"status": "data_missing"},
     }
     current = (latest or {}).get("market_snapshot") or empty_market_snapshot()
+    current_output = current if include_companies else {key: value for key, value in current.items() if key != "markets"}
     decision = decision_layer(current)
     decision["line_movement"] = (latest or {}).get("market_dynamics") or {"status": "data_missing"}
     return {
@@ -1261,7 +1283,7 @@ def build_imported_ai_packet(fixture: str) -> Dict[str, Any]:
         "source": "pang_import", "fixture": match, "data_quality": metadata.get("data_quality"),
         "fundamentals": fundamentals,
         "market": {
-            "current": current, "saved_stage_count": len(history), "saved_stages": [x.get("stage") for x in history],
+            "current": current_output, "saved_stage_count": len(history), "saved_stages": [x.get("stage") for x in history],
             "required_timeline": PREMATCH_STAGE_ORDER,
             "missing_stages": [stage for stage in PREMATCH_STAGE_ORDER if stage not in by_stage or by_stage[stage].get("import_status") != "available"],
             "timeline": timeline, "latest_dynamics": (latest or {}).get("market_dynamics"),
@@ -1276,9 +1298,9 @@ def build_imported_ai_packet(fixture: str) -> Dict[str, Any]:
 
 
 @app.get("/shadow/imported-prematch/{fixture}")
-def shadow_imported_prematch(fixture: str, token: Optional[str] = None):
+def shadow_imported_prematch(fixture: str, include_companies: bool = False, include_lineups: bool = False, token: Optional[str] = None):
     require_shadow_token(token)
-    return JSONResponse(build_imported_ai_packet(fixture))
+    return JSONResponse(build_imported_ai_packet(fixture, include_companies=include_companies, include_lineups=include_lineups))
 
 
 

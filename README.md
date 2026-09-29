@@ -150,3 +150,9 @@ GET  /shadow/imported-prematch/{MATCH_UUID}?token=SHADOW_ACCESS_TOKEN
 
 POST 请求可直接传一个数据包、数据包数组，或 `{ "packets": [...] }`。
 外部 UUID 与原有数字 fixture ID 分开使用；缺失节点保留为 `data_missing`，不会用当前盘口反推。
+
+持久化文件默认使用 gzip 压缩（路径和接口保持不变），也能继续读取旧版纯 JSON 文件。
+GET 默认只返回 Consensus Main Line 和变化结果；仅在确实需要逐家公司报价时添加
+`?include_companies=true`，需要完整阵容历史时添加 `?include_lineups=true`。
+POST 支持 `Content-Encoding: gzip`，可直接发送压缩 JSON，
+避免完整公司数组在网络传输中膨胀。
