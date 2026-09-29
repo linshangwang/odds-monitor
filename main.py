@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.7.2"
+VERSION = "0.8.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -677,7 +677,7 @@ def write_snapshot_store(store: Dict[str, Any]) -> None:
             print("[SNAPSHOT_STORE] write failed: " + str(exc))
 
 
-def get_fixture_snapshots(fixture: int) -> List[Dict[str, Any]]:
+def get_fixture_snapshots(fixture: Any) -> List[Dict[str, Any]]:
     rows = load_snapshot_store().get("fixtures", {}).get(str(fixture), [])
     return sorted(rows, key=lambda x: (STAGE_ORDER.index(x.get("stage")) if x.get("stage") in STAGE_ORDER else 999, x.get("snapshot_at", 0)))
 
@@ -690,6 +690,142 @@ def save_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
         store["fixtures"][str(record["fixture"])] = sorted(rows, key=lambda x: (STAGE_ORDER.index(x.get("stage")) if x.get("stage") in STAGE_ORDER else 999, x.get("snapshot_at", 0)))
         write_snapshot_store(store)
     return {"saved": True, "path": SNAPSHOT_STORE_PATH, "fixture": record["fixture"], "stage": record["stage"]}
+
+
+def _parse_timestamp(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp())
+    except (TypeError, ValueError):
+        return None
+
+
+def _import_consensus(source: Dict[str, Any]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    for market in ("1x2", "asian_handicap", "over_under", "btts", "home_team_total", "away_team_total"):
+        row = source.get(market) or {}
+        if row.get("status") != "available":
+            result[market] = None
+            continue
+        prices = row.get("median_prices") or {}
+        item = {key: as_float(value) for key, value in prices.items()}
+        if market not in ("1x2", "btts"):
+            item["line"] = as_float(row.get("line"))
+        item["method"] = "imported_consensus_main_line"
+        item["bookmaker_count"] = row.get("bookmaker_coverage")
+        result[market] = item
+    return result
+
+
+def _import_company_markets(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    markets = empty_market_snapshot()["markets"]
+    grouped: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for raw in rows or []:
+        market = str(raw.get("market") or "").lower()
+        if market not in markets:
+            continue
+        bookmaker = str(raw.get("bookmaker_name") or raw.get("bookmaker_id") or "unknown")
+        selection = str(raw.get("selection") or "").strip().lower()
+        price = as_float(raw.get("price"))
+        if market in ("1x2", "btts"):
+            key = (market, bookmaker, "")
+            item = grouped.setdefault(key, {"bookmaker": bookmaker, "raw_values": []})
+            normalized = {"home": "home", "draw": "draw", "away": "away", "yes": "yes", "no": "no"}.get(selection)
+            if normalized:
+                item[normalized] = price
+            item["raw_values"].append(raw)
+        else:
+            line = str(raw.get("line") if raw.get("line") is not None else "")
+            key = (market, bookmaker, line)
+            item = grouped.setdefault(key, {"bookmaker": bookmaker, "line": as_float(line), "raw_values": []})
+            side = "home" if selection.startswith("home") else "away" if selection.startswith("away") else "over" if selection.startswith("over") else "under" if selection.startswith("under") else None
+            if side:
+                item[side] = price
+            item["raw_values"].append(raw)
+    by_book: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for (market, bookmaker, line), item in grouped.items():
+        if market in ("1x2", "btts"):
+            markets[market].append(item)
+        else:
+            book = by_book.setdefault((market, bookmaker), {"bookmaker": bookmaker, "lines": []})
+            book["lines"].append({key: value for key, value in item.items() if key != "bookmaker"})
+    for (market, _), item in by_book.items():
+        markets[market].append(item)
+    return markets
+
+
+def imported_market_snapshot(stage: Dict[str, Any]) -> Dict[str, Any]:
+    snapshot = empty_market_snapshot()
+    if stage.get("status") != "available":
+        return snapshot
+    consensus = _import_consensus(stage.get("consensus_main_line") or {})
+    snapshot.update({
+        "available": any(consensus.values()),
+        "updated_at": stage.get("latest_observed_at"),
+        "bookmaker_count": stage.get("bookmaker_count", 0),
+        "markets": _import_company_markets(stage.get("company_market_array") or []),
+        "primary": dict(consensus),
+        "consensus_main_line": consensus,
+        "data_status": {key: ("available" if value else "data_missing") for key, value in consensus.items()},
+    })
+    return snapshot
+
+
+def import_prematch_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(packet, dict):
+        raise HTTPException(status_code=400, detail="packet_must_be_an_object")
+    if packet.get("schema_version") != "shadow_prematch_packet_v1":
+        raise HTTPException(status_code=400, detail="unsupported_schema_version")
+    match = packet.get("match") or {}
+    fixture = str(match.get("match_id") or "").strip()
+    if not fixture:
+        raise HTTPException(status_code=400, detail="missing_match_id")
+    timeline = packet.get("timeline")
+    if not isinstance(timeline, list):
+        raise HTTPException(status_code=400, detail="timeline_must_be_an_array")
+    seen = set()
+    history: List[Dict[str, Any]] = []
+    records: List[Dict[str, Any]] = []
+    imported = []
+    for stage_data in timeline:
+        stage = normalize_stage(stage_data.get("stage"))
+        if stage not in PREMATCH_STAGE_ORDER or stage in seen:
+            raise HTTPException(status_code=400, detail={"error": "invalid_or_duplicate_stage", "stage": stage})
+        seen.add(stage)
+        status = "available" if stage_data.get("status") == "available" else "data_missing"
+        market_snapshot = imported_market_snapshot(stage_data)
+        dynamics = compare_market_snapshots([x for x in history if x.get("import_status") == "available"], market_snapshot, stage) if status == "available" else {
+            "stage": stage, "comparison_status": "data_missing", "revalidation_trigger": {"triggered": False, "reasons": []},
+            "data_missing": list(market_snapshot["data_status"].keys())
+        }
+        dynamics["classification"] = classify_market_move(dynamics, None, None)
+        record = {
+            "version": VERSION, "fixture": fixture, "external_fixture_id": fixture, "source": "pang_import",
+            "stage": stage, "snapshot_at": _parse_timestamp(stage_data.get("latest_observed_at") or stage_data.get("target_at")) or int(time.time()),
+            "fixture_info": match, "data_quality": packet.get("data_quality"), "coverage": {"source": "pang", "quote_count": stage_data.get("quote_count"), "bookmaker_count": stage_data.get("bookmaker_count")},
+            "import_status": status, "missing_reason": stage_data.get("reason") if status == "data_missing" else None,
+            "market_snapshot": market_snapshot, "market_dynamics": dynamics,
+        }
+        history.append(record)
+        records.append(record)
+        imported.append({"stage": stage, "status": status})
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        existing = store.setdefault("fixtures", {}).get(fixture, [])
+        replaced_stages = {row["stage"] for row in records}
+        merged = [row for row in existing if row.get("stage") not in replaced_stages] + records
+        store["fixtures"][fixture] = sorted(merged, key=lambda x: (STAGE_ORDER.index(x.get("stage")) if x.get("stage") in STAGE_ORDER else 999, x.get("snapshot_at", 0)))
+        store.setdefault("external_prematch", {})[fixture] = {
+            "schema_version": packet.get("schema_version"), "league": packet.get("league"), "exported_at": packet.get("exported_at"),
+            "match": match, "required_timeline": packet.get("required_timeline") or PREMATCH_STAGE_ORDER,
+            "lineup_history": packet.get("lineup_history") or [], "data_quality": packet.get("data_quality"), "imported_at": int(time.time()),
+        }
+        store["version"] = VERSION
+        write_snapshot_store(store)
+    return {"fixture": fixture, "match": f"{match.get('home_team_name')} vs {match.get('away_team_name')}", "stages": imported}
 
 
 def line_from_primary(primary: Optional[Dict[str, Any]]) -> Optional[float]:
@@ -878,7 +1014,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
 
 @app.get("/")
 def root():
-    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet"]}
+    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/imported-prematch/{fixture}"]}
 
 
 @app.get("/health")
@@ -1064,6 +1200,85 @@ def shadow_snapshots(fixture: int, token: Optional[str] = None):
     require_shadow_token(token)
     rows = get_fixture_snapshots(fixture)
     return JSONResponse({"ok": True, "version": VERSION, "fixture": fixture, "stage_order": STAGE_ORDER, "count": len(rows), "snapshots": rows})
+
+
+@app.post("/shadow/import-prematch-packets")
+async def shadow_import_prematch_packets(request: Request, token: Optional[str] = None):
+    """Import canonical prematch packets without calling or changing upstream providers."""
+    require_shadow_token(token)
+    payload = await request.json()
+    packets = payload.get("packets") if isinstance(payload, dict) and "packets" in payload else payload
+    if isinstance(packets, dict):
+        packets = [packets]
+    if not isinstance(packets, list) or not packets:
+        raise HTTPException(status_code=400, detail="one_or_more_packets_required")
+    if len(packets) > 100:
+        raise HTTPException(status_code=413, detail="maximum_100_packets_per_request")
+    results = [import_prematch_packet(packet) for packet in packets]
+    return JSONResponse({"ok": True, "version": VERSION, "imported_count": len(results), "results": results})
+
+
+def build_imported_ai_packet(fixture: str) -> Dict[str, Any]:
+    store = load_snapshot_store()
+    metadata = store.get("external_prematch", {}).get(str(fixture))
+    if not metadata:
+        raise HTTPException(status_code=404, detail="imported_fixture_not_found")
+    history = get_fixture_snapshots(fixture)
+    by_stage = {row.get("stage"): row for row in history if row.get("stage") in PREMATCH_STAGE_ORDER}
+    timeline = []
+    for stage in PREMATCH_STAGE_ORDER:
+        row = by_stage.get(stage)
+        if not row or row.get("import_status") != "available":
+            timeline.append({
+                "stage": stage, "status": "data_missing",
+                "reason": (row or {}).get("missing_reason") or "historical checkpoint was not captured; current odds were not backfilled",
+            })
+            continue
+        market = row.get("market_snapshot") or empty_market_snapshot()
+        timeline.append({
+            "stage": stage, "status": "available", "snapshot_at": row.get("snapshot_at"),
+            "consensus_main_line": market.get("consensus_main_line"), "company_market_array": market.get("markets"),
+            "market_dynamics": row.get("market_dynamics"), "collection_profile": row.get("coverage"),
+        })
+    available = [row for row in history if row.get("import_status") == "available"]
+    latest = available[-1] if available else None
+    match = metadata.get("match") or {}
+    fundamentals = {
+        "status": "partial" if metadata.get("lineup_history") else "data_missing",
+        "lineup_history": metadata.get("lineup_history") or [],
+        "result_utility": {"status": "data_missing"}, "tactical_risk_appetite": {"status": "data_missing"},
+        "rotation_quality": {"status": "partial" if metadata.get("lineup_history") else "data_missing"},
+        "execution_ability": {"status": "data_missing"}, "tactical_matchup": {"status": "data_missing"},
+        "game_state_elasticity": {"status": "data_missing"}, "first_goal_state_transition": {"status": "data_missing"},
+        "open_game_beneficiary": {"status": "data_missing"}, "time_segment_strength": {"status": "data_missing"},
+        "goal_conversion": {"status": "data_missing"},
+    }
+    current = (latest or {}).get("market_snapshot") or empty_market_snapshot()
+    decision = decision_layer(current)
+    decision["line_movement"] = (latest or {}).get("market_dynamics") or {"status": "data_missing"}
+    return {
+        "ok": True, "status": "ready", "version": VERSION, "generated_at": int(time.time()),
+        "source": "pang_import", "fixture": match, "data_quality": metadata.get("data_quality"),
+        "fundamentals": fundamentals,
+        "market": {
+            "current": current, "saved_stage_count": len(history), "saved_stages": [x.get("stage") for x in history],
+            "required_timeline": PREMATCH_STAGE_ORDER,
+            "missing_stages": [stage for stage in PREMATCH_STAGE_ORDER if stage not in by_stage or by_stage[stage].get("import_status") != "available"],
+            "timeline": timeline, "latest_dynamics": (latest or {}).get("market_dynamics"),
+        },
+        "analysis_rules": {
+            "order": ["pure_fundamental_script", *FUNDAMENTAL_CHAIN, "market_timeline", "fundamental_revalidation", "model_probability_vs_market_no_vig_probability", "edge", "ev", "script_coverage", "crowding", "line_movement", "lineup_confidence", "death_path", "bet_or_pass"],
+            "missing_data_rule": "Missing historical checkpoints and facts remain data_missing; never backfill them from current odds.",
+            "prematch_only": True, "line_move_is_not_edge": True,
+        },
+        "market_move_classes": MOVE_CLASSES, "decision_layer": decision,
+    }
+
+
+@app.get("/shadow/imported-prematch/{fixture}")
+def shadow_imported_prematch(fixture: str, token: Optional[str] = None):
+    require_shadow_token(token)
+    return JSONResponse(build_imported_ai_packet(fixture))
 
 
 

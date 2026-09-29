@@ -139,6 +139,46 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["competition_count"], 1)
         self.assertEqual(result["team_count"], 2)
 
+    def prematch_packet(self):
+        consensus = {
+            "1x2": {"status": "available", "median_prices": {"home": 2.0, "draw": 3.4, "away": 3.8}},
+            "asian_handicap": {"status": "available", "line": -0.25, "bookmaker_coverage": 2, "median_prices": {"home": 1.9, "away": 1.95}},
+            "over_under": {"status": "available", "line": 2.5, "bookmaker_coverage": 2, "median_prices": {"over": 1.91, "under": 1.94}},
+            "btts": {"status": "data_missing"}, "home_team_total": {"status": "data_missing"}, "away_team_total": {"status": "data_missing"},
+        }
+        row = {"stage": "Opening", "status": "available", "latest_observed_at": "2026-09-29T00:00:00+00:00", "bookmaker_count": 2, "quote_count": 9, "consensus_main_line": consensus, "company_market_array": [
+            {"bookmaker_name": "A", "market": "1x2", "selection": "Home", "price": "2.0"},
+            {"bookmaker_name": "A", "market": "1x2", "selection": "Draw", "price": "3.4"},
+            {"bookmaker_name": "A", "market": "1x2", "selection": "Away", "price": "3.8"},
+        ]}
+        return {"schema_version": "shadow_prematch_packet_v1", "league": "UEFA Nations League", "match": {"match_id": "uuid-1", "home_team_name": "Home", "away_team_name": "Away"}, "required_timeline": main.PREMATCH_STAGE_ORDER, "timeline": [row, {"stage": "T-15m", "status": "data_missing", "reason": "not captured"}], "lineup_history": [{"observed_at": "x"}], "data_quality": {"level": "partial"}}
+
+    def test_imported_packet_preserves_uuid_arrays_and_missing_stage(self):
+        result = main.import_prematch_packet(self.prematch_packet())
+        self.assertEqual(result["fixture"], "uuid-1")
+        rows = main.get_fixture_snapshots("uuid-1")
+        self.assertEqual(len(rows), 2)
+        opening = rows[0]
+        self.assertEqual(opening["market_snapshot"]["primary"]["asian_handicap"]["line"], -0.25)
+        self.assertEqual(opening["market_snapshot"]["markets"]["1x2"][0]["home"], 2.0)
+        missing = [x for x in rows if x["stage"] == "T-15m"][0]
+        self.assertEqual(missing["import_status"], "data_missing")
+        packet = main.build_imported_ai_packet("uuid-1")
+        self.assertIn("T-15m", packet["market"]["missing_stages"])
+        self.assertEqual(packet["decision_layer"]["decision"], "PASS")
+
+    def test_import_is_idempotent_per_stage(self):
+        packet = self.prematch_packet()
+        main.import_prematch_packet(packet)
+        main.import_prematch_packet(packet)
+        self.assertEqual(len(main.get_fixture_snapshots("uuid-1")), 2)
+
+    def test_import_rejects_unknown_schema(self):
+        packet = self.prematch_packet()
+        packet["schema_version"] = "unknown"
+        with self.assertRaises(main.HTTPException):
+            main.import_prematch_packet(packet)
+
 
 if __name__ == "__main__":
     unittest.main()
