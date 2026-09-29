@@ -115,6 +115,30 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         finally:
             main.NAMI_API_USER, main.NAMI_API_SECRET = original_user, original_secret
 
+    def test_nami_capability_uses_entitled_v5_realtime_endpoint(self):
+        payload = {
+            "code": 0,
+            "query": {"total": 2, "type": "diary"},
+            "results": {
+                "match": [{"id": 1}, {"id": 2}],
+                "competition": [{"id": 3}],
+                "team": [{"id": 4}, {"id": 5}],
+            },
+        }
+        with patch("main.call_nami", return_value={
+            "ok": True, "available": True, "degraded": False,
+            "status_code": 200, "data": payload, "error": None,
+        }) as mocked:
+            result = main.nami_capability_check()
+        endpoint, params = mocked.call_args.args
+        self.assertEqual(endpoint, "/api/v5/football/match/schedule/diary")
+        self.assertRegex(params["date"], r"^\d{8}$")
+        self.assertEqual(result["api_version"], "v5")
+        self.assertEqual(result["product"], "football_realtime")
+        self.assertEqual(result["sample_count"], 2)
+        self.assertEqual(result["competition_count"], 1)
+        self.assertEqual(result["team_count"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

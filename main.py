@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.7.1"
+VERSION = "0.7.2"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -201,17 +201,28 @@ def call_nami(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, A
 
 
 def nami_capability_check() -> Dict[str, Any]:
-    check = call_nami("/api/v4/football/competition/list", {"id": 0, "time": 0, "limit": 1})
+    # The trial subscription is the football real-time package.  Probe an
+    # entitled v5 endpoint instead of a basic-data endpoint, since Nami
+    # authorizes those product packages independently.
+    probe_date = datetime.now(ZoneInfo(AUTO_FETCH_TIMEZONE)).strftime("%Y%m%d")
+    endpoint = "/api/v5/football/match/schedule/diary"
+    check = call_nami(endpoint, {"date": probe_date})
     data = check.get("data") if isinstance(check.get("data"), dict) else {}
+    results = data.get("results") if isinstance(data.get("results"), dict) else {}
     error = str(check.get("error") or "")
     return {
         "configured": bool(NAMI_API_USER and NAMI_API_SECRET), "ok": check.get("ok", False),
         "available": check.get("available", False), "degraded": check.get("degraded", True),
         "required": False, "fallback": "continue_without_nami" if not check.get("ok") else None,
         "status_code": check.get("status_code"),
+        "api_version": "v5", "product": "football_realtime", "probe_endpoint": endpoint,
+        "probe_date": probe_date,
         "ip_whitelist_required": "ip" in error.lower() and ("授权" in error or "unauthor" in error.lower()),
         "error_category": "ip_not_authorized" if "ip" in error.lower() else ("upstream_error" if error else None),
-        "response_fields": sorted(data.keys()), "sample_count": len(data.get("results") or []),
+        "response_fields": sorted(data.keys()),
+        "sample_count": len(results.get("match") or []),
+        "competition_count": len(results.get("competition") or []),
+        "team_count": len(results.get("team") or []),
     }
 
 
