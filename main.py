@@ -2,6 +2,8 @@ import json
 import os
 import time
 import threading
+import hashlib
+from statistics import median
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -14,7 +16,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.6.1"
+VERSION = "0.7.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -59,6 +61,7 @@ raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 
 TRACKING_STAGES = [
+    {"key": "Opening", "label": "Opening 开盘", "offset": timedelta(hours=-48), "purpose": "保存首次真实可得盘口；不得由后续盘口反推"},
     {"key": "T-24h", "label": "T-24h 初判", "offset": timedelta(hours=-24), "purpose": "初始基本面与早盘定位"},
     {"key": "T-12h", "label": "T-12h 早盘确认", "offset": timedelta(hours=-12), "purpose": "早盘/水位第一次确认"},
     {"key": "T-6h", "label": "T-6h 盘口/赔率确认", "offset": timedelta(hours=-6), "purpose": "盘口持续性与赔率结构确认"},
@@ -69,6 +72,7 @@ TRACKING_STAGES = [
     {"key": "FT", "label": "FT 赛后复盘", "offset": timedelta(hours=2), "purpose": "赛后复盘命中/偏差"},
 ]
 STAGE_ORDER = [x["key"] for x in TRACKING_STAGES]
+PREMATCH_STAGE_ORDER = [x for x in STAGE_ORDER if x != "FT"]
 STAGE_ALIASES = {}
 for s in TRACKING_STAGES:
     STAGE_ALIASES[s["key"].lower()] = s["key"]
@@ -282,7 +286,15 @@ def as_float(value: Any) -> Optional[float]:
 
 
 def empty_market_snapshot() -> Dict[str, Any]:
-    return {"available": False, "updated_at": None, "bookmaker_count": 0, "markets": {"1x2": [], "asian_handicap": [], "over_under": []}, "primary": {"1x2": None, "asian_handicap": None, "over_under": None}}
+    keys = ["1x2", "asian_handicap", "over_under", "btts", "home_team_total", "away_team_total"]
+    return {
+        "available": False, "updated_at": None, "bookmaker_count": 0,
+        "markets": {key: [] for key in keys},
+        # primary is kept as a compatibility alias. It now contains consensus lines.
+        "primary": {key: None for key in keys},
+        "consensus_main_line": {key: None for key in keys},
+        "data_status": {key: "data_missing" for key in keys},
+    }
 
 
 def choose_primary_line(markets: List[Dict[str, Any]], prefer_zero: bool = False, prefer_value: Optional[float] = None) -> Optional[Dict[str, Any]]:
@@ -295,6 +307,70 @@ def choose_primary_line(markets: List[Dict[str, Any]], prefer_zero: bool = False
             score = abs(lf) if prefer_zero else abs(lf - (prefer_value if prefer_value is not None else lf))
             candidates.append((score, {"bookmaker": market.get("bookmaker"), **line}))
     return sorted(candidates, key=lambda x: x[0])[0][1] if candidates else None
+
+
+def _median(values: List[Any]) -> Optional[float]:
+    nums = [x for x in (as_float(v) for v in values) if x is not None]
+    return round(float(median(nums)), 4) if nums else None
+
+
+def _consensus_1x2(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    complete = [x for x in rows if all(as_float(x.get(k)) for k in ("home", "draw", "away"))]
+    if not complete:
+        return None
+    return {
+        "method": "median_all_complete_bookmakers", "bookmaker_count": len(complete),
+        "home": _median([x.get("home") for x in complete]),
+        "draw": _median([x.get("draw") for x in complete]),
+        "away": _median([x.get("away") for x in complete]),
+    }
+
+
+def _consensus_line(markets: List[Dict[str, Any]], price_keys: Tuple[str, str]) -> Optional[Dict[str, Any]]:
+    by_line: Dict[float, List[Dict[str, Any]]] = {}
+    for market in markets:
+        for line in market.get("lines", []) or []:
+            value = as_float(line.get("line"))
+            if value is None:
+                continue
+            by_line.setdefault(value, []).append({"bookmaker": market.get("bookmaker"), **line})
+    if not by_line:
+        return None
+    # The main line is the line quoted by the largest number of books. Ties are
+    # broken by the most balanced median two-way prices, then sample size.
+    ranked = []
+    for value, rows in by_line.items():
+        left, right = _median([r.get(price_keys[0]) for r in rows]), _median([r.get(price_keys[1]) for r in rows])
+        balance = abs(left - right) if left is not None and right is not None else 999.0
+        ranked.append((-len(rows), balance, abs(value), value, rows, left, right))
+    _, _, _, value, rows, left, right = sorted(ranked, key=lambda x: x[:4])[0]
+    return {
+        "method": "modal_line_then_balanced_median_prices", "line": value,
+        price_keys[0]: left, price_keys[1]: right,
+        "bookmaker_count": len(rows), "bookmakers": sorted({str(r.get('bookmaker')) for r in rows if r.get('bookmaker')}),
+    }
+
+
+def _two_way_market(values: List[Dict[str, Any]], labels: Tuple[str, str]) -> Dict[str, Any]:
+    entry = {labels[0]: None, labels[1]: None, "raw_values": values}
+    for value in values:
+        raw = str(value.get("value", "")).strip().lower()
+        if raw == labels[0].lower(): entry[labels[0]] = value.get("odd")
+        if raw == labels[1].lower(): entry[labels[1]] = value.get("odd")
+    return entry
+
+
+def _line_market(values: List[Dict[str, Any]], prefixes: Tuple[str, str], keys: Tuple[str, str]) -> List[Dict[str, Any]]:
+    lines: Dict[str, Dict[str, Any]] = {}
+    for value in values:
+        raw = str(value.get("value", "")).strip()
+        for prefix, key in zip(prefixes, keys):
+            if raw.lower().startswith(prefix.lower() + " "):
+                line = raw[len(prefix):].strip()
+                lines.setdefault(line, {"line": line, keys[0]: None, keys[1]: None, "raw_values": []})
+                lines[line][key] = value.get("odd")
+                lines[line]["raw_values"].append(value)
+    return list(lines.values())
 
 
 def extract_market_snapshot(odds_result: Dict[str, Any]) -> Dict[str, Any]:
@@ -318,28 +394,28 @@ def extract_market_snapshot(odds_result: Dict[str, Any]) -> Dict[str, Any]:
                     if str(v.get("value")) == "Away": entry["away"] = v.get("odd")
                 snapshot["markets"]["1x2"].append(entry)
             elif name == "Asian Handicap":
-                lines: Dict[str, Dict[str, Any]] = {}
-                for v in values:
-                    val = str(v.get("value"))
-                    if val.startswith("Home ") or val.startswith("Away "):
-                        side, line = val.split(" ", 1)
-                        lines.setdefault(line, {"line": line, "home": None, "away": None, "raw_values": []})
-                        lines[line]["home" if side == "Home" else "away"] = v.get("odd")
-                        lines[line]["raw_values"].append(v)
-                snapshot["markets"]["asian_handicap"].append({"bookmaker": bm_name, "lines": list(lines.values())})
+                snapshot["markets"]["asian_handicap"].append({"bookmaker": bm_name, "lines": _line_market(values, ("Home", "Away"), ("home", "away"))})
             elif name == "Goals Over/Under":
-                lines = {}
-                for v in values:
-                    val = str(v.get("value"))
-                    if val.startswith("Over ") or val.startswith("Under "):
-                        side, line = val.split(" ", 1)
-                        lines.setdefault(line, {"line": line, "over": None, "under": None, "raw_values": []})
-                        lines[line]["over" if side == "Over" else "under"] = v.get("odd")
-                        lines[line]["raw_values"].append(v)
-                snapshot["markets"]["over_under"].append({"bookmaker": bm_name, "lines": list(lines.values())})
-    snapshot["primary"]["1x2"] = snapshot["markets"]["1x2"][0] if snapshot["markets"]["1x2"] else None
-    snapshot["primary"]["asian_handicap"] = choose_primary_line(snapshot["markets"]["asian_handicap"], prefer_zero=True)
-    snapshot["primary"]["over_under"] = choose_primary_line(snapshot["markets"]["over_under"], prefer_value=2.5)
+                snapshot["markets"]["over_under"].append({"bookmaker": bm_name, "lines": _line_market(values, ("Over", "Under"), ("over", "under"))})
+            elif name in ("Both Teams Score", "Both Teams To Score"):
+                snapshot["markets"]["btts"].append({"bookmaker": bm_name, **_two_way_market(values, ("yes", "no"))})
+            elif name in ("Home Team Total Goals", "Home Goals Over/Under"):
+                snapshot["markets"]["home_team_total"].append({"bookmaker": bm_name, "lines": _line_market(values, ("Over", "Under"), ("over", "under"))})
+            elif name in ("Away Team Total Goals", "Away Goals Over/Under"):
+                snapshot["markets"]["away_team_total"].append({"bookmaker": bm_name, "lines": _line_market(values, ("Over", "Under"), ("over", "under"))})
+    consensus = {
+        "1x2": _consensus_1x2(snapshot["markets"]["1x2"]),
+        "asian_handicap": _consensus_line(snapshot["markets"]["asian_handicap"], ("home", "away")),
+        "over_under": _consensus_line(snapshot["markets"]["over_under"], ("over", "under")),
+        "btts": _consensus_1x2([]),
+        "home_team_total": _consensus_line(snapshot["markets"]["home_team_total"], ("over", "under")),
+        "away_team_total": _consensus_line(snapshot["markets"]["away_team_total"], ("over", "under")),
+    }
+    btts = snapshot["markets"]["btts"]
+    consensus["btts"] = ({"method": "median_all_complete_bookmakers", "bookmaker_count": len(btts), "yes": _median([x.get("yes") for x in btts]), "no": _median([x.get("no") for x in btts])} if btts else None)
+    snapshot["consensus_main_line"] = consensus
+    snapshot["primary"] = dict(consensus)
+    snapshot["data_status"] = {key: ("available" if value else "data_missing") for key, value in consensus.items()}
     return snapshot
 
 
@@ -349,7 +425,7 @@ def odds_summary(result: Dict[str, Any]) -> Dict[str, Any]:
         return {"available": False}
     bookmakers = rows[0].get("bookmakers", []) or []
     key_markets = []
-    wanted = {"Match Winner", "Asian Handicap", "Goals Over/Under", "Both Teams Score", "Double Chance"}
+    wanted = {"Match Winner", "Asian Handicap", "Goals Over/Under", "Both Teams Score", "Both Teams To Score", "Home Team Total Goals", "Away Team Total Goals", "Home Goals Over/Under", "Away Goals Over/Under", "Double Chance"}
     for bm in bookmakers:
         for bet in bm.get("bets", []) or []:
             if bet.get("name") in wanted:
@@ -400,7 +476,7 @@ def collect_prematch_data(fixture_id: int, include_raw: bool = False) -> Dict[st
         response = data.get("response") if isinstance(data, dict) else None
         coverage[name] = {"ok": result.get("ok"), "status_code": result.get("status_code"), "results": data.get("results") if isinstance(data, dict) else None, "has_data": bool(response), "request_url": result.get("request_url")}
     market_snapshot = extract_market_snapshot(calls.get("odds_prematch", {}))
-    structured = {"standings": {"home": standings_for_team(calls.get("standings", {}), home_id), "away": standings_for_team(calls.get("standings", {}), away_id)}, "recent_form_last_10": {"home": recent_form(response_list(calls.get("home_recent_10", {})), home_id), "away": recent_form(response_list(calls.get("away_recent_10", {})), away_id)}, "season_stats": {"home": season_stats_summary(calls.get("home_team_season_stats", {})), "away": season_stats_summary(calls.get("away_team_season_stats", {}))}, "head_to_head_count": len(response_list(calls.get("head_to_head_last_10", {}))), "injuries": injuries_summary(calls.get("injuries", {}), home_id, away_id), "prediction": prediction_summary(calls.get("predictions", {})), "odds": odds_summary(calls.get("odds_prematch", {})), "odds_market_snapshot": market_snapshot, "lineups_available": coverage.get("lineups", {}).get("has_data", False), "snapshot_requirements": {"required_markets": ["1x2", "asian_handicap", "over_under"], "metrics_supported": ["line_crossing", "continuous_strengthening", "reversal", "market_saturation"]}}
+    structured = {"standings": {"home": standings_for_team(calls.get("standings", {}), home_id), "away": standings_for_team(calls.get("standings", {}), away_id)}, "recent_form_last_10": {"home": recent_form(response_list(calls.get("home_recent_10", {})), home_id), "away": recent_form(response_list(calls.get("away_recent_10", {})), away_id)}, "season_stats": {"home": season_stats_summary(calls.get("home_team_season_stats", {})), "away": season_stats_summary(calls.get("away_team_season_stats", {}))}, "head_to_head_count": len(response_list(calls.get("head_to_head_last_10", {}))), "injuries": injuries_summary(calls.get("injuries", {}), home_id, away_id), "prediction": prediction_summary(calls.get("predictions", {})), "odds": odds_summary(calls.get("odds_prematch", {})), "odds_market_snapshot": market_snapshot, "lineups_available": coverage.get("lineups", {}).get("has_data", False), "snapshot_requirements": {"required_markets": ["1x2", "asian_handicap", "over_under"], "optional_markets": ["btts", "home_team_total", "away_team_total"], "metrics_supported": ["line_crossing", "continuous_strengthening", "reversal", "market_saturation", "cross_market_divergence", "fundamental_revalidation"]}}
     quality = data_quality(coverage)
     return {"ok": True, "version": VERSION, "generated_at": int(time.time()), "fixture": {k: v for k, v in ctx.items() if k not in ["fixture_detail", "fixture_row"]}, "coverage": coverage, "data_quality": quality, "structured_inputs": structured, "shadow_summary": make_shadow_summary(ctx, structured, quality), "football_ai_prompt": make_prompt(ctx), "raw_data_pack": {"fixture_detail": ctx.get("fixture_detail"), **{k: compact_result(v) for k, v in calls.items()}} if include_raw else None}
 
@@ -473,7 +549,7 @@ def make_shadow_summary(ctx: Dict[str, Any], structured: Dict[str, Any], quality
 
 
 def make_prompt(ctx: Dict[str, Any]) -> str:
-    return "你是足球AI影子分析。请只基于 JSON 数据做赛前分析，不要凭空补充。必须读取 structured_inputs.odds_market_snapshot 的 1X2、Asian Handicap、O/U，并输出盘口跨档、持续强化、反转、Market Saturation。"
+    return "你是足球AI影子分析。先独立生成 Pure Fundamental Script，再读取完整 T-X 时间轴。盘口差异只能触发事实复核，不能单独改写基本面。读取 1X2/AH/O-U，若可得同时读取 BTTS/Home TT/Away TT；任何缺失必须标记 data_missing，禁止用当前盘口反推历史。最终依次检查 no-vig 概率、Edge、EV、Script Coverage、Crowding、Line Movement、Lineup Confidence 与 Death Path，并允许 PASS。"
 
 
 def fixture_datetime_utc(summary: Dict[str, Any]) -> Optional[datetime]:
@@ -564,7 +640,7 @@ def market_saturation(ms: Dict[str, Any]) -> Dict[str, Any]:
     def one(k: str) -> Dict[str, Any]:
         counts: Dict[str, int] = {}
         for bm in get_nested(ms, ["markets", k], []) or []:
-            if k == "1x2": counts["1x2"] = counts.get("1x2", 0) + 1
+            if k in ("1x2", "btts"): counts[k] = counts.get(k, 0) + 1
             else:
                 for line in bm.get("lines", []) or []:
                     key = str(line.get("line")); counts[key] = counts.get(key, 0) + 1
@@ -572,7 +648,7 @@ def market_saturation(ms: Dict[str, Any]) -> Dict[str, Any]:
         top_line, top_count = max(counts.items(), key=lambda x: x[1]) if counts else (None, 0)
         ratio = top_count / total if total else None
         return {"top_line": top_line, "top_count": top_count, "total": total, "ratio": ratio, "is_saturated": ratio is not None and ratio >= 0.6}
-    return {"1x2": one("1x2"), "asian_handicap": one("asian_handicap"), "over_under": one("over_under")}
+    return {key: one(key) for key in ("1x2", "asian_handicap", "over_under", "btts", "home_team_total", "away_team_total")}
 
 
 def compare_market_snapshots(history: List[Dict[str, Any]], current: Dict[str, Any], stage: str) -> Dict[str, Any]:
@@ -590,7 +666,150 @@ def compare_market_snapshots(history: List[Dict[str, Any]], current: Dict[str, A
     directions = [x for x in directions if x is not None] + ([ah_now] if ah_now is not None else [])
     continuous = len(directions) >= 3 and all(directions[i] <= directions[i+1] for i in range(len(directions)-1))
     reversal = len(directions) >= 3 and ((directions[-3] < directions[-2] and directions[-1] < directions[-2]) or (directions[-3] > directions[-2] and directions[-1] > directions[-2]))
-    return {"stage": stage, "previous_stage": previous.get("stage") if previous else None, "line_crossing": {"asian_handicap_delta": ah_delta, "asian_handicap_crossed_025_or_more": abs(ah_delta) >= 0.25 if ah_delta is not None else None, "over_under_delta": ou_delta, "over_under_crossed_025_or_more": abs(ou_delta) >= 0.25 if ou_delta is not None else None}, "water_movement": {"home_1x2_odd_delta": home_now - home_prev if home_now is not None and home_prev is not None else None, "away_1x2_odd_delta": away_now - away_prev if away_now is not None and away_prev is not None else None}, "continuous_strengthening": continuous, "reversal": reversal, "market_saturation": market_saturation(current)}
+    home_delta = home_now - home_prev if home_now is not None and home_prev is not None else None
+    away_delta = away_now - away_prev if away_now is not None and away_prev is not None else None
+    missing = [key for key, status in (current.get("data_status") or {}).items() if status == "data_missing"]
+    ah_sign = 0 if ah_delta in (None, 0) else (1 if ah_delta > 0 else -1)
+    home_sign = 0 if home_delta in (None, 0) else (1 if home_delta > 0 else -1)
+    cross_market = bool(ah_sign and home_sign and ah_sign == home_sign)
+    significant_price = any(x is not None and abs(x) >= 0.10 for x in (home_delta, away_delta))
+    significant_line = any(x is not None and abs(x) >= 0.25 for x in (ah_delta, ou_delta))
+    reasons = []
+    if significant_line: reasons.append("significant_line_move")
+    if significant_price: reasons.append("abnormal_price_move")
+    if cross_market: reasons.append("cross_market_divergence")
+    return {
+        "stage": stage, "previous_stage": previous.get("stage") if previous else None,
+        "comparison_status": "data_missing" if not previous else "compared",
+        "line_crossing": {"asian_handicap_delta": ah_delta, "asian_handicap_crossed_025_or_more": abs(ah_delta) >= 0.25 if ah_delta is not None else None, "over_under_delta": ou_delta, "over_under_crossed_025_or_more": abs(ou_delta) >= 0.25 if ou_delta is not None else None},
+        "water_movement": {"home_1x2_odd_delta": home_delta, "away_1x2_odd_delta": away_delta},
+        "continuous_strengthening": continuous, "reversal": reversal,
+        "cross_market_divergence": cross_market,
+        "revalidation_trigger": {"triggered": bool(reasons), "reasons": reasons, "thresholds": {"line": 0.25, "decimal_price": 0.10}},
+        "data_missing": missing,
+        "market_saturation": market_saturation(current)
+    }
+
+
+FUNDAMENTAL_CHAIN = [
+    "result_utility", "tactical_risk_appetite", "rotation_quality", "execution_ability",
+    "tactical_matchup", "game_state_elasticity", "first_goal_state_transition",
+    "open_game_beneficiary", "time_segment_strength", "goal_conversion"
+]
+MOVE_CLASSES = ["Fundamental Confirmed", "Likely Information-Driven", "Market-Only Move", "Cross-Market Divergence", "Model-Market Divergence"]
+
+
+def pure_fundamental_script(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Create an odds-independent, evidence-addressable V4 extension.
+
+    Unknown tactical fields remain data_missing instead of being guessed from prices.
+    """
+    si = data.get("structured_inputs") or {}
+    lineup_available = bool(si.get("lineups_available"))
+    injuries = si.get("injuries") or {}
+    form = si.get("recent_form_last_10") or {}
+    stats = si.get("season_stats") or {}
+    standings = si.get("standings") or {}
+    evidence = {
+        "standings": standings, "recent_form_last_10": form, "season_stats": stats,
+        "injuries": injuries, "lineups_available": lineup_available,
+    }
+    chain = {
+        "result_utility": {"status": "data_missing", "home_win_draw_loss_utility": None, "away_win_draw_loss_utility": None, "reason": "competition objective/qualification rules are not supplied by current feeds"},
+        "tactical_risk_appetite": {"status": "data_missing", "value": None, "depends_on": "result_utility and verified coach intent"},
+        "rotation_quality": {"status": "available" if lineup_available else "data_missing", "starting_xi_strength": None, "creativity": None, "finishing": None, "chemistry": None, "bench_strength": None, "bench_upgrade": None, "lineup_intent": None},
+        "execution_ability": {"status": "partial" if stats else "data_missing", "source": "season_stats and recent_form; no event-level xG/xThreat feed"},
+        "tactical_matchup": {"status": "data_missing", "value": None, "reason": "formation/style/event-level data unavailable"},
+        "game_state_elasticity": {"status": "data_missing", "states": {"0_0_persists": None, "home_scores_first": None, "away_scores_first": None, "draw_at_60": None, "trailing_last_30": None}},
+        "first_goal_state_transition": {"status": "data_missing", "home_first": None, "away_first": None},
+        "open_game_beneficiary": {"status": "data_missing", "team": None, "reason": "requires tactical risk and transition/conversion evidence"},
+        "time_segment_strength": {"status": "data_missing", "segments": {"0_15": None, "16_30": None, "31_45": None, "46_60": None, "61_75": None, "76_90": None}},
+        "goal_conversion": {"status": "partial" if stats else "data_missing", "strength_edge": None, "goal_edge": None, "margin_edge": None, "warning": "Strength Edge != Goal Edge != Margin Edge"},
+    }
+    content = json.dumps({"fixture": data.get("fixture"), "evidence": evidence, "chain": chain}, ensure_ascii=False, sort_keys=True, default=str)
+    return {
+        "schema": "pure_fundamental_script_v4_extension", "odds_independent": True,
+        "generated_at": int(time.time()), "evidence": evidence, "chain_order": FUNDAMENTAL_CHAIN,
+        "chain": chain, "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+    }
+
+
+def get_fundamental_versions(fixture: int) -> List[Dict[str, Any]]:
+    rows = load_snapshot_store().get("fundamental_versions", {}).get(str(fixture), [])
+    return sorted(rows, key=lambda x: (x.get("version_number", 0), x.get("created_at", 0)))
+
+
+def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict[str, Any], previous: Optional[Dict[str, Any]] = None, probability_change: Optional[Dict[str, Any]] = None, best_market_change: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        rows = store.setdefault("fundamental_versions", {}).setdefault(str(fixture), [])
+        old_script = (previous or {}).get("script") or {}
+        changed_sections = [key for key in FUNDAMENTAL_CHAIN if get_nested(old_script, ["chain", key]) != get_nested(script, ["chain", key])]
+        record = {
+            "version_number": len(rows) + 1, "created_at": int(time.time()), "trigger": trigger,
+            "changed_information": changed_sections, "variable_changes": {key: {"before": get_nested(old_script, ["chain", key]), "after": get_nested(script, ["chain", key])} for key in changed_sections},
+            "probability_change": probability_change or {"status": "data_missing", "reason": "no independent model probability supplied"},
+            "best_market_change": best_market_change or {"status": "data_missing", "reason": "decision inputs incomplete"},
+            "script": script,
+        }
+        rows.append(record)
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return record
+
+
+def classify_market_move(dynamics: Dict[str, Any], previous_version: Optional[Dict[str, Any]], new_script: Optional[Dict[str, Any]], model_market_divergence: bool = False) -> str:
+    if dynamics.get("cross_market_divergence"):
+        return "Cross-Market Divergence"
+    if model_market_divergence:
+        return "Model-Market Divergence"
+    if previous_version and new_script and get_nested(previous_version, ["script", "content_hash"]) != new_script.get("content_hash"):
+        return "Fundamental Confirmed"
+    if get_nested(dynamics, ["revalidation_trigger", "triggered"]):
+        return "Market-Only Move"
+    return "Likely Information-Driven" if dynamics.get("comparison_status") == "data_missing" else "Market-Only Move"
+
+
+def no_vig_probabilities(odds: Dict[str, Any], keys: List[str]) -> Optional[Dict[str, float]]:
+    implied = {key: (1.0 / as_float(odds.get(key))) for key in keys if as_float(odds.get(key)) and as_float(odds.get(key)) > 1.0}
+    if len(implied) != len(keys):
+        return None
+    total = sum(implied.values())
+    return {key: round(value / total, 6) for key, value in implied.items()}
+
+
+def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optional[Dict[str, float]] = None, script_coverage: Optional[Dict[str, float]] = None, crowding: Optional[float] = None, lineup_confidence: Optional[float] = None, death_path: Optional[List[str]] = None) -> Dict[str, Any]:
+    main = get_nested(market_snapshot, ["consensus_main_line", "1x2"]) or get_nested(market_snapshot, ["primary", "1x2"]) or {}
+    market_probability = no_vig_probabilities(main, ["home", "draw", "away"])
+    missing = []
+    if not market_probability: missing.append("market_no_vig_probability")
+    if not model_probabilities: missing.append("model_probability")
+    if script_coverage is None: missing.append("script_coverage")
+    if crowding is None: missing.append("crowding")
+    if lineup_confidence is None: missing.append("lineup_confidence")
+    candidates = []
+    if market_probability and model_probabilities:
+        for key in ("home", "draw", "away"):
+            model_p = as_float(model_probabilities.get(key))
+            price = as_float(main.get(key))
+            if model_p is None or price is None: continue
+            edge = model_p - market_probability[key]
+            ev = model_p * price - 1.0
+            candidates.append({"selection": key, "model_probability": round(model_p, 6), "market_no_vig_probability": market_probability[key], "edge": round(edge, 6), "ev": round(ev, 6), "script_coverage": (script_coverage or {}).get(key)})
+    candidates.sort(key=lambda x: (x.get("ev", -999), x.get("edge", -999)), reverse=True)
+    best = candidates[0] if candidates else None
+    pass_reasons = list(missing)
+    if best and (best["edge"] <= 0 or best["ev"] <= 0): pass_reasons.append("no_positive_edge_and_ev")
+    if death_path: pass_reasons.append("death_path_present")
+    decision = "PASS" if pass_reasons or not best else best["selection"]
+    return {
+        "decision": decision, "best_market": best, "candidates": candidates,
+        "market_no_vig_probability": market_probability, "model_probability": model_probabilities,
+        "edge": best.get("edge") if best else None, "ev": best.get("ev") if best else None,
+        "script_coverage": script_coverage, "crowding": crowding,
+        "line_movement": None, "lineup_confidence": lineup_confidence,
+        "death_path": death_path or [], "pass_reasons": pass_reasons,
+    }
 
 
 @app.get("/")
@@ -756,10 +975,18 @@ def shadow_snapshot(fixture: int, stage: str = "manual", raw: bool = False, toke
     history = get_fixture_snapshots(fixture)
     market_snapshot = get_nested(data, ["structured_inputs", "odds_market_snapshot"], empty_market_snapshot())
     dynamics = compare_market_snapshots(history, market_snapshot, normalized)
-    record = {"version": VERSION, "fixture": fixture, "stage": normalized, "requested_stage": stage, "snapshot_at": int(time.time()), "fixture_info": data.get("fixture"), "data_quality": data.get("data_quality"), "coverage": data.get("coverage"), "market_snapshot": market_snapshot, "market_dynamics": dynamics, "shadow_summary": data.get("shadow_summary")}
+    versions = get_fundamental_versions(fixture)
+    previous_version = versions[-1] if versions else None
+    script = pure_fundamental_script(data)
+    trigger = get_nested(dynamics, ["revalidation_trigger"], {}) or {}
+    should_version = not versions or bool(trigger.get("triggered")) or normalized in ("T-1h", "T-15m", "Closing")
+    fundamental_version = save_fundamental_version(fixture, script, {"stage": normalized, **trigger}, previous_version) if should_version else previous_version
+    move_class = classify_market_move(dynamics, previous_version, script)
+    dynamics["classification"] = move_class
+    record = {"version": VERSION, "fixture": fixture, "stage": normalized, "requested_stage": stage, "snapshot_at": int(time.time()), "fixture_info": data.get("fixture"), "data_quality": data.get("data_quality"), "coverage": data.get("coverage"), "market_snapshot": market_snapshot, "market_dynamics": dynamics, "pure_fundamental_script_hash": script.get("content_hash"), "fundamental_version_number": (fundamental_version or {}).get("version_number"), "shadow_summary": data.get("shadow_summary")}
     saved = save_snapshot(record)
     print("[SHADOW_SNAPSHOT] " + json.dumps({"stage": normalized, "fixture": fixture, "data_quality": data.get("data_quality"), "market_dynamics": dynamics, "summary": data.get("shadow_summary")}, ensure_ascii=False)[:6000])
-    return JSONResponse({"ok": True, "saved": saved, "stage": normalized, "snapshot_at": record["snapshot_at"], "fixture": fixture, "market_snapshot": market_snapshot, "market_dynamics": dynamics, "data": data})
+    return JSONResponse({"ok": True, "saved": saved, "stage": normalized, "snapshot_at": record["snapshot_at"], "fixture": fixture, "market_snapshot": market_snapshot, "market_dynamics": dynamics, "pure_fundamental_script": script, "fundamental_version": fundamental_version, "data": data})
 
 
 @app.get("/shadow/snapshots")
@@ -774,16 +1001,24 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
     """Build one AI-ready prematch packet from persisted market history + one current fundamentals fetch."""
     data = collect_prematch_data(fixture, include_raw=False)
     history = get_fixture_snapshots(fixture)
+    by_stage = {row.get("stage"): row for row in history if row.get("stage") in PREMATCH_STAGE_ORDER}
     timeline = []
-    for row in history:
+    for stage in PREMATCH_STAGE_ORDER:
+        row = by_stage.get(stage)
+        if not row:
+            timeline.append({"stage": stage, "status": "data_missing", "reason": "historical checkpoint was not captured; current odds were not backfilled"})
+            continue
         ms = row.get("market_snapshot") or {}
-        primary = ms.get("primary") or {}
+        primary = ms.get("consensus_main_line") or ms.get("primary") or {}
         timeline.append({
-            "stage": row.get("stage"),
+            "stage": row.get("stage"), "status": "available",
             "snapshot_at": row.get("snapshot_at"),
             "asian_handicap": primary.get("asian_handicap"),
             "over_under": primary.get("over_under"),
             "1x2": primary.get("1x2"),
+            "btts": primary.get("btts"),
+            "home_team_total": primary.get("home_team_total"),
+            "away_team_total": primary.get("away_team_total"),
             "market_dynamics": row.get("market_dynamics"),
             "collection_profile": get_nested(row, ["coverage"], {})
         })
@@ -793,6 +1028,10 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
     latest_ah = line_from_primary(get_nested(latest or {}, ["market_snapshot", "primary", "asian_handicap"]))
     total_ah_move = latest_ah - first_ah if first_ah is not None and latest_ah is not None else None
     si = data.get("structured_inputs") or {}
+    script = pure_fundamental_script(data)
+    versions = get_fundamental_versions(fixture)
+    decision = decision_layer(si.get("odds_market_snapshot") or empty_market_snapshot())
+    decision["line_movement"] = latest.get("market_dynamics") if latest else {"status": "data_missing"}
     upstream_ok = bool(data.get("ok")) and bool(data.get("fixture"))
     return {
         "ok": upstream_ok,
@@ -810,21 +1049,27 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
             "lineups_available": si.get("lineups_available"),
             "prediction": si.get("prediction")
         },
+        "pure_fundamental_script": script,
+        "fundamental_versions": versions,
         "market": {
             "current": si.get("odds_market_snapshot"),
             "saved_stage_count": len(history),
             "saved_stages": [x.get("stage") for x in history],
+            "required_timeline": PREMATCH_STAGE_ORDER,
+            "missing_stages": [x for x in PREMATCH_STAGE_ORDER if x not in by_stage],
             "timeline": timeline,
             "total_asian_handicap_move": total_ah_move,
             "latest_dynamics": latest.get("market_dynamics") if latest else None,
             "latest_saturation": get_nested(latest or {}, ["market_dynamics", "market_saturation"])
         },
         "analysis_rules": {
-            "order": ["data_integrity", "fundamentals", "recent_form", "motivation", "lineup_injuries", "market_timeline", "model_market_conflict", "market_saturation", "remaining_edge", "risk", "final_shadow_lean"],
+            "order": ["pure_fundamental_script", *FUNDAMENTAL_CHAIN, "market_timeline", "fundamental_revalidation", "model_probability_vs_market_no_vig_probability", "edge", "ev", "script_coverage", "crowding", "line_movement", "lineup_confidence", "death_path", "bet_or_pass"],
             "missing_data_rule": "Any unavailable injuries, lineups, odds, standings or other inputs must be marked 数据缺失; never infer missing facts.",
             "prematch_only": True,
             "line_move_is_not_edge": True
         },
+        "market_move_classes": MOVE_CLASSES,
+        "decision_layer": decision,
         "shadow_summary": data.get("shadow_summary")
     }
 
@@ -833,6 +1078,22 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
 def shadow_ai_packet(fixture: int, token: Optional[str] = None):
     require_shadow_token(token)
     return JSONResponse(build_shadow_ai_packet(fixture))
+
+
+@app.post("/shadow/evaluate")
+async def shadow_evaluate(request: Request, token: Optional[str] = None):
+    """Evaluate explicit independent model inputs without mutating fundamentals."""
+    require_shadow_token(token)
+    payload = await request.json()
+    fixture = int(payload.get("fixture"))
+    history = get_fixture_snapshots(fixture)
+    current = (history[-1].get("market_snapshot") if history else None) or empty_market_snapshot()
+    result = decision_layer(
+        current, payload.get("model_probabilities"), payload.get("script_coverage"),
+        as_float(payload.get("crowding")), as_float(payload.get("lineup_confidence")), payload.get("death_path") or []
+    )
+    result["line_movement"] = history[-1].get("market_dynamics") if history else {"status": "data_missing"}
+    return JSONResponse({"ok": True, "version": VERSION, "fixture": fixture, "evaluation": result})
 
 
 @app.get("/shadow/report", response_class=PlainTextResponse)
@@ -902,7 +1163,14 @@ def auto_snapshot_cycle() -> None:
                             history = get_fixture_snapshots(int(fx["fixture_id"]))
                             market_snapshot = get_nested(data, ["structured_inputs", "odds_market_snapshot"], empty_market_snapshot())
                             dynamics = compare_market_snapshots(history, market_snapshot, key)
-                            record = {"version": VERSION, "fixture": int(fx["fixture_id"]), "stage": key, "requested_stage": "auto", "snapshot_at": int(time.time()), "fixture_info": data.get("fixture"), "data_quality": data.get("data_quality"), "coverage": data.get("coverage"), "market_snapshot": market_snapshot, "market_dynamics": dynamics, "shadow_summary": data.get("shadow_summary")}
+                            versions = get_fundamental_versions(int(fx["fixture_id"]))
+                            previous_version = versions[-1] if versions else None
+                            trigger = get_nested(dynamics, ["revalidation_trigger"], {}) or {}
+                            full_data = collect_prematch_data(int(fx["fixture_id"]), include_raw=False) if (not versions or trigger.get("triggered") or key in ("T-1h", "T-15m", "Closing")) else None
+                            script = pure_fundamental_script(full_data) if full_data else get_nested(previous_version or {}, ["script"], {})
+                            fundamental_version = save_fundamental_version(int(fx["fixture_id"]), script, {"stage": key, **trigger}, previous_version) if full_data else previous_version
+                            dynamics["classification"] = classify_market_move(dynamics, previous_version, script)
+                            record = {"version": VERSION, "fixture": int(fx["fixture_id"]), "stage": key, "requested_stage": "auto", "snapshot_at": int(time.time()), "fixture_info": data.get("fixture"), "data_quality": data.get("data_quality"), "coverage": data.get("coverage"), "market_snapshot": market_snapshot, "market_dynamics": dynamics, "pure_fundamental_script_hash": script.get("content_hash"), "fundamental_version_number": (fundamental_version or {}).get("version_number"), "shadow_summary": data.get("shadow_summary")}
                             save_snapshot(record)
                             print("[AUTO_SNAPSHOT] saved " + json.dumps({"fixture": fx["fixture_id"], "stage": key, "due": due.isoformat()}, ensure_ascii=False))
                         except Exception as exc:

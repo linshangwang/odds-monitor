@@ -1,4 +1,4 @@
-# Football Data Monitor - Railway 初版
+# Football AI 影子分析 / Odds Monitor v0.7
 
 这是一个 Railway 可部署的 FastAPI 项目，用来测试：
 
@@ -82,6 +82,49 @@ https://你的项目.up.railway.app/debug/last-push-events
 https://你的项目.up.railway.app/debug/last-push-statistics
 ```
 
-## 注意
+## V4 兼容升级
 
-当前版本只是接通服务和接口测试，不是最终分析系统。后续还需要接数据库、定时任务、事件/统计快照存储、变化检测和提醒规则。
+- 固定时间轴：`Opening → T-24h → T-12h → T-6h → T-3h → T-1h → T-15m → Closing`。未真实采集的节点返回 `data_missing`，不使用当前赔率回填。
+- 每个节点保存 1X2、亚洲让球、大小球，并在上游提供时保存 BTTS、主队进球数、客队进球数。
+- `primary` 字段继续保留以兼容旧调用方，但内容改为基于完整公司数组计算的 `consensus_main_line`，不再机械取第一家公司。
+- 显著跨档、异常价格或跨市场背离会触发基本面重新采集，并保存基本面版本、触发原因、变量变化、概率变化和最优盘口变化。
+- Pure Fundamental Script 与盘口隔离；未知的战术/动机信息明确为 `data_missing`。
+- 决策层检查模型概率、市场去水概率、Edge、EV、Script Coverage、Crowding、Line Movement、Lineup Confidence 和 Death Path；输入不足或无正优势时返回 `PASS`。
+
+主要接口保持兼容，并新增：
+
+```text
+GET  /shadow/ai-packet?fixture=FIXTURE_ID
+POST /shadow/evaluate
+```
+
+`/shadow/evaluate` 的 JSON 示例：
+
+```json
+{
+  "fixture": 123,
+  "model_probabilities": {"home": 0.50, "draw": 0.28, "away": 0.22},
+  "script_coverage": {"home": 0.75, "draw": 0.40, "away": 0.20},
+  "crowding": 0.45,
+  "lineup_confidence": 0.90,
+  "death_path": []
+}
+```
+
+## Railway 持久化
+
+在 Railway 为服务挂载 `/data` Volume，并设置：
+
+```text
+SNAPSHOT_STORE_PATH=/data/shadow_snapshots.json
+```
+
+存储格式向后兼容原 `fixtures` 快照；新增的 `fundamental_versions` 与其并列保存。
+
+## 测试
+
+```bash
+python -m unittest -v
+```
+
+真实密钥只放在 Railway Variables，禁止写入仓库或日志。
