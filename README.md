@@ -161,3 +161,6 @@ POST 支持 `Content-Encoding: gzip`，可直接发送压缩 JSON，
 同步程序推荐使用请求头 `Authorization: Bearer ...` 或 `X-Shadow-Token: ...`，
 避免把令牌放进 URL。可用 `X-Sync-Mode: incremental` 和 `X-Sync-Source: pang`
 记录增量同步来源；`/shadow/import-status` 返回最后成功时间、请求大小和比赛数量。
+节点导入按比赛、阶段、观测时间和内容指纹幂等合并；重复内容标记 `unchanged`，
+较旧内容标记 `stale_skipped`，不会覆盖较新的节点。响应中的 `stage_counts`
+分别报告 `inserted`、`updated`、`unchanged` 和 `stale_skipped`。

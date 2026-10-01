@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -797,6 +797,11 @@ def imported_market_snapshot(stage: Dict[str, Any]) -> Dict[str, Any]:
     return snapshot
 
 
+def _content_hash(value: Any) -> str:
+    raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def import_prematch_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(packet, dict):
         raise HTTPException(status_code=400, detail="packet_must_be_an_object")
@@ -810,7 +815,6 @@ def import_prematch_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(timeline, list):
         raise HTTPException(status_code=400, detail="timeline_must_be_an_array")
     seen = set()
-    history: List[Dict[str, Any]] = []
     records: List[Dict[str, Any]] = []
     imported = []
     for stage_data in timeline:
@@ -820,35 +824,61 @@ def import_prematch_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
         seen.add(stage)
         status = "available" if stage_data.get("status") == "available" else "data_missing"
         market_snapshot = imported_market_snapshot(stage_data)
-        dynamics = compare_market_snapshots([x for x in history if x.get("import_status") == "available"], market_snapshot, stage) if status == "available" else {
-            "stage": stage, "comparison_status": "data_missing", "revalidation_trigger": {"triggered": False, "reasons": []},
-            "data_missing": list(market_snapshot["data_status"].keys())
-        }
-        dynamics["classification"] = classify_market_move(dynamics, None, None)
+        source_hash = _content_hash({"stage": stage, "status": status, "market_snapshot": market_snapshot, "missing_reason": stage_data.get("reason")})
         record = {
             "version": VERSION, "fixture": fixture, "external_fixture_id": fixture, "source": "pang_import",
             "stage": stage, "snapshot_at": _parse_timestamp(stage_data.get("latest_observed_at") or stage_data.get("target_at")) or int(time.time()),
             "fixture_info": match, "data_quality": packet.get("data_quality"), "coverage": {"source": "pang", "quote_count": stage_data.get("quote_count"), "bookmaker_count": stage_data.get("bookmaker_count")},
             "import_status": status, "missing_reason": stage_data.get("reason") if status == "data_missing" else None,
-            "market_snapshot": market_snapshot, "market_dynamics": dynamics,
+            "market_snapshot": market_snapshot, "source_content_hash": source_hash, "market_dynamics": None,
         }
-        history.append(record)
         records.append(record)
-        imported.append({"stage": stage, "status": status})
     with SNAPSHOT_STORE_LOCK:
         store = load_snapshot_store()
         existing = store.setdefault("fixtures", {}).get(fixture, [])
-        replaced_stages = {row["stage"] for row in records}
-        merged = [row for row in existing if row.get("stage") not in replaced_stages] + records
+        existing_by_stage = {row.get("stage"): row for row in existing}
+        accepted = []
+        for record in records:
+            old = existing_by_stage.get(record["stage"])
+            old_hash = (old or {}).get("source_content_hash")
+            if old and not old_hash:
+                old_hash = _content_hash({"stage": old.get("stage"), "status": old.get("import_status"), "market_snapshot": old.get("market_snapshot"), "missing_reason": old.get("missing_reason")})
+            if old_hash == record["source_content_hash"]:
+                action = "unchanged"
+            elif old and int(record.get("snapshot_at") or 0) < int(old.get("snapshot_at") or 0):
+                action = "stale_skipped"
+            else:
+                action = "inserted" if not old else "updated"
+                accepted.append(record)
+                existing_by_stage[record["stage"]] = record
+            imported.append({"stage": record["stage"], "status": record["import_status"], "action": action})
+        replaced_stages = {row["stage"] for row in accepted}
+        merged = [row for row in existing if row.get("stage") not in replaced_stages] + accepted
+        merged = sorted(merged, key=lambda x: (STAGE_ORDER.index(x.get("stage")) if x.get("stage") in STAGE_ORDER else 999, x.get("snapshot_at", 0)))
+        prior_available: List[Dict[str, Any]] = []
+        for row in merged:
+            market_snapshot = row.get("market_snapshot") or empty_market_snapshot()
+            if row.get("import_status") == "available":
+                dynamics = compare_market_snapshots(prior_available, market_snapshot, row.get("stage"))
+                prior_available.append(row)
+            else:
+                dynamics = {"stage": row.get("stage"), "comparison_status": "data_missing", "revalidation_trigger": {"triggered": False, "reasons": []}, "data_missing": list((market_snapshot.get("data_status") or {}).keys())}
+            dynamics["classification"] = classify_market_move(dynamics, None, None)
+            row["market_dynamics"] = dynamics
         store["fixtures"][fixture] = sorted(merged, key=lambda x: (STAGE_ORDER.index(x.get("stage")) if x.get("stage") in STAGE_ORDER else 999, x.get("snapshot_at", 0)))
-        store.setdefault("external_prematch", {})[fixture] = {
-            "schema_version": packet.get("schema_version"), "league": packet.get("league"), "exported_at": packet.get("exported_at"),
-            "match": match, "required_timeline": packet.get("required_timeline") or PREMATCH_STAGE_ORDER,
-            "lineup_history": packet.get("lineup_history") or [], "data_quality": packet.get("data_quality"), "imported_at": int(time.time()),
-        }
-        store["version"] = VERSION
-        write_snapshot_store(store)
-    return {"fixture": fixture, "match": f"{match.get('home_team_name')} vs {match.get('away_team_name')}", "stages": imported}
+        external_prematch = store.setdefault("external_prematch", {})
+        if accepted or fixture not in external_prematch:
+            previous_meta = external_prematch.get(fixture) or {}
+            external_prematch[fixture] = {
+                "schema_version": packet.get("schema_version"), "league": packet.get("league") or previous_meta.get("league"), "exported_at": packet.get("exported_at") or previous_meta.get("exported_at"),
+                "match": match or previous_meta.get("match"), "required_timeline": packet.get("required_timeline") or previous_meta.get("required_timeline") or PREMATCH_STAGE_ORDER,
+                "lineup_history": packet.get("lineup_history") if "lineup_history" in packet else previous_meta.get("lineup_history", []),
+                "data_quality": packet.get("data_quality") or previous_meta.get("data_quality"), "imported_at": int(time.time()),
+            }
+            store["version"] = VERSION
+            write_snapshot_store(store)
+    counts = {action: sum(1 for row in imported if row["action"] == action) for action in ("inserted", "updated", "unchanged", "stale_skipped")}
+    return {"fixture": fixture, "match": f"{match.get('home_team_name')} vs {match.get('away_team_name')}", "stages": imported, "counts": counts, "changed": bool(accepted)}
 
 
 def line_from_primary(primary: Optional[Dict[str, Any]]) -> Optional[float]:
@@ -1253,14 +1283,16 @@ async def shadow_import_prematch_packets(request: Request, token: Optional[str] 
     with SNAPSHOT_STORE_LOCK:
         store = load_snapshot_store()
         previous = store.get("import_sync_status") or {}
+        totals = {key: sum(row.get("counts", {}).get(key, 0) for row in results) for key in ("inserted", "updated", "unchanged", "stale_skipped")}
         store["import_sync_status"] = {
             "status": "ok", "last_success_at": int(time.time()), "previous_success_at": previous.get("last_success_at"),
             "packet_count": len(results), "fixtures": [row.get("fixture") for row in results],
             "request_bytes": len(await request.body()), "content_encoding": request.headers.get("content-encoding") or "identity",
             "mode": request.headers.get("x-sync-mode") or "batch", "source": request.headers.get("x-sync-source") or "external",
+            "stage_counts": totals, "changed_fixture_count": sum(1 for row in results if row.get("changed")),
         }
         write_snapshot_store(store)
-    return JSONResponse({"ok": True, "version": VERSION, "imported_count": len(results), "results": results})
+    return JSONResponse({"ok": True, "version": VERSION, "imported_count": len(results), "stage_counts": totals, "results": results})
 
 
 @app.get("/shadow/import-status")

@@ -195,9 +195,22 @@ class ShadowV4UpgradeTests(unittest.TestCase):
 
     def test_import_is_idempotent_per_stage(self):
         packet = self.prematch_packet()
-        main.import_prematch_packet(packet)
-        main.import_prematch_packet(packet)
+        first = main.import_prematch_packet(packet)
+        second = main.import_prematch_packet(packet)
         self.assertEqual(len(main.get_fixture_snapshots("uuid-1")), 2)
+        self.assertEqual(first["counts"]["inserted"], 2)
+        self.assertEqual(second["counts"]["unchanged"], 2)
+        self.assertFalse(second["changed"])
+
+    def test_incremental_import_skips_stale_stage(self):
+        packet = self.prematch_packet()
+        main.import_prematch_packet(packet)
+        packet["timeline"][0]["latest_observed_at"] = "2026-09-28T00:00:00+00:00"
+        packet["timeline"][0]["consensus_main_line"]["1x2"]["median_prices"]["home"] = 9.0
+        result = main.import_prematch_packet(packet)
+        self.assertEqual(result["counts"]["stale_skipped"], 1)
+        opening = [x for x in main.get_fixture_snapshots("uuid-1") if x["stage"] == "Opening"][0]
+        self.assertEqual(opening["market_snapshot"]["primary"]["1x2"]["home"], 2.0)
 
     def test_import_rejects_unknown_schema(self):
         packet = self.prematch_packet()
