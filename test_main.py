@@ -111,6 +111,33 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("home_adjustment_out_of_range", result["errors"])
 
+    def test_complete_prematch_pipeline_binds_fresh_market_and_versions_fundamentals(self):
+        main.import_prematch_packet(self.prematch_packet())
+        latest = max(row.get("snapshot_at") or 0 for row in main.get_fixture_snapshots("uuid-1") if row.get("import_status") == "available")
+        payload = {
+            "fixture": "uuid-1", "league_home_rate": 1.5, "league_away_rate": 1.2,
+            "home_attack_rate": 1.8, "home_defense_rate": 1.0,
+            "away_attack_rate": 1.1, "away_defense_rate": 1.5,
+            "home_sample_size": 10, "away_sample_size": 10, "league_sample_size": 100,
+            "metric_type": "xg", "home_adjustment": 1.0, "away_adjustment": 1.0,
+            "lineup_confidence": 0.85,
+            "provenance": {"source": "verified_event_data", "uses_market_odds": False},
+            "script_coverage": {"home": 0.8, "draw": 0.4, "away": 0.3},
+            "crowding": 0.3, "death_path": [],
+            "revalidation_trigger": {"triggered": True, "reasons": ["significant_line_move"]},
+        }
+        with patch("main.time.time", return_value=latest + 60):
+            first = main.evaluate_imported_prematch(payload)
+            second = main.evaluate_imported_prematch({**payload, "home_adjustment": 1.05})
+        self.assertEqual(first["decision_layer"]["data_freshness"]["state"], "fresh")
+        self.assertNotIn("market_no_vig_probability", first["decision_layer"]["pass_reasons"])
+        self.assertEqual(first["fundamental_version"]["version_number"], 1)
+        self.assertEqual(second["fundamental_version"]["version_number"], 2)
+        self.assertIsNotNone(second["fundamental_version"]["probability_change"]["delta"])
+        self.assertIn("fundamental_estimator", second["fundamental_version"]["variable_changes"])
+        self.assertEqual(second["fundamental_version"]["trigger"]["reasons"], ["significant_line_move"])
+        self.assertTrue(second["fundamental_version"]["script"]["odds_independent"])
+
     def test_fundamental_version_persists_audit_fields(self):
         script = {"content_hash": "x", "chain": {key: {"status": "data_missing"} for key in main.FUNDAMENTAL_CHAIN}}
         row = main.save_fundamental_version(1, script, {"stage": "Opening", "triggered": False})

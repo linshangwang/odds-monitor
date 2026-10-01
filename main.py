@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1005,9 +1005,13 @@ def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict
         rows = store.setdefault("fundamental_versions", {}).setdefault(str(fixture), [])
         old_script = (previous or {}).get("script") or {}
         changed_sections = [key for key in FUNDAMENTAL_CHAIN if get_nested(old_script, ["chain", key]) != get_nested(script, ["chain", key])]
+        variable_changes = {key: {"before": get_nested(old_script, ["chain", key]), "after": get_nested(script, ["chain", key])} for key in changed_sections}
+        if old_script.get("estimator") != script.get("estimator"):
+            changed_sections.append("fundamental_estimator")
+            variable_changes["fundamental_estimator"] = {"before": old_script.get("estimator"), "after": script.get("estimator")}
         record = {
             "version_number": len(rows) + 1, "created_at": int(time.time()), "trigger": trigger,
-            "changed_information": changed_sections, "variable_changes": {key: {"before": get_nested(old_script, ["chain", key]), "after": get_nested(script, ["chain", key])} for key in changed_sections},
+            "changed_information": changed_sections, "variable_changes": variable_changes,
             "probability_change": probability_change or {"status": "data_missing", "reason": "no independent model probability supplied"},
             "best_market_change": best_market_change or {"status": "data_missing", "reason": "decision inputs incomplete"},
             "script": script,
@@ -1163,9 +1167,90 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
     }
 
 
+def _fundamental_evaluation_script(payload: Dict[str, Any], estimator: Dict[str, Any], model: Dict[str, Any]) -> Dict[str, Any]:
+    supplied_chain = payload.get("fundamental_chain") if isinstance(payload.get("fundamental_chain"), dict) else {}
+    chain = {
+        key: supplied_chain.get(key) if isinstance(supplied_chain.get(key), dict)
+        else {"status": "data_missing", "reason": "not supplied for this recalculation"}
+        for key in FUNDAMENTAL_CHAIN
+    }
+    independent_content = {
+        "fixture": str(payload.get("fixture") or ""), "chain": chain,
+        "estimator_method": estimator.get("method"), "estimator_inputs": estimator.get("inputs"),
+        "expected_goals": estimator.get("expected_goals"), "model_method": model.get("method"),
+        "model_probability": get_nested(model, ["probabilities", "1x2"]),
+    }
+    return {
+        "schema": "prematch_fundamental_evaluation_v1", "odds_independent": True,
+        "generated_at": int(time.time()), "chain_order": FUNDAMENTAL_CHAIN, "chain": chain,
+        "estimator": {"method": estimator.get("method"), "inputs": estimator.get("inputs"), "expected_goals": estimator.get("expected_goals"), "confidence": estimator.get("confidence"), "audit": estimator.get("audit")},
+        "model": {"method": model.get("method"), "model_hash": model.get("model_hash"), "probabilities": model.get("probabilities")},
+        "content_hash": _content_hash(independent_content),
+    }
+
+
+def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = True) -> Dict[str, Any]:
+    fixture = str(payload.get("fixture") or "").strip()
+    if not fixture:
+        raise HTTPException(status_code=422, detail="fixture_required")
+    store = load_snapshot_store()
+    metadata = (store.get("external_prematch") or {}).get(fixture)
+    if not metadata:
+        raise HTTPException(status_code=404, detail="imported_fixture_not_found")
+    estimator = fundamental_expected_goals(payload)
+    if not estimator.get("ok"):
+        raise HTTPException(status_code=422, detail=estimator)
+    xg = estimator["expected_goals"]
+    model = poisson_probability_model(xg["home"], xg["away"], estimator["confidence"], payload.get("provenance"))
+    if estimator.get("status") != "ready":
+        model["status"] = "insufficient_confidence"
+    history = get_fixture_snapshots(fixture)
+    available = [row for row in history if row.get("import_status") == "available"]
+    latest = max(available, key=lambda row: int(row.get("snapshot_at") or 0), default=None)
+    market = (latest or {}).get("market_snapshot") or empty_market_snapshot()
+    freshness = imported_fixture_freshness(metadata, history)
+    decision = decision_layer(
+        market, get_nested(model, ["probabilities", "1x2"]), payload.get("script_coverage"),
+        as_float(payload.get("crowding")), as_float(payload.get("lineup_confidence")), payload.get("death_path") or [],
+    )
+    decision["line_movement"] = (latest or {}).get("market_dynamics") or {"status": "data_missing"}
+    decision["data_freshness"] = freshness
+    if model.get("status") != "ready":
+        decision["pass_reasons"].append("model_input_confidence_below_0_6")
+    if not freshness.get("decision_eligible"):
+        decision["pass_reasons"].append(freshness.get("reason") or "data_not_fresh")
+    decision["pass_reasons"] = list(dict.fromkeys(decision["pass_reasons"]))
+    if decision["pass_reasons"]:
+        decision["decision"] = "PASS"
+
+    script = _fundamental_evaluation_script(payload, estimator, model)
+    versions = get_fundamental_versions(fixture)
+    previous = versions[-1] if versions else None
+    previous_probability = get_nested(previous or {}, ["script", "model", "probabilities", "1x2"])
+    current_probability = get_nested(model, ["probabilities", "1x2"])
+    probability_change = {
+        "before": previous_probability, "after": current_probability,
+        "delta": {key: round(current_probability[key] - previous_probability[key], 6) for key in ("home", "draw", "away")} if previous_probability else None,
+    }
+    previous_best = get_nested(previous or {}, ["best_market_change", "after"])
+    current_best = decision.get("best_market")
+    best_market_change = {"before": previous_best, "after": current_best, "changed": previous_best != current_best}
+    trigger = payload.get("revalidation_trigger") if isinstance(payload.get("revalidation_trigger"), dict) else {
+        "triggered": False, "reasons": ["pipeline_evaluation"]
+    }
+    version_record = save_fundamental_version(
+        fixture, script, trigger, previous=previous,
+        probability_change=probability_change, best_market_change=best_market_change,
+    ) if persist_version else None
+    return {
+        "ok": True, "version": VERSION, "fixture": fixture, "estimator": estimator, "model": model,
+        "decision_layer": decision, "fundamental_version": version_record,
+    }
+
+
 @app.get("/")
 def root():
-    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/import-status", "/shadow/data-source-health", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/imported-prematch/{fixture}"]}
+    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/import-status", "/shadow/data-source-health", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/imported-prematch/{fixture}"]}
 
 
 @app.get("/health")
@@ -1504,6 +1589,17 @@ async def shadow_fundamental_xg(request: Request, token: Optional[str] = None, a
     if estimator["status"] != "ready":
         model["status"] = "insufficient_confidence"
     return JSONResponse({"ok": True, "version": VERSION, "estimator": estimator, "model": model, "decision": "PASS", "reason": "probability_generation_only; bind a fresh fixture and complete decision inputs before evaluation"})
+
+
+@app.post("/shadow/model/prematch-evaluate")
+async def shadow_prematch_evaluate(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    """Run and audit the complete odds-independent model-to-market decision pipeline."""
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_json_body")
+    return JSONResponse(evaluate_imported_prematch(payload, persist_version=True))
 
 
 def build_imported_ai_packet(fixture: str, include_companies: bool = False, include_lineups: bool = False) -> Dict[str, Any]:

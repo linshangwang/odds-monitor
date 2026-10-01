@@ -162,6 +162,7 @@ GET  /shadow/import-status?token=SHADOW_ACCESS_TOKEN
 GET  /shadow/data-source-health?token=SHADOW_ACCESS_TOKEN
 POST /shadow/model/poisson?token=SHADOW_ACCESS_TOKEN
 POST /shadow/model/fundamental-xg?token=SHADOW_ACCESS_TOKEN
+POST /shadow/model/prematch-evaluate?token=SHADOW_ACCESS_TOKEN
 GET  /shadow/imported-prematch/{MATCH_UUID}?token=SHADOW_ACCESS_TOKEN
 ```
 
@@ -211,3 +212,25 @@ POST 支持 `Content-Encoding: gzip`，可直接发送压缩 JSON，
 公式为 `球队进攻率 × 对手防守率 ÷ 联赛场景基准 × 调整系数`。调整系数限制在
 0.8–1.2；支持 xG 或进球率，但进球率会获得较低的数据质量权重。该接口只生成
 概率并固定返回 PASS，必须绑定新鲜比赛和完整决策字段后才能进入最终推荐。
+
+`/shadow/model/prematch-evaluate` 将已导入比赛的最新真实盘口与独立基本面模型绑定，依次执行
+基本面 xG、Poisson 概率、市场去水概率、Edge/EV 和最终风险门槛。它不使用赔率生成或修改
+基本面；比赛不存在、盘口过期、已经开赛、模型置信度不足或决策字段不完整时均返回 `PASS`。
+每次调用都会保存一条基本面版本，包含触发原因、变量变化、概率变化和最优盘口变化。
+
+请求体在 `/shadow/model/fundamental-xg` 字段基础上增加：
+
+```json
+{
+  "fixture": "MATCH_UUID",
+  "script_coverage": {"home": 0.75, "draw": 0.45, "away": 0.25},
+  "crowding": 0.35,
+  "death_path": [],
+  "revalidation_trigger": {"triggered": true, "reasons": ["significant_line_move"]},
+  "fundamental_chain": {
+    "result_utility": {"status": "available", "evidence": "verified competition state"}
+  }
+}
+```
+
+未提供的基本面链环节明确保存为 `data_missing`，不会根据盘口补写。
