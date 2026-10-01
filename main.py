@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -27,6 +27,11 @@ SHADOW_ACCESS_TOKEN = os.getenv("SHADOW_ACCESS_TOKEN", "")
 SNAPSHOT_STORE_PATH = os.getenv("SNAPSHOT_STORE_PATH", "/tmp/shadow_snapshots.json")
 SNAPSHOT_STORE_GZIP = os.getenv("SNAPSHOT_STORE_GZIP", "true").lower() in ("1", "true", "yes", "on")
 EXTERNAL_DATA_STALE_SECONDS = max(60, int(os.getenv("EXTERNAL_DATA_STALE_SECONDS", "1800")))
+MIN_EDGE = float(os.getenv("MIN_EDGE", "0.03"))
+MIN_EV = float(os.getenv("MIN_EV", "0.03"))
+MIN_SCRIPT_COVERAGE = float(os.getenv("MIN_SCRIPT_COVERAGE", "0.60"))
+MAX_CROWDING = float(os.getenv("MAX_CROWDING", "0.80"))
+MIN_LINEUP_CONFIDENCE = float(os.getenv("MIN_LINEUP_CONFIDENCE", "0.70"))
 AUTO_SNAPSHOT_ENABLED = os.getenv("AUTO_SNAPSHOT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 AUTO_SNAPSHOT_POLL_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_POLL_SECONDS", "300")))
 AUTO_SNAPSHOT_WINDOW_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_WINDOW_SECONDS", "600")))
@@ -1118,12 +1123,17 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
     market_probability = no_vig_probabilities(main, ["home", "draw", "away"])
     missing = []
     if not market_probability: missing.append("market_no_vig_probability")
+    valid_model = False
+    if model_probabilities:
+        values = [as_float(model_probabilities.get(key)) for key in ("home", "draw", "away")]
+        valid_model = all(value is not None and 0 <= value <= 1 for value in values) and abs(sum(values) - 1.0) <= 0.02
     if not model_probabilities: missing.append("model_probability")
+    elif not valid_model: missing.append("model_probability_invalid_or_not_normalized")
     if script_coverage is None: missing.append("script_coverage")
     if crowding is None: missing.append("crowding")
     if lineup_confidence is None: missing.append("lineup_confidence")
     candidates = []
-    if market_probability and model_probabilities:
+    if market_probability and valid_model:
         for key in ("home", "draw", "away"):
             model_p = as_float(model_probabilities.get(key))
             price = as_float(main.get(key))
@@ -1134,7 +1144,12 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
     candidates.sort(key=lambda x: (x.get("ev", -999), x.get("edge", -999)), reverse=True)
     best = candidates[0] if candidates else None
     pass_reasons = list(missing)
-    if best and (best["edge"] <= 0 or best["ev"] <= 0): pass_reasons.append("no_positive_edge_and_ev")
+    if best and best["edge"] < MIN_EDGE: pass_reasons.append("edge_below_minimum")
+    if best and best["ev"] < MIN_EV: pass_reasons.append("ev_below_minimum")
+    if best and as_float(best.get("script_coverage")) is None: pass_reasons.append("script_coverage_for_selection_missing")
+    elif best and as_float(best.get("script_coverage")) < MIN_SCRIPT_COVERAGE: pass_reasons.append("script_coverage_below_minimum")
+    if crowding is not None and crowding > MAX_CROWDING: pass_reasons.append("crowding_above_maximum")
+    if lineup_confidence is not None and lineup_confidence < MIN_LINEUP_CONFIDENCE: pass_reasons.append("lineup_confidence_below_minimum")
     if death_path: pass_reasons.append("death_path_present")
     decision = "PASS" if pass_reasons or not best else best["selection"]
     return {
@@ -1144,6 +1159,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
         "script_coverage": script_coverage, "crowding": crowding,
         "line_movement": None, "lineup_confidence": lineup_confidence,
         "death_path": death_path or [], "pass_reasons": pass_reasons,
+        "thresholds": {"minimum_edge": MIN_EDGE, "minimum_ev": MIN_EV, "minimum_script_coverage": MIN_SCRIPT_COVERAGE, "maximum_crowding": MAX_CROWDING, "minimum_lineup_confidence": MIN_LINEUP_CONFIDENCE},
     }
 
 

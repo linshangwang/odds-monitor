@@ -89,7 +89,20 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 - `primary` 字段继续保留以兼容旧调用方，但内容改为基于完整公司数组计算的 `consensus_main_line`，不再机械取第一家公司。
 - 显著跨档、异常价格或跨市场背离会触发基本面重新采集，并保存基本面版本、触发原因、变量变化、概率变化和最优盘口变化。
 - Pure Fundamental Script 与盘口隔离；未知的战术/动机信息明确为 `data_missing`。
-- 决策层检查模型概率、市场去水概率、Edge、EV、Script Coverage、Crowding、Line Movement、Lineup Confidence 和 Death Path；输入不足或无正优势时返回 `PASS`。
+- 决策层检查模型概率、市场去水概率、Edge、EV、Script Coverage、Crowding、Line Movement、Lineup Confidence 和 Death Path；输入不足或未达到风险门槛时返回 `PASS`。
+
+默认最终推荐门槛可通过 Railway Variables 调整：
+
+```text
+MIN_EDGE=0.03
+MIN_EV=0.03
+MIN_SCRIPT_COVERAGE=0.60
+MAX_CROWDING=0.80
+MIN_LINEUP_CONFIDENCE=0.70
+```
+
+模型主胜、平局、客胜概率必须各自在 0–1 内且合计误差不超过 0.02。最佳候选仍需同时满足
+Edge、EV、脚本覆盖率、拥挤度和阵容可信度门槛，且不存在 Death Path；任何一项缺失或不合格均明确记录原因并 `PASS`。
 
 主要接口保持兼容，并新增：
 

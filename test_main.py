@@ -61,6 +61,17 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["decision"], "home")
         self.assertAlmostEqual(result["ev"], .10, places=6)
 
+    def test_decision_layer_enforces_minimums_and_probability_validation(self):
+        snapshot = main.empty_market_snapshot()
+        snapshot["consensus_main_line"]["1x2"] = {"home": 2.0, "draw": 3.5, "away": 4.0}
+        weak = main.decision_layer(snapshot, {"home": .50, "draw": .28, "away": .22}, {"home": .8, "draw": .4, "away": .3}, .4, .9, [])
+        self.assertEqual(weak["decision"], "PASS")
+        self.assertTrue(any(reason in weak["pass_reasons"] for reason in ("edge_below_minimum", "ev_below_minimum")))
+        crowded = main.decision_layer(snapshot, {"home": .55, "draw": .25, "away": .20}, {"home": .8, "draw": .4, "away": .3}, .9, .9, [])
+        self.assertIn("crowding_above_maximum", crowded["pass_reasons"])
+        invalid = main.decision_layer(snapshot, {"home": .70, "draw": .40, "away": .20}, {"home": .8}, .2, .9, [])
+        self.assertIn("model_probability_invalid_or_not_normalized", invalid["pass_reasons"])
+
     def test_independent_poisson_model_is_normalized_and_symmetric(self):
         model = main.poisson_probability_model(1.4, 1.4, 0.8, {"source": "verified_team_metrics", "uses_market_odds": False})
         self.assertTrue(model["ok"])
