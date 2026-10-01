@@ -77,6 +77,29 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         low = main.poisson_probability_model(1.5, 1.0, 0.4, {"source": "limited_stats", "uses_market_odds": False})
         self.assertEqual(low["status"], "insufficient_confidence")
 
+    def test_fundamental_expected_goals_is_auditable_and_market_independent(self):
+        inputs = {
+            "league_home_rate": 1.5, "league_away_rate": 1.2,
+            "home_attack_rate": 1.8, "home_defense_rate": 1.0,
+            "away_attack_rate": 1.1, "away_defense_rate": 1.5,
+            "home_sample_size": 10, "away_sample_size": 10, "league_sample_size": 100,
+            "metric_type": "xg", "home_adjustment": 1.0, "away_adjustment": 1.0,
+            "lineup_confidence": 0.8,
+            "provenance": {"source": "verified_event_data", "uses_market_odds": False},
+        }
+        result = main.fundamental_expected_goals(inputs)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "ready")
+        self.assertAlmostEqual(result["expected_goals"]["home"], 1.8, places=6)
+        self.assertAlmostEqual(result["expected_goals"]["away"], 1.1 * 1.0 / 1.2, places=6)
+        self.assertGreaterEqual(result["confidence"], 0.6)
+        self.assertFalse(result["uses_market_odds"])
+
+    def test_fundamental_expected_goals_rejects_extreme_adjustment(self):
+        result = main.fundamental_expected_goals({"home_adjustment": 1.5})
+        self.assertFalse(result["ok"])
+        self.assertIn("home_adjustment_out_of_range", result["errors"])
+
     def test_fundamental_version_persists_audit_fields(self):
         script = {"content_hash": "x", "chain": {key: {"status": "data_missing"} for key in main.FUNDAMENTAL_CHAIN}}
         row = main.save_fundamental_version(1, script, {"stage": "Opening", "triggered": False})

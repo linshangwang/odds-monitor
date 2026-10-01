@@ -148,6 +148,7 @@ POST /shadow/import-prematch-packets?token=SHADOW_ACCESS_TOKEN
 GET  /shadow/import-status?token=SHADOW_ACCESS_TOKEN
 GET  /shadow/data-source-health?token=SHADOW_ACCESS_TOKEN
 POST /shadow/model/poisson?token=SHADOW_ACCESS_TOKEN
+POST /shadow/model/fundamental-xg?token=SHADOW_ACCESS_TOKEN
 GET  /shadow/imported-prematch/{MATCH_UUID}?token=SHADOW_ACCESS_TOKEN
 ```
 
@@ -191,3 +192,9 @@ POST 支持 `Content-Encoding: gzip`，可直接发送压缩 JSON，
   "death_path": []
 }
 ```
+
+`/shadow/model/fundamental-xg` 在 Poisson 前增加可审计的 λ 生成层：使用联赛主客场
+基准、球队同场景进攻率、对手同场景防守率、样本量、指标类型和明确阵容调整。
+公式为 `球队进攻率 × 对手防守率 ÷ 联赛场景基准 × 调整系数`。调整系数限制在
+0.8–1.2；支持 xG 或进球率，但进球率会获得较低的数据质量权重。该接口只生成
+概率并固定返回 PASS，必须绑定新鲜比赛和完整决策字段后才能进入最终推荐。

@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1072,6 +1072,47 @@ def poisson_probability_model(home_expected_goals: Any, away_expected_goals: Any
     }
 
 
+def fundamental_expected_goals(inputs: Dict[str, Any]) -> Dict[str, Any]:
+    required_rates = ["league_home_rate", "league_away_rate", "home_attack_rate", "home_defense_rate", "away_attack_rate", "away_defense_rate"]
+    rates = {key: as_float(inputs.get(key)) for key in required_rates}
+    errors = [f"{key}_out_of_range" for key, value in rates.items() if value is None or not 0.1 <= value <= 5.0]
+    samples = {key: as_float(inputs.get(key)) for key in ("home_sample_size", "away_sample_size", "league_sample_size")}
+    if samples["home_sample_size"] is None or not 1 <= samples["home_sample_size"] <= 100: errors.append("home_sample_size_out_of_range")
+    if samples["away_sample_size"] is None or not 1 <= samples["away_sample_size"] <= 100: errors.append("away_sample_size_out_of_range")
+    if samples["league_sample_size"] is None or not 10 <= samples["league_sample_size"] <= 5000: errors.append("league_sample_size_out_of_range")
+    metric_type = str(inputs.get("metric_type") or "").lower()
+    if metric_type not in ("xg", "goals"): errors.append("metric_type_must_be_xg_or_goals")
+    home_adjustment = as_float(inputs.get("home_adjustment", 1.0))
+    away_adjustment = as_float(inputs.get("away_adjustment", 1.0))
+    if home_adjustment is None or not 0.8 <= home_adjustment <= 1.2: errors.append("home_adjustment_out_of_range")
+    if away_adjustment is None or not 0.8 <= away_adjustment <= 1.2: errors.append("away_adjustment_out_of_range")
+    lineup_confidence = as_float(inputs.get("lineup_confidence"))
+    if lineup_confidence is None or not 0.0 <= lineup_confidence <= 1.0: errors.append("lineup_confidence_out_of_range")
+    provenance = inputs.get("provenance")
+    if not isinstance(provenance, dict) or not provenance.get("source") or provenance.get("uses_market_odds") is not False:
+        errors.append("independent_provenance_required")
+    if errors:
+        return {"ok": False, "status": "invalid_input", "errors": errors}
+    home_base = rates["home_attack_rate"] * rates["away_defense_rate"] / rates["league_home_rate"]
+    away_base = rates["away_attack_rate"] * rates["home_defense_rate"] / rates["league_away_rate"]
+    home_xg = max(0.05, min(6.0, home_base * home_adjustment))
+    away_xg = max(0.05, min(6.0, away_base * away_adjustment))
+    sample_confidence = min(1.0, min(samples["home_sample_size"], samples["away_sample_size"]) / 10.0) * min(1.0, samples["league_sample_size"] / 50.0)
+    metric_quality = 0.9 if metric_type == "xg" else 0.7
+    confidence = round(0.5 * sample_confidence + 0.3 * metric_quality + 0.2 * lineup_confidence, 4)
+    status = "ready" if confidence >= 0.6 else "insufficient_confidence"
+    audit = {
+        "formula": "team_attack_rate * opponent_defense_rate / league_venue_rate * explicit_adjustment",
+        "home_base": round(home_base, 6), "away_base": round(away_base, 6),
+        "sample_confidence": round(sample_confidence, 6), "metric_quality": metric_quality,
+    }
+    return {
+        "ok": True, "status": status, "method": "fundamental_relative_strength_xg_v1", "uses_market_odds": False,
+        "expected_goals": {"home": round(home_xg, 6), "away": round(away_xg, 6)},
+        "confidence": confidence, "inputs": {**rates, **samples, "metric_type": metric_type, "home_adjustment": home_adjustment, "away_adjustment": away_adjustment, "lineup_confidence": lineup_confidence, "provenance": provenance},
+        "audit": audit,
+        "estimator_hash": _content_hash({"rates": rates, "samples": samples, "metric_type": metric_type, "home_adjustment": home_adjustment, "away_adjustment": away_adjustment, "lineup_confidence": lineup_confidence, "provenance": provenance}),
+    }
 def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optional[Dict[str, float]] = None, script_coverage: Optional[Dict[str, float]] = None, crowding: Optional[float] = None, lineup_confidence: Optional[float] = None, death_path: Optional[List[str]] = None) -> Dict[str, Any]:
     main = get_nested(market_snapshot, ["consensus_main_line", "1x2"]) or get_nested(market_snapshot, ["primary", "1x2"]) or {}
     market_probability = no_vig_probabilities(main, ["home", "draw", "away"])
@@ -1108,7 +1149,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
 
 @app.get("/")
 def root():
-    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/import-status", "/shadow/data-source-health", "/shadow/model/poisson", "/shadow/imported-prematch/{fixture}"]}
+    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/import-status", "/shadow/data-source-health", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/imported-prematch/{fixture}"]}
 
 
 @app.get("/health")
@@ -1430,6 +1471,23 @@ async def shadow_poisson_model(request: Request, token: Optional[str] = None, au
         decision["decision"] = "PASS"
     decision["data_freshness"] = freshness
     return JSONResponse({"ok": True, "version": VERSION, "fixture": fixture or None, "model": model, "decision_layer": decision})
+
+
+@app.post("/shadow/model/fundamental-xg")
+async def shadow_fundamental_xg(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_json_body")
+    estimator = fundamental_expected_goals(payload)
+    if not estimator.get("ok"):
+        raise HTTPException(status_code=422, detail=estimator)
+    xg = estimator["expected_goals"]
+    model = poisson_probability_model(xg["home"], xg["away"], estimator["confidence"], payload.get("provenance"))
+    if estimator["status"] != "ready":
+        model["status"] = "insufficient_confidence"
+    return JSONResponse({"ok": True, "version": VERSION, "estimator": estimator, "model": model, "decision": "PASS", "reason": "probability_generation_only; bind a fresh fixture and complete decision inputs before evaluation"})
 
 
 def build_imported_ai_packet(fixture: str, include_companies: bool = False, include_lineups: bool = False) -> Dict[str, Any]:
