@@ -234,3 +234,25 @@ POST 支持 `Content-Encoding: gzip`，可直接发送压缩 JSON，
 ```
 
 未提供的基本面链环节明确保存为 `data_missing`，不会根据盘口补写。
+
+## 本地只读同步器
+
+`sync_prematch.py` 只在本地运行。它可以读取本地 JSON/JSON.GZ，或通过 SSH 对 pang 上一个
+已经存在的绝对路径执行固定的 `cat`/`gzip -cd`。程序不接受自定义远程命令，不向 pang
+上传文件，也不创建远程程序或计划任务。上传 Railway 时使用 gzip、Bearer 请求头和增量模式。
+
+先做不联网的检查：
+
+```text
+python sync_prematch.py --input bundle.json.gz --league "UEFA Nations League" --dry-run
+```
+
+使用已经配置好的 SSH 主机别名读取现有文件：
+
+```text
+python sync_prematch.py --ssh-host pang --remote-path /absolute/path/bundle.json.gz --league "UEFA Nations League" --dry-run
+```
+
+取消 `--dry-run` 才会上传 Railway。访问令牌只能通过本机环境变量
+`SHADOW_ACCESS_TOKEN` 提供；程序不会把令牌放进 URL 或输出中。SSH 模式使用密钥或 agent，
+不会把 pang 密码写入脚本。
