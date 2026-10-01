@@ -1,4 +1,4 @@
-# Football AI 影子分析 / Odds Monitor v0.8
+# Football AI 影子分析 / Odds Monitor v0.9
 
 这是一个 Railway 可部署的 FastAPI 项目，用来测试：
 
@@ -145,6 +145,7 @@ python -m unittest -v
 
 ```text
 POST /shadow/import-prematch-packets?token=SHADOW_ACCESS_TOKEN
+GET  /shadow/import-status?token=SHADOW_ACCESS_TOKEN
 GET  /shadow/imported-prematch/{MATCH_UUID}?token=SHADOW_ACCESS_TOKEN
 ```
 
@@ -156,3 +157,7 @@ GET 默认只返回 Consensus Main Line 和变化结果；仅在确实需要逐�
 `?include_companies=true`，需要完整阵容历史时添加 `?include_lineups=true`。
 POST 支持 `Content-Encoding: gzip`，可直接发送压缩 JSON，
 避免完整公司数组在网络传输中膨胀。
+
+同步程序推荐使用请求头 `Authorization: Bearer ...` 或 `X-Shadow-Token: ...`，
+避免把令牌放进 URL。可用 `X-Sync-Mode: incremental` 和 `X-Sync-Source: pang`
+记录增量同步来源；`/shadow/import-status` 返回最后成功时间、请求大小和比赛数量。

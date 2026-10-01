@@ -12,12 +12,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.8.1"
+VERSION = "0.9.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -94,6 +94,14 @@ STARTUP_COLLECT: Dict[str, Any] = {}
 def require_shadow_token(token: Optional[str]) -> None:
     if SHADOW_ACCESS_TOKEN and token != SHADOW_ACCESS_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid or missing token")
+
+
+def resolve_shadow_token(query_token: Optional[str], authorization: Optional[str], header_token: Optional[str]) -> Optional[str]:
+    if header_token:
+        return header_token
+    if authorization and authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return query_token
 
 
 def mask_secret(text: str) -> str:
@@ -730,6 +738,9 @@ def _import_company_markets(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[s
     markets = empty_market_snapshot()["markets"]
     grouped: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     for raw in rows or []:
+        market_name = str(raw.get("market_name") or "").lower()
+        if any(token in market_name for token in ("first half", "1st half", "second half", "2nd half")):
+            continue
         market = str(raw.get("market") or "").lower()
         if market not in markets:
             continue
@@ -768,11 +779,17 @@ def imported_market_snapshot(stage: Dict[str, Any]) -> Dict[str, Any]:
     if stage.get("status") != "available":
         return snapshot
     consensus = _import_consensus(stage.get("consensus_main_line") or {})
+    markets = _import_company_markets(stage.get("company_market_array") or [])
+    for key in ("home_team_total", "away_team_total"):
+        recalculated = _consensus_line(markets[key], ("over", "under"))
+        if recalculated:
+            recalculated["method"] = "full_time_company_array_consensus"
+            consensus[key] = recalculated
     snapshot.update({
         "available": any(consensus.values()),
         "updated_at": stage.get("latest_observed_at"),
         "bookmaker_count": stage.get("bookmaker_count", 0),
-        "markets": _import_company_markets(stage.get("company_market_array") or []),
+        "markets": markets,
         "primary": dict(consensus),
         "consensus_main_line": consensus,
         "data_status": {key: ("available" if value else "data_missing") for key, value in consensus.items()},
@@ -1020,7 +1037,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
 
 @app.get("/")
 def root():
-    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/imported-prematch/{fixture}"]}
+    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/import-status", "/shadow/imported-prematch/{fixture}"]}
 
 
 @app.get("/health")
@@ -1209,9 +1226,9 @@ def shadow_snapshots(fixture: int, token: Optional[str] = None):
 
 
 @app.post("/shadow/import-prematch-packets")
-async def shadow_import_prematch_packets(request: Request, token: Optional[str] = None):
+async def shadow_import_prematch_packets(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     """Import canonical prematch packets without calling or changing upstream providers."""
-    require_shadow_token(token)
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     body = await request.body()
     if len(body) > 30 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="request_body_too_large")
@@ -1233,7 +1250,31 @@ async def shadow_import_prematch_packets(request: Request, token: Optional[str] 
     if len(packets) > 100:
         raise HTTPException(status_code=413, detail="maximum_100_packets_per_request")
     results = [import_prematch_packet(packet) for packet in packets]
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        previous = store.get("import_sync_status") or {}
+        store["import_sync_status"] = {
+            "status": "ok", "last_success_at": int(time.time()), "previous_success_at": previous.get("last_success_at"),
+            "packet_count": len(results), "fixtures": [row.get("fixture") for row in results],
+            "request_bytes": len(await request.body()), "content_encoding": request.headers.get("content-encoding") or "identity",
+            "mode": request.headers.get("x-sync-mode") or "batch", "source": request.headers.get("x-sync-source") or "external",
+        }
+        write_snapshot_store(store)
     return JSONResponse({"ok": True, "version": VERSION, "imported_count": len(results), "results": results})
+
+
+@app.get("/shadow/import-status")
+def shadow_import_status(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    store = load_snapshot_store()
+    metadata = store.get("external_prematch", {})
+    return JSONResponse({
+        "ok": True, "version": VERSION, "sync": store.get("import_sync_status") or {"status": "never_imported"},
+        "fixture_count": len(metadata), "fixtures": [
+            {"fixture": fixture, "league": row.get("league"), "imported_at": row.get("imported_at"), "match": row.get("match")}
+            for fixture, row in metadata.items()
+        ],
+    })
 
 
 def build_imported_ai_packet(fixture: str, include_companies: bool = False, include_lineups: bool = False) -> Dict[str, Any]:

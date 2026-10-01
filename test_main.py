@@ -144,12 +144,16 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "1x2": {"status": "available", "median_prices": {"home": 2.0, "draw": 3.4, "away": 3.8}},
             "asian_handicap": {"status": "available", "line": -0.25, "bookmaker_coverage": 2, "median_prices": {"home": 1.9, "away": 1.95}},
             "over_under": {"status": "available", "line": 2.5, "bookmaker_coverage": 2, "median_prices": {"over": 1.91, "under": 1.94}},
-            "btts": {"status": "data_missing"}, "home_team_total": {"status": "data_missing"}, "away_team_total": {"status": "data_missing"},
+            "btts": {"status": "data_missing"}, "home_team_total": {"status": "available", "line": 0.5, "median_prices": {"over": 1.8, "under": 2.0}}, "away_team_total": {"status": "data_missing"},
         }
         row = {"stage": "Opening", "status": "available", "latest_observed_at": "2026-09-29T00:00:00+00:00", "bookmaker_count": 2, "quote_count": 9, "consensus_main_line": consensus, "company_market_array": [
             {"bookmaker_name": "A", "market": "1x2", "selection": "Home", "price": "2.0"},
             {"bookmaker_name": "A", "market": "1x2", "selection": "Draw", "price": "3.4"},
             {"bookmaker_name": "A", "market": "1x2", "selection": "Away", "price": "3.8"},
+            {"bookmaker_name": "A", "market": "home_team_total", "market_name": "Total - Home", "selection": "Over 2.5", "line": "2.5", "price": "1.9"},
+            {"bookmaker_name": "A", "market": "home_team_total", "market_name": "Total - Home", "selection": "Under 2.5", "line": "2.5", "price": "1.95"},
+            {"bookmaker_name": "A", "market": "home_team_total", "market_name": "Home Team Total Goals(1st Half)", "selection": "Over 0.5", "line": "0.5", "price": "1.8"},
+            {"bookmaker_name": "A", "market": "home_team_total", "market_name": "Home Team Total Goals(1st Half)", "selection": "Under 0.5", "line": "0.5", "price": "2.0"},
         ]}
         return {"schema_version": "shadow_prematch_packet_v1", "league": "UEFA Nations League", "match": {"match_id": "uuid-1", "home_team_name": "Home", "away_team_name": "Away"}, "required_timeline": main.PREMATCH_STAGE_ORDER, "timeline": [row, {"stage": "T-15m", "status": "data_missing", "reason": "not captured"}], "lineup_history": [{"observed_at": "x"}], "data_quality": {"level": "partial"}}
 
@@ -160,6 +164,8 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         opening = rows[0]
         self.assertEqual(opening["market_snapshot"]["primary"]["asian_handicap"]["line"], -0.25)
+        self.assertEqual(opening["market_snapshot"]["primary"]["home_team_total"]["line"], 2.5)
+        self.assertEqual(len(opening["market_snapshot"]["markets"]["home_team_total"][0]["lines"]), 1)
         self.assertEqual(opening["market_snapshot"]["markets"]["1x2"][0]["home"], 2.0)
         missing = [x for x in rows if x["stage"] == "T-15m"][0]
         self.assertEqual(missing["import_status"], "data_missing")
@@ -181,6 +187,11 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         with open(main.SNAPSHOT_STORE_PATH, "wb") as handle:
             handle.write(b'{"version":"legacy","fixtures":{}}')
         self.assertEqual(main.load_snapshot_store()["version"], "legacy")
+
+    def test_shadow_token_supports_header_and_bearer(self):
+        self.assertEqual(main.resolve_shadow_token("query", None, "header"), "header")
+        self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer-value", None), "bearer-value")
+        self.assertEqual(main.resolve_shadow_token("query", None, None), "query")
 
     def test_import_is_idempotent_per_stage(self):
         packet = self.prematch_packet()
