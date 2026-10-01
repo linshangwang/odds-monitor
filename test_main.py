@@ -212,6 +212,20 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         opening = [x for x in main.get_fixture_snapshots("uuid-1") if x["stage"] == "Opening"][0]
         self.assertEqual(opening["market_snapshot"]["primary"]["1x2"]["home"], 2.0)
 
+    def test_imported_fixture_freshness_gates_decisions(self):
+        metadata = {"match": {"kickoff_utc": "2026-10-02T12:00:00+00:00"}}
+        history = [{"import_status": "available", "snapshot_at": 1000}]
+        fresh = main.imported_fixture_freshness(metadata, history, now_ts=1100)
+        self.assertEqual(fresh["state"], "fresh")
+        self.assertTrue(fresh["decision_eligible"])
+        stale = main.imported_fixture_freshness(metadata, history, now_ts=1000 + main.EXTERNAL_DATA_STALE_SECONDS + 1)
+        self.assertEqual(stale["state"], "stale")
+        self.assertFalse(stale["decision_eligible"])
+        historical = main.imported_fixture_freshness({"match": {"kickoff_utc": "1970-01-01T00:16:00+00:00"}}, history, now_ts=1100)
+        self.assertEqual(historical["state"], "historical")
+        missing = main.imported_fixture_freshness(metadata, [], now_ts=1100)
+        self.assertEqual(missing["state"], "data_missing")
+
     def test_import_rejects_unknown_schema(self):
         packet = self.prematch_packet()
         packet["schema_version"] = "unknown"

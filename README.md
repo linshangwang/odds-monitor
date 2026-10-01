@@ -146,6 +146,7 @@ python -m unittest -v
 ```text
 POST /shadow/import-prematch-packets?token=SHADOW_ACCESS_TOKEN
 GET  /shadow/import-status?token=SHADOW_ACCESS_TOKEN
+GET  /shadow/data-source-health?token=SHADOW_ACCESS_TOKEN
 GET  /shadow/imported-prematch/{MATCH_UUID}?token=SHADOW_ACCESS_TOKEN
 ```
 
@@ -164,3 +165,7 @@ POST 支持 `Content-Encoding: gzip`，可直接发送压缩 JSON，
 节点导入按比赛、阶段、观测时间和内容指纹幂等合并；重复内容标记 `unchanged`，
 较旧内容标记 `stale_skipped`，不会覆盖较新的节点。响应中的 `stage_counts`
 分别报告 `inserted`、`updated`、`unchanged` 和 `stale_skipped`。
+
+`/shadow/data-source-health` 汇总 pang 只读数据的新鲜度和 Nami 配置状态。
+默认盘口新鲜度门槛为30分钟，可用 `EXTERNAL_DATA_STALE_SECONDS` 调整；超过门槛、
+没有可用盘口或比赛已开赛时，AI数据包会加入对应原因并强制 `PASS`。

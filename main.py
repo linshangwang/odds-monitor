@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.9.1"
+VERSION = "0.9.2"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -25,6 +25,7 @@ AUTO_FETCH_FIXTURE_ID = os.getenv("AUTO_FETCH_FIXTURE_ID", "")
 SHADOW_ACCESS_TOKEN = os.getenv("SHADOW_ACCESS_TOKEN", "")
 SNAPSHOT_STORE_PATH = os.getenv("SNAPSHOT_STORE_PATH", "/tmp/shadow_snapshots.json")
 SNAPSHOT_STORE_GZIP = os.getenv("SNAPSHOT_STORE_GZIP", "true").lower() in ("1", "true", "yes", "on")
+EXTERNAL_DATA_STALE_SECONDS = max(60, int(os.getenv("EXTERNAL_DATA_STALE_SECONDS", "1800")))
 AUTO_SNAPSHOT_ENABLED = os.getenv("AUTO_SNAPSHOT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 AUTO_SNAPSHOT_POLL_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_POLL_SECONDS", "300")))
 AUTO_SNAPSHOT_WINDOW_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_WINDOW_SECONDS", "600")))
@@ -1067,12 +1068,12 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
 
 @app.get("/")
 def root():
-    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/import-status", "/shadow/imported-prematch/{fixture}"]}
+    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/import-status", "/shadow/data-source-health", "/shadow/imported-prematch/{fixture}"]}
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "has_thestats_key": bool(THESTATS_API_KEY), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}}
+    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "has_thestats_key": bool(THESTATS_API_KEY), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "external_data_stale_seconds": EXTERNAL_DATA_STALE_SECONDS, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}}
 
 
 @app.get("/shadow/nami-capabilities")
@@ -1309,6 +1310,47 @@ def shadow_import_status(token: Optional[str] = None, authorization: Optional[st
     })
 
 
+def imported_fixture_freshness(metadata: Dict[str, Any], history: List[Dict[str, Any]], now_ts: Optional[int] = None) -> Dict[str, Any]:
+    now_ts = int(now_ts or time.time())
+    kickoff = _parse_timestamp(get_nested(metadata, ["match", "kickoff_utc"]))
+    available = [row for row in history if row.get("import_status") == "available"]
+    latest = max((int(row.get("snapshot_at") or 0) for row in available), default=0) or None
+    age = max(0, now_ts - latest) if latest else None
+    if not latest:
+        state, eligible, reason = "data_missing", False, "no_available_market_snapshot"
+    elif kickoff and now_ts >= kickoff:
+        state, eligible, reason = "historical", False, "fixture_is_not_prematch"
+    elif age is not None and age > EXTERNAL_DATA_STALE_SECONDS:
+        state, eligible, reason = "stale", False, "latest_market_snapshot_exceeds_freshness_threshold"
+    else:
+        state, eligible, reason = "fresh", True, None
+    return {
+        "state": state, "decision_eligible": eligible, "reason": reason,
+        "latest_snapshot_at": latest, "age_seconds": age, "stale_after_seconds": EXTERNAL_DATA_STALE_SECONDS,
+        "kickoff_at": kickoff,
+    }
+
+
+@app.get("/shadow/data-source-health")
+def shadow_data_source_health(probe_nami: bool = False, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    store = load_snapshot_store()
+    fixtures = []
+    for fixture, metadata in (store.get("external_prematch", {}) or {}).items():
+        freshness = imported_fixture_freshness(metadata, get_fixture_snapshots(fixture))
+        fixtures.append({"fixture": fixture, "match": metadata.get("match"), "freshness": freshness})
+    state_counts = {state: sum(1 for row in fixtures if row["freshness"]["state"] == state) for state in ("fresh", "stale", "historical", "data_missing")}
+    nami = nami_capability_check() if probe_nami else {
+        "configured": bool(NAMI_API_USER and NAMI_API_SECRET), "status": "not_probed",
+        "optional": True, "failure_policy": "continue_without_nami",
+    }
+    return JSONResponse({
+        "ok": True, "version": VERSION, "generated_at": int(time.time()),
+        "pang": {"write_policy": "read_only_source_no_remote_tasks", "sync": store.get("import_sync_status") or {"status": "never_imported"}, "fixture_state_counts": state_counts, "fixtures": fixtures},
+        "nami": nami, "decision_gate": {"requires_fresh_prematch_data": True, "stale_action": "PASS"},
+    })
+
+
 def build_imported_ai_packet(fixture: str, include_companies: bool = False, include_lineups: bool = False) -> Dict[str, Any]:
     store = load_snapshot_store()
     metadata = store.get("external_prematch", {}).get(str(fixture))
@@ -1351,9 +1393,16 @@ def build_imported_ai_packet(fixture: str, include_companies: bool = False, incl
     current_output = current if include_companies else {key: value for key, value in current.items() if key != "markets"}
     decision = decision_layer(current)
     decision["line_movement"] = (latest or {}).get("market_dynamics") or {"status": "data_missing"}
+    freshness = imported_fixture_freshness(metadata, history)
+    decision["data_freshness"] = freshness
+    if not freshness["decision_eligible"]:
+        reason = freshness.get("reason") or "data_not_fresh"
+        if reason not in decision["pass_reasons"]:
+            decision["pass_reasons"].append(reason)
+        decision["decision"] = "PASS"
     return {
         "ok": True, "status": "ready", "version": VERSION, "generated_at": int(time.time()),
-        "source": "pang_import", "fixture": match, "data_quality": metadata.get("data_quality"),
+        "source": "pang_import", "fixture": match, "data_quality": metadata.get("data_quality"), "data_freshness": freshness,
         "fundamentals": fundamentals,
         "market": {
             "current": current_output, "saved_stage_count": len(history), "saved_stages": [x.get("stage") for x in history],
