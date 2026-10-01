@@ -147,6 +147,7 @@ python -m unittest -v
 POST /shadow/import-prematch-packets?token=SHADOW_ACCESS_TOKEN
 GET  /shadow/import-status?token=SHADOW_ACCESS_TOKEN
 GET  /shadow/data-source-health?token=SHADOW_ACCESS_TOKEN
+POST /shadow/model/poisson?token=SHADOW_ACCESS_TOKEN
 GET  /shadow/imported-prematch/{MATCH_UUID}?token=SHADOW_ACCESS_TOKEN
 ```
 
@@ -169,3 +170,24 @@ POST 支持 `Content-Encoding: gzip`，可直接发送压缩 JSON，
 `/shadow/data-source-health` 汇总 pang 只读数据的新鲜度和 Nami 配置状态。
 默认盘口新鲜度门槛为30分钟，可用 `EXTERNAL_DATA_STALE_SECONDS` 调整；超过门槛、
 没有可用盘口或比赛已开赛时，AI数据包会加入对应原因并强制 `PASS`。
+
+## 独立概率模型
+
+`/shadow/model/poisson` 接受明确的主客队预期进球、输入置信度及来源说明，
+输出比分分布、1X2、2.5大小球和BTTS概率。来源必须明确声明
+`uses_market_odds=false`，禁止使用盘口反推模型；置信度低于0.6、数据过期、
+比赛已开赛或最终决策字段不完整时继续返回 `PASS`。
+
+```json
+{
+  "fixture": "MATCH_UUID",
+  "home_expected_goals": 1.65,
+  "away_expected_goals": 1.10,
+  "input_confidence": 0.78,
+  "provenance": {"source": "verified_team_metrics", "uses_market_odds": false},
+  "script_coverage": {"home": 0.75, "draw": 0.45, "away": 0.25},
+  "crowding": 0.35,
+  "lineup_confidence": 0.85,
+  "death_path": []
+}
+```

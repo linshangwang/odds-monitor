@@ -1,5 +1,6 @@
 import json
 import gzip
+import math
 import os
 import time
 import threading
@@ -17,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.9.2"
+VERSION = "0.10.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1032,6 +1033,45 @@ def no_vig_probabilities(odds: Dict[str, Any], keys: List[str]) -> Optional[Dict
     return {key: round(value / total, 6) for key, value in implied.items()}
 
 
+def poisson_probability_model(home_expected_goals: Any, away_expected_goals: Any, input_confidence: Any, provenance: Any, max_goals: int = 10) -> Dict[str, Any]:
+    home_xg, away_xg, confidence = as_float(home_expected_goals), as_float(away_expected_goals), as_float(input_confidence)
+    errors = []
+    if home_xg is None or not 0.05 <= home_xg <= 6.0: errors.append("home_expected_goals_out_of_range")
+    if away_xg is None or not 0.05 <= away_xg <= 6.0: errors.append("away_expected_goals_out_of_range")
+    if confidence is None or not 0.0 <= confidence <= 1.0: errors.append("input_confidence_out_of_range")
+    if not isinstance(provenance, dict) or not provenance.get("source") or provenance.get("uses_market_odds") is not False:
+        errors.append("independent_provenance_required")
+    if errors:
+        return {"ok": False, "status": "invalid_input", "errors": errors}
+    home_probs = [math.exp(-home_xg) * home_xg ** goals / math.factorial(goals) for goals in range(max_goals + 1)]
+    away_probs = [math.exp(-away_xg) * away_xg ** goals / math.factorial(goals) for goals in range(max_goals + 1)]
+    grid = {(home, away): home_probs[home] * away_probs[away] for home in range(max_goals + 1) for away in range(max_goals + 1)}
+    mass = sum(grid.values())
+    normalized = {score: probability / mass for score, probability in grid.items()}
+    one_x_two = {
+        "home": sum(p for (home, away), p in normalized.items() if home > away),
+        "draw": sum(p for (home, away), p in normalized.items() if home == away),
+        "away": sum(p for (home, away), p in normalized.items() if home < away),
+    }
+    totals = {"over_2_5": sum(p for (home, away), p in normalized.items() if home + away >= 3)}
+    totals["under_2_5"] = 1.0 - totals["over_2_5"]
+    btts_yes = sum(p for (home, away), p in normalized.items() if home > 0 and away > 0)
+    top_scores = sorted(normalized.items(), key=lambda item: item[1], reverse=True)[:8]
+    status = "ready" if confidence >= 0.6 else "insufficient_confidence"
+    return {
+        "ok": True, "status": status, "method": "independent_poisson_v1", "uses_market_odds": False,
+        "inputs": {"home_expected_goals": home_xg, "away_expected_goals": away_xg, "input_confidence": confidence, "provenance": provenance},
+        "probabilities": {
+            "1x2": {key: round(value, 6) for key, value in one_x_two.items()},
+            "over_under_2_5": {key: round(value, 6) for key, value in totals.items()},
+            "btts": {"yes": round(btts_yes, 6), "no": round(1.0 - btts_yes, 6)},
+            "top_scores": [{"score": f"{home}-{away}", "probability": round(probability, 6)} for (home, away), probability in top_scores],
+        },
+        "truncated_tail_mass": round(1.0 - mass, 10),
+        "model_hash": _content_hash({"home_xg": home_xg, "away_xg": away_xg, "confidence": confidence, "provenance": provenance, "method": "independent_poisson_v1"}),
+    }
+
+
 def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optional[Dict[str, float]] = None, script_coverage: Optional[Dict[str, float]] = None, crowding: Optional[float] = None, lineup_confidence: Optional[float] = None, death_path: Optional[List[str]] = None) -> Dict[str, Any]:
     main = get_nested(market_snapshot, ["consensus_main_line", "1x2"]) or get_nested(market_snapshot, ["primary", "1x2"]) or {}
     market_probability = no_vig_probabilities(main, ["home", "draw", "away"])
@@ -1068,7 +1108,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
 
 @app.get("/")
 def root():
-    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/import-status", "/shadow/data-source-health", "/shadow/imported-prematch/{fixture}"]}
+    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/import-status", "/shadow/data-source-health", "/shadow/model/poisson", "/shadow/imported-prematch/{fixture}"]}
 
 
 @app.get("/health")
@@ -1349,6 +1389,47 @@ def shadow_data_source_health(probe_nami: bool = False, token: Optional[str] = N
         "pang": {"write_policy": "read_only_source_no_remote_tasks", "sync": store.get("import_sync_status") or {"status": "never_imported"}, "fixture_state_counts": state_counts, "fixtures": fixtures},
         "nami": nami, "decision_gate": {"requires_fresh_prematch_data": True, "stale_action": "PASS"},
     })
+
+
+@app.post("/shadow/model/poisson")
+async def shadow_poisson_model(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_json_body")
+    model = poisson_probability_model(
+        payload.get("home_expected_goals"), payload.get("away_expected_goals"),
+        payload.get("input_confidence"), payload.get("provenance"),
+    )
+    if not model.get("ok"):
+        raise HTTPException(status_code=422, detail=model)
+    fixture = str(payload.get("fixture") or "").strip()
+    market = empty_market_snapshot()
+    freshness = None
+    if fixture:
+        store = load_snapshot_store()
+        metadata = store.get("external_prematch", {}).get(fixture)
+        if not metadata:
+            raise HTTPException(status_code=404, detail="imported_fixture_not_found")
+        history = get_fixture_snapshots(fixture)
+        available = [row for row in history if row.get("import_status") == "available"]
+        market = (available[-1].get("market_snapshot") if available else None) or empty_market_snapshot()
+        freshness = imported_fixture_freshness(metadata, history)
+    decision = decision_layer(
+        market, model.get("probabilities", {}).get("1x2"), payload.get("script_coverage"),
+        as_float(payload.get("crowding")), as_float(payload.get("lineup_confidence")), payload.get("death_path") or [],
+    )
+    if model.get("status") != "ready":
+        decision["pass_reasons"].append("model_input_confidence_below_0_6")
+        decision["decision"] = "PASS"
+    if freshness and not freshness.get("decision_eligible"):
+        reason = freshness.get("reason") or "data_not_fresh"
+        if reason not in decision["pass_reasons"]:
+            decision["pass_reasons"].append(reason)
+        decision["decision"] = "PASS"
+    decision["data_freshness"] = freshness
+    return JSONResponse({"ok": True, "version": VERSION, "fixture": fixture or None, "model": model, "decision_layer": decision})
 
 
 def build_imported_ai_packet(fixture: str, include_companies: bool = False, include_lineups: bool = False) -> Dict[str, Any]:

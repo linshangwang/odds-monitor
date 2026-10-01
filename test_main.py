@@ -61,6 +61,22 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["decision"], "home")
         self.assertAlmostEqual(result["ev"], .10, places=6)
 
+    def test_independent_poisson_model_is_normalized_and_symmetric(self):
+        model = main.poisson_probability_model(1.4, 1.4, 0.8, {"source": "verified_team_metrics", "uses_market_odds": False})
+        self.assertTrue(model["ok"])
+        self.assertEqual(model["status"], "ready")
+        one_x_two = model["probabilities"]["1x2"]
+        self.assertAlmostEqual(sum(one_x_two.values()), 1.0, places=5)
+        self.assertAlmostEqual(one_x_two["home"], one_x_two["away"], places=6)
+        self.assertFalse(model["uses_market_odds"])
+
+    def test_poisson_model_rejects_market_derived_or_low_confidence_inputs(self):
+        invalid = main.poisson_probability_model(1.5, 1.0, 0.9, {"source": "odds", "uses_market_odds": True})
+        self.assertFalse(invalid["ok"])
+        self.assertIn("independent_provenance_required", invalid["errors"])
+        low = main.poisson_probability_model(1.5, 1.0, 0.4, {"source": "limited_stats", "uses_market_odds": False})
+        self.assertEqual(low["status"], "insufficient_confidence")
+
     def test_fundamental_version_persists_audit_fields(self):
         script = {"content_hash": "x", "chain": {key: {"status": "data_missing"} for key in main.FUNDAMENTAL_CHAIN}}
         row = main.save_fundamental_version(1, script, {"stage": "Opening", "triggered": False})
