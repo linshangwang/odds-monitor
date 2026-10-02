@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.52.0"
+VERSION = "0.53.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -793,6 +793,11 @@ def get_fixture_snapshots(fixture: Any) -> List[Dict[str, Any]]:
     return sorted(rows, key=lambda x: (STAGE_ORDER.index(x.get("stage")) if x.get("stage") in STAGE_ORDER else 999, x.get("snapshot_at", 0)))
 
 
+def latest_prematch_snapshot(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    eligible = [row for row in rows if row.get("stage") in PREMATCH_STAGE_ORDER]
+    return max(eligible, key=lambda row: (PREMATCH_STAGE_ORDER.index(row["stage"]), int(row.get("snapshot_at") or 0)), default=None)
+
+
 def complete_prematch_timeline(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     by_stage = {row.get("stage"): row for row in rows if row.get("stage") in PREMATCH_STAGE_ORDER}
     timeline = []
@@ -815,7 +820,7 @@ def audit_line_movement_timeline(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     timeline = complete_prematch_timeline(rows)
     available = [row for row in timeline if row.get("timeline_status") == "available"]
     comparable = [row for row in available if get_nested(row, ["market_dynamics", "comparison_status"]) == "compared"]
-    latest = max(available, key=lambda row: int(row.get("snapshot_at") or 0), default=None)
+    latest = latest_prematch_snapshot(available)
     latest_comparable = get_nested(latest or {}, ["market_dynamics", "comparison_status"]) == "compared"
     eligible = len(available) >= 2 and latest_comparable
     return {
@@ -1780,7 +1785,7 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
         model["status"] = "insufficient_confidence"
     history = get_fixture_snapshots(fixture)
     available = [row for row in history if row.get("import_status") == "available"]
-    latest = max(available, key=lambda row: int(row.get("snapshot_at") or 0), default=None)
+    latest = latest_prematch_snapshot(available)
     market = (latest or {}).get("market_snapshot") or empty_market_snapshot()
     freshness = imported_fixture_freshness(metadata, history)
     line_movement_audit = audit_line_movement_timeline(history)
@@ -2488,7 +2493,7 @@ async def shadow_poisson_model(request: Request, token: Optional[str] = None, au
             raise HTTPException(status_code=404, detail="imported_fixture_not_found")
         history = get_fixture_snapshots(fixture)
         available = [row for row in history if row.get("import_status") == "available"]
-        latest = max(available, key=lambda row: int(row.get("snapshot_at") or 0), default=None)
+        latest = latest_prematch_snapshot(available)
         market = (latest or {}).get("market_snapshot") or empty_market_snapshot()
         freshness = imported_fixture_freshness(metadata, history)
     decision = decision_layer(

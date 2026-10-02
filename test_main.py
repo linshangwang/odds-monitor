@@ -46,6 +46,15 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(complete["available_stage_count"], 2)
         self.assertFalse(complete["current_odds_used_as_history"])
 
+    def test_latest_prematch_snapshot_prefers_later_stage_over_write_time(self):
+        rows = [
+            {"stage": "Opening", "snapshot_at": 9999},
+            {"stage": "T-3h", "snapshot_at": 100},
+            {"stage": "T-15m", "snapshot_at": 200},
+        ]
+        self.assertEqual(main.latest_prematch_snapshot(rows)["stage"], "T-15m")
+        self.assertIsNone(main.latest_prematch_snapshot([{"stage": "FT", "snapshot_at": 10000}]))
+
     def test_consensus_uses_all_books_not_first_book_primary(self):
         result = api_football_odds([
             {"name": "Outlier", "bets": [{"name": "Match Winner", "values": [{"value": "Home", "odd": "9.0"}, {"value": "Draw", "odd": "9.0"}, {"value": "Away", "odd": "1.1"}]}, {"name": "Asian Handicap", "values": [{"value": "Home -1", "odd": "1.9"}, {"value": "Away -1", "odd": "1.9"}]}]},

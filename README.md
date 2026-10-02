@@ -183,6 +183,8 @@ T-X 变盘比较现覆盖全部可用市场：1X2、AH、O/U、BTTS、主队进�
 最终下注门槛至少需要两个真实可用节点，并且最新节点必须完成与前序节点的比较；单点赔率仍可
 计算模型概率、Edge和EV供审计，但会以 `line_movement_requires_two_real_comparable_stages`
 强制 PASS。
+“最新盘口”按固定 T-X 阶段顺序选择最接近开赛的真实节点，而非按数据库写入时间。较早阶段
+即使稍后补传或修订，也不会覆盖 T-3h、T-1h、T-15m 或 Closing 的决策位置。
 总完整度至少需达到0.6，且 Result Utility、Rotation Quality、Execution Ability、Goal Conversion
 四个关键环节不得缺失。证据不足时仍生成概率供审计，但最终建议强制 PASS。
 `available` 或 `partial` 不能只写状态：必须同时包含至少一个实质字段，例如证据、变量值或明确
