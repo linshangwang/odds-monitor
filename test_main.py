@@ -229,6 +229,18 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["robustness"], "fragile")
         self.assertIsNotNone(result["warning"])
 
+    def test_portfolio_run_history_records_recommendation_change(self):
+        first_portfolio = {"risk_preference": "balanced", "portfolio_decision": "READY", "risk_adjusted_recommendation": {"decision": "COMBINE", "source": "first_choice_high_consistency", "robustness": "resilient", "reason": "test", "recommended_option": {"legs": [{"fixture": "a", "market": "1x2", "selection": "home", "line": None, "price": 2.0}]}}}
+        first = main.save_portfolio_run("test-set", ["a", "b"], first_portfolio, 3, ["T-3h"])
+        second = main.save_portfolio_run("test-set", ["a", "b"], first_portfolio, 3, ["T-1h"])
+        changed_portfolio = {**first_portfolio, "risk_adjusted_recommendation": {"decision": "PASS", "reason": "no_combination_passed_half_edge_stress_test"}}
+        third = main.save_portfolio_run("test-set", ["a", "b"], changed_portfolio, 3, ["T-15m"])
+        self.assertTrue(first["recommendation_change"]["changed"])
+        self.assertFalse(second["recommendation_change"]["changed"])
+        self.assertTrue(third["recommendation_change"]["changed"])
+        self.assertEqual(len(main.get_portfolio_runs("test-set")), 3)
+        self.assertEqual(third["recommendation"]["decision"], "PASS")
+
     def test_independent_poisson_model_is_normalized_and_symmetric(self):
         model = main.poisson_probability_model(1.4, 1.4, 0.8, {"source": "verified_team_metrics", "uses_market_odds": False})
         self.assertTrue(model["ok"])

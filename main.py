@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.24.0"
+VERSION = "0.25.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1517,6 +1517,44 @@ def _risk_adjusted_combination(first: Dict[str, Any], second: Dict[str, Any], ri
     }
 
 
+def _portfolio_recommendation_signature(portfolio: Dict[str, Any]) -> Dict[str, Any]:
+    recommendation = portfolio.get("risk_adjusted_recommendation") or {}
+    option = recommendation.get("recommended_option") or {}
+    return {
+        "decision": recommendation.get("decision"), "source": recommendation.get("source"),
+        "robustness": recommendation.get("robustness"), "reason": recommendation.get("reason"),
+        "legs": [
+            {key: leg.get(key) for key in ("fixture", "market", "selection", "line", "price")}
+            for leg in (option.get("legs") or [])
+        ],
+    }
+
+
+def save_portfolio_run(portfolio_id: str, fixtures: List[str], portfolio: Dict[str, Any], max_legs: int, trigger_reasons: List[str]) -> Dict[str, Any]:
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        runs = store.setdefault("portfolio_runs", {}).setdefault(portfolio_id, [])
+        signature = _portfolio_recommendation_signature(portfolio)
+        previous_signature = (runs[-1].get("recommendation") if runs else None)
+        record = {
+            "version_number": len(runs) + 1, "created_at": int(time.time()), "portfolio_id": portfolio_id,
+            "fixtures": fixtures, "risk_preference": portfolio.get("risk_preference"), "max_legs": max_legs,
+            "trigger_reasons": trigger_reasons or ["portfolio_evaluation"],
+            "recommendation": signature,
+            "recommendation_change": {"changed": previous_signature != signature, "before": previous_signature, "after": signature},
+            "portfolio_decision": portfolio.get("portfolio_decision"),
+        }
+        runs.append(record)
+        store["portfolio_runs"][portfolio_id] = runs[-100:]
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return record
+
+
+def get_portfolio_runs(portfolio_id: str) -> List[Dict[str, Any]]:
+    return list(load_snapshot_store().get("portfolio_runs", {}).get(portfolio_id, []))
+
+
 def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6, risk_preference: str = "balanced") -> Dict[str, Any]:
     max_legs = max(2, min(int(max_legs), 10))
     risk_preference = str(risk_preference or "balanced").strip().lower()
@@ -1914,7 +1952,26 @@ async def shadow_portfolio_evaluate(request: Request, token: Optional[str] = Non
     for match in matches:
         evaluation = evaluate_imported_prematch(match, persist_version=True)
         rows.append({"fixture": evaluation["fixture"], "correlation_group": match.get("correlation_group") or evaluation["fixture"], "evaluation": evaluation})
-    return JSONResponse({"ok": True, "version": VERSION, "evaluations": rows, "portfolio": build_portfolio(rows, payload.get("max_legs", 6), payload.get("risk_preference", "balanced"))})
+    max_legs = max(2, min(int(payload.get("max_legs", 6)), 10))
+    portfolio = build_portfolio(rows, max_legs, payload.get("risk_preference", "balanced"))
+    supplied_id = str(payload.get("portfolio_id") or "").strip()
+    portfolio_id = supplied_id or "auto-" + _content_hash({"fixtures": sorted(fixtures)})[:16]
+    if len(portfolio_id) > 100 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in portfolio_id):
+        raise HTTPException(status_code=422, detail="portfolio_id_must_use_1_to_100_safe_characters")
+    trigger_reasons = list(dict.fromkeys(
+        str(reason) for match in matches for reason in get_nested(match, ["revalidation_trigger", "reasons"], []) if reason
+    ))
+    portfolio_run = save_portfolio_run(portfolio_id, fixtures, portfolio, max_legs, trigger_reasons)
+    return JSONResponse({"ok": True, "version": VERSION, "portfolio_id": portfolio_id, "evaluations": rows, "portfolio": portfolio, "portfolio_run": portfolio_run})
+
+
+@app.get("/shadow/portfolio/history/{portfolio_id}")
+def shadow_portfolio_history(portfolio_id: str, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    runs = get_portfolio_runs(portfolio_id)
+    if not runs:
+        raise HTTPException(status_code=404, detail="portfolio_history_not_found")
+    return JSONResponse({"ok": True, "version": VERSION, "portfolio_id": portfolio_id, "count": len(runs), "runs": runs})
 
 
 def build_imported_ai_packet(fixture: str, include_companies: bool = False, include_lineups: bool = False) -> Dict[str, Any]:
