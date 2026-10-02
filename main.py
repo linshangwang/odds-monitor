@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.28.0"
+VERSION = "0.29.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1317,6 +1317,25 @@ def _fundamental_evaluation_script(payload: Dict[str, Any], estimator: Dict[str,
     }
 
 
+def audit_fundamental_chain(script: Dict[str, Any]) -> Dict[str, Any]:
+    chain = script.get("chain") or {}
+    weights = {"available": 1.0, "partial": 0.5}
+    scores = {key: weights.get(str((chain.get(key) or {}).get("status") or "data_missing").lower(), 0.0) for key in FUNDAMENTAL_CHAIN}
+    missing = [key for key, score in scores.items() if score == 0.0]
+    partial = [key for key, score in scores.items() if score == 0.5]
+    critical = ["result_utility", "rotation_quality", "execution_ability", "goal_conversion"]
+    critical_missing = [key for key in critical if scores.get(key, 0.0) == 0.0]
+    completeness = sum(scores.values()) / len(FUNDAMENTAL_CHAIN)
+    eligible = completeness >= 0.6 and not critical_missing
+    return {
+        "status": "eligible" if eligible else "insufficient",
+        "decision_eligible": eligible, "completeness_score": round(completeness, 4),
+        "minimum_completeness": 0.6, "critical_sections": critical,
+        "critical_missing": critical_missing, "missing_sections": missing, "partial_sections": partial,
+        "policy": "probability generation remains available; final recommendation must PASS when insufficient",
+    }
+
+
 def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = True) -> Dict[str, Any]:
     fixture = str(payload.get("fixture") or "").strip()
     if not fixture:
@@ -1352,6 +1371,12 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
         decision["decision"] = "PASS"
 
     script = _fundamental_evaluation_script(payload, estimator, model)
+    chain_audit = audit_fundamental_chain(script)
+    decision["fundamental_chain_audit"] = chain_audit
+    if not chain_audit["decision_eligible"]:
+        decision["pass_reasons"].append("fundamental_chain_insufficient")
+        decision["pass_reasons"] = list(dict.fromkeys(decision["pass_reasons"]))
+        decision["decision"] = "PASS"
     versions = get_fundamental_versions(fixture)
     previous = versions[-1] if versions else None
     previous_probability = get_nested(previous or {}, ["script", "model", "probabilities", "1x2"])
@@ -1372,7 +1397,7 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
     ) if persist_version else None
     return {
         "ok": True, "version": VERSION, "fixture": fixture, "estimator": estimator, "model": model,
-        "decision_layer": decision, "fundamental_version": version_record,
+        "decision_layer": decision, "fundamental_chain_audit": chain_audit, "fundamental_version": version_record,
     }
 
 

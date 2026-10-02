@@ -387,6 +387,32 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("best_market_change", row)
         self.assertEqual(len(main.get_fundamental_versions(1)), 1)
 
+    def test_fundamental_chain_audit_requires_critical_sections_and_minimum_coverage(self):
+        chain = {key: {"status": "available"} for key in main.FUNDAMENTAL_CHAIN}
+        eligible = main.audit_fundamental_chain({"chain": chain})
+        self.assertTrue(eligible["decision_eligible"])
+        chain["goal_conversion"] = {"status": "data_missing"}
+        insufficient = main.audit_fundamental_chain({"chain": chain})
+        self.assertFalse(insufficient["decision_eligible"])
+        self.assertIn("goal_conversion", insufficient["critical_missing"])
+
+    def test_prematch_pipeline_passes_when_fundamental_chain_is_missing(self):
+        main.import_prematch_packet(self.prematch_packet())
+        latest = max(row.get("snapshot_at") or 0 for row in main.get_fixture_snapshots("uuid-1") if row.get("import_status") == "available")
+        payload = {
+            "fixture": "uuid-1", "league_home_rate": 1.5, "league_away_rate": 1.2,
+            "home_attack_rate": 1.8, "home_defense_rate": 1.0, "away_attack_rate": 1.1, "away_defense_rate": 1.5,
+            "home_sample_size": 10, "away_sample_size": 10, "league_sample_size": 100, "metric_type": "xg",
+            "home_adjustment": 1.0, "away_adjustment": 1.0, "lineup_confidence": .85,
+            "provenance": {"source": "verified_event_data", "uses_market_odds": False},
+            "script_coverage": {"home": .8, "draw": .4, "away": .3}, "crowding": .3, "death_path": [],
+        }
+        with patch("main.time.time", return_value=latest + 60):
+            result = main.evaluate_imported_prematch(payload)
+        self.assertEqual(result["decision_layer"]["decision"], "PASS")
+        self.assertIn("fundamental_chain_insufficient", result["decision_layer"]["pass_reasons"])
+        self.assertEqual(result["fundamental_chain_audit"]["status"], "insufficient")
+
     def test_nami_call_never_returns_credentials_in_endpoint(self):
         original_user, original_secret = main.NAMI_API_USER, main.NAMI_API_SECRET
         main.NAMI_API_USER, main.NAMI_API_SECRET = "user-value", "secret-value"

@@ -143,6 +143,10 @@ Selection Change、Robustness Change、Risk Downgrade to PASS 和 Recovery from 
 并列出新增腿、移除腿以及决策来源和稳健性前后变化。
 版本中的 `change_drivers` 按比赛保存基本面复核触发原因、盘口变化分类、PASS门槛、最佳盘口
 及基本面版本号。没有事实证据时标记 `data_missing`，不会仅因推荐变化而推断基本面发生变化。
+
+完整赛前评估新增 `fundamental_chain_audit`：available计1、partial计0.5、data_missing计0，
+总完整度至少需达到0.6，且 Result Utility、Rotation Quality、Execution Ability、Goal Conversion
+四个关键环节不得缺失。证据不足时仍生成概率供审计，但最终建议强制 PASS。
 再输出综合过关第一首选、综合过关次首选和高博弈单关。2 腿是偏稳健建议，3 腿是默认
 平衡建议，4 腿以上作为可选扩展高波动方案；用户可用 `max_legs` 指定 2–10 的展示上限，
 不是只能选择 2–3 腿。同一 `correlation_group` 最多一腿，同一比赛不能重复提交。
