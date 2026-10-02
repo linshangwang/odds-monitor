@@ -409,6 +409,11 @@ class ShadowV4UpgradeTests(unittest.TestCase):
 
     def test_fundamental_chain_audit_requires_critical_sections_and_minimum_coverage(self):
         chain = {key: {"status": "available", "evidence": f"verified-{key}", "source": "trusted-feed", "observed_at": "2026-10-03T00:00:00Z"} for key in main.FUNDAMENTAL_CHAIN}
+        chain["result_utility"].update({"home": {"win": 1, "draw": 0, "loss": -1}, "away": {"win": 1, "draw": 0, "loss": -1}})
+        rotation_side = {"starting_xi_strength": .8, "creativity": .7, "finishing": .75, "chemistry": .8}
+        chain["rotation_quality"].update({"home": rotation_side, "away": rotation_side})
+        chain["execution_ability"].update({"home": {"score": .7}, "away": {"score": .6}})
+        chain["goal_conversion"].update({"home": {"rate": .12}, "away": {"rate": .1}})
         eligible = main.audit_fundamental_chain({"chain": chain}, now_ts=1790989200)
         self.assertTrue(eligible["decision_eligible"])
         chain["goal_conversion"] = {"status": "data_missing"}
@@ -446,6 +451,23 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(audit["critical_timestamp_issues"]["rotation_quality"]["issue"], "stale")
         self.assertEqual(audit["critical_timestamp_issues"]["goal_conversion"]["issue"], "future_timestamp")
         self.assertNotIn("execution_ability", audit["critical_timestamp_issues"])
+
+    def test_critical_fundamental_semantics_require_both_teams(self):
+        now_ts = 1790989200
+        chain = {key: {"status": "available", "evidence": key, "source": "trusted-feed", "observed_at": now_ts} for key in main.FUNDAMENTAL_CHAIN}
+        chain["result_utility"].update({"home": {"win": 1, "draw": 0, "loss": -1}, "away": {"win": 1, "draw": 0, "loss": -1}})
+        rotation_side = {"starting_xi_strength": .8, "creativity": .7, "finishing": .75, "chemistry": .8}
+        chain["rotation_quality"].update({"home": rotation_side, "away": rotation_side})
+        chain["execution_ability"].update({"home": {"score": .7}, "away": {"score": .6}})
+        chain["goal_conversion"].update({"home": {"rate": .12}, "away": {"rate": .1}})
+        valid = main.audit_fundamental_chain({"chain": chain}, now_ts=now_ts)
+        self.assertTrue(valid["decision_eligible"])
+        del chain["result_utility"]["away"]["loss"]
+        chain["goal_conversion"]["away"] = {"note": "no numeric metric"}
+        invalid = main.audit_fundamental_chain({"chain": chain}, now_ts=now_ts)
+        self.assertFalse(invalid["decision_eligible"])
+        self.assertIn("loss", invalid["critical_semantic_issues"]["result_utility"]["away"]["missing_numeric_fields"])
+        self.assertEqual(invalid["critical_semantic_issues"]["goal_conversion"]["away"]["reason"], "at_least_one_numeric_metric_required")
 
     def test_prematch_pipeline_passes_when_fundamental_chain_is_missing(self):
         main.import_prematch_packet(self.prematch_packet())

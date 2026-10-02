@@ -155,6 +155,9 @@ Selection Change、Robustness Change、Risk Downgrade to PASS 和 Recovery from 
 阵容消息和临场事件的合理时效不同，关键环节采用分类阈值：Result Utility 48小时、Rotation
 Quality 24小时、Execution Ability 与 Goal Conversion 14天。关键时间戳缺失、无效、明显在
 未来或超过对应时效时强制 PASS；非关键环节继续只做缺失审计。
+关键内容还需满足最低结构：Result Utility包含双方数值型win/draw/loss；Rotation Quality
+双方各至少4个指定质量维度；Execution Ability与Goal Conversion双方各至少一个数值指标。
+不符合时返回 `critical_semantic_issues`，概率仍可审计但最终建议强制PASS。
 
 组合接口对外严格校验：请求体必须是对象，`max_legs` 必须为2–10的整数，风险偏好只能是
 conservative、balanced、aggressive，复核原因必须是数组。异常输入返回明确的400/422，

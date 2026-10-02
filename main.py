@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.38.0"
+VERSION = "0.39.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1051,6 +1051,7 @@ CRITICAL_FUNDAMENTAL_MAX_AGE_SECONDS = {
     "execution_ability": 14 * 24 * 3600,
     "goal_conversion": 14 * 24 * 3600,
 }
+ROTATION_QUALITY_FIELDS = ["starting_xi_strength", "creativity", "finishing", "chemistry", "bench_strength", "bench_upgrade", "lineup_intent"]
 MOVE_CLASSES = ["Fundamental Confirmed", "Likely Information-Driven", "Market-Only Move", "Cross-Market Divergence", "Model-Market Divergence"]
 
 
@@ -1456,8 +1457,28 @@ def audit_fundamental_chain(script: Dict[str, Any], now_ts: Optional[int] = None
             issue = "future_timestamp" if age < -300 else ("stale" if age > max_age else None)
         if issue:
             critical_timestamp_issues[key] = {"issue": issue, "observed_at": raw_timestamp, "age_seconds": age, "max_age_seconds": max_age}
+    semantic_issues = {}
+    result_utility = chain.get("result_utility") or {}
+    for side in ("home", "away"):
+        side_values = result_utility.get(side) if isinstance(result_utility.get(side), dict) else {}
+        missing_fields = [outcome for outcome in ("win", "draw", "loss") if as_float(side_values.get(outcome)) is None]
+        if missing_fields:
+            semantic_issues.setdefault("result_utility", {})[side] = {"missing_numeric_fields": missing_fields}
+    rotation = chain.get("rotation_quality") or {}
+    for side in ("home", "away"):
+        side_values = rotation.get(side) if isinstance(rotation.get(side), dict) else {}
+        present = [field for field in ROTATION_QUALITY_FIELDS if side_values.get(field) not in (None, "", [], {})]
+        if len(present) < 4:
+            semantic_issues.setdefault("rotation_quality", {})[side] = {"required_minimum_fields": 4, "present_fields": present}
+    for section_name in ("execution_ability", "goal_conversion"):
+        section = chain.get(section_name) or {}
+        for side in ("home", "away"):
+            side_values = section.get(side) if isinstance(section.get(side), dict) else {}
+            numeric_fields = [field for field, value in side_values.items() if as_float(value) is not None]
+            if not numeric_fields:
+                semantic_issues.setdefault(section_name, {})[side] = {"reason": "at_least_one_numeric_metric_required"}
     completeness = sum(scores.values()) / len(FUNDAMENTAL_CHAIN)
-    eligible = completeness >= 0.6 and not critical_missing and not critical_provenance_missing and not critical_timestamp_issues
+    eligible = completeness >= 0.6 and not critical_missing and not critical_provenance_missing and not critical_timestamp_issues and not semantic_issues
     return {
         "status": "eligible" if eligible else "insufficient",
         "decision_eligible": eligible, "completeness_score": round(completeness, 4),
@@ -1469,6 +1490,13 @@ def audit_fundamental_chain(script: Dict[str, Any], now_ts: Optional[int] = None
         "timestamp_missing_sections": timestamp_missing_sections,
         "critical_timestamp_issues": critical_timestamp_issues,
         "critical_max_age_seconds": CRITICAL_FUNDAMENTAL_MAX_AGE_SECONDS,
+        "critical_semantic_issues": semantic_issues,
+        "critical_schema": {
+            "result_utility": "home/away each require numeric win, draw, loss",
+            "rotation_quality": "home/away each require at least 4 named quality fields",
+            "execution_ability": "home/away each require at least one numeric metric",
+            "goal_conversion": "home/away each require at least one numeric metric",
+        },
         "evidence_rule": "available or partial requires at least one substantive field beyond status/reason/warning",
         "provenance_rule": "critical sections require source or provenance and a valid type-specific observed_at/as_of",
         "policy": "probability generation remains available; final recommendation must PASS when insufficient",
