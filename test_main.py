@@ -194,6 +194,14 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["decision"], "home")
         self.assertAlmostEqual(result["ev"], .10, places=6)
 
+    def test_decision_layer_passes_when_consensus_has_only_one_bookmaker(self):
+        snapshot = main.empty_market_snapshot()
+        snapshot["consensus_main_line"]["1x2"] = {"home": 2.0, "draw": 3.5, "away": 4.0, "bookmaker_count": 1}
+        result = main.decision_layer(snapshot, {"home": .55, "draw": .25, "away": .20}, {"home": .8, "draw": .3, "away": .2}, .4, .9, [])
+        self.assertEqual(result["decision"], "PASS")
+        self.assertIn("consensus_bookmaker_coverage_below_minimum", result["pass_reasons"])
+        self.assertFalse(result["candidates"][0]["market_coverage_eligible"])
+
     def test_model_market_divergence_uses_probability_gap(self):
         decision = {"lineup_confidence": .9, "candidates": [
             {"market": "1x2", "selection": "home", "edge": .035},

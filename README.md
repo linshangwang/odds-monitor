@@ -210,6 +210,7 @@ T-1h、T-15m 或 Closing 信号继续保持 pending，等待对应阶段的新�
 受保护的存储健康接口同时报告压缩前后体积、压缩率、比赛/快照/复核任务数量和容量预警；默认压缩文件达到 256MB 时进入 warning，可用 `SNAPSHOT_STORE_WARN_BYTES` 调整。
 持久化备份是真正的上一已提交版本：首次写入建立基线，后续写入先保留旧主文件，再原子替换新主文件，避免逻辑错误同时覆盖主文件与回退点。
 pang 导入的六类盘口均优先从完整公司数组重新计算 Consensus Main Line；只有对应公司数组不完整时才使用上游共识，并以 `upstream_consensus_fallback` 和 `consensus_audit` 明确标注，绝不把上游 primary 当作无条件真值。
+Consensus 样本少于两家公司时仍可展示概率和价差，但不能形成最终建议，输出 `consensus_bookmaker_coverage_below_minimum` 并 PASS；阈值可通过 `MIN_CONSENSUS_BOOKMAKERS` 调整。
 总完整度至少需达到0.6，且 Result Utility、Rotation Quality、Execution Ability、Goal Conversion
 四个关键环节不得缺失。证据不足时仍生成概率供审计，但最终建议强制 PASS。
 `available` 或 `partial` 不能只写状态：必须同时包含至少一个实质字段，例如证据、变量值或明确
