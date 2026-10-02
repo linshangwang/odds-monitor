@@ -145,6 +145,29 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["risk_preference"], "balanced")
         self.assertEqual(result["first_choice_combination"]["leg_count"], 3)
 
+    def test_portfolio_audit_explains_correlation_and_leg_cap_exclusions(self):
+        def row(fixture, group, coverage):
+            candidate = {"market": "1x2", "selection": "home", "price": 1.6, "script_coverage": coverage, "edge": .06, "ev": .08}
+            return {"fixture": fixture, "correlation_group": group, "evaluation": {"decision_layer": {"recommendation_tiers": {"first_choice_high_consistency": candidate}}}}
+        rows = [row("a", "shared", .9), row("b", "shared", .8), row("c", "unique-c", .7), row("d", "unique-d", .6)]
+        result = main.build_portfolio(rows, 2)["first_choice_combination"]
+        reasons = {item["fixture"]: item["reason"] for item in result["selection_audit"]["excluded"]}
+        self.assertEqual(reasons["b"], "correlation_group_already_selected")
+        self.assertEqual(reasons["d"], "max_legs_reached")
+
+    def test_second_choice_requires_an_actually_selected_upgrade(self):
+        first = {"market": "1x2", "selection": "home", "price": 1.6, "script_coverage": .8, "edge": .06, "ev": .08}
+        second = {"market": "over_under", "selection": "over", "price": 2.0, "script_coverage": .9, "edge": .05, "ev": .12}
+        rows = [
+            {"fixture": "fallback", "correlation_group": "same", "evaluation": {"decision_layer": {"recommendation_tiers": {"first_choice_high_consistency": first}}}},
+            {"fixture": "upgrade", "correlation_group": "same", "evaluation": {"decision_layer": {"recommendation_tiers": {"first_choice_high_consistency": first, "second_choice_higher_return": second}}}},
+            {"fixture": "other", "correlation_group": "other", "evaluation": {"decision_layer": {"recommendation_tiers": {"first_choice_high_consistency": first}}}},
+        ]
+        result = main.build_portfolio(rows, 2)["second_choice_combination"]
+        self.assertIn(result["decision"], {"COMBINE", "PASS"})
+        if result["decision"] == "COMBINE":
+            self.assertTrue(any(leg["source_tier"] == "second_choice_higher_return" for leg in result["legs"]))
+
     def test_independent_poisson_model_is_normalized_and_symmetric(self):
         model = main.poisson_probability_model(1.4, 1.4, 0.8, {"source": "verified_team_metrics", "uses_market_odds": False})
         self.assertTrue(model["ok"])

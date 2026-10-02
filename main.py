@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.19.0"
+VERSION = "0.20.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1378,6 +1378,7 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
 
 def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int, allow_fallback: bool = False, risk_preference: str = "balanced") -> Dict[str, Any]:
     candidates = []
+    excluded = []
     seen_groups = set()
     upgraded = False
     ordered = sorted(rows, key=lambda row: (
@@ -1387,21 +1388,30 @@ def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int,
     for row in ordered:
         tiers = get_nested(row, ["evaluation", "decision_layer", "recommendation_tiers"]) or {}
         candidate = tiers.get(tier)
+        source_tier = tier
         if not candidate and allow_fallback:
             candidate = tiers.get("first_choice_high_consistency")
-        elif candidate and tier == "second_choice_higher_return":
-            upgraded = True
+            source_tier = "first_choice_high_consistency_fallback"
         if not candidate:
+            excluded.append({"fixture": row.get("fixture"), "reason": "no_eligible_candidate_for_tier", "requested_tier": tier})
             continue
         group = str(row.get("correlation_group") or row.get("fixture") or "")
         if group in seen_groups:
+            excluded.append({"fixture": row.get("fixture"), "correlation_group": group, "reason": "correlation_group_already_selected", "requested_tier": tier})
+            continue
+        if len(candidates) >= max_legs:
+            excluded.append({"fixture": row.get("fixture"), "correlation_group": group, "reason": "max_legs_reached", "requested_tier": tier})
             continue
         seen_groups.add(group)
-        candidates.append({"fixture": row.get("fixture"), "correlation_group": group, **candidate})
-        if len(candidates) >= max_legs:
-            break
+        candidates.append({"fixture": row.get("fixture"), "correlation_group": group, "source_tier": source_tier, **candidate})
+        if tier == "second_choice_higher_return" and source_tier == tier:
+            upgraded = True
     if len(candidates) < 2 or (tier == "second_choice_higher_return" and not upgraded):
-        return {"decision": "PASS", "legs": candidates, "reason": "fewer_than_two_eligible_independent_legs" if len(candidates) < 2 else "no_higher_return_upgrade_available"}
+        return {
+            "decision": "PASS", "legs": candidates,
+            "reason": "fewer_than_two_eligible_independent_legs" if len(candidates) < 2 else "no_higher_return_upgrade_available",
+            "selection_audit": {"selected": candidates, "excluded": excluded},
+        }
     suggested_options = []
     for leg_count in range(2, len(candidates) + 1):
         option_legs = candidates[:leg_count]
@@ -1421,6 +1431,7 @@ def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int,
         "leg_count": recommended_count, "available_leg_count": len(candidates), "suggested_options": suggested_options,
         "risk_preference": risk_preference, "recommended_option": recommended,
         "recommendation_reason": recommendation_reasons[risk_preference],
+        "selection_audit": {"selected": candidates, "excluded": excluded},
         "selection_guidance": "2 legs lower variance; 3 legs balanced default; 4+ legs are optional expanded high variance",
         "independence_assumption": "screened by correlation_group; residual correlation is not modeled",
         "combined_ev": {"status": "data_missing", "reason": "Asian pushes and residual cross-match correlation prevent naive probability multiplication"},
