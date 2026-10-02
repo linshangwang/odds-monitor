@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.29.0"
+VERSION = "0.30.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1320,7 +1320,21 @@ def _fundamental_evaluation_script(payload: Dict[str, Any], estimator: Dict[str,
 def audit_fundamental_chain(script: Dict[str, Any]) -> Dict[str, Any]:
     chain = script.get("chain") or {}
     weights = {"available": 1.0, "partial": 0.5}
-    scores = {key: weights.get(str((chain.get(key) or {}).get("status") or "data_missing").lower(), 0.0) for key in FUNDAMENTAL_CHAIN}
+    allowed_statuses = {"available", "partial", "data_missing"}
+    invalid_status_sections = []
+    unsubstantiated_sections = []
+    scores = {}
+    for key in FUNDAMENTAL_CHAIN:
+        section = chain.get(key) if isinstance(chain.get(key), dict) else {}
+        status = str(section.get("status") or "data_missing").lower()
+        if status not in allowed_statuses:
+            invalid_status_sections.append(key)
+            status = "data_missing"
+        substantive_values = [value for field, value in section.items() if field not in {"status", "reason", "warning"} and value not in (None, "", [], {})]
+        if status in weights and not substantive_values:
+            unsubstantiated_sections.append(key)
+            status = "data_missing"
+        scores[key] = weights.get(status, 0.0)
     missing = [key for key, score in scores.items() if score == 0.0]
     partial = [key for key, score in scores.items() if score == 0.5]
     critical = ["result_utility", "rotation_quality", "execution_ability", "goal_conversion"]
@@ -1332,6 +1346,8 @@ def audit_fundamental_chain(script: Dict[str, Any]) -> Dict[str, Any]:
         "decision_eligible": eligible, "completeness_score": round(completeness, 4),
         "minimum_completeness": 0.6, "critical_sections": critical,
         "critical_missing": critical_missing, "missing_sections": missing, "partial_sections": partial,
+        "unsubstantiated_sections": unsubstantiated_sections, "invalid_status_sections": invalid_status_sections,
+        "evidence_rule": "available or partial requires at least one substantive field beyond status/reason/warning",
         "policy": "probability generation remains available; final recommendation must PASS when insufficient",
     }
 

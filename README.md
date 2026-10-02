@@ -147,6 +147,9 @@ Selection Change、Robustness Change、Risk Downgrade to PASS 和 Recovery from 
 完整赛前评估新增 `fundamental_chain_audit`：available计1、partial计0.5、data_missing计0，
 总完整度至少需达到0.6，且 Result Utility、Rotation Quality、Execution Ability、Goal Conversion
 四个关键环节不得缺失。证据不足时仍生成概率供审计，但最终建议强制 PASS。
+`available` 或 `partial` 不能只写状态：必须同时包含至少一个实质字段，例如证据、变量值或明确
+结论；只有状态的空壳环节按 `data_missing` 计分。未知状态也不会计分，并分别列入
+`unsubstantiated_sections` 和 `invalid_status_sections`。
 再输出综合过关第一首选、综合过关次首选和高博弈单关。2 腿是偏稳健建议，3 腿是默认
 平衡建议，4 腿以上作为可选扩展高波动方案；用户可用 `max_legs` 指定 2–10 的展示上限，
 不是只能选择 2–3 腿。同一 `correlation_group` 最多一腿，同一比赛不能重复提交。

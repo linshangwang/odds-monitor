@@ -388,13 +388,23 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(len(main.get_fundamental_versions(1)), 1)
 
     def test_fundamental_chain_audit_requires_critical_sections_and_minimum_coverage(self):
-        chain = {key: {"status": "available"} for key in main.FUNDAMENTAL_CHAIN}
+        chain = {key: {"status": "available", "evidence": f"verified-{key}"} for key in main.FUNDAMENTAL_CHAIN}
         eligible = main.audit_fundamental_chain({"chain": chain})
         self.assertTrue(eligible["decision_eligible"])
         chain["goal_conversion"] = {"status": "data_missing"}
         insufficient = main.audit_fundamental_chain({"chain": chain})
         self.assertFalse(insufficient["decision_eligible"])
         self.assertIn("goal_conversion", insufficient["critical_missing"])
+
+    def test_fundamental_chain_rejects_empty_available_and_unknown_status(self):
+        chain = {key: {"status": "available", "evidence": f"verified-{key}"} for key in main.FUNDAMENTAL_CHAIN}
+        chain["result_utility"] = {"status": "available"}
+        chain["tactical_matchup"] = {"status": "certain", "evidence": "unsupported status"}
+        audit = main.audit_fundamental_chain({"chain": chain})
+        self.assertFalse(audit["decision_eligible"])
+        self.assertIn("result_utility", audit["unsubstantiated_sections"])
+        self.assertIn("tactical_matchup", audit["invalid_status_sections"])
+        self.assertIn("result_utility", audit["critical_missing"])
 
     def test_prematch_pipeline_passes_when_fundamental_chain_is_missing(self):
         main.import_prematch_packet(self.prematch_packet())
