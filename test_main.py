@@ -213,6 +213,22 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         option = main.build_portfolio(rows, 2)["first_choice_combination"]["recommended_option"]
         self.assertEqual(option["half_edge_stress_test"]["status"], "data_missing")
 
+    def test_conservative_portfolio_passes_when_stress_test_is_not_positive(self):
+        fragile = {"market": "1x2", "selection": "home", "price": 2.0, "model_probability": .52, "market_no_vig_probability": .45, "script_coverage": .9, "edge": .07, "ev": .04}
+        rows = [{"fixture": str(index), "evaluation": {"decision_layer": {"recommendation_tiers": {"first_choice_high_consistency": fragile}}}} for index in range(2)]
+        result = main.build_portfolio(rows, 2, "conservative")["risk_adjusted_recommendation"]
+        self.assertEqual(result["decision"], "PASS")
+        self.assertEqual(result["reason"], "no_combination_passed_half_edge_stress_test")
+
+    def test_aggressive_portfolio_can_select_fragile_higher_return_with_warning(self):
+        first = {"market": "1x2", "selection": "home", "price": 2.0, "model_probability": .55, "market_no_vig_probability": .5, "script_coverage": .9, "edge": .05, "ev": .1}
+        second = {"market": "btts", "selection": "yes", "price": 2.0, "model_probability": .52, "market_no_vig_probability": .45, "script_coverage": .7, "edge": .07, "ev": .04}
+        rows = [{"fixture": str(index), "evaluation": {"decision_layer": {"recommendation_tiers": {"first_choice_high_consistency": first, "second_choice_higher_return": second}}}} for index in range(2)]
+        result = main.build_portfolio(rows, 2, "aggressive")["risk_adjusted_recommendation"]
+        self.assertEqual(result["source"], "second_choice_higher_return")
+        self.assertEqual(result["robustness"], "fragile")
+        self.assertIsNotNone(result["warning"])
+
     def test_independent_poisson_model_is_normalized_and_symmetric(self):
         model = main.poisson_probability_model(1.4, 1.4, 0.8, {"source": "verified_team_metrics", "uses_market_odds": False})
         self.assertTrue(model["ok"])

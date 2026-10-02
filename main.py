@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.23.0"
+VERSION = "0.24.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1485,6 +1485,38 @@ def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int,
     }
 
 
+def _risk_adjusted_combination(first: Dict[str, Any], second: Dict[str, Any], risk_preference: str) -> Dict[str, Any]:
+    available = [("first_choice_high_consistency", first), ("second_choice_higher_return", second)]
+    available = [(name, combination) for name, combination in available if combination.get("decision") == "COMBINE"]
+    if not available:
+        return {"decision": "PASS", "reason": "no_eligible_combination"}
+
+    def robustness(combination: Dict[str, Any]) -> str:
+        stress = get_nested(combination, ["recommended_option", "half_edge_stress_test"]) or {}
+        if stress.get("status") != "available":
+            return "unknown"
+        return "resilient" if stress.get("remains_positive_ev") else "fragile"
+
+    annotated = [(name, combination, robustness(combination)) for name, combination in available]
+    if risk_preference == "conservative":
+        eligible = [row for row in annotated if row[2] == "resilient"]
+        if not eligible:
+            return {"decision": "PASS", "reason": "no_combination_passed_half_edge_stress_test", "evaluated": [{"source": name, "robustness": state} for name, _, state in annotated]}
+        selected = eligible[0]
+    elif risk_preference == "balanced":
+        selected = next((row for row in annotated if row[0] == "first_choice_high_consistency" and row[2] == "resilient"), None)
+        selected = selected or next((row for row in annotated if row[2] == "resilient"), None) or annotated[0]
+    else:
+        selected = next((row for row in annotated if row[0] == "second_choice_higher_return"), annotated[0])
+    name, combination, state = selected
+    warning = "nominal_edge_only; stress_test_not_passed" if state == "fragile" else ("stress_test_unavailable" if state == "unknown" else None)
+    return {
+        "decision": "COMBINE", "source": name, "robustness": state,
+        "warning": warning, "recommended_option": combination.get("recommended_option"),
+        "reason": "selected according to risk_preference and half-edge stress result",
+    }
+
+
 def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6, risk_preference: str = "balanced") -> Dict[str, Any]:
     max_legs = max(2, min(int(max_legs), 10))
     risk_preference = str(risk_preference or "balanced").strip().lower()
@@ -1499,8 +1531,10 @@ def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6, ri
     high_variance.sort(key=lambda row: (row.get("ev", -999), row.get("edge", -999)), reverse=True)
     first = _combination_from_rows(valid_rows, "first_choice_high_consistency", max_legs, risk_preference=risk_preference)
     second = _combination_from_rows(valid_rows, "second_choice_higher_return", max_legs, allow_fallback=True, risk_preference=risk_preference)
+    risk_adjusted = _risk_adjusted_combination(first, second, risk_preference)
     return {
         "first_choice_combination": first, "second_choice_combination": second,
+        "risk_adjusted_recommendation": risk_adjusted,
         "high_variance_singles": high_variance,
         "portfolio_decision": "PASS" if first["decision"] == "PASS" and second["decision"] == "PASS" and not high_variance else "READY",
         "risk_preference": risk_preference,
