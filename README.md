@@ -185,6 +185,8 @@ T-X 变盘比较现覆盖全部可用市场：1X2、AH、O/U、BTTS、主队进�
 强制 PASS。
 “最新盘口”按固定 T-X 阶段顺序选择最接近开赛的真实节点，而非按数据库写入时间。较早阶段
 即使稍后补传或修订，也不会覆盖 T-3h、T-1h、T-15m 或 Closing 的决策位置。
+数据新鲜度也绑定该最新阶段，而不是所有记录中最大的写入时间；超过当前时间5分钟的快照标记
+`invalid_timestamp` 并强制 PASS，防止时间漂移或错误时间戳污染临场判断。
 总完整度至少需达到0.6，且 Result Utility、Rotation Quality、Execution Ability、Goal Conversion
 四个关键环节不得缺失。证据不足时仍生成概率供审计，但最终建议强制 PASS。
 `available` 或 `partial` 不能只写状态：必须同时包含至少一个实质字段，例如证据、变量值或明确

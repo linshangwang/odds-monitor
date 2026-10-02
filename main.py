@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.53.0"
+VERSION = "0.54.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -2391,21 +2391,25 @@ def shadow_revalidation_queue(status: str = "pending", fixture: Optional[str] = 
 def imported_fixture_freshness(metadata: Dict[str, Any], history: List[Dict[str, Any]], now_ts: Optional[int] = None) -> Dict[str, Any]:
     now_ts = int(now_ts or time.time())
     kickoff = _parse_timestamp(get_nested(metadata, ["match", "kickoff_utc"]))
-    available = [row for row in history if row.get("import_status") == "available"]
-    latest = max((int(row.get("snapshot_at") or 0) for row in available), default=0) or None
-    age = max(0, now_ts - latest) if latest else None
-    if not latest:
+    available = [row for row in history if row.get("import_status") == "available" and get_nested(row, ["market_snapshot", "available"]) is not False]
+    latest_row = latest_prematch_snapshot(available)
+    latest = int((latest_row or {}).get("snapshot_at") or 0) or None
+    age = now_ts - latest if latest else None
+    if not latest_row or not latest:
         state, eligible, reason = "data_missing", False, "no_available_market_snapshot"
+    elif age < -300:
+        state, eligible, reason = "invalid_timestamp", False, "latest_market_snapshot_is_in_future"
     elif kickoff and now_ts >= kickoff:
         state, eligible, reason = "historical", False, "fixture_is_not_prematch"
-    elif age is not None and age > EXTERNAL_DATA_STALE_SECONDS:
+    elif age > EXTERNAL_DATA_STALE_SECONDS:
         state, eligible, reason = "stale", False, "latest_market_snapshot_exceeds_freshness_threshold"
     else:
         state, eligible, reason = "fresh", True, None
     return {
         "state": state, "decision_eligible": eligible, "reason": reason,
         "latest_snapshot_at": latest, "age_seconds": age, "stale_after_seconds": EXTERNAL_DATA_STALE_SECONDS,
-        "kickoff_at": kickoff,
+        "latest_stage": (latest_row or {}).get("stage"), "selection_policy": "latest_prematch_stage_not_latest_write_time",
+        "future_tolerance_seconds": 300, "kickoff_at": kickoff,
     }
 
 
@@ -2452,7 +2456,7 @@ def shadow_data_source_health(probe_nami: bool = False, token: Optional[str] = N
     for fixture, metadata in (store.get("external_prematch", {}) or {}).items():
         freshness = imported_fixture_freshness(metadata, get_fixture_snapshots(fixture))
         fixtures.append({"fixture": fixture, "match": metadata.get("match"), "freshness": freshness})
-    state_counts = {state: sum(1 for row in fixtures if row["freshness"]["state"] == state) for state in ("fresh", "stale", "historical", "data_missing")}
+    state_counts = {state: sum(1 for row in fixtures if row["freshness"]["state"] == state) for state in ("fresh", "stale", "historical", "invalid_timestamp", "data_missing")}
     nami = nami_capability_check() if probe_nami else {
         "configured": bool(NAMI_API_USER and NAMI_API_SECRET), "status": "not_probed",
         "optional": True, "failure_policy": "continue_without_nami",

@@ -895,7 +895,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
 
     def test_imported_fixture_freshness_gates_decisions(self):
         metadata = {"match": {"kickoff_utc": "2026-10-02T12:00:00+00:00"}}
-        history = [{"import_status": "available", "snapshot_at": 1000}]
+        history = [{"stage": "Opening", "import_status": "available", "snapshot_at": 1000}]
         fresh = main.imported_fixture_freshness(metadata, history, now_ts=1100)
         self.assertEqual(fresh["state"], "fresh")
         self.assertTrue(fresh["decision_eligible"])
@@ -906,6 +906,19 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(historical["state"], "historical")
         missing = main.imported_fixture_freshness(metadata, [], now_ts=1100)
         self.assertEqual(missing["state"], "data_missing")
+
+    def test_freshness_uses_latest_stage_and_rejects_future_timestamp(self):
+        metadata = {"match": {"kickoff_utc": "2030-01-01T00:00:00+00:00"}}
+        history = [
+            {"stage": "Opening", "import_status": "available", "snapshot_at": 9900},
+            {"stage": "T-1h", "import_status": "available", "snapshot_at": 1000},
+        ]
+        stale = main.imported_fixture_freshness(metadata, history, now_ts=10000)
+        self.assertEqual(stale["latest_stage"], "T-1h")
+        self.assertEqual(stale["state"], "stale")
+        future = main.imported_fixture_freshness(metadata, [{"stage": "T-15m", "import_status": "available", "snapshot_at": 10401}], now_ts=10000)
+        self.assertEqual(future["state"], "invalid_timestamp")
+        self.assertFalse(future["decision_eligible"])
 
     def test_lineup_confidence_is_capped_by_verified_evidence(self):
         now_ts = 1790989200
