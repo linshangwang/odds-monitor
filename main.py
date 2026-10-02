@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.64.0"
+VERSION = "0.65.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1001,9 +1001,21 @@ def revalidation_queue_view(tasks: List[Dict[str, Any]], now_ts: Optional[int] =
         score = stage_weight.get(task.get("stage"), 0) + max((reason_weight.get(reason, 1) for reason in task.get("reasons") or []), default=0)
         if age >= 1800:
             score += 2
+        pending = task.get("status") == "pending"
+        attempted = pending and int(task.get("attempt_count") or 0) > 0
+        overdue = pending and age >= 1800
+        workflow_state = (
+            "overdue_awaiting_evidence" if overdue and attempted else
+            "overdue_unattempted" if overdue else
+            "awaiting_evidence" if attempted else
+            "queued" if pending else str(task.get("status") or "unknown")
+        )
         task.update({
             "age_seconds": age,
-            "overdue": task.get("status") == "pending" and age >= 1800,
+            "overdue": overdue,
+            "attempted": attempted,
+            "workflow_state": workflow_state,
+            "next_action": "collect_required_evidence" if attempted else ("run_fundamental_revalidation" if pending else None),
             "priority_score": score,
             "priority": "critical" if score >= 12 else ("high" if score >= 8 else "normal"),
         })
@@ -2541,9 +2553,17 @@ def shadow_import_status(token: Optional[str] = None, authorization: Optional[st
     store = load_snapshot_store()
     metadata = store.get("external_prematch", {})
     queue = list((store.get("fundamental_revalidation_queue") or {}).values())
+    queue_view = revalidation_queue_view(queue)
     return JSONResponse({
         "ok": True, "version": VERSION, "sync": store.get("import_sync_status") or {"status": "never_imported"},
-        "revalidation": {"pending": sum(task.get("status") == "pending" for task in queue), "overdue": sum(task.get("overdue") for task in revalidation_queue_view(queue) if task.get("status") == "pending"), "over_capacity": sum(task.get("status") == "pending" for task in queue) > 500, "retention_policy": "pending_tasks_are_never_silently_evicted"},
+        "revalidation": {
+            "pending": sum(task.get("status") == "pending" for task in queue_view),
+            "unattempted": sum(task.get("workflow_state") in ("queued", "overdue_unattempted") for task in queue_view),
+            "awaiting_evidence": sum(task.get("workflow_state") in ("awaiting_evidence", "overdue_awaiting_evidence") for task in queue_view),
+            "overdue": sum(bool(task.get("overdue")) for task in queue_view if task.get("status") == "pending"),
+            "over_capacity": sum(task.get("status") == "pending" for task in queue) > 500,
+            "retention_policy": "pending_tasks_are_never_silently_evicted",
+        },
         "fixture_count": len(metadata), "fixtures": [
             {"fixture": fixture, "league": row.get("league"), "imported_at": row.get("imported_at"), "match": row.get("match")}
             for fixture, row in metadata.items()

@@ -971,6 +971,17 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertTrue(viewed[0]["overdue"])
         self.assertFalse(viewed[1]["overdue"])
 
+    def test_revalidation_queue_distinguishes_unattempted_and_awaiting_evidence(self):
+        tasks = [
+            {"task_id": "new", "status": "pending", "stage": "T-3h", "created_at": 9900},
+            {"task_id": "attempted", "status": "pending", "stage": "T-3h", "created_at": 9000, "attempt_count": 1, "required_evidence": ["result_utility"]},
+        ]
+        viewed = {task["task_id"]: task for task in main.revalidation_queue_view(tasks, now_ts=10000)}
+        self.assertEqual(viewed["new"]["workflow_state"], "queued")
+        self.assertEqual(viewed["new"]["next_action"], "run_fundamental_revalidation")
+        self.assertEqual(viewed["attempted"]["workflow_state"], "awaiting_evidence")
+        self.assertEqual(viewed["attempted"]["next_action"], "collect_required_evidence")
+
     def test_revalidation_resolution_records_evidence_and_actual_change(self):
         main.write_snapshot_store({"version": main.VERSION, "fixtures": {}, "fundamental_revalidation_queue": {
             "task": {"task_id": "task", "fixture": "fixture-1", "stage": "T-3h", "status": "pending", "reasons": ["significant_line_move"]}
