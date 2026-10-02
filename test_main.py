@@ -210,6 +210,19 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("consensus_not_recalculated_from_company_array", result["pass_reasons"])
         self.assertFalse(result["candidates"][0]["consensus_source_eligible"])
 
+    def test_consensus_dispersion_blocks_conflicting_bookmaker_prices(self):
+        consensus = main._consensus_1x2([
+            {"bookmaker": "A", "home": 1.7, "draw": 3.4, "away": 4.2},
+            {"bookmaker": "B", "home": 2.1, "draw": 3.45, "away": 4.1},
+        ])
+        self.assertFalse(consensus["dispersion_eligible"])
+        self.assertAlmostEqual(consensus["maximum_price_spread"], .4)
+        snapshot = main.empty_market_snapshot()
+        snapshot["consensus_main_line"]["1x2"] = consensus
+        result = main.decision_layer(snapshot, {"home": .58, "draw": .23, "away": .19}, {"home": .8, "draw": .3, "away": .2}, .4, .9, [])
+        self.assertEqual(result["decision"], "PASS")
+        self.assertIn("consensus_price_dispersion_above_maximum", result["pass_reasons"])
+
     def test_model_market_divergence_uses_probability_gap(self):
         decision = {"lineup_confidence": .9, "candidates": [
             {"market": "1x2", "selection": "home", "edge": .035},

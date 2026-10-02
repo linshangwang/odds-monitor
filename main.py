@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.71.0"
+VERSION = "0.72.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -37,6 +37,7 @@ MAX_CROWDING = float(os.getenv("MAX_CROWDING", "0.80"))
 MIN_LINEUP_CONFIDENCE = float(os.getenv("MIN_LINEUP_CONFIDENCE", "0.70"))
 HIGH_VARIANCE_MIN_SCRIPT_COVERAGE = float(os.getenv("HIGH_VARIANCE_MIN_SCRIPT_COVERAGE", "0.40"))
 MIN_CONSENSUS_BOOKMAKERS = max(1, int(os.getenv("MIN_CONSENSUS_BOOKMAKERS", "2")))
+MAX_CONSENSUS_PRICE_SPREAD = max(0.01, float(os.getenv("MAX_CONSENSUS_PRICE_SPREAD", "0.25")))
 AUTO_SNAPSHOT_ENABLED = os.getenv("AUTO_SNAPSHOT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 AUTO_SNAPSHOT_POLL_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_POLL_SECONDS", "300")))
 AUTO_SNAPSHOT_WINDOW_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_WINDOW_SECONDS", "600")))
@@ -409,6 +410,21 @@ def _median(values: List[Any]) -> Optional[float]:
     return round(float(median(nums)), 4) if nums else None
 
 
+def _price_dispersion(rows: List[Dict[str, Any]], keys: Tuple[str, ...]) -> Dict[str, Any]:
+    spreads = {}
+    for key in keys:
+        values = [as_float(row.get(key)) for row in rows]
+        valid = [value for value in values if value is not None and value > 1.0]
+        spreads[key] = round(max(valid) - min(valid), 4) if len(valid) >= 2 else 0.0
+    maximum = max(spreads.values(), default=0.0)
+    return {
+        "price_spread_by_selection": spreads,
+        "maximum_price_spread": maximum,
+        "dispersion_eligible": maximum <= MAX_CONSENSUS_PRICE_SPREAD,
+        "maximum_allowed_price_spread": MAX_CONSENSUS_PRICE_SPREAD,
+    }
+
+
 def _consensus_1x2(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     complete = [x for x in rows if all((as_float(x.get(k)) or 0) > 1.0 for k in ("home", "draw", "away"))]
     if not complete:
@@ -418,6 +434,7 @@ def _consensus_1x2(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         "home": _median([x.get("home") for x in complete]),
         "draw": _median([x.get("draw") for x in complete]),
         "away": _median([x.get("away") for x in complete]),
+        **_price_dispersion(complete, ("home", "draw", "away")),
     }
 
 
@@ -443,6 +460,7 @@ def _consensus_line(markets: List[Dict[str, Any]], price_keys: Tuple[str, str]) 
         "method": "modal_line_then_balanced_median_prices", "line": value,
         price_keys[0]: left, price_keys[1]: right,
         "bookmaker_count": len(rows), "bookmakers": sorted({str(r.get('bookmaker')) for r in rows if r.get('bookmaker')}),
+        **_price_dispersion(rows, price_keys),
     }
 
 
@@ -507,7 +525,8 @@ def extract_market_snapshot(odds_result: Dict[str, Any]) -> Dict[str, Any]:
         "away_team_total": _consensus_line(snapshot["markets"]["away_team_total"], ("over", "under")),
     }
     btts = snapshot["markets"]["btts"]
-    consensus["btts"] = ({"method": "median_all_complete_bookmakers", "bookmaker_count": len(btts), "yes": _median([x.get("yes") for x in btts]), "no": _median([x.get("no") for x in btts])} if btts else None)
+    complete_btts = [row for row in btts if (as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1]
+    consensus["btts"] = ({"method": "median_all_complete_bookmakers", "bookmaker_count": len(complete_btts), "yes": _median([x.get("yes") for x in complete_btts]), "no": _median([x.get("no") for x in complete_btts]), **_price_dispersion(complete_btts, ("yes", "no"))} if complete_btts else None)
     snapshot["consensus_main_line"] = consensus
     snapshot["primary"] = dict(consensus)
     snapshot["data_status"] = {key: ("available" if value else "data_missing") for key, value in consensus.items()}
@@ -1123,6 +1142,7 @@ def imported_market_snapshot(stage: Dict[str, Any]) -> Dict[str, Any]:
             "bookmaker_count": len([row for row in markets["btts"] if (as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1]),
             "yes": _median([row.get("yes") for row in markets["btts"] if (as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1]),
             "no": _median([row.get("no") for row in markets["btts"] if (as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1]),
+            **_price_dispersion([row for row in markets["btts"] if (as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1], ("yes", "no")),
         } if any((as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1 for row in markets["btts"]) else None),
         "home_team_total": _consensus_line(markets["home_team_total"], ("over", "under")),
         "away_team_total": _consensus_line(markets["away_team_total"], ("over", "under")),
@@ -1705,6 +1725,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
         bookmaker_count = int(as_float(main.get("bookmaker_count")) or 0) if main.get("bookmaker_count") is not None else None
         market_coverage_eligible = bookmaker_count is None or bookmaker_count >= MIN_CONSENSUS_BOOKMAKERS
         consensus_source_eligible = main.get("source") != "upstream_consensus_fallback"
+        dispersion_eligible = main.get("dispersion_eligible") is not False
         line = as_float(main.get("line")) if market not in ("1x2", "btts") else None
         distribution_name = {"asian_handicap": "goal_difference", "over_under": "total_goals", "home_team_total": "home_goals", "away_team_total": "away_goals"}.get(market)
         distribution = get_nested(model_probabilities or {}, ["settlement_distributions", distribution_name]) if distribution_name else None
@@ -1718,7 +1739,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
                 if not metrics:
                     continue
                 edge = metrics["model_probability"] - market_probability[key]
-                candidates.append({"market": market, "selection": key, "line": line, "price": price, **metrics, "market_no_vig_probability": market_probability[key], "edge": round(edge, 6), "script_coverage": _coverage_for(script_coverage or {}, market, key), "settlement_aware": True, "bookmaker_count": bookmaker_count, "market_coverage_eligible": market_coverage_eligible, "consensus_source_eligible": consensus_source_eligible})
+                candidates.append({"market": market, "selection": key, "line": line, "price": price, **metrics, "market_no_vig_probability": market_probability[key], "edge": round(edge, 6), "script_coverage": _coverage_for(script_coverage or {}, market, key), "settlement_aware": True, "bookmaker_count": bookmaker_count, "market_coverage_eligible": market_coverage_eligible, "consensus_source_eligible": consensus_source_eligible, "dispersion_eligible": dispersion_eligible})
             continue
         model_pair = _model_pair(model_probabilities or {}, market, line)
         if model_pair:
@@ -1730,16 +1751,16 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
         for key in keys:
             model_p, price = model_pair[key], as_float(main.get(key))
             edge, ev = model_p - market_probability[key], model_p * price - 1.0
-            candidates.append({"market": market, "selection": key, "line": line, "price": price, "model_probability": round(model_p, 6), "market_no_vig_probability": market_probability[key], "edge": round(edge, 6), "ev": round(ev, 6), "script_coverage": _coverage_for(script_coverage or {}, market, key), "bookmaker_count": bookmaker_count, "market_coverage_eligible": market_coverage_eligible, "consensus_source_eligible": consensus_source_eligible})
+            candidates.append({"market": market, "selection": key, "line": line, "price": price, "model_probability": round(model_p, 6), "market_no_vig_probability": market_probability[key], "edge": round(edge, 6), "ev": round(ev, 6), "script_coverage": _coverage_for(script_coverage or {}, market, key), "bookmaker_count": bookmaker_count, "market_coverage_eligible": market_coverage_eligible, "consensus_source_eligible": consensus_source_eligible, "dispersion_eligible": dispersion_eligible})
     if model_probabilities and not valid_model_market_count: missing.append("model_probability_invalid_or_not_normalized")
     if not market_probabilities: missing.append("market_no_vig_probability")
     candidates.sort(key=lambda x: (x.get("ev", -999), x.get("edge", -999)), reverse=True)
     best_unfiltered = candidates[0] if candidates else None
-    qualified = [row for row in candidates if row["market_coverage_eligible"] and row["consensus_source_eligible"] and row["edge"] >= MIN_EDGE and row["ev"] >= MIN_EV and as_float(row.get("script_coverage")) is not None and row["script_coverage"] >= MIN_SCRIPT_COVERAGE]
+    qualified = [row for row in candidates if row["market_coverage_eligible"] and row["consensus_source_eligible"] and row["dispersion_eligible"] and row["edge"] >= MIN_EDGE and row["ev"] >= MIN_EV and as_float(row.get("script_coverage")) is not None and row["script_coverage"] >= MIN_SCRIPT_COVERAGE]
     first_choice = max(qualified, key=lambda row: (row["script_coverage"], row["edge"], row["ev"]), default=None)
     second_pool = [row for row in qualified if not first_choice or (row["market"], row["selection"], row.get("line")) != (first_choice["market"], first_choice["selection"], first_choice.get("line"))]
     second_choice = max(second_pool, key=lambda row: (row["ev"], row["edge"], row["script_coverage"]), default=None)
-    high_variance_pool = [row for row in candidates if row["market_coverage_eligible"] and row["consensus_source_eligible"] and row["edge"] >= MIN_EDGE and row["ev"] >= MIN_EV and as_float(row.get("script_coverage")) is not None and HIGH_VARIANCE_MIN_SCRIPT_COVERAGE <= row["script_coverage"] < MIN_SCRIPT_COVERAGE]
+    high_variance_pool = [row for row in candidates if row["market_coverage_eligible"] and row["consensus_source_eligible"] and row["dispersion_eligible"] and row["edge"] >= MIN_EDGE and row["ev"] >= MIN_EV and as_float(row.get("script_coverage")) is not None and HIGH_VARIANCE_MIN_SCRIPT_COVERAGE <= row["script_coverage"] < MIN_SCRIPT_COVERAGE]
     high_variance = max(high_variance_pool, key=lambda row: (row["ev"], row["edge"]), default=None)
     best = first_choice or best_unfiltered
     pass_reasons = list(missing)
@@ -1749,6 +1770,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
     elif best and as_float(best.get("script_coverage")) < MIN_SCRIPT_COVERAGE: pass_reasons.append("script_coverage_below_minimum")
     if best and not best.get("market_coverage_eligible", True): pass_reasons.append("consensus_bookmaker_coverage_below_minimum")
     if best and not best.get("consensus_source_eligible", True): pass_reasons.append("consensus_not_recalculated_from_company_array")
+    if best and not best.get("dispersion_eligible", True): pass_reasons.append("consensus_price_dispersion_above_maximum")
     if crowding is not None and crowding > MAX_CROWDING: pass_reasons.append("crowding_above_maximum")
     if lineup_confidence is not None and lineup_confidence < MIN_LINEUP_CONFIDENCE: pass_reasons.append("lineup_confidence_below_minimum")
     if death_path: pass_reasons.append("death_path_present")
@@ -1771,7 +1793,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
         "line_movement": None, "lineup_confidence": lineup_confidence,
         "death_path": death_path or [], "pass_reasons": pass_reasons,
         "settlement_policy": {"supported_line_increment": 0.25, "quarter_lines": "split into adjacent half-lines", "push_half_win_half_loss": "included in model EV", "unsupported_lines": "PASS"},
-        "thresholds": {"minimum_edge": MIN_EDGE, "minimum_ev": MIN_EV, "minimum_script_coverage": MIN_SCRIPT_COVERAGE, "high_variance_minimum_script_coverage": HIGH_VARIANCE_MIN_SCRIPT_COVERAGE, "maximum_crowding": MAX_CROWDING, "minimum_lineup_confidence": MIN_LINEUP_CONFIDENCE, "minimum_consensus_bookmakers": MIN_CONSENSUS_BOOKMAKERS},
+        "thresholds": {"minimum_edge": MIN_EDGE, "minimum_ev": MIN_EV, "minimum_script_coverage": MIN_SCRIPT_COVERAGE, "high_variance_minimum_script_coverage": HIGH_VARIANCE_MIN_SCRIPT_COVERAGE, "maximum_crowding": MAX_CROWDING, "minimum_lineup_confidence": MIN_LINEUP_CONFIDENCE, "minimum_consensus_bookmakers": MIN_CONSENSUS_BOOKMAKERS, "maximum_consensus_price_spread": MAX_CONSENSUS_PRICE_SPREAD},
     }
 
 

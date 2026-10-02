@@ -212,6 +212,7 @@ T-1h、T-15m 或 Closing 信号继续保持 pending，等待对应阶段的新�
 pang 导入的六类盘口均优先从完整公司数组重新计算 Consensus Main Line；只有对应公司数组不完整时才使用上游共识，并以 `upstream_consensus_fallback` 和 `consensus_audit` 明确标注，绝不把上游 primary 当作无条件真值。
 Consensus 样本少于两家公司时仍可展示概率和价差，但不能形成最终建议，输出 `consensus_bookmaker_coverage_below_minimum` 并 PASS；阈值可通过 `MIN_CONSENSUS_BOOKMAKERS` 调整。
 标记为 `upstream_consensus_fallback` 的盘口同样只用于展示与监控，不能形成最终建议；系统必须取得公司数组并自行重算后才能解除该 PASS 门槛。
+系统同时计算同一主盘口各公司的价格离散度。任一选项的最大价差超过默认 0.25 时，标记 `dispersion_eligible=false` 并强制 PASS；阈值可通过 `MAX_CONSENSUS_PRICE_SPREAD` 调整。
 总完整度至少需达到0.6，且 Result Utility、Rotation Quality、Execution Ability、Goal Conversion
 四个关键环节不得缺失。证据不足时仍生成概率供审计，但最终建议强制 PASS。
 `available` 或 `partial` 不能只写状态：必须同时包含至少一个实质字段，例如证据、变量值或明确
