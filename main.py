@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.33.0"
+VERSION = "0.34.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -699,14 +699,44 @@ def load_snapshot_store() -> Dict[str, Any]:
             raise SnapshotStoreReadError("snapshot_store_read_failed; existing_file_was_not_overwritten") from exc
 
 
+def snapshot_backup_path() -> Path:
+    p = Path(SNAPSHOT_STORE_PATH)
+    return p.with_suffix(p.suffix + ".bak")
+
+
+def load_snapshot_backup_store() -> Dict[str, Any]:
+    backup = snapshot_backup_path()
+    if not backup.exists():
+        raise SnapshotStoreReadError("snapshot_store_backup_not_found")
+    try:
+        raw = backup.read_bytes()
+        if raw.startswith(b"\x1f\x8b"):
+            raw = gzip.decompress(raw)
+        store = json.loads(raw.decode("utf-8"))
+        if not isinstance(store, dict):
+            raise ValueError("snapshot backup root must be an object")
+        return store
+    except SnapshotStoreReadError:
+        raise
+    except Exception as exc:
+        print("[SNAPSHOT_STORE] backup read failed: " + type(exc).__name__)
+        raise SnapshotStoreReadError("snapshot_store_backup_read_failed") from exc
+
+
 def write_snapshot_store(store: Dict[str, Any]) -> bool:
     with SNAPSHOT_STORE_LOCK:
         tmp = None
+        backup_tmp = None
         try:
             p = Path(SNAPSHOT_STORE_PATH); p.parent.mkdir(parents=True, exist_ok=True)
             tmp = p.with_suffix(p.suffix + ".tmp")
+            backup = snapshot_backup_path()
+            backup_tmp = backup.with_suffix(backup.suffix + ".tmp")
             raw = json.dumps(store, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            tmp.write_bytes(gzip.compress(raw, compresslevel=6) if SNAPSHOT_STORE_GZIP else raw)
+            encoded = gzip.compress(raw, compresslevel=6) if SNAPSHOT_STORE_GZIP else raw
+            tmp.write_bytes(encoded)
+            backup_tmp.write_bytes(encoded)
+            backup_tmp.replace(backup)
             tmp.replace(p)
             return True
         except Exception as exc:
@@ -714,6 +744,11 @@ def write_snapshot_store(store: Dict[str, Any]) -> bool:
             if tmp is not None:
                 try:
                     tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            if backup_tmp is not None:
+                try:
+                    backup_tmp.unlink(missing_ok=True)
                 except Exception:
                     pass
             raise SnapshotStoreWriteError("snapshot_store_write_failed") from exc
