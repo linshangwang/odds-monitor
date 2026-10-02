@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.80.0"
+VERSION = "0.81.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1399,7 +1399,12 @@ def market_saturation(ms: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def compare_market_snapshots(history: List[Dict[str, Any]], current: Dict[str, Any], stage: str) -> Dict[str, Any]:
-    previous = history[-1] if history else None
+    if stage in PREMATCH_STAGE_ORDER:
+        current_index = PREMATCH_STAGE_ORDER.index(stage)
+        earlier = [row for row in history if row.get("stage") in PREMATCH_STAGE_ORDER and PREMATCH_STAGE_ORDER.index(row.get("stage")) < current_index]
+        previous = max(earlier, key=lambda row: (PREMATCH_STAGE_ORDER.index(row.get("stage")), int(row.get("snapshot_at") or 0)), default=None)
+    else:
+        previous = max(history, key=lambda row: int(row.get("snapshot_at") or 0), default=None)
     prev = previous.get("market_snapshot") if previous else None
     curp = current.get("primary", {}) if current else {}
     prevp = prev.get("primary", {}) if prev else {}

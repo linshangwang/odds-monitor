@@ -302,6 +302,26 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(dynamics["cross_market_directional_signals"]["total_over_strength"], .04)
         self.assertEqual(dynamics["cross_market_directional_signals"]["btts_yes_strength"], -.03)
 
+    def test_market_comparison_never_uses_future_stage_as_previous(self):
+        history = [
+            {"stage": "T-24h", "snapshot_at": 100, "market_snapshot": {"primary": {"1x2": {"home": 2.0, "draw": 3.5, "away": 4.0}}}},
+            {"stage": "T-1h", "snapshot_at": 300, "market_snapshot": {"primary": {"1x2": {"home": 1.7, "draw": 3.8, "away": 5.0}}}},
+            {"stage": "Closing", "snapshot_at": 400, "market_snapshot": {"primary": {"1x2": {"home": 1.6, "draw": 4.0, "away": 5.5}}}},
+        ]
+        current = main.empty_market_snapshot()
+        current["primary"]["1x2"] = {"home": 1.9, "draw": 3.6, "away": 4.2}
+        dynamics = main.compare_market_snapshots(history, current, "T-6h")
+        self.assertEqual(dynamics["previous_stage"], "T-24h")
+        self.assertAlmostEqual(dynamics["market_movements"]["1x2"]["home"], -.1)
+
+    def test_opening_never_uses_later_stage_as_history(self):
+        history = [{"stage": "T-24h", "snapshot_at": 200, "market_snapshot": {"primary": {"1x2": {"home": 2.0}}}}]
+        current = main.empty_market_snapshot()
+        current["primary"]["1x2"] = {"home": 2.1}
+        dynamics = main.compare_market_snapshots(history, current, "Opening")
+        self.assertEqual(dynamics["comparison_status"], "data_missing")
+        self.assertIsNone(dynamics["previous_stage"])
+
     def test_consensus_deduplicates_bookmaker_name_variants(self):
         consensus = main._consensus_1x2([
             {"bookmaker": "Book A", "home": 2.0, "draw": 3.4, "away": 4.0},
