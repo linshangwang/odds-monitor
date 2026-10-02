@@ -502,6 +502,16 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("open_game_beneficiary", audit["structural_issues"])
         self.assertIn("time_segment_strength", audit["structural_issues"])
 
+    def test_fundamental_chain_rejects_market_contamination(self):
+        chain = {key: {"status": "data_missing"} for key in main.FUNDAMENTAL_CHAIN}
+        chain["tactical_matchup"] = {"status": "partial", "source": "bookmaker market odds", "observed_at": 1790989200, "evidence": "price shortened"}
+        chain["game_state_elasticity"] = {"status": "partial", "source": "analyst", "observed_at": 1790989200, "market_probability": .62}
+        audit = main.audit_fundamental_chain({"chain": chain}, now_ts=1790989200)
+        self.assertFalse(audit["decision_eligible"])
+        self.assertIn("tactical_matchup", audit["market_contaminated_sections"])
+        self.assertIn("game_state_elasticity", audit["market_contaminated_sections"])
+        self.assertIn("market_probability", " ".join(audit["market_contaminated_sections"]["game_state_elasticity"]))
+
     def test_fundamental_chain_rejects_empty_available_and_unknown_status(self):
         chain = {key: {"status": "available", "evidence": f"verified-{key}", "source": "trusted-feed"} for key in main.FUNDAMENTAL_CHAIN}
         chain["result_utility"] = {"status": "available"}

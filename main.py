@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.48.0"
+VERSION = "0.49.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1569,6 +1569,31 @@ def audit_fundamental_chain(script: Dict[str, Any], now_ts: Optional[int] = None
             critical_timestamp_issues[key] = {"issue": issue, "observed_at": raw_timestamp, "age_seconds": age, "max_age_seconds": max_age}
     semantic_issues = {}
     structural_issues = {}
+    market_contaminated_sections = {}
+    forbidden_market_keys = {"odds", "market_odds", "bookmaker", "market_probability", "market_no_vig_probability", "implied_probability", "line_movement", "market_snapshot"}
+    forbidden_source_tokens = ("bookmaker", "betting odds", "market odds", "no-vig", "implied probability")
+
+    def contamination_paths(value: Any, path: str = "") -> List[str]:
+        found = []
+        if isinstance(value, dict):
+            for field, child in value.items():
+                child_path = f"{path}.{field}" if path else str(field)
+                if str(field).lower() in forbidden_market_keys:
+                    found.append(child_path)
+                found.extend(contamination_paths(child, child_path))
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                found.extend(contamination_paths(child, f"{path}[{index}]"))
+        elif isinstance(value, str) and path.lower().split(".")[-1] in {"source", "provenance"}:
+            lowered = value.lower()
+            if any(token in lowered for token in forbidden_source_tokens):
+                found.append(path)
+        return found
+
+    for key in FUNDAMENTAL_CHAIN:
+        paths = contamination_paths(chain.get(key) or {})
+        if paths:
+            market_contaminated_sections[key] = sorted(set(paths))
     result_utility = chain.get("result_utility") or {}
     for side in ("home", "away"):
         side_values = result_utility.get(side) if isinstance(result_utility.get(side), dict) else {}
@@ -1628,7 +1653,7 @@ def audit_fundamental_chain(script: Dict[str, Any], now_ts: Optional[int] = None
         if absent:
             structural_issues["goal_conversion_edges"] = {"missing_fields": absent, "rule": "strength_edge_goal_edge_and_margin_edge_are_distinct"}
     completeness = sum(scores.values()) / len(FUNDAMENTAL_CHAIN)
-    eligible = completeness >= 0.6 and not critical_missing and not critical_provenance_missing and not critical_timestamp_issues and not semantic_issues and not structural_issues
+    eligible = completeness >= 0.6 and not critical_missing and not critical_provenance_missing and not critical_timestamp_issues and not semantic_issues and not structural_issues and not market_contaminated_sections
     return {
         "status": "eligible" if eligible else "insufficient",
         "decision_eligible": eligible, "completeness_score": round(completeness, 4),
@@ -1642,6 +1667,7 @@ def audit_fundamental_chain(script: Dict[str, Any], now_ts: Optional[int] = None
         "critical_max_age_seconds": CRITICAL_FUNDAMENTAL_MAX_AGE_SECONDS,
         "critical_semantic_issues": semantic_issues,
         "structural_issues": structural_issues,
+        "market_contaminated_sections": market_contaminated_sections,
         "critical_schema": {
             "result_utility": "home/away each require numeric win, draw, loss",
             "rotation_quality": "home/away each require at least 4 named quality fields; numeric scores must be 0..1",
@@ -1650,7 +1676,8 @@ def audit_fundamental_chain(script: Dict[str, Any], now_ts: Optional[int] = None
         },
         "evidence_rule": "available or partial requires at least one substantive field beyond status/reason/warning",
         "provenance_rule": "critical sections require source or provenance and a valid type-specific observed_at/as_of",
-        "policy": "probability generation remains available; final recommendation must PASS when insufficient",
+        "odds_independence_rule": "fundamental sections must not contain odds, bookmaker, market probability, implied probability, market snapshot, or line movement inputs",
+        "policy": "probability generation remains available; final recommendation must PASS when insufficient or market-contaminated",
     }
 
 
