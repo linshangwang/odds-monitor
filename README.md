@@ -154,6 +154,9 @@ Selection Change、Robustness Change、Risk Downgrade to PASS 和 Recovery from 
 组合接口对外严格校验：请求体必须是对象，`max_legs` 必须为2–10的整数，风险偏好只能是
 conservative、balanced、aggressive，复核原因必须是数组。异常输入返回明确的400/422，
 不会因类型错误产生500；内部旧调用仍使用安全默认值并限制在2–10腿。
+
+持久化写入采用同目录临时文件后原子替换。写盘或替换失败时不再只记录日志并假装保存成功，
+而是清理临时文件并抛出统一的 `snapshot_store_write_failed`；只有原子替换完成才返回成功。
 再输出综合过关第一首选、综合过关次首选和高博弈单关。2 腿是偏稳健建议，3 腿是默认
 平衡建议，4 腿以上作为可选扩展高波动方案；用户可用 `max_legs` 指定 2–10 的展示上限，
 不是只能选择 2–3 腿。同一 `correlation_group` 最多一腿，同一比赛不能重复提交。

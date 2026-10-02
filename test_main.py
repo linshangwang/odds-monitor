@@ -548,6 +548,12 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             handle.write(b'{"version":"legacy","fixtures":{}}')
         self.assertEqual(main.load_snapshot_store()["version"], "legacy")
 
+    def test_snapshot_store_write_failure_is_never_reported_as_success(self):
+        with patch("pathlib.Path.write_bytes", side_effect=OSError("disk full")):
+            with self.assertRaises(main.SnapshotStoreWriteError) as raised:
+                main.write_snapshot_store({"version": main.VERSION, "fixtures": {}})
+        self.assertEqual(str(raised.exception), "snapshot_store_write_failed")
+
     def test_shadow_token_supports_header_and_bearer(self):
         self.assertEqual(main.resolve_shadow_token("query", None, "header"), "header")
         self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer-value", None), "bearer-value")
