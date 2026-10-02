@@ -241,6 +241,17 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(len(main.get_portfolio_runs("test-set")), 3)
         self.assertEqual(third["recommendation"]["decision"], "PASS")
 
+    def test_portfolio_history_timeline_never_backfills_missing_stages(self):
+        portfolio = {"risk_preference": "balanced", "portfolio_decision": "PASS", "risk_adjusted_recommendation": {"decision": "PASS", "reason": "test"}}
+        opening = main.save_portfolio_run("timeline", ["a", "b"], portfolio, 3, [], "Opening")
+        closing = main.save_portfolio_run("timeline", ["a", "b"], portfolio, 3, [], "Closing")
+        timeline = main.portfolio_run_timeline([opening, closing])
+        self.assertEqual([row["stage"] for row in timeline], main.PREMATCH_STAGE_ORDER)
+        self.assertEqual(timeline[0]["status"], "available")
+        self.assertEqual(timeline[1]["status"], "data_missing")
+        self.assertEqual(timeline[-1]["status"], "available")
+        self.assertIn("not backfilled", timeline[1]["reason"])
+
     def test_independent_poisson_model_is_normalized_and_symmetric(self):
         model = main.poisson_probability_model(1.4, 1.4, 0.8, {"source": "verified_team_metrics", "uses_market_odds": False})
         self.assertTrue(model["ok"])

@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.25.0"
+VERSION = "0.26.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1530,7 +1530,7 @@ def _portfolio_recommendation_signature(portfolio: Dict[str, Any]) -> Dict[str, 
     }
 
 
-def save_portfolio_run(portfolio_id: str, fixtures: List[str], portfolio: Dict[str, Any], max_legs: int, trigger_reasons: List[str]) -> Dict[str, Any]:
+def save_portfolio_run(portfolio_id: str, fixtures: List[str], portfolio: Dict[str, Any], max_legs: int, trigger_reasons: List[str], stage: str = "manual") -> Dict[str, Any]:
     with SNAPSHOT_STORE_LOCK:
         store = load_snapshot_store()
         runs = store.setdefault("portfolio_runs", {}).setdefault(portfolio_id, [])
@@ -1539,6 +1539,7 @@ def save_portfolio_run(portfolio_id: str, fixtures: List[str], portfolio: Dict[s
         record = {
             "version_number": len(runs) + 1, "created_at": int(time.time()), "portfolio_id": portfolio_id,
             "fixtures": fixtures, "risk_preference": portfolio.get("risk_preference"), "max_legs": max_legs,
+            "stage": stage,
             "trigger_reasons": trigger_reasons or ["portfolio_evaluation"],
             "recommendation": signature,
             "recommendation_change": {"changed": previous_signature != signature, "before": previous_signature, "after": signature},
@@ -1553,6 +1554,20 @@ def save_portfolio_run(portfolio_id: str, fixtures: List[str], portfolio: Dict[s
 
 def get_portfolio_runs(portfolio_id: str) -> List[Dict[str, Any]]:
     return list(load_snapshot_store().get("portfolio_runs", {}).get(portfolio_id, []))
+
+
+def portfolio_run_timeline(runs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    latest_by_stage = {}
+    for run in runs:
+        stage = run.get("stage")
+        if stage in PREMATCH_STAGE_ORDER and (stage not in latest_by_stage or int(run.get("created_at") or 0) >= int(latest_by_stage[stage].get("created_at") or 0)):
+            latest_by_stage[stage] = run
+    return [
+        {"stage": stage, "status": "available", "run": latest_by_stage[stage]}
+        if stage in latest_by_stage else
+        {"stage": stage, "status": "data_missing", "reason": "portfolio was not evaluated at this checkpoint; later recommendations were not backfilled"}
+        for stage in PREMATCH_STAGE_ORDER
+    ]
 
 
 def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6, risk_preference: str = "balanced") -> Dict[str, Any]:
@@ -1961,7 +1976,10 @@ async def shadow_portfolio_evaluate(request: Request, token: Optional[str] = Non
     trigger_reasons = list(dict.fromkeys(
         str(reason) for match in matches for reason in get_nested(match, ["revalidation_trigger", "reasons"], []) if reason
     ))
-    portfolio_run = save_portfolio_run(portfolio_id, fixtures, portfolio, max_legs, trigger_reasons)
+    stage = normalize_stage(str(payload.get("stage") or "manual"))
+    if stage != "manual" and stage not in PREMATCH_STAGE_ORDER:
+        raise HTTPException(status_code=422, detail="stage_must_be_opening_or_supported_t_minus_checkpoint")
+    portfolio_run = save_portfolio_run(portfolio_id, fixtures, portfolio, max_legs, trigger_reasons, stage)
     return JSONResponse({"ok": True, "version": VERSION, "portfolio_id": portfolio_id, "evaluations": rows, "portfolio": portfolio, "portfolio_run": portfolio_run})
 
 
@@ -1971,7 +1989,7 @@ def shadow_portfolio_history(portfolio_id: str, token: Optional[str] = None, aut
     runs = get_portfolio_runs(portfolio_id)
     if not runs:
         raise HTTPException(status_code=404, detail="portfolio_history_not_found")
-    return JSONResponse({"ok": True, "version": VERSION, "portfolio_id": portfolio_id, "count": len(runs), "runs": runs})
+    return JSONResponse({"ok": True, "version": VERSION, "portfolio_id": portfolio_id, "count": len(runs), "timeline": portfolio_run_timeline(runs), "manual_runs": [run for run in runs if run.get("stage") == "manual"], "runs": runs})
 
 
 def build_imported_ai_packet(fixture: str, include_companies: bool = False, include_lineups: bool = False) -> Dict[str, Any]:
