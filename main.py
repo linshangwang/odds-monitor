@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.32.0"
+VERSION = "0.33.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -100,6 +100,10 @@ STARTUP_COLLECT: Dict[str, Any] = {}
 
 
 class SnapshotStoreWriteError(RuntimeError):
+    pass
+
+
+class SnapshotStoreReadError(RuntimeError):
     pass
 
 
@@ -679,16 +683,20 @@ def tracking_plan_for_fixture(summary: Dict[str, Any]) -> Dict[str, Any]:
 
 def load_snapshot_store() -> Dict[str, Any]:
     with SNAPSHOT_STORE_LOCK:
+        p = Path(SNAPSHOT_STORE_PATH)
+        if not p.exists():
+            return {"version": VERSION, "fixtures": {}}
         try:
-            p = Path(SNAPSHOT_STORE_PATH)
-            if p.exists():
-                raw = p.read_bytes()
-                if raw.startswith(b"\x1f\x8b"):
-                    raw = gzip.decompress(raw)
-                return json.loads(raw.decode("utf-8"))
+            raw = p.read_bytes()
+            if raw.startswith(b"\x1f\x8b"):
+                raw = gzip.decompress(raw)
+            store = json.loads(raw.decode("utf-8"))
+            if not isinstance(store, dict):
+                raise ValueError("snapshot store root must be an object")
+            return store
         except Exception as exc:
-            print("[SNAPSHOT_STORE] read failed: " + str(exc))
-        return {"version": VERSION, "fixtures": {}}
+            print("[SNAPSHOT_STORE] read failed: " + type(exc).__name__)
+            raise SnapshotStoreReadError("snapshot_store_read_failed; existing_file_was_not_overwritten") from exc
 
 
 def write_snapshot_store(store: Dict[str, Any]) -> bool:

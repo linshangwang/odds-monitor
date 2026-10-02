@@ -554,6 +554,21 @@ class ShadowV4UpgradeTests(unittest.TestCase):
                 main.write_snapshot_store({"version": main.VERSION, "fixtures": {}})
         self.assertEqual(str(raised.exception), "snapshot_store_write_failed")
 
+    def test_corrupt_existing_snapshot_store_is_not_treated_as_empty(self):
+        with open(main.SNAPSHOT_STORE_PATH, "wb") as handle:
+            handle.write(b"not-json-and-not-gzip")
+        with self.assertRaises(main.SnapshotStoreReadError) as raised:
+            main.load_snapshot_store()
+        self.assertIn("existing_file_was_not_overwritten", str(raised.exception))
+        with open(main.SNAPSHOT_STORE_PATH, "rb") as handle:
+            self.assertEqual(handle.read(), b"not-json-and-not-gzip")
+
+    def test_non_object_snapshot_store_is_rejected(self):
+        with open(main.SNAPSHOT_STORE_PATH, "wb") as handle:
+            handle.write(b"[]")
+        with self.assertRaises(main.SnapshotStoreReadError):
+            main.load_snapshot_store()
+
     def test_shadow_token_supports_header_and_bearer(self):
         self.assertEqual(main.resolve_shadow_token("query", None, "header"), "header")
         self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer-value", None), "bearer-value")
