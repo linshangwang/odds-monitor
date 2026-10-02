@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.65.0"
+VERSION = "0.66.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1170,7 +1170,7 @@ def normalize_information_search(value: Any, snapshot_at: Optional[int] = None) 
     return result
 
 
-def import_prematch_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
+def import_prematch_packet(packet: Dict[str, Any], store_override: Optional[Dict[str, Any]] = None, persist: bool = True) -> Dict[str, Any]:
     if not isinstance(packet, dict):
         raise HTTPException(status_code=400, detail="packet_must_be_an_object")
     if packet.get("schema_version") != "shadow_prematch_packet_v1":
@@ -1206,7 +1206,7 @@ def import_prematch_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
         record["stage_timing_audit"] = audit_stage_timing(stage, record["snapshot_at"], match.get("kickoff_utc"))
         records.append(record)
     with SNAPSHOT_STORE_LOCK:
-        store = load_snapshot_store()
+        store = store_override if store_override is not None else load_snapshot_store()
         external_prematch = store.setdefault("external_prematch", {})
         previous_meta = external_prematch.get(fixture) or {}
         next_meta_content = {
@@ -1260,9 +1260,18 @@ def import_prematch_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
         if accepted or metadata_changed:
             external_prematch[fixture] = {**next_meta_content, "imported_at": int(time.time())}
             store["version"] = VERSION
-            write_snapshot_store(store)
+            if persist:
+                write_snapshot_store(store)
     counts = {action: sum(1 for row in imported if row["action"] == action) for action in ("inserted", "updated", "unchanged", "stale_skipped")}
     return {"fixture": fixture, "match": f"{match.get('home_team_name')} vs {match.get('away_team_name')}", "stages": imported, "counts": counts, "changed": bool(accepted or metadata_changed), "metadata_changed": metadata_changed, "revalidation_tasks_created": len(queued)}
+
+
+def import_prematch_packet_batch(packets: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Validate and merge a batch in memory, then persist it exactly once."""
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        results = [import_prematch_packet(packet, store_override=store, persist=False) for packet in packets]
+        return results, store
 
 
 def line_from_primary(primary: Optional[Dict[str, Any]]) -> Optional[float]:
@@ -2531,9 +2540,8 @@ async def shadow_import_prematch_packets(request: Request, token: Optional[str] 
         raise HTTPException(status_code=400, detail="one_or_more_packets_required")
     if len(packets) > 100:
         raise HTTPException(status_code=413, detail="maximum_100_packets_per_request")
-    results = [import_prematch_packet(packet) for packet in packets]
     with SNAPSHOT_STORE_LOCK:
-        store = load_snapshot_store()
+        results, store = import_prematch_packet_batch(packets)
         previous = store.get("import_sync_status") or {}
         totals = {key: sum(row.get("counts", {}).get(key, 0) for row in results) for key in ("inserted", "updated", "unchanged", "stale_skipped")}
         store["import_sync_status"] = {

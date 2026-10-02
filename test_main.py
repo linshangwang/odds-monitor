@@ -884,6 +884,24 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(second["counts"]["unchanged"], 2)
         self.assertFalse(second["changed"])
 
+    def test_batch_import_merges_in_memory_without_partial_persistence(self):
+        first = self.prematch_packet()
+        second = self.prematch_packet()
+        second["match"] = {**second["match"], "match_id": "uuid-2"}
+        with patch.object(main, "write_snapshot_store") as writer:
+            results, store = main.import_prematch_packet_batch([first, second])
+        self.assertEqual(writer.call_count, 0)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(set(store["fixtures"]), {"uuid-1", "uuid-2"})
+
+    def test_batch_import_failure_does_not_persist_earlier_packets(self):
+        valid = self.prematch_packet()
+        invalid = {**self.prematch_packet(), "schema_version": "unsupported"}
+        with patch.object(main, "write_snapshot_store") as writer:
+            with self.assertRaises(main.HTTPException):
+                main.import_prematch_packet_batch([valid, invalid])
+        self.assertEqual(writer.call_count, 0)
+
     def test_imported_market_move_creates_deduplicated_revalidation_task(self):
         packet = self.prematch_packet()
         moved = dict(packet["timeline"][0])
