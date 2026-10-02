@@ -145,6 +145,9 @@ Selection Change、Robustness Change、Risk Downgrade to PASS 和 Recovery from 
 及基本面版本号。没有事实证据时标记 `data_missing`，不会仅因推荐变化而推断基本面发生变化。
 
 完整赛前评估新增 `fundamental_chain_audit`：available计1、partial计0.5、data_missing计0，
+并校验五种比赛状态、首次进球双方路径、六个时间分段、开放局面受益方，以及
+`Strength Edge / Goal Edge / Margin Edge` 三层是否分别给出。结构不完整会明确列入
+`structural_issues` 并强制 PASS。响应同时提供精简的 `decision_summary`，便于前端直接展示。
 总完整度至少需达到0.6，且 Result Utility、Rotation Quality、Execution Ability、Goal Conversion
 四个关键环节不得缺失。证据不足时仍生成概率供审计，但最终建议强制 PASS。
 `available` 或 `partial` 不能只写状态：必须同时包含至少一个实质字段，例如证据、变量值或明确

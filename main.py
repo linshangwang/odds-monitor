@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.40.0"
+VERSION = "0.41.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1459,6 +1459,7 @@ def audit_fundamental_chain(script: Dict[str, Any], now_ts: Optional[int] = None
         if issue:
             critical_timestamp_issues[key] = {"issue": issue, "observed_at": raw_timestamp, "age_seconds": age, "max_age_seconds": max_age}
     semantic_issues = {}
+    structural_issues = {}
     result_utility = chain.get("result_utility") or {}
     for side in ("home", "away"):
         side_values = result_utility.get(side) if isinstance(result_utility.get(side), dict) else {}
@@ -1490,8 +1491,35 @@ def audit_fundamental_chain(script: Dict[str, Any], now_ts: Optional[int] = None
             negative_fields = [field for field in numeric_fields if as_float(side_values.get(field)) < 0]
             if negative_fields:
                 semantic_issues.setdefault(section_name, {}).setdefault(side, {})["negative_numeric_fields"] = negative_fields
+    # These sections are not hard-critical individually, but an "available" claim must
+    # describe the complete state model instead of a free-form note.
+    required_nested_fields = {
+        "game_state_elasticity": ("states", ("0_0_persists", "home_scores_first", "away_scores_first", "draw_at_60", "trailing_last_30")),
+        "time_segment_strength": ("segments", ("0_15", "16_30", "31_45", "46_60", "61_75", "76_90")),
+    }
+    for section_name, (container_name, required_fields) in required_nested_fields.items():
+        section = chain.get(section_name) if isinstance(chain.get(section_name), dict) else {}
+        if str(section.get("status") or "data_missing").lower() not in weights:
+            continue
+        container = section.get(container_name) if isinstance(section.get(container_name), dict) else {}
+        absent = [field for field in required_fields if container.get(field) in (None, "", [], {})]
+        if absent:
+            structural_issues[section_name] = {"container": container_name, "missing_fields": absent}
+    first_goal = chain.get("first_goal_state_transition") if isinstance(chain.get("first_goal_state_transition"), dict) else {}
+    if str(first_goal.get("status") or "data_missing").lower() in weights:
+        absent = [field for field in ("home_first", "away_first") if first_goal.get(field) in (None, "", [], {})]
+        if absent:
+            structural_issues["first_goal_state_transition"] = {"missing_fields": absent}
+    open_game = chain.get("open_game_beneficiary") if isinstance(chain.get("open_game_beneficiary"), dict) else {}
+    if str(open_game.get("status") or "data_missing").lower() in weights and str(open_game.get("team") or "").lower() not in {"home", "away", "neither", "uncertain"}:
+        structural_issues["open_game_beneficiary"] = {"reason": "team_must_be_home_away_neither_or_uncertain"}
+    conversion = chain.get("goal_conversion") if isinstance(chain.get("goal_conversion"), dict) else {}
+    if str(conversion.get("status") or "data_missing").lower() in weights:
+        absent = [field for field in ("strength_edge", "goal_edge", "margin_edge") if conversion.get(field) in (None, "", [], {})]
+        if absent:
+            structural_issues["goal_conversion_edges"] = {"missing_fields": absent, "rule": "strength_edge_goal_edge_and_margin_edge_are_distinct"}
     completeness = sum(scores.values()) / len(FUNDAMENTAL_CHAIN)
-    eligible = completeness >= 0.6 and not critical_missing and not critical_provenance_missing and not critical_timestamp_issues and not semantic_issues
+    eligible = completeness >= 0.6 and not critical_missing and not critical_provenance_missing and not critical_timestamp_issues and not semantic_issues and not structural_issues
     return {
         "status": "eligible" if eligible else "insufficient",
         "decision_eligible": eligible, "completeness_score": round(completeness, 4),
@@ -1504,6 +1532,7 @@ def audit_fundamental_chain(script: Dict[str, Any], now_ts: Optional[int] = None
         "critical_timestamp_issues": critical_timestamp_issues,
         "critical_max_age_seconds": CRITICAL_FUNDAMENTAL_MAX_AGE_SECONDS,
         "critical_semantic_issues": semantic_issues,
+        "structural_issues": structural_issues,
         "critical_schema": {
             "result_utility": "home/away each require numeric win, draw, loss",
             "rotation_quality": "home/away each require at least 4 named quality fields; numeric scores must be 0..1",
@@ -1513,6 +1542,26 @@ def audit_fundamental_chain(script: Dict[str, Any], now_ts: Optional[int] = None
         "evidence_rule": "available or partial requires at least one substantive field beyond status/reason/warning",
         "provenance_rule": "critical sections require source or provenance and a valid type-specific observed_at/as_of",
         "policy": "probability generation remains available; final recommendation must PASS when insufficient",
+    }
+
+
+def build_decision_summary(decision: Dict[str, Any], chain_audit: Dict[str, Any], model: Dict[str, Any]) -> Dict[str, Any]:
+    best = decision.get("best_market") or {}
+    passed = decision.get("decision") == "PASS"
+    return {
+        "decision": decision.get("decision"),
+        "status": "pass" if passed else "actionable",
+        "recommended_market": None if passed else best.get("market"),
+        "recommended_selection": None if passed else best.get("selection"),
+        "line": None if passed else best.get("line"),
+        "price": None if passed else best.get("price"),
+        "edge": None if passed else best.get("edge"),
+        "ev": None if passed else best.get("ev"),
+        "script_coverage": None if passed else best.get("script_coverage"),
+        "model_status": model.get("status"),
+        "fundamental_chain_status": chain_audit.get("status"),
+        "pass_reasons": decision.get("pass_reasons") or [],
+        "explanation": "No bet: one or more mandatory gates failed." if passed else "Selection passed model, price, script and risk gates.",
     }
 
 
@@ -1577,7 +1626,8 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
     ) if persist_version else None
     return {
         "ok": True, "version": VERSION, "fixture": fixture, "estimator": estimator, "model": model,
-        "decision_layer": decision, "fundamental_chain_audit": chain_audit, "fundamental_version": version_record,
+        "decision_layer": decision, "decision_summary": build_decision_summary(decision, chain_audit, model),
+        "fundamental_chain_audit": chain_audit, "fundamental_version": version_record,
     }
 
 

@@ -386,6 +386,8 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(first["decision_layer"]["data_freshness"]["state"], "fresh")
         self.assertNotIn("market_no_vig_probability", first["decision_layer"]["pass_reasons"])
         self.assertEqual(first["fundamental_version"]["version_number"], 1)
+        self.assertIn(first["decision_summary"]["status"], {"pass", "actionable"})
+        self.assertEqual(first["decision_summary"]["decision"], first["decision_layer"]["decision"])
         self.assertEqual(second["fundamental_version"]["version_number"], 2)
         self.assertIsNotNone(second["fundamental_version"]["probability_change"]["delta"])
         self.assertIn("fundamental_estimator", second["fundamental_version"]["variable_changes"])
@@ -413,13 +415,30 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         rotation_side = {"starting_xi_strength": .8, "creativity": .7, "finishing": .75, "chemistry": .8}
         chain["rotation_quality"].update({"home": rotation_side, "away": rotation_side})
         chain["execution_ability"].update({"home": {"score": .7}, "away": {"score": .6}})
-        chain["goal_conversion"].update({"home": {"rate": .12}, "away": {"rate": .1}})
+        chain["goal_conversion"].update({"home": {"rate": .12}, "away": {"rate": .1}, "strength_edge": "home", "goal_edge": "home", "margin_edge": "home"})
+        chain["game_state_elasticity"]["states"] = {"0_0_persists": "compact", "home_scores_first": "away_expands", "away_scores_first": "home_expands", "draw_at_60": "both_expand", "trailing_last_30": "trailing_team_expands"}
+        chain["first_goal_state_transition"].update({"home_first": "lower_risk", "away_first": "higher_risk"})
+        chain["open_game_beneficiary"]["team"] = "home"
+        chain["time_segment_strength"]["segments"] = {key: "home" for key in ("0_15", "16_30", "31_45", "46_60", "61_75", "76_90")}
         eligible = main.audit_fundamental_chain({"chain": chain}, now_ts=1790989200)
         self.assertTrue(eligible["decision_eligible"])
         chain["goal_conversion"] = {"status": "data_missing"}
         insufficient = main.audit_fundamental_chain({"chain": chain}, now_ts=1790989200)
         self.assertFalse(insufficient["decision_eligible"])
         self.assertIn("goal_conversion", insufficient["critical_missing"])
+
+    def test_chain_structural_states_and_conversion_edges_are_required(self):
+        now_ts = 1790989200
+        chain = {key: {"status": "data_missing"} for key in main.FUNDAMENTAL_CHAIN}
+        chain["game_state_elasticity"] = {"status": "available", "source": "analyst", "observed_at": now_ts, "states": {"0_0_persists": "compact"}}
+        chain["first_goal_state_transition"] = {"status": "partial", "source": "analyst", "observed_at": now_ts, "home_first": "lower_risk"}
+        chain["open_game_beneficiary"] = {"status": "available", "source": "analyst", "observed_at": now_ts, "team": "both"}
+        chain["time_segment_strength"] = {"status": "available", "source": "events", "observed_at": now_ts, "segments": {"0_15": "home"}}
+        audit = main.audit_fundamental_chain({"chain": chain}, now_ts=now_ts)
+        self.assertIn("game_state_elasticity", audit["structural_issues"])
+        self.assertIn("first_goal_state_transition", audit["structural_issues"])
+        self.assertIn("open_game_beneficiary", audit["structural_issues"])
+        self.assertIn("time_segment_strength", audit["structural_issues"])
 
     def test_fundamental_chain_rejects_empty_available_and_unknown_status(self):
         chain = {key: {"status": "available", "evidence": f"verified-{key}", "source": "trusted-feed"} for key in main.FUNDAMENTAL_CHAIN}
@@ -459,7 +478,11 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         rotation_side = {"starting_xi_strength": .8, "creativity": .7, "finishing": .75, "chemistry": .8}
         chain["rotation_quality"].update({"home": rotation_side, "away": rotation_side})
         chain["execution_ability"].update({"home": {"score": .7}, "away": {"score": .6}})
-        chain["goal_conversion"].update({"home": {"rate": .12}, "away": {"rate": .1}})
+        chain["goal_conversion"].update({"home": {"rate": .12}, "away": {"rate": .1}, "strength_edge": "home", "goal_edge": "home", "margin_edge": "home"})
+        chain["game_state_elasticity"]["states"] = {"0_0_persists": "compact", "home_scores_first": "away_expands", "away_scores_first": "home_expands", "draw_at_60": "both_expand", "trailing_last_30": "trailing_team_expands"}
+        chain["first_goal_state_transition"].update({"home_first": "lower_risk", "away_first": "higher_risk"})
+        chain["open_game_beneficiary"]["team"] = "home"
+        chain["time_segment_strength"]["segments"] = {key: "home" for key in ("0_15", "16_30", "31_45", "46_60", "61_75", "76_90")}
         valid = main.audit_fundamental_chain({"chain": chain}, now_ts=now_ts)
         self.assertTrue(valid["decision_eligible"])
         del chain["result_utility"]["away"]["loss"]
@@ -503,6 +526,8 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         with patch("main.time.time", return_value=latest + 60):
             result = main.evaluate_imported_prematch(payload)
         self.assertEqual(result["decision_layer"]["decision"], "PASS")
+        self.assertEqual(result["decision_summary"]["status"], "pass")
+        self.assertIsNone(result["decision_summary"]["recommended_market"])
         self.assertIn("fundamental_chain_insufficient", result["decision_layer"]["pass_reasons"])
         self.assertEqual(result["fundamental_chain_audit"]["status"], "insufficient")
 
