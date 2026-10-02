@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.63.0"
+VERSION = "0.64.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -953,6 +953,35 @@ def resolve_revalidation_tasks(fixture: str, version_record: Optional[Dict[str, 
                     "probability_change": version_record.get("probability_change"),
                     "best_market_change": version_record.get("best_market_change"),
                     "resolved_through_stage": resolved_through_stage,
+                })
+                changed += 1
+        if changed:
+            store["version"] = VERSION
+            write_snapshot_store(store)
+        return changed
+
+
+def record_incomplete_revalidation_attempt(fixture: str, chain_audit: Dict[str, Any], attempted_through_stage: Optional[str] = None) -> int:
+    """Keep a triggered task pending while proving that a factual recheck was attempted."""
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        changed = 0
+        through_index = PREMATCH_STAGE_ORDER.index(attempted_through_stage) if attempted_through_stage in PREMATCH_STAGE_ORDER else len(PREMATCH_STAGE_ORDER)
+        for task in (store.get("fundamental_revalidation_queue") or {}).values():
+            task_stage = task.get("stage")
+            task_index = PREMATCH_STAGE_ORDER.index(task_stage) if task_stage in PREMATCH_STAGE_ORDER else len(PREMATCH_STAGE_ORDER)
+            if task.get("fixture") == str(fixture) and task.get("status") == "pending" and task_index <= through_index:
+                task.update({
+                    "attempt_count": int(task.get("attempt_count") or 0) + 1,
+                    "last_attempt_at": int(time.time()),
+                    "last_attempt_outcome": "insufficient_verified_fundamental_evidence",
+                    "attempted_through_stage": attempted_through_stage,
+                    "required_evidence": sorted(set(
+                        list(chain_audit.get("critical_missing") or [])
+                        + list(chain_audit.get("critical_provenance_missing") or [])
+                        + list((chain_audit.get("critical_semantic_issues") or {}).keys())
+                        + list((chain_audit.get("critical_structural_issues") or {}).keys())
+                    )),
                 })
                 changed += 1
         if changed:
@@ -2448,6 +2477,12 @@ def shadow_snapshot(fixture: int, stage: str = "manual", raw: bool = False, toke
     dynamics["classification_audit"] = classification
     record = {"version": VERSION, "fixture": fixture, "stage": normalized, "requested_stage": stage, "snapshot_at": int(time.time()), "fixture_info": data.get("fixture"), "data_quality": data.get("data_quality"), "coverage": data.get("coverage"), "market_snapshot": market_snapshot, "market_dynamics": dynamics, "pure_fundamental_script_hash": script.get("content_hash"), "fundamental_version_number": (fundamental_version or {}).get("version_number"), "shadow_summary": data.get("shadow_summary")}
     saved = save_snapshot(record)
+    chain_audit = audit_fundamental_chain(script)
+    if saved.get("revalidation_task_created"):
+        if chain_audit.get("decision_eligible"):
+            saved["revalidation_tasks_resolved"] = resolve_revalidation_tasks(str(fixture), fundamental_version, False, normalized)
+        else:
+            saved["revalidation_attempts_recorded"] = record_incomplete_revalidation_attempt(str(fixture), chain_audit, normalized)
     print("[SHADOW_SNAPSHOT] " + json.dumps({"stage": normalized, "fixture": fixture, "data_quality": data.get("data_quality"), "market_dynamics": dynamics, "summary": data.get("shadow_summary")}, ensure_ascii=False)[:6000])
     return JSONResponse({"ok": True, "saved": saved, "stage": normalized, "snapshot_at": record["snapshot_at"], "fixture": fixture, "market_snapshot": market_snapshot, "market_dynamics": dynamics, "pure_fundamental_script": script, "fundamental_version": fundamental_version, "data": data})
 
@@ -2999,7 +3034,13 @@ def auto_snapshot_cycle() -> None:
                             dynamics["classification"] = classification["classification"]
                             dynamics["classification_audit"] = classification
                             record = {"version": VERSION, "fixture": int(fx["fixture_id"]), "stage": key, "requested_stage": "auto", "snapshot_at": int(time.time()), "fixture_info": data.get("fixture"), "data_quality": data.get("data_quality"), "coverage": data.get("coverage"), "market_snapshot": market_snapshot, "market_dynamics": dynamics, "pure_fundamental_script_hash": script.get("content_hash"), "fundamental_version_number": (fundamental_version or {}).get("version_number"), "shadow_summary": data.get("shadow_summary")}
-                            save_snapshot(record)
+                            saved = save_snapshot(record)
+                            if saved.get("revalidation_task_created"):
+                                chain_audit = audit_fundamental_chain(script)
+                                if chain_audit.get("decision_eligible"):
+                                    resolve_revalidation_tasks(str(fx["fixture_id"]), fundamental_version, False, key)
+                                else:
+                                    record_incomplete_revalidation_attempt(str(fx["fixture_id"]), chain_audit, key)
                             print("[AUTO_SNAPSHOT] saved " + json.dumps({"fixture": fx["fixture_id"], "stage": key, "due": due.isoformat()}, ensure_ascii=False))
                         except Exception as exc:
                             print("[AUTO_SNAPSHOT] fixture failed: " + str(exc))

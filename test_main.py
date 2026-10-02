@@ -1008,6 +1008,20 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(queue["current"]["status"], "revalidated")
         self.assertEqual(queue["later"]["status"], "pending")
 
+    def test_incomplete_revalidation_attempt_stays_pending_with_missing_evidence(self):
+        main.write_snapshot_store({"version": main.VERSION, "fixtures": {}, "fundamental_revalidation_queue": {
+            "task": {"task_id": "task", "fixture": "fixture-1", "stage": "T-3h", "status": "pending", "created_at": 1},
+            "later": {"task_id": "later", "fixture": "fixture-1", "stage": "T-15m", "status": "pending", "created_at": 1},
+        }})
+        audit = {"critical_missing": ["result_utility"], "critical_provenance_missing": ["rotation_quality"], "critical_semantic_issues": {}, "critical_structural_issues": {}}
+        recorded = main.record_incomplete_revalidation_attempt("fixture-1", audit, "T-3h")
+        queue = main.load_snapshot_store()["fundamental_revalidation_queue"]
+        self.assertEqual(recorded, 1)
+        self.assertEqual(queue["task"]["status"], "pending")
+        self.assertEqual(queue["task"]["attempt_count"], 1)
+        self.assertEqual(queue["task"]["required_evidence"], ["result_utility", "rotation_quality"])
+        self.assertNotIn("last_attempt_at", queue["later"])
+
     def test_first_revalidation_version_does_not_claim_fundamental_change(self):
         main.write_snapshot_store({"version": main.VERSION, "fixtures": {}, "fundamental_revalidation_queue": {
             "task": {"task_id": "task", "fixture": "fixture-1", "status": "pending"}
