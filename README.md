@@ -154,6 +154,9 @@ Selection Change、Robustness Change、Risk Downgrade to PASS 和 Recovery from 
 只有实际完成新的基本面版本计算后任务才会转为 `revalidated`，盘口变化本身不会改写基本面。
 队列会结合 T-X 节点、触发类型和等待时间生成 normal/high/critical 优先级；等待超过30分钟的
 pending 任务标记为 overdue，并在 `/shadow/import-status` 汇总待处理与逾期数量。
+任务结案会保存所用基本面版本、证据状态、变化字段、概率变化和最优盘口变化；只有相对旧版本
+发现真实事实变化时才标记 `Fundamental Confirmed`，首次建模不会被误判为基本面变化，否则归为
+`Market-Only Move`。
 总完整度至少需达到0.6，且 Result Utility、Rotation Quality、Execution Ability、Goal Conversion
 四个关键环节不得缺失。证据不足时仍生成概率供审计，但最终建议强制 PASS。
 `available` 或 `partial` 不能只写状态：必须同时包含至少一个实质字段，例如证据、变量值或明确

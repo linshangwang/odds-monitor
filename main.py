@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.43.0"
+VERSION = "0.44.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -827,15 +827,28 @@ def _enqueue_revalidation(store: Dict[str, Any], fixture: str, row: Dict[str, An
     return task
 
 
-def resolve_revalidation_tasks(fixture: str, version_number: Optional[int]) -> int:
-    if version_number is None:
+def resolve_revalidation_tasks(fixture: str, version_record: Optional[Dict[str, Any]]) -> int:
+    if not version_record or version_record.get("version_number") is None:
         return 0
+    changed_information = list(version_record.get("changed_information") or [])
+    prior_version_exists = int(version_record.get("version_number") or 0) > 1
+    substantive_change = prior_version_exists and bool(changed_information)
+    resolution_classification = "Fundamental Confirmed" if substantive_change else "Market-Only Move"
     with SNAPSHOT_STORE_LOCK:
         store = load_snapshot_store()
         changed = 0
         for task in (store.get("fundamental_revalidation_queue") or {}).values():
             if task.get("fixture") == str(fixture) and task.get("status") == "pending":
-                task.update({"status": "revalidated", "resolved_at": int(time.time()), "fundamental_version_number": version_number})
+                task.update({
+                    "status": "revalidated", "resolved_at": int(time.time()),
+                    "fundamental_version_number": version_record.get("version_number"),
+                    "evidence_status": "verified_fundamental_chain",
+                    "resolution_classification": resolution_classification,
+                    "fundamental_changed": substantive_change,
+                    "changed_information": changed_information if substantive_change else [],
+                    "probability_change": version_record.get("probability_change"),
+                    "best_market_change": version_record.get("best_market_change"),
+                })
                 changed += 1
         if changed:
             store["version"] = VERSION
@@ -1687,7 +1700,7 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
         fixture, script, trigger, previous=previous,
         probability_change=probability_change, best_market_change=best_market_change,
     ) if persist_version else None
-    resolved_revalidations = resolve_revalidation_tasks(fixture, (version_record or {}).get("version_number")) if version_record and trigger.get("triggered") and chain_audit.get("decision_eligible") else 0
+    resolved_revalidations = resolve_revalidation_tasks(fixture, version_record) if version_record and trigger.get("triggered") and chain_audit.get("decision_eligible") else 0
     return {
         "ok": True, "version": VERSION, "fixture": fixture, "estimator": estimator, "model": model,
         "decision_layer": decision, "decision_summary": build_decision_summary(decision, chain_audit, model),

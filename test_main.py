@@ -746,6 +746,31 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertTrue(viewed[0]["overdue"])
         self.assertFalse(viewed[1]["overdue"])
 
+    def test_revalidation_resolution_records_evidence_and_actual_change(self):
+        main.write_snapshot_store({"version": main.VERSION, "fixtures": {}, "fundamental_revalidation_queue": {
+            "task": {"task_id": "task", "fixture": "fixture-1", "stage": "T-3h", "status": "pending", "reasons": ["significant_line_move"]}
+        }})
+        version = {
+            "version_number": 2, "changed_information": ["rotation_quality"],
+            "probability_change": {"delta": {"home": -.03, "draw": .01, "away": .02}},
+            "best_market_change": {"changed": True, "before": "home", "after": "away"},
+        }
+        self.assertEqual(main.resolve_revalidation_tasks("fixture-1", version), 1)
+        task = main.load_snapshot_store()["fundamental_revalidation_queue"]["task"]
+        self.assertEqual(task["resolution_classification"], "Fundamental Confirmed")
+        self.assertEqual(task["evidence_status"], "verified_fundamental_chain")
+        self.assertTrue(task["fundamental_changed"])
+        self.assertEqual(task["changed_information"], ["rotation_quality"])
+
+    def test_first_revalidation_version_does_not_claim_fundamental_change(self):
+        main.write_snapshot_store({"version": main.VERSION, "fixtures": {}, "fundamental_revalidation_queue": {
+            "task": {"task_id": "task", "fixture": "fixture-1", "status": "pending"}
+        }})
+        main.resolve_revalidation_tasks("fixture-1", {"version_number": 1, "changed_information": main.FUNDAMENTAL_CHAIN})
+        task = main.load_snapshot_store()["fundamental_revalidation_queue"]["task"]
+        self.assertEqual(task["resolution_classification"], "Market-Only Move")
+        self.assertFalse(task["fundamental_changed"])
+
     def test_incremental_import_skips_stale_stage(self):
         packet = self.prematch_packet()
         main.import_prematch_packet(packet)
