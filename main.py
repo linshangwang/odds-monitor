@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.51.0"
+VERSION = "0.52.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -799,7 +799,8 @@ def complete_prematch_timeline(rows: List[Dict[str, Any]]) -> List[Dict[str, Any
     for stage in PREMATCH_STAGE_ORDER:
         row = by_stage.get(stage)
         if row:
-            timeline.append({**row, "timeline_status": row.get("import_status") or ("available" if get_nested(row, ["market_snapshot", "available"]) else "data_missing"), "synthetic_placeholder": False})
+            usable = row.get("import_status") != "data_missing" and bool(get_nested(row, ["market_snapshot", "available"]))
+            timeline.append({**row, "timeline_status": "available" if usable else "data_missing", "synthetic_placeholder": False})
         else:
             timeline.append({
                 "stage": stage, "timeline_status": "data_missing", "import_status": "data_missing",
@@ -808,6 +809,24 @@ def complete_prematch_timeline(rows: List[Dict[str, Any]]) -> List[Dict[str, Any
                 "synthetic_placeholder": True, "backfilled_from_current": False,
             })
     return timeline
+
+
+def audit_line_movement_timeline(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    timeline = complete_prematch_timeline(rows)
+    available = [row for row in timeline if row.get("timeline_status") == "available"]
+    comparable = [row for row in available if get_nested(row, ["market_dynamics", "comparison_status"]) == "compared"]
+    latest = max(available, key=lambda row: int(row.get("snapshot_at") or 0), default=None)
+    latest_comparable = get_nested(latest or {}, ["market_dynamics", "comparison_status"]) == "compared"
+    eligible = len(available) >= 2 and latest_comparable
+    return {
+        "decision_eligible": eligible,
+        "available_stage_count": len(available), "required_minimum_available_stages": 2,
+        "comparable_stage_count": len(comparable), "latest_stage": (latest or {}).get("stage"),
+        "latest_comparison_status": get_nested(latest or {}, ["market_dynamics", "comparison_status"]) or "data_missing",
+        "reason": None if eligible else "line_movement_requires_two_real_comparable_stages",
+        "missing_stages": [row["stage"] for row in timeline if row.get("timeline_status") == "data_missing"],
+        "current_odds_used_as_history": False,
+    }
 
 
 def save_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -1764,17 +1783,21 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
     latest = max(available, key=lambda row: int(row.get("snapshot_at") or 0), default=None)
     market = (latest or {}).get("market_snapshot") or empty_market_snapshot()
     freshness = imported_fixture_freshness(metadata, history)
+    line_movement_audit = audit_line_movement_timeline(history)
     decision = decision_layer(
         market, model.get("probabilities"), payload.get("script_coverage"),
         as_float(payload.get("crowding")), lineup_audit.get("effective_confidence"), payload.get("death_path") or [],
     )
     decision["lineup_confidence_audit"] = lineup_audit
     decision["line_movement"] = (latest or {}).get("market_dynamics") or {"status": "data_missing"}
+    decision["line_movement_audit"] = line_movement_audit
     decision["data_freshness"] = freshness
     if model.get("status") != "ready":
         decision["pass_reasons"].append("model_input_confidence_below_0_6")
     if not freshness.get("decision_eligible"):
         decision["pass_reasons"].append(freshness.get("reason") or "data_not_fresh")
+    if not line_movement_audit.get("decision_eligible"):
+        decision["pass_reasons"].append(line_movement_audit["reason"])
     decision["pass_reasons"] = list(dict.fromkeys(decision["pass_reasons"]))
     if decision["pass_reasons"]:
         decision["decision"] = "PASS"

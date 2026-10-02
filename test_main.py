@@ -36,6 +36,16 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(t_one["timeline_status"], "available")
         self.assertFalse(t_one["synthetic_placeholder"])
 
+    def test_line_movement_gate_requires_two_real_comparable_stages(self):
+        opening = {"stage": "Opening", "snapshot_at": 1, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "data_missing"}}
+        single = main.audit_line_movement_timeline([opening])
+        self.assertFalse(single["decision_eligible"])
+        later = {"stage": "T-12h", "snapshot_at": 2, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "compared"}}
+        complete = main.audit_line_movement_timeline([opening, later])
+        self.assertTrue(complete["decision_eligible"])
+        self.assertEqual(complete["available_stage_count"], 2)
+        self.assertFalse(complete["current_odds_used_as_history"])
+
     def test_consensus_uses_all_books_not_first_book_primary(self):
         result = api_football_odds([
             {"name": "Outlier", "bets": [{"name": "Match Winner", "values": [{"value": "Home", "odd": "9.0"}, {"value": "Draw", "odd": "9.0"}, {"value": "Away", "odd": "1.1"}]}, {"name": "Asian Handicap", "values": [{"value": "Home -1", "odd": "1.9"}, {"value": "Away -1", "odd": "1.9"}]}]},
