@@ -202,6 +202,7 @@ T-X 变盘比较现覆盖全部可用市场：1X2、AH、O/U、BTTS、主队进�
 T-1h、T-15m 或 Closing 信号继续保持 pending，等待对应阶段的新事实复核。
 `Likely Information-Driven` 只在变盘已触发、信息状态为 `suspected_unconfirmed` 且至少存在一个
 证据引用时使用；“暂时找不到原因”不再被包装成信息盘。每次分类附 `classification_audit.basis`。
+外部导入的 `information_search.evidence_refs` 会限制数量和长度，并校验结构化证据的来源、定位符与观察时间；未来时间或不可识别来源只进入审计，不参与信息盘分类。
 总完整度至少需达到0.6，且 Result Utility、Rotation Quality、Execution Ability、Goal Conversion
 四个关键环节不得缺失。证据不足时仍生成概率供审计，但最终建议强制 PASS。
 `available` 或 `partial` 不能只写状态：必须同时包含至少一个实质字段，例如证据、变量值或明确

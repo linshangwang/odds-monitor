@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.61.0"
+VERSION = "0.62.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1072,6 +1072,57 @@ def _content_hash(value: Any) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def normalize_information_search(value: Any, snapshot_at: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    allowed_statuses = {"not_searched", "no_evidence_found", "suspected_unconfirmed", "confirmed"}
+    status = str(value.get("status") or "not_searched").strip().lower()
+    invalid_reasons: List[str] = []
+    if status not in allowed_statuses:
+        invalid_reasons.append("unsupported_status")
+        status = "not_searched"
+    raw_refs = value.get("evidence_refs")
+    if raw_refs is None:
+        raw_refs = []
+    if not isinstance(raw_refs, list):
+        raw_refs = []
+        invalid_reasons.append("evidence_refs_not_array")
+    normalized_refs: List[Any] = []
+    for ref in raw_refs[:20]:
+        if isinstance(ref, str):
+            cleaned = ref.strip()
+            if cleaned and len(cleaned) <= 500 and not any(ord(char) < 32 for char in cleaned):
+                normalized_refs.append(cleaned)
+            else:
+                invalid_reasons.append("invalid_string_reference")
+        elif isinstance(ref, dict):
+            source = str(ref.get("source") or "").strip()
+            locator = str(ref.get("url") or ref.get("id") or ref.get("title") or "").strip()
+            observed_at = ref.get("observed_at")
+            observed_ts = _parse_timestamp(observed_at) if observed_at is not None else None
+            future = observed_at is not None and snapshot_at is not None and (observed_ts is None or observed_ts > snapshot_at + 300)
+            if source and locator and len(source) <= 100 and len(locator) <= 1000 and not future:
+                normalized_refs.append({key: ref.get(key) for key in ("source", "url", "id", "title", "observed_at") if ref.get(key) is not None})
+            else:
+                invalid_reasons.append("invalid_structured_reference")
+        else:
+            invalid_reasons.append("unsupported_reference_type")
+    if len(raw_refs) > 20:
+        invalid_reasons.append("evidence_reference_limit_exceeded")
+    result = {key: value.get(key) for key in ("query", "searched_at", "notes") if value.get(key) is not None}
+    result.update({
+        "status": status,
+        "evidence_refs": normalized_refs,
+        "evidence_audit": {
+            "valid_count": len(normalized_refs),
+            "invalid_count": len(invalid_reasons),
+            "invalid_reasons": sorted(set(invalid_reasons)),
+            "decision_eligible": bool(normalized_refs),
+        },
+    })
+    return result
+
+
 def import_prematch_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(packet, dict):
         raise HTTPException(status_code=400, detail="packet_must_be_an_object")
@@ -1094,14 +1145,16 @@ def import_prematch_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
         seen.add(stage)
         status = "available" if stage_data.get("status") == "available" else "data_missing"
         market_snapshot = imported_market_snapshot(stage_data)
-        source_hash = _content_hash({"stage": stage, "status": status, "market_snapshot": market_snapshot, "missing_reason": stage_data.get("reason"), "latest_observed_at": stage_data.get("latest_observed_at"), "target_at": stage_data.get("target_at"), "kickoff_utc": match.get("kickoff_utc"), "information_search": stage_data.get("information_search")})
+        snapshot_at = _parse_timestamp(stage_data.get("latest_observed_at") or stage_data.get("target_at")) or int(time.time())
+        information_search = normalize_information_search(stage_data.get("information_search"), snapshot_at)
+        source_hash = _content_hash({"stage": stage, "status": status, "market_snapshot": market_snapshot, "missing_reason": stage_data.get("reason"), "latest_observed_at": stage_data.get("latest_observed_at"), "target_at": stage_data.get("target_at"), "kickoff_utc": match.get("kickoff_utc"), "information_search": information_search})
         record = {
             "version": VERSION, "fixture": fixture, "external_fixture_id": fixture, "source": "pang_import",
-            "stage": stage, "snapshot_at": _parse_timestamp(stage_data.get("latest_observed_at") or stage_data.get("target_at")) or int(time.time()),
+            "stage": stage, "snapshot_at": snapshot_at,
             "fixture_info": match, "data_quality": packet.get("data_quality"), "coverage": {"source": "pang", "quote_count": stage_data.get("quote_count"), "bookmaker_count": stage_data.get("bookmaker_count")},
             "import_status": status, "missing_reason": stage_data.get("reason") if status == "data_missing" else None,
             "market_snapshot": market_snapshot, "source_content_hash": source_hash, "market_dynamics": None,
-            "information_search": stage_data.get("information_search") if isinstance(stage_data.get("information_search"), dict) else None,
+            "information_search": information_search,
         }
         record["stage_timing_audit"] = audit_stage_timing(stage, record["snapshot_at"], match.get("kickoff_utc"))
         records.append(record)
@@ -1351,7 +1404,9 @@ def classify_market_move_details(dynamics: Dict[str, Any], previous_version: Opt
     else:
         information = dynamics.get("information_search") if isinstance(dynamics.get("information_search"), dict) else {}
         evidence_refs = information.get("evidence_refs") if isinstance(information.get("evidence_refs"), list) else []
-        suspected = information.get("status") == "suspected_unconfirmed" and any(str(ref).strip() for ref in evidence_refs)
+        evidence_audit = information.get("evidence_audit") if isinstance(information.get("evidence_audit"), dict) else None
+        evidence_eligible = bool(evidence_audit.get("decision_eligible")) if evidence_audit is not None else any(str(ref).strip() for ref in evidence_refs)
+        suspected = information.get("status") == "suspected_unconfirmed" and evidence_eligible
         if get_nested(dynamics, ["revalidation_trigger", "triggered"]) and suspected:
             classification, basis = "Likely Information-Driven", "explicit_unconfirmed_information_with_evidence_reference"
         else:

@@ -125,6 +125,27 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         result = main.classify_market_move_details(dynamics, None, None)
         self.assertEqual(result["classification"], "Market-Only Move")
 
+    def test_information_search_rejects_future_or_unidentifiable_evidence(self):
+        normalized = main.normalize_information_search({
+            "status": "suspected_unconfirmed",
+            "evidence_refs": [
+                {"source": "press", "title": "report", "observed_at": "2030-01-01T00:00:00Z"},
+                {"source": "", "title": "anonymous"},
+            ],
+        }, snapshot_at=1000)
+        self.assertFalse(normalized["evidence_audit"]["decision_eligible"])
+        result = main.classify_market_move_details({"revalidation_trigger": {"triggered": True}, "information_search": normalized}, None, None)
+        self.assertEqual(result["classification"], "Market-Only Move")
+
+    def test_information_search_accepts_bounded_structured_evidence(self):
+        normalized = main.normalize_information_search({
+            "status": "suspected_unconfirmed",
+            "evidence_refs": [{"source": "club_press_conference", "id": "report-1", "observed_at": "1970-01-01T00:10:00Z"}],
+        }, snapshot_at=1000)
+        self.assertTrue(normalized["evidence_audit"]["decision_eligible"])
+        result = main.classify_market_move_details({"revalidation_trigger": {"triggered": True}, "information_search": normalized}, None, None)
+        self.assertEqual(result["classification"], "Likely Information-Driven")
+
     def test_optional_markets_participate_in_movement_and_divergence(self):
         previous = {"stage": "T-3h", "market_snapshot": {"primary": {
             "over_under": {"line": 2.5, "over": 1.9, "under": 1.9},
