@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.79.0"
+VERSION = "0.80.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1576,23 +1576,29 @@ def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict
 
 
 def classify_market_move_details(dynamics: Dict[str, Any], previous_version: Optional[Dict[str, Any]], new_script: Optional[Dict[str, Any]], model_market_divergence: bool = False) -> Dict[str, Any]:
-    if dynamics.get("cross_market_divergence"):
-        classification, basis = "Cross-Market Divergence", "cross_market_signals_disagree"
-    elif model_market_divergence:
-        classification, basis = "Model-Market Divergence", "eligible_model_probability_differs_from_market"
-    elif previous_version and new_script and get_nested(previous_version, ["script", "content_hash"]) != new_script.get("content_hash"):
-        classification, basis = "Fundamental Confirmed", "verified_fundamental_version_changed"
-    else:
-        information = dynamics.get("information_search") if isinstance(dynamics.get("information_search"), dict) else {}
-        evidence_refs = information.get("evidence_refs") if isinstance(information.get("evidence_refs"), list) else []
-        evidence_audit = information.get("evidence_audit") if isinstance(information.get("evidence_audit"), dict) else None
-        evidence_eligible = bool(evidence_audit.get("decision_eligible")) if evidence_audit is not None else any(str(ref).strip() for ref in evidence_refs)
-        suspected = information.get("status") == "suspected_unconfirmed" and evidence_eligible
-        if get_nested(dynamics, ["revalidation_trigger", "triggered"]) and suspected:
-            classification, basis = "Likely Information-Driven", "explicit_unconfirmed_information_with_evidence_reference"
-        else:
-            classification, basis = "Market-Only Move", "no_verified_fundamental_change"
-    return {"classification": classification, "basis": basis, "inferred_without_evidence": False}
+    information = dynamics.get("information_search") if isinstance(dynamics.get("information_search"), dict) else {}
+    evidence_refs = information.get("evidence_refs") if isinstance(information.get("evidence_refs"), list) else []
+    evidence_audit = information.get("evidence_audit") if isinstance(information.get("evidence_audit"), dict) else None
+    evidence_eligible = bool(evidence_audit.get("decision_eligible")) if evidence_audit is not None else any(str(ref).strip() for ref in evidence_refs)
+    suspected = information.get("status") == "suspected_unconfirmed" and evidence_eligible and bool(get_nested(dynamics, ["revalidation_trigger", "triggered"]))
+    fundamental_changed = bool(previous_version and new_script and get_nested(previous_version, ["script", "content_hash"]) != new_script.get("content_hash"))
+    conditions = [
+        ("Fundamental Confirmed", fundamental_changed, "verified_fundamental_version_changed"),
+        ("Model-Market Divergence", bool(model_market_divergence), "eligible_model_probability_differs_from_market"),
+        ("Cross-Market Divergence", bool(dynamics.get("cross_market_divergence")), "cross_market_signals_disagree"),
+        ("Likely Information-Driven", suspected, "explicit_unconfirmed_information_with_evidence_reference"),
+    ]
+    matched = [{"classification": name, "basis": basis} for name, active, basis in conditions if active]
+    if not matched:
+        matched = [{"classification": "Market-Only Move", "basis": "no_verified_fundamental_change"}]
+    primary = matched[0]
+    return {
+        "classification": primary["classification"], "basis": primary["basis"],
+        "matched_classifications": [row["classification"] for row in matched],
+        "classification_bases": {row["classification"]: row["basis"] for row in matched},
+        "primary_precedence": ["Fundamental Confirmed", "Model-Market Divergence", "Cross-Market Divergence", "Likely Information-Driven", "Market-Only Move"],
+        "inferred_without_evidence": False,
+    }
 
 
 def classify_market_move(dynamics: Dict[str, Any], previous_version: Optional[Dict[str, Any]], new_script: Optional[Dict[str, Any]], model_market_divergence: bool = False) -> str:

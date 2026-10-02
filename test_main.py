@@ -146,6 +146,15 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         result = main.classify_market_move_details({"revalidation_trigger": {"triggered": True}, "information_search": normalized}, None, None)
         self.assertEqual(result["classification"], "Likely Information-Driven")
 
+    def test_market_move_classification_preserves_overlapping_signals(self):
+        previous = {"script": {"content_hash": "old"}}
+        script = {"content_hash": "new"}
+        dynamics = {"cross_market_divergence": True, "revalidation_trigger": {"triggered": True}}
+        result = main.classify_market_move_details(dynamics, previous, script, model_market_divergence=True)
+        self.assertEqual(result["classification"], "Fundamental Confirmed")
+        self.assertEqual(result["matched_classifications"], ["Fundamental Confirmed", "Model-Market Divergence", "Cross-Market Divergence"])
+        self.assertIn("Cross-Market Divergence", result["classification_bases"])
+
     def test_optional_markets_participate_in_movement_and_divergence(self):
         previous = {"stage": "T-3h", "market_snapshot": {"primary": {
             "over_under": {"line": 2.5, "over": 1.9, "under": 1.9},
