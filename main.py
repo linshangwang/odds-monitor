@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.26.0"
+VERSION = "0.27.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1530,12 +1530,43 @@ def _portfolio_recommendation_signature(portfolio: Dict[str, Any]) -> Dict[str, 
     }
 
 
+def _portfolio_transition(before: Optional[Dict[str, Any]], after: Dict[str, Any]) -> Dict[str, Any]:
+    if before is None:
+        return {"classification": "Initial Recommendation", "changed": True, "added_legs": after.get("legs") or [], "removed_legs": []}
+    before_decision, after_decision = before.get("decision"), after.get("decision")
+    before_legs = before.get("legs") or []
+    after_legs = after.get("legs") or []
+    leg_key = lambda leg: (str(leg.get("fixture")), str(leg.get("market")), str(leg.get("selection")), str(leg.get("line")))
+    before_map, after_map = {leg_key(leg): leg for leg in before_legs}, {leg_key(leg): leg for leg in after_legs}
+    added = [after_map[key] for key in after_map.keys() - before_map.keys()]
+    removed = [before_map[key] for key in before_map.keys() - after_map.keys()]
+    if before == after:
+        classification = "No Change"
+    elif before_decision != "PASS" and after_decision == "PASS":
+        classification = "Risk Downgrade to PASS"
+    elif before_decision == "PASS" and after_decision != "PASS":
+        classification = "Recovery from PASS"
+    elif added or removed:
+        classification = "Selection Change"
+    elif before.get("robustness") != after.get("robustness"):
+        classification = "Robustness Change"
+    else:
+        classification = "Recommendation Metadata Change"
+    return {
+        "classification": classification, "changed": before != after, "added_legs": added, "removed_legs": removed,
+        "decision_change": {"before": before_decision, "after": after_decision},
+        "source_change": {"before": before.get("source"), "after": after.get("source")},
+        "robustness_change": {"before": before.get("robustness"), "after": after.get("robustness")},
+    }
+
+
 def save_portfolio_run(portfolio_id: str, fixtures: List[str], portfolio: Dict[str, Any], max_legs: int, trigger_reasons: List[str], stage: str = "manual") -> Dict[str, Any]:
     with SNAPSHOT_STORE_LOCK:
         store = load_snapshot_store()
         runs = store.setdefault("portfolio_runs", {}).setdefault(portfolio_id, [])
         signature = _portfolio_recommendation_signature(portfolio)
         previous_signature = (runs[-1].get("recommendation") if runs else None)
+        transition = _portfolio_transition(previous_signature, signature)
         record = {
             "version_number": len(runs) + 1, "created_at": int(time.time()), "portfolio_id": portfolio_id,
             "fixtures": fixtures, "risk_preference": portfolio.get("risk_preference"), "max_legs": max_legs,
@@ -1543,6 +1574,7 @@ def save_portfolio_run(portfolio_id: str, fixtures: List[str], portfolio: Dict[s
             "trigger_reasons": trigger_reasons or ["portfolio_evaluation"],
             "recommendation": signature,
             "recommendation_change": {"changed": previous_signature != signature, "before": previous_signature, "after": signature},
+            "transition": transition,
             "portfolio_decision": portfolio.get("portfolio_decision"),
         }
         runs.append(record)

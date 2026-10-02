@@ -252,6 +252,21 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(timeline[-1]["status"], "available")
         self.assertIn("not backfilled", timeline[1]["reason"])
 
+    def test_portfolio_transition_classifies_leg_change_and_pass_downgrade(self):
+        before = {"decision": "COMBINE", "source": "first_choice_high_consistency", "robustness": "resilient", "legs": [{"fixture": "a", "market": "1x2", "selection": "home", "line": None}]}
+        changed = {"decision": "COMBINE", "source": "first_choice_high_consistency", "robustness": "resilient", "legs": [{"fixture": "b", "market": "btts", "selection": "yes", "line": None}]}
+        selection_transition = main._portfolio_transition(before, changed)
+        self.assertEqual(selection_transition["classification"], "Selection Change")
+        self.assertEqual(selection_transition["added_legs"][0]["fixture"], "b")
+        downgraded = main._portfolio_transition(before, {"decision": "PASS", "source": None, "robustness": None, "legs": []})
+        self.assertEqual(downgraded["classification"], "Risk Downgrade to PASS")
+
+    def test_portfolio_transition_classifies_recovery_and_no_change(self):
+        passed = {"decision": "PASS", "source": None, "robustness": None, "legs": []}
+        active = {"decision": "COMBINE", "source": "first_choice_high_consistency", "robustness": "resilient", "legs": []}
+        self.assertEqual(main._portfolio_transition(passed, active)["classification"], "Recovery from PASS")
+        self.assertEqual(main._portfolio_transition(active, active)["classification"], "No Change")
+
     def test_independent_poisson_model_is_normalized_and_symmetric(self):
         model = main.poisson_probability_model(1.4, 1.4, 0.8, {"source": "verified_team_metrics", "uses_market_odds": False})
         self.assertTrue(model["ok"])

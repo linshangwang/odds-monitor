@@ -138,6 +138,9 @@ Edge、EV、脚本覆盖率、拥挤度和阵容可信度门槛，且不存在 D
 组合评估还可传 `stage`，支持 Opening、T-24h、T-12h、T-6h、T-3h、T-1h、T-15m、Closing。
 历史接口固定返回完整八节点 `timeline`；没有执行组合评估的节点明确为 `data_missing`，后续建议
 不会反向填充早期节点。未传阶段的评估独立列入 `manual_runs`。
+每个保存版本还带有 `transition`：自动区分 Initial Recommendation、No Change、
+Selection Change、Robustness Change、Risk Downgrade to PASS 和 Recovery from PASS，
+并列出新增腿、移除腿以及决策来源和稳健性前后变化。
 再输出综合过关第一首选、综合过关次首选和高博弈单关。2 腿是偏稳健建议，3 腿是默认
 平衡建议，4 腿以上作为可选扩展高波动方案；用户可用 `max_legs` 指定 2–10 的展示上限，
 不是只能选择 2–3 腿。同一 `correlation_group` 最多一腿，同一比赛不能重复提交。
