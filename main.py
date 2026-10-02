@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.44.0"
+VERSION = "0.45.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1082,24 +1082,40 @@ def compare_market_snapshots(history: List[Dict[str, Any]], current: Dict[str, A
     prev = previous.get("market_snapshot") if previous else None
     curp = current.get("primary", {}) if current else {}
     prevp = prev.get("primary", {}) if prev else {}
+    def delta(market: str, field: str) -> Optional[float]:
+        now, before = as_float(get_nested(curp, [market, field])), as_float(get_nested(prevp, [market, field]))
+        return round(now - before, 6) if now is not None and before is not None else None
+
+    movements = {
+        "1x2": {field: delta("1x2", field) for field in ("home", "draw", "away")},
+        "asian_handicap": {field: delta("asian_handicap", field) for field in ("line", "home", "away")},
+        "over_under": {field: delta("over_under", field) for field in ("line", "over", "under")},
+        "btts": {field: delta("btts", field) for field in ("yes", "no")},
+        "home_team_total": {field: delta("home_team_total", field) for field in ("line", "over", "under")},
+        "away_team_total": {field: delta("away_team_total", field) for field in ("line", "over", "under")},
+    }
     ah_now, ah_prev = line_from_primary(curp.get("asian_handicap")), line_from_primary(prevp.get("asian_handicap"))
-    ou_now, ou_prev = line_from_primary(curp.get("over_under")), line_from_primary(prevp.get("over_under"))
-    home_now, home_prev = odd_from_1x2(curp.get("1x2"), "home"), odd_from_1x2(prevp.get("1x2"), "home")
-    away_now, away_prev = odd_from_1x2(curp.get("1x2"), "away"), odd_from_1x2(prevp.get("1x2"), "away")
-    ah_delta = ah_now - ah_prev if ah_now is not None and ah_prev is not None else None
-    ou_delta = ou_now - ou_prev if ou_now is not None and ou_prev is not None else None
+    ah_delta, ou_delta = movements["asian_handicap"]["line"], movements["over_under"]["line"]
+    home_delta, away_delta = movements["1x2"]["home"], movements["1x2"]["away"]
     directions = [line_from_primary(get_nested(r, ["market_snapshot", "primary", "asian_handicap"])) for r in history[-3:]]
     directions = [x for x in directions if x is not None] + ([ah_now] if ah_now is not None else [])
     continuous = len(directions) >= 3 and all(directions[i] <= directions[i+1] for i in range(len(directions)-1))
     reversal = len(directions) >= 3 and ((directions[-3] < directions[-2] and directions[-1] < directions[-2]) or (directions[-3] > directions[-2] and directions[-1] > directions[-2]))
-    home_delta = home_now - home_prev if home_now is not None and home_prev is not None else None
-    away_delta = away_now - away_prev if away_now is not None and away_prev is not None else None
     missing = [key for key, status in (current.get("data_status") or {}).items() if status == "data_missing"]
-    ah_sign = 0 if ah_delta in (None, 0) else (1 if ah_delta > 0 else -1)
-    home_sign = 0 if home_delta in (None, 0) else (1 if home_delta > 0 else -1)
-    cross_market = bool(ah_sign and home_sign and ah_sign == home_sign)
-    significant_price = any(x is not None and abs(x) >= 0.10 for x in (home_delta, away_delta))
-    significant_line = any(x is not None and abs(x) >= 0.25 for x in (ah_delta, ou_delta))
+    def opposed(a: Optional[float], b: Optional[float]) -> bool:
+        return a not in (None, 0) and b not in (None, 0) and a * b < 0
+
+    divergence_pairs = {
+        "1x2_vs_asian_handicap": opposed(-home_delta if home_delta is not None else None, -ah_delta if ah_delta is not None else None),
+        "over_under_vs_btts": opposed(ou_delta, -movements["btts"]["yes"] if movements["btts"]["yes"] is not None else None),
+        "home_1x2_vs_home_team_total": opposed(-home_delta if home_delta is not None else None, movements["home_team_total"]["line"]),
+        "away_1x2_vs_away_team_total": opposed(-away_delta if away_delta is not None else None, movements["away_team_total"]["line"]),
+    }
+    cross_market = any(divergence_pairs.values())
+    price_deltas = [value for market in movements.values() for field, value in market.items() if field != "line"]
+    line_deltas = [movements[market]["line"] for market in ("asian_handicap", "over_under", "home_team_total", "away_team_total")]
+    significant_price = any(value is not None and abs(value) >= 0.10 for value in price_deltas)
+    significant_line = any(value is not None and abs(value) >= 0.25 for value in line_deltas)
     reasons = []
     if significant_line: reasons.append("significant_line_move")
     if significant_price: reasons.append("abnormal_price_move")
@@ -1107,10 +1123,11 @@ def compare_market_snapshots(history: List[Dict[str, Any]], current: Dict[str, A
     return {
         "stage": stage, "previous_stage": previous.get("stage") if previous else None,
         "comparison_status": "data_missing" if not previous else "compared",
+        "market_movements": movements,
         "line_crossing": {"asian_handicap_delta": ah_delta, "asian_handicap_crossed_025_or_more": abs(ah_delta) >= 0.25 if ah_delta is not None else None, "over_under_delta": ou_delta, "over_under_crossed_025_or_more": abs(ou_delta) >= 0.25 if ou_delta is not None else None},
         "water_movement": {"home_1x2_odd_delta": home_delta, "away_1x2_odd_delta": away_delta},
         "continuous_strengthening": continuous, "reversal": reversal,
-        "cross_market_divergence": cross_market,
+        "cross_market_divergence": cross_market, "cross_market_divergence_pairs": divergence_pairs,
         "revalidation_trigger": {"triggered": bool(reasons), "reasons": reasons, "thresholds": {"line": 0.25, "decimal_price": 0.10}},
         "data_missing": missing,
         "market_saturation": market_saturation(current)

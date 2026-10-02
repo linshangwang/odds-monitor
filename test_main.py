@@ -49,6 +49,24 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertTrue(dynamics["revalidation_trigger"]["triggered"])
         self.assertIn("significant_line_move", dynamics["revalidation_trigger"]["reasons"])
 
+    def test_optional_markets_participate_in_movement_and_divergence(self):
+        previous = {"stage": "T-3h", "market_snapshot": {"primary": {
+            "over_under": {"line": 2.5, "over": 1.9, "under": 1.9},
+            "btts": {"yes": 1.8, "no": 2.0},
+            "home_team_total": {"line": 1.5, "over": 1.9, "under": 1.9},
+        }}}
+        current = main.empty_market_snapshot()
+        current["primary"].update({
+            "over_under": {"line": 2.75, "over": 1.75, "under": 2.1},
+            "btts": {"yes": 1.95, "no": 1.85},
+            "home_team_total": {"line": 1.75, "over": 1.75, "under": 2.05},
+        })
+        dynamics = main.compare_market_snapshots([previous], current, "T-1h")
+        self.assertEqual(dynamics["market_movements"]["btts"]["yes"], .15)
+        self.assertEqual(dynamics["market_movements"]["home_team_total"]["line"], .25)
+        self.assertTrue(dynamics["cross_market_divergence_pairs"]["over_under_vs_btts"])
+        self.assertIn("cross_market_divergence", dynamics["revalidation_trigger"]["reasons"])
+
     def test_decision_layer_passes_when_inputs_missing(self):
         result = main.decision_layer(main.empty_market_snapshot())
         self.assertEqual(result["decision"], "PASS")
