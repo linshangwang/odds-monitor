@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.70.0"
+VERSION = "0.71.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1704,6 +1704,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
         main = consensus.get(market) or {}
         bookmaker_count = int(as_float(main.get("bookmaker_count")) or 0) if main.get("bookmaker_count") is not None else None
         market_coverage_eligible = bookmaker_count is None or bookmaker_count >= MIN_CONSENSUS_BOOKMAKERS
+        consensus_source_eligible = main.get("source") != "upstream_consensus_fallback"
         line = as_float(main.get("line")) if market not in ("1x2", "btts") else None
         distribution_name = {"asian_handicap": "goal_difference", "over_under": "total_goals", "home_team_total": "home_goals", "away_team_total": "away_goals"}.get(market)
         distribution = get_nested(model_probabilities or {}, ["settlement_distributions", distribution_name]) if distribution_name else None
@@ -1717,7 +1718,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
                 if not metrics:
                     continue
                 edge = metrics["model_probability"] - market_probability[key]
-                candidates.append({"market": market, "selection": key, "line": line, "price": price, **metrics, "market_no_vig_probability": market_probability[key], "edge": round(edge, 6), "script_coverage": _coverage_for(script_coverage or {}, market, key), "settlement_aware": True, "bookmaker_count": bookmaker_count, "market_coverage_eligible": market_coverage_eligible})
+                candidates.append({"market": market, "selection": key, "line": line, "price": price, **metrics, "market_no_vig_probability": market_probability[key], "edge": round(edge, 6), "script_coverage": _coverage_for(script_coverage or {}, market, key), "settlement_aware": True, "bookmaker_count": bookmaker_count, "market_coverage_eligible": market_coverage_eligible, "consensus_source_eligible": consensus_source_eligible})
             continue
         model_pair = _model_pair(model_probabilities or {}, market, line)
         if model_pair:
@@ -1729,16 +1730,16 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
         for key in keys:
             model_p, price = model_pair[key], as_float(main.get(key))
             edge, ev = model_p - market_probability[key], model_p * price - 1.0
-            candidates.append({"market": market, "selection": key, "line": line, "price": price, "model_probability": round(model_p, 6), "market_no_vig_probability": market_probability[key], "edge": round(edge, 6), "ev": round(ev, 6), "script_coverage": _coverage_for(script_coverage or {}, market, key), "bookmaker_count": bookmaker_count, "market_coverage_eligible": market_coverage_eligible})
+            candidates.append({"market": market, "selection": key, "line": line, "price": price, "model_probability": round(model_p, 6), "market_no_vig_probability": market_probability[key], "edge": round(edge, 6), "ev": round(ev, 6), "script_coverage": _coverage_for(script_coverage or {}, market, key), "bookmaker_count": bookmaker_count, "market_coverage_eligible": market_coverage_eligible, "consensus_source_eligible": consensus_source_eligible})
     if model_probabilities and not valid_model_market_count: missing.append("model_probability_invalid_or_not_normalized")
     if not market_probabilities: missing.append("market_no_vig_probability")
     candidates.sort(key=lambda x: (x.get("ev", -999), x.get("edge", -999)), reverse=True)
     best_unfiltered = candidates[0] if candidates else None
-    qualified = [row for row in candidates if row["market_coverage_eligible"] and row["edge"] >= MIN_EDGE and row["ev"] >= MIN_EV and as_float(row.get("script_coverage")) is not None and row["script_coverage"] >= MIN_SCRIPT_COVERAGE]
+    qualified = [row for row in candidates if row["market_coverage_eligible"] and row["consensus_source_eligible"] and row["edge"] >= MIN_EDGE and row["ev"] >= MIN_EV and as_float(row.get("script_coverage")) is not None and row["script_coverage"] >= MIN_SCRIPT_COVERAGE]
     first_choice = max(qualified, key=lambda row: (row["script_coverage"], row["edge"], row["ev"]), default=None)
     second_pool = [row for row in qualified if not first_choice or (row["market"], row["selection"], row.get("line")) != (first_choice["market"], first_choice["selection"], first_choice.get("line"))]
     second_choice = max(second_pool, key=lambda row: (row["ev"], row["edge"], row["script_coverage"]), default=None)
-    high_variance_pool = [row for row in candidates if row["market_coverage_eligible"] and row["edge"] >= MIN_EDGE and row["ev"] >= MIN_EV and as_float(row.get("script_coverage")) is not None and HIGH_VARIANCE_MIN_SCRIPT_COVERAGE <= row["script_coverage"] < MIN_SCRIPT_COVERAGE]
+    high_variance_pool = [row for row in candidates if row["market_coverage_eligible"] and row["consensus_source_eligible"] and row["edge"] >= MIN_EDGE and row["ev"] >= MIN_EV and as_float(row.get("script_coverage")) is not None and HIGH_VARIANCE_MIN_SCRIPT_COVERAGE <= row["script_coverage"] < MIN_SCRIPT_COVERAGE]
     high_variance = max(high_variance_pool, key=lambda row: (row["ev"], row["edge"]), default=None)
     best = first_choice or best_unfiltered
     pass_reasons = list(missing)
@@ -1747,6 +1748,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
     if best and as_float(best.get("script_coverage")) is None: pass_reasons.append("script_coverage_for_selection_missing")
     elif best and as_float(best.get("script_coverage")) < MIN_SCRIPT_COVERAGE: pass_reasons.append("script_coverage_below_minimum")
     if best and not best.get("market_coverage_eligible", True): pass_reasons.append("consensus_bookmaker_coverage_below_minimum")
+    if best and not best.get("consensus_source_eligible", True): pass_reasons.append("consensus_not_recalculated_from_company_array")
     if crowding is not None and crowding > MAX_CROWDING: pass_reasons.append("crowding_above_maximum")
     if lineup_confidence is not None and lineup_confidence < MIN_LINEUP_CONFIDENCE: pass_reasons.append("lineup_confidence_below_minimum")
     if death_path: pass_reasons.append("death_path_present")

@@ -202,6 +202,14 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("consensus_bookmaker_coverage_below_minimum", result["pass_reasons"])
         self.assertFalse(result["candidates"][0]["market_coverage_eligible"])
 
+    def test_decision_layer_does_not_bet_upstream_consensus_fallback(self):
+        snapshot = main.empty_market_snapshot()
+        snapshot["consensus_main_line"]["1x2"] = {"home": 2.0, "draw": 3.5, "away": 4.0, "bookmaker_count": 4, "source": "upstream_consensus_fallback"}
+        result = main.decision_layer(snapshot, {"home": .55, "draw": .25, "away": .20}, {"home": .8, "draw": .3, "away": .2}, .4, .9, [])
+        self.assertEqual(result["decision"], "PASS")
+        self.assertIn("consensus_not_recalculated_from_company_array", result["pass_reasons"])
+        self.assertFalse(result["candidates"][0]["consensus_source_eligible"])
+
     def test_model_market_divergence_uses_probability_gap(self):
         decision = {"lineup_confidence": .9, "candidates": [
             {"market": "1x2", "selection": "home", "edge": .035},
