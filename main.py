@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.73.0"
+VERSION = "0.74.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -38,6 +38,7 @@ MIN_LINEUP_CONFIDENCE = float(os.getenv("MIN_LINEUP_CONFIDENCE", "0.70"))
 HIGH_VARIANCE_MIN_SCRIPT_COVERAGE = float(os.getenv("HIGH_VARIANCE_MIN_SCRIPT_COVERAGE", "0.40"))
 MIN_CONSENSUS_BOOKMAKERS = max(1, int(os.getenv("MIN_CONSENSUS_BOOKMAKERS", "2")))
 MAX_CONSENSUS_PRICE_SPREAD = max(0.01, float(os.getenv("MAX_CONSENSUS_PRICE_SPREAD", "0.25")))
+MAX_CONSENSUS_NO_VIG_PROBABILITY_SPREAD = max(0.005, float(os.getenv("MAX_CONSENSUS_NO_VIG_PROBABILITY_SPREAD", "0.05")))
 AUTO_SNAPSHOT_ENABLED = os.getenv("AUTO_SNAPSHOT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 AUTO_SNAPSHOT_POLL_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_POLL_SECONDS", "300")))
 AUTO_SNAPSHOT_WINDOW_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_WINDOW_SECONDS", "600")))
@@ -417,11 +418,27 @@ def _price_dispersion(rows: List[Dict[str, Any]], keys: Tuple[str, ...]) -> Dict
         valid = [value for value in values if value is not None and value > 1.0]
         spreads[key] = round(max(valid) - min(valid), 4) if len(valid) >= 2 else 0.0
     maximum = max(spreads.values(), default=0.0)
+    probability_rows = []
+    for row in rows:
+        implied = {key: 1.0 / as_float(row.get(key)) for key in keys if (as_float(row.get(key)) or 0) > 1.0}
+        total = sum(implied.values())
+        if len(implied) == len(keys) and total > 0:
+            probability_rows.append({key: implied[key] / total for key in keys})
+    probability_spreads = {
+        key: round(max(row[key] for row in probability_rows) - min(row[key] for row in probability_rows), 6)
+        if len(probability_rows) >= 2 else 0.0
+        for key in keys
+    }
+    maximum_probability_spread = max(probability_spreads.values(), default=0.0)
     return {
         "price_spread_by_selection": spreads,
         "maximum_price_spread": maximum,
-        "dispersion_eligible": maximum <= MAX_CONSENSUS_PRICE_SPREAD,
+        "price_spread_within_reference": maximum <= MAX_CONSENSUS_PRICE_SPREAD,
         "maximum_allowed_price_spread": MAX_CONSENSUS_PRICE_SPREAD,
+        "no_vig_probability_spread_by_selection": probability_spreads,
+        "maximum_no_vig_probability_spread": maximum_probability_spread,
+        "dispersion_eligible": maximum_probability_spread <= MAX_CONSENSUS_NO_VIG_PROBABILITY_SPREAD,
+        "maximum_allowed_no_vig_probability_spread": MAX_CONSENSUS_NO_VIG_PROBABILITY_SPREAD,
     }
 
 
@@ -1796,7 +1813,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
         "line_movement": None, "lineup_confidence": lineup_confidence,
         "death_path": death_path or [], "pass_reasons": pass_reasons,
         "settlement_policy": {"supported_line_increment": 0.25, "quarter_lines": "split into adjacent half-lines", "push_half_win_half_loss": "included in model EV", "unsupported_lines": "PASS"},
-        "thresholds": {"minimum_edge": MIN_EDGE, "minimum_ev": MIN_EV, "minimum_script_coverage": MIN_SCRIPT_COVERAGE, "high_variance_minimum_script_coverage": HIGH_VARIANCE_MIN_SCRIPT_COVERAGE, "maximum_crowding": MAX_CROWDING, "minimum_lineup_confidence": MIN_LINEUP_CONFIDENCE, "minimum_consensus_bookmakers": MIN_CONSENSUS_BOOKMAKERS, "maximum_consensus_price_spread": MAX_CONSENSUS_PRICE_SPREAD},
+        "thresholds": {"minimum_edge": MIN_EDGE, "minimum_ev": MIN_EV, "minimum_script_coverage": MIN_SCRIPT_COVERAGE, "high_variance_minimum_script_coverage": HIGH_VARIANCE_MIN_SCRIPT_COVERAGE, "maximum_crowding": MAX_CROWDING, "minimum_lineup_confidence": MIN_LINEUP_CONFIDENCE, "minimum_consensus_bookmakers": MIN_CONSENSUS_BOOKMAKERS, "maximum_consensus_price_spread_reference": MAX_CONSENSUS_PRICE_SPREAD, "maximum_consensus_no_vig_probability_spread": MAX_CONSENSUS_NO_VIG_PROBABILITY_SPREAD},
     }
 
 

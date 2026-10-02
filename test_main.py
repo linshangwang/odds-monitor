@@ -217,11 +217,22 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         ])
         self.assertFalse(consensus["dispersion_eligible"])
         self.assertAlmostEqual(consensus["maximum_price_spread"], .4)
+        self.assertGreater(consensus["maximum_no_vig_probability_spread"], .05)
         snapshot = main.empty_market_snapshot()
         snapshot["consensus_main_line"]["1x2"] = consensus
         result = main.decision_layer(snapshot, {"home": .58, "draw": .23, "away": .19}, {"home": .8, "draw": .3, "away": .2}, .4, .9, [])
         self.assertEqual(result["decision"], "PASS")
         self.assertIn("consensus_price_dispersion_above_maximum", result["pass_reasons"])
+
+    def test_probability_dispersion_does_not_over_penalize_long_odds_price_gap(self):
+        consensus = main._consensus_1x2([
+            {"bookmaker": "A", "home": 1.2, "draw": 6.0, "away": 15.0},
+            {"bookmaker": "B", "home": 1.2, "draw": 6.0, "away": 15.4},
+        ])
+        self.assertGreater(consensus["maximum_price_spread"], .25)
+        self.assertFalse(consensus["price_spread_within_reference"])
+        self.assertTrue(consensus["dispersion_eligible"])
+        self.assertLess(consensus["maximum_no_vig_probability_spread"], .05)
 
     def test_consensus_line_tie_uses_market_center_not_shallowest_line(self):
         consensus = main._consensus_line([{
