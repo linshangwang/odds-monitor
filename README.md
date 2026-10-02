@@ -196,6 +196,8 @@ T-X 变盘比较现覆盖全部可用市场：1X2、AH、O/U、BTTS、主队进�
 单独发生修订时也会持久化并重跑时间校验，不再因赔率内容未变化而被忽略。
 复核任务以实际盘口信号生成去重指纹，纯元数据修订不会重复排队；同一比赛同一节点出现新的
 盘口信号时，新任务会将旧 pending 任务标为 `superseded`，队列只保留最新任务待处理。
+队列达到保留上限时只裁剪最旧的 revalidated/superseded 历史，pending 永不静默淘汰；若 pending
+本身超过500条，`/shadow/import-status` 返回 `over_capacity=true`，便于及时扩容或处理积压。
 总完整度至少需达到0.6，且 Result Utility、Rotation Quality、Execution Ability、Goal Conversion
 四个关键环节不得缺失。证据不足时仍生成概率供审计，但最终建议强制 PASS。
 `available` 或 `partial` 不能只写状态：必须同时包含至少一个实质字段，例如证据、变量值或明确

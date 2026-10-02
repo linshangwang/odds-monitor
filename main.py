@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.58.0"
+VERSION = "0.59.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -904,11 +904,22 @@ def _enqueue_revalidation(store: Dict[str, Any], fixture: str, row: Dict[str, An
         "policy": "fact_recheck_required; market_move_alone_must_not_modify_fundamentals",
     }
     queue[task_id] = task
-    if len(queue) > 500:
-        oldest = sorted(queue.values(), key=lambda item: int(item.get("created_at") or 0))[:-500]
-        for item in oldest:
-            queue.pop(item["task_id"], None)
+    _trim_revalidation_queue(queue)
     return task
+
+
+def _trim_revalidation_queue(queue: Dict[str, Dict[str, Any]], limit: int = 500) -> Dict[str, Any]:
+    pending = [task for task in queue.values() if task.get("status") == "pending"]
+    terminal = sorted((task for task in queue.values() if task.get("status") != "pending"), key=lambda task: int(task.get("created_at") or 0), reverse=True)
+    keep_terminal = max(0, limit - len(pending))
+    remove = terminal[keep_terminal:]
+    for task in remove:
+        queue.pop(task.get("task_id"), None)
+    return {
+        "limit": limit, "pending_count": len(pending), "terminal_retained": min(len(terminal), keep_terminal),
+        "terminal_removed": len(remove), "over_capacity": len(pending) > limit,
+        "policy": "pending_tasks_are_never_silently_evicted",
+    }
 
 
 def resolve_revalidation_tasks(fixture: str, version_record: Optional[Dict[str, Any]], model_market_divergence: bool = False) -> int:
@@ -2417,7 +2428,7 @@ def shadow_import_status(token: Optional[str] = None, authorization: Optional[st
     queue = list((store.get("fundamental_revalidation_queue") or {}).values())
     return JSONResponse({
         "ok": True, "version": VERSION, "sync": store.get("import_sync_status") or {"status": "never_imported"},
-        "revalidation": {"pending": sum(task.get("status") == "pending" for task in queue), "overdue": sum(task.get("overdue") for task in revalidation_queue_view(queue) if task.get("status") == "pending")},
+        "revalidation": {"pending": sum(task.get("status") == "pending" for task in queue), "overdue": sum(task.get("overdue") for task in revalidation_queue_view(queue) if task.get("status") == "pending"), "over_capacity": sum(task.get("status") == "pending" for task in queue) > 500, "retention_policy": "pending_tasks_are_never_silently_evicted"},
         "fixture_count": len(metadata), "fixtures": [
             {"fixture": fixture, "league": row.get("league"), "imported_at": row.get("imported_at"), "match": row.get("match")}
             for fixture, row in metadata.items()

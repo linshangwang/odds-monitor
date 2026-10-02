@@ -884,6 +884,22 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(old["status"], "superseded")
         self.assertEqual(old["superseded_by"], second["task_id"])
 
+    def test_revalidation_retention_never_evicts_pending_tasks(self):
+        queue = {f"p-{index}": {"task_id": f"p-{index}", "status": "pending", "created_at": index} for index in range(501)}
+        queue.update({f"done-{index}": {"task_id": f"done-{index}", "status": "revalidated", "created_at": index} for index in range(20)})
+        audit = main._trim_revalidation_queue(queue, limit=500)
+        self.assertEqual(sum(task["status"] == "pending" for task in queue.values()), 501)
+        self.assertEqual(len(queue), 501)
+        self.assertTrue(audit["over_capacity"])
+        self.assertEqual(audit["terminal_removed"], 20)
+        self.assertEqual(audit["policy"], "pending_tasks_are_never_silently_evicted")
+
+    def test_revalidation_retention_keeps_newest_terminal_history(self):
+        queue = {"pending": {"task_id": "pending", "status": "pending", "created_at": 99}}
+        queue.update({f"done-{index}": {"task_id": f"done-{index}", "status": "revalidated", "created_at": index} for index in range(5)})
+        main._trim_revalidation_queue(queue, limit=3)
+        self.assertEqual(set(queue), {"pending", "done-4", "done-3"})
+
     def test_revalidation_queue_prioritizes_late_and_overdue_moves(self):
         tasks = [
             {"task_id": "early", "status": "pending", "stage": "T-24h", "created_at": 9000, "reasons": ["abnormal_price_move"]},
