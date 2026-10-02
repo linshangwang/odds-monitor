@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.36.0"
+VERSION = "0.37.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1413,6 +1413,8 @@ def audit_fundamental_chain(script: Dict[str, Any]) -> Dict[str, Any]:
     allowed_statuses = {"available", "partial", "data_missing"}
     invalid_status_sections = []
     unsubstantiated_sections = []
+    provenance_missing_sections = []
+    timestamp_missing_sections = []
     scores = {}
     for key in FUNDAMENTAL_CHAIN:
         section = chain.get(key) if isinstance(chain.get(key), dict) else {}
@@ -1424,20 +1426,29 @@ def audit_fundamental_chain(script: Dict[str, Any]) -> Dict[str, Any]:
         if status in weights and not substantive_values:
             unsubstantiated_sections.append(key)
             status = "data_missing"
+        if status in weights and not (section.get("source") or section.get("provenance")):
+            provenance_missing_sections.append(key)
+        if status in weights and not (section.get("observed_at") or section.get("as_of")):
+            timestamp_missing_sections.append(key)
         scores[key] = weights.get(status, 0.0)
     missing = [key for key, score in scores.items() if score == 0.0]
     partial = [key for key, score in scores.items() if score == 0.5]
     critical = ["result_utility", "rotation_quality", "execution_ability", "goal_conversion"]
     critical_missing = [key for key in critical if scores.get(key, 0.0) == 0.0]
+    critical_provenance_missing = [key for key in critical if key in provenance_missing_sections]
     completeness = sum(scores.values()) / len(FUNDAMENTAL_CHAIN)
-    eligible = completeness >= 0.6 and not critical_missing
+    eligible = completeness >= 0.6 and not critical_missing and not critical_provenance_missing
     return {
         "status": "eligible" if eligible else "insufficient",
         "decision_eligible": eligible, "completeness_score": round(completeness, 4),
         "minimum_completeness": 0.6, "critical_sections": critical,
         "critical_missing": critical_missing, "missing_sections": missing, "partial_sections": partial,
         "unsubstantiated_sections": unsubstantiated_sections, "invalid_status_sections": invalid_status_sections,
+        "provenance_missing_sections": provenance_missing_sections,
+        "critical_provenance_missing": critical_provenance_missing,
+        "timestamp_missing_sections": timestamp_missing_sections,
         "evidence_rule": "available or partial requires at least one substantive field beyond status/reason/warning",
+        "provenance_rule": "critical sections require source or provenance; observed_at/as_of is audited separately",
         "policy": "probability generation remains available; final recommendation must PASS when insufficient",
     }
 
