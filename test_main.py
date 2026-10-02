@@ -73,6 +73,18 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(audit["status"], "data_missing")
         self.assertTrue(audit["decision_eligible"])
 
+    def test_timeline_sequence_rejects_non_monotonic_stage_times(self):
+        rows = [
+            {"stage": "Opening", "snapshot_at": 200, "import_status": "available", "stage_timing_audit": {"status": "valid"}},
+            {"stage": "T-24h", "snapshot_at": 100, "import_status": "available", "stage_timing_audit": {"status": "valid"}},
+            {"stage": "T-12h", "snapshot_at": 300, "import_status": "available", "stage_timing_audit": {"status": "valid"}},
+        ]
+        audit = main.audit_timeline_sequence(rows)
+        self.assertEqual(audit["Opening"]["status"], "valid")
+        self.assertEqual(audit["T-24h"]["status"], "invalid")
+        self.assertEqual(audit["T-24h"]["reason"], "non_monotonic_stage_timestamp")
+        self.assertEqual(audit["T-12h"]["status"], "valid")
+
     def test_consensus_uses_all_books_not_first_book_primary(self):
         result = api_football_odds([
             {"name": "Outlier", "bets": [{"name": "Match Winner", "values": [{"value": "Home", "odd": "9.0"}, {"value": "Draw", "odd": "9.0"}, {"value": "Away", "odd": "1.1"}]}, {"name": "Asian Handicap", "values": [{"value": "Home -1", "odd": "1.9"}, {"value": "Away -1", "odd": "1.9"}]}]},

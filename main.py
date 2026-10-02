@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.55.0"
+VERSION = "0.56.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -794,7 +794,7 @@ def get_fixture_snapshots(fixture: Any) -> List[Dict[str, Any]]:
 
 
 def latest_prematch_snapshot(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    eligible = [row for row in rows if row.get("stage") in PREMATCH_STAGE_ORDER and get_nested(row, ["stage_timing_audit", "status"]) != "invalid"]
+    eligible = [row for row in rows if row.get("stage") in PREMATCH_STAGE_ORDER and get_nested(row, ["stage_timing_audit", "status"]) != "invalid" and get_nested(row, ["sequence_timing_audit", "status"]) != "invalid"]
     return max(eligible, key=lambda row: (PREMATCH_STAGE_ORDER.index(row["stage"]), int(row.get("snapshot_at") or 0)), default=None)
 
 
@@ -819,13 +819,31 @@ def audit_stage_timing(stage: str, observed_at: Any, kickoff_at: Any) -> Dict[st
     }
 
 
+def audit_timeline_sequence(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    ordered = sorted((row for row in rows if row.get("stage") in PREMATCH_STAGE_ORDER), key=lambda row: PREMATCH_STAGE_ORDER.index(row["stage"]))
+    result: Dict[str, Dict[str, Any]] = {}
+    previous_stage, previous_at = None, None
+    for row in ordered:
+        stage, observed_at = row["stage"], _parse_timestamp(row.get("snapshot_at"))
+        usable = row.get("import_status") == "available" and get_nested(row, ["stage_timing_audit", "status"]) != "invalid"
+        if not usable or observed_at is None:
+            result[stage] = {"status": "data_missing", "decision_eligible": False, "reason": "stage_unavailable_or_timestamp_missing"}
+            continue
+        if previous_at is not None and observed_at <= previous_at:
+            result[stage] = {"status": "invalid", "decision_eligible": False, "reason": "non_monotonic_stage_timestamp", "previous_stage": previous_stage, "previous_snapshot_at": previous_at, "snapshot_at": observed_at}
+            continue
+        result[stage] = {"status": "valid", "decision_eligible": True, "reason": None, "previous_stage": previous_stage, "previous_snapshot_at": previous_at, "snapshot_at": observed_at}
+        previous_stage, previous_at = stage, observed_at
+    return result
+
+
 def complete_prematch_timeline(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     by_stage = {row.get("stage"): row for row in rows if row.get("stage") in PREMATCH_STAGE_ORDER}
     timeline = []
     for stage in PREMATCH_STAGE_ORDER:
         row = by_stage.get(stage)
         if row:
-            usable = row.get("import_status") != "data_missing" and bool(get_nested(row, ["market_snapshot", "available"])) and get_nested(row, ["stage_timing_audit", "status"]) != "invalid"
+            usable = row.get("import_status") != "data_missing" and bool(get_nested(row, ["market_snapshot", "available"])) and get_nested(row, ["stage_timing_audit", "status"]) != "invalid" and get_nested(row, ["sequence_timing_audit", "status"]) != "invalid"
             timeline.append({**row, "timeline_status": "available" if usable else "data_missing", "synthetic_placeholder": False})
         else:
             timeline.append({
@@ -1089,10 +1107,13 @@ def import_prematch_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
         replaced_stages = {row["stage"] for row in accepted}
         merged = [row for row in existing if row.get("stage") not in replaced_stages] + accepted
         merged = sorted(merged, key=lambda x: (STAGE_ORDER.index(x.get("stage")) if x.get("stage") in STAGE_ORDER else 999, x.get("snapshot_at", 0)))
+        sequence_audit = audit_timeline_sequence(merged)
+        for row in merged:
+            row["sequence_timing_audit"] = sequence_audit.get(row.get("stage"), {"status": "data_missing", "decision_eligible": False})
         prior_available: List[Dict[str, Any]] = []
         for row in merged:
             market_snapshot = row.get("market_snapshot") or empty_market_snapshot()
-            if row.get("import_status") == "available" and get_nested(row, ["stage_timing_audit", "status"]) != "invalid":
+            if row.get("import_status") == "available" and get_nested(row, ["stage_timing_audit", "status"]) != "invalid" and get_nested(row, ["sequence_timing_audit", "status"]) != "invalid":
                 dynamics = compare_market_snapshots(prior_available, market_snapshot, row.get("stage"))
                 prior_available.append(row)
             else:
