@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.62.0"
+VERSION = "0.63.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -879,8 +879,14 @@ def save_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
         rows = [r for r in store["fixtures"][str(record["fixture"])] if r.get("stage") != record.get("stage")]
         rows.append(record)
         store["fixtures"][str(record["fixture"])] = sorted(rows, key=lambda x: (STAGE_ORDER.index(x.get("stage")) if x.get("stage") in STAGE_ORDER else 999, x.get("snapshot_at", 0)))
+        revalidation_task = _enqueue_revalidation(store, str(record["fixture"]), record)
+        store["version"] = VERSION
         write_snapshot_store(store)
-    return {"saved": True, "path": SNAPSHOT_STORE_PATH, "fixture": record["fixture"], "stage": record["stage"]}
+    return {
+        "saved": True, "path": SNAPSHOT_STORE_PATH, "fixture": record["fixture"], "stage": record["stage"],
+        "revalidation_task_created": bool(revalidation_task),
+        "revalidation_task_id": (revalidation_task or {}).get("task_id"),
+    }
 
 
 def _enqueue_revalidation(store: Dict[str, Any], fixture: str, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:

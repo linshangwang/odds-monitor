@@ -919,6 +919,31 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(old["status"], "superseded")
         self.assertEqual(old["superseded_by"], second["task_id"])
 
+    def test_native_snapshot_trigger_enters_revalidation_queue(self):
+        record = {
+            "fixture": 123, "stage": "T-3h", "snapshot_at": 100,
+            "market_snapshot": {"consensus_main_line": {"1x2": {"home": 1.8}}},
+            "market_dynamics": {
+                "classification": "Market-Only Move",
+                "revalidation_trigger": {"triggered": True, "reasons": ["abnormal_price_move"]},
+            },
+        }
+        saved = main.save_snapshot(record)
+        queue = main.load_snapshot_store()["fundamental_revalidation_queue"]
+        self.assertTrue(saved["revalidation_task_created"])
+        self.assertIn(saved["revalidation_task_id"], queue)
+        self.assertEqual(queue[saved["revalidation_task_id"]]["fixture"], "123")
+
+    def test_native_snapshot_without_trigger_does_not_enter_queue(self):
+        record = {
+            "fixture": 124, "stage": "Opening", "snapshot_at": 100,
+            "market_snapshot": {"consensus_main_line": {"1x2": {"home": 2.0}}},
+            "market_dynamics": {"classification": "Market-Only Move", "revalidation_trigger": {"triggered": False, "reasons": []}},
+        }
+        saved = main.save_snapshot(record)
+        self.assertFalse(saved["revalidation_task_created"])
+        self.assertEqual(main.load_snapshot_store().get("fundamental_revalidation_queue", {}), {})
+
     def test_revalidation_retention_never_evicts_pending_tasks(self):
         queue = {f"p-{index}": {"task_id": f"p-{index}", "status": "pending", "created_at": index} for index in range(501)}
         queue.update({f"done-{index}": {"task_id": f"done-{index}", "status": "revalidated", "created_at": index} for index in range(20)})
