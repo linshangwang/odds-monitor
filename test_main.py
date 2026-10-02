@@ -116,6 +116,17 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["portfolio_decision"], "PASS")
         self.assertEqual(result["first_choice_combination"]["decision"], "PASS")
 
+    def test_portfolio_offers_more_than_three_legs_as_optional_choices(self):
+        rows = []
+        for index in range(5):
+            candidate = {"market": "1x2", "selection": "home", "price": 1.5 + index * .1, "script_coverage": .9 - index * .03, "edge": .06, "ev": .08}
+            rows.append({"fixture": f"f{index}", "correlation_group": f"g{index}", "evaluation": {"decision_layer": {"recommendation_tiers": {"first_choice_high_consistency": candidate, "second_choice_higher_return": None, "high_variance_single": None}}}})
+        combination = main.build_portfolio(rows, 5)["first_choice_combination"]
+        self.assertEqual(combination["leg_count"], 3)
+        self.assertEqual(combination["available_leg_count"], 5)
+        self.assertEqual([option["leg_count"] for option in combination["suggested_options"]], [2, 3, 4, 5])
+        self.assertEqual(combination["suggested_options"][-1]["risk_label"], "expanded_high_variance")
+
     def test_independent_poisson_model_is_normalized_and_symmetric(self):
         model = main.poisson_probability_model(1.4, 1.4, 0.8, {"source": "verified_team_metrics", "uses_market_odds": False})
         self.assertTrue(model["ok"])

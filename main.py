@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.17.0"
+VERSION = "0.18.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1402,18 +1402,25 @@ def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int,
             break
     if len(candidates) < 2 or (tier == "second_choice_higher_return" and not upgraded):
         return {"decision": "PASS", "legs": candidates, "reason": "fewer_than_two_eligible_independent_legs" if len(candidates) < 2 else "no_higher_return_upgrade_available"}
-    combined_price = 1.0
-    for candidate in candidates:
-        combined_price *= candidate["price"]
+    suggested_options = []
+    for leg_count in range(2, len(candidates) + 1):
+        option_legs = candidates[:leg_count]
+        combined_price = math.prod(candidate["price"] for candidate in option_legs)
+        risk = "lower_variance" if leg_count == 2 else ("balanced" if leg_count == 3 else "expanded_high_variance")
+        suggested_options.append({"leg_count": leg_count, "risk_label": risk, "combined_decimal_price": round(combined_price, 4), "legs": option_legs})
+    recommended_count = min(3, len(candidates))
+    recommended = next(option for option in suggested_options if option["leg_count"] == recommended_count)
     return {
-        "decision": "COMBINE", "legs": candidates, "combined_decimal_price": round(combined_price, 4),
-        "leg_count": len(candidates), "independence_assumption": "screened by correlation_group; residual correlation is not modeled",
+        "decision": "COMBINE", "legs": recommended["legs"], "combined_decimal_price": recommended["combined_decimal_price"],
+        "leg_count": recommended_count, "available_leg_count": len(candidates), "suggested_options": suggested_options,
+        "selection_guidance": "2 legs lower variance; 3 legs balanced default; 4+ legs are optional expanded high variance",
+        "independence_assumption": "screened by correlation_group; residual correlation is not modeled",
         "combined_ev": {"status": "data_missing", "reason": "Asian pushes and residual cross-match correlation prevent naive probability multiplication"},
     }
 
 
-def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 3) -> Dict[str, Any]:
-    max_legs = max(2, min(int(max_legs), 3))
+def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6) -> Dict[str, Any]:
+    max_legs = max(2, min(int(max_legs), 10))
     valid_rows = [row for row in evaluation_rows if row.get("fixture") and isinstance(row.get("evaluation"), dict)]
     high_variance = []
     for row in valid_rows:
@@ -1427,7 +1434,7 @@ def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 3) ->
         "first_choice_combination": first, "second_choice_combination": second,
         "high_variance_singles": high_variance,
         "portfolio_decision": "PASS" if first["decision"] == "PASS" and second["decision"] == "PASS" and not high_variance else "READY",
-        "rules": {"minimum_legs": 2, "maximum_legs": 3, "one_leg_per_correlation_group": True, "forced_fill": False},
+        "rules": {"minimum_combination_legs": 2, "maximum_requested_legs": max_legs, "hard_cap": 10, "default_recommendation_legs": 3, "one_leg_per_correlation_group": True, "forced_fill": False},
     }
 
 
@@ -1803,7 +1810,7 @@ async def shadow_portfolio_evaluate(request: Request, token: Optional[str] = Non
     for match in matches:
         evaluation = evaluate_imported_prematch(match, persist_version=True)
         rows.append({"fixture": evaluation["fixture"], "correlation_group": match.get("correlation_group") or evaluation["fixture"], "evaluation": evaluation})
-    return JSONResponse({"ok": True, "version": VERSION, "evaluations": rows, "portfolio": build_portfolio(rows, payload.get("max_legs", 3))})
+    return JSONResponse({"ok": True, "version": VERSION, "evaluations": rows, "portfolio": build_portfolio(rows, payload.get("max_legs", 6))})
 
 
 def build_imported_ai_packet(fixture: str, include_companies: bool = False, include_lineups: bool = False) -> Dict[str, Any]:
