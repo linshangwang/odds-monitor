@@ -114,6 +114,12 @@ Edge、EV、脚本覆盖率、拥挤度和阵容可信度门槛，且不存在 D
 高博弈候选不会为了填充结果而进入第一或第二首选；Crowding、Lineup Confidence、Death Path
 或关键字段出现硬性问题时，三层都清空并返回 `PASS`。
 
+`/shadow/portfolio/evaluate` 接受 1–10 场完整赛前模型输入，逐场运行同一套新鲜度与决策闸门，
+再输出综合过关第一首选、综合过关次首选和高博弈单关。组合限制为 2–3 腿，同一
+`correlation_group` 最多一腿，同一比赛不能重复提交。腿数不足或相关性筛选后不足两腿时
+直接 `PASS`，不会强行凑单。系统只计算组合展示赔率；由于亚洲盘走盘及跨比赛剩余相关性，
+组合 EV 明确标记为 `data_missing`，不做错误的概率相乘。
+
 主要接口保持兼容，并新增：
 
 ```text
@@ -173,6 +179,7 @@ GET  /shadow/data-source-health?token=SHADOW_ACCESS_TOKEN
 POST /shadow/model/poisson?token=SHADOW_ACCESS_TOKEN
 POST /shadow/model/fundamental-xg?token=SHADOW_ACCESS_TOKEN
 POST /shadow/model/prematch-evaluate?token=SHADOW_ACCESS_TOKEN
+POST /shadow/portfolio/evaluate?token=SHADOW_ACCESS_TOKEN
 GET  /shadow/imported-prematch/{MATCH_UUID}?token=SHADOW_ACCESS_TOKEN
 ```
 

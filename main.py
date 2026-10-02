@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.16.0"
+VERSION = "0.17.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1376,9 +1376,64 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
     }
 
 
+def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int, allow_fallback: bool = False) -> Dict[str, Any]:
+    candidates = []
+    seen_groups = set()
+    upgraded = False
+    ordered = sorted(rows, key=lambda row: (
+        as_float(get_nested(row, ["evaluation", "decision_layer", "recommendation_tiers", tier, "script_coverage"])) or -1,
+        as_float(get_nested(row, ["evaluation", "decision_layer", "recommendation_tiers", tier, "ev"])) or -999,
+    ), reverse=True)
+    for row in ordered:
+        tiers = get_nested(row, ["evaluation", "decision_layer", "recommendation_tiers"]) or {}
+        candidate = tiers.get(tier)
+        if not candidate and allow_fallback:
+            candidate = tiers.get("first_choice_high_consistency")
+        elif candidate and tier == "second_choice_higher_return":
+            upgraded = True
+        if not candidate:
+            continue
+        group = str(row.get("correlation_group") or row.get("fixture") or "")
+        if group in seen_groups:
+            continue
+        seen_groups.add(group)
+        candidates.append({"fixture": row.get("fixture"), "correlation_group": group, **candidate})
+        if len(candidates) >= max_legs:
+            break
+    if len(candidates) < 2 or (tier == "second_choice_higher_return" and not upgraded):
+        return {"decision": "PASS", "legs": candidates, "reason": "fewer_than_two_eligible_independent_legs" if len(candidates) < 2 else "no_higher_return_upgrade_available"}
+    combined_price = 1.0
+    for candidate in candidates:
+        combined_price *= candidate["price"]
+    return {
+        "decision": "COMBINE", "legs": candidates, "combined_decimal_price": round(combined_price, 4),
+        "leg_count": len(candidates), "independence_assumption": "screened by correlation_group; residual correlation is not modeled",
+        "combined_ev": {"status": "data_missing", "reason": "Asian pushes and residual cross-match correlation prevent naive probability multiplication"},
+    }
+
+
+def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 3) -> Dict[str, Any]:
+    max_legs = max(2, min(int(max_legs), 3))
+    valid_rows = [row for row in evaluation_rows if row.get("fixture") and isinstance(row.get("evaluation"), dict)]
+    high_variance = []
+    for row in valid_rows:
+        candidate = get_nested(row, ["evaluation", "decision_layer", "recommendation_tiers", "high_variance_single"])
+        if candidate:
+            high_variance.append({"fixture": row["fixture"], **candidate})
+    high_variance.sort(key=lambda row: (row.get("ev", -999), row.get("edge", -999)), reverse=True)
+    first = _combination_from_rows(valid_rows, "first_choice_high_consistency", max_legs)
+    second = _combination_from_rows(valid_rows, "second_choice_higher_return", max_legs, allow_fallback=True)
+    return {
+        "first_choice_combination": first, "second_choice_combination": second,
+        "high_variance_singles": high_variance,
+        "portfolio_decision": "PASS" if first["decision"] == "PASS" and second["decision"] == "PASS" and not high_variance else "READY",
+        "rules": {"minimum_legs": 2, "maximum_legs": 3, "one_leg_per_correlation_group": True, "forced_fill": False},
+    }
+
+
 @app.get("/")
 def root():
-    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/import-status", "/shadow/data-source-health", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/imported-prematch/{fixture}"]}
+    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/import-status", "/shadow/data-source-health", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}"]}
 
 
 @app.get("/health")
@@ -1729,6 +1784,26 @@ async def shadow_prematch_evaluate(request: Request, token: Optional[str] = None
     except Exception:
         raise HTTPException(status_code=400, detail="invalid_json_body")
     return JSONResponse(evaluate_imported_prematch(payload, persist_version=True))
+
+
+@app.post("/shadow/portfolio/evaluate")
+async def shadow_portfolio_evaluate(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_json_body")
+    matches = payload.get("matches")
+    if not isinstance(matches, list) or not 1 <= len(matches) <= 10:
+        raise HTTPException(status_code=422, detail="matches_must_contain_1_to_10_items")
+    fixtures = [str(row.get("fixture") or "").strip() for row in matches if isinstance(row, dict)]
+    if len(fixtures) != len(matches) or any(not fixture for fixture in fixtures) or len(set(fixtures)) != len(fixtures):
+        raise HTTPException(status_code=422, detail="unique_fixture_required_for_each_match")
+    rows = []
+    for match in matches:
+        evaluation = evaluate_imported_prematch(match, persist_version=True)
+        rows.append({"fixture": evaluation["fixture"], "correlation_group": match.get("correlation_group") or evaluation["fixture"], "evaluation": evaluation})
+    return JSONResponse({"ok": True, "version": VERSION, "evaluations": rows, "portfolio": build_portfolio(rows, payload.get("max_legs", 3))})
 
 
 def build_imported_ai_packet(fixture: str, include_companies: bool = False, include_lineups: bool = False) -> Dict[str, Any]:

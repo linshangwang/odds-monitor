@@ -94,6 +94,28 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIsNone(result["recommendation_tiers"]["first_choice_high_consistency"])
         self.assertEqual(result["recommendation_tiers"]["high_variance_single"]["selection"], "home")
 
+    def test_portfolio_builds_two_tiers_without_correlated_duplicate_legs(self):
+        def row(fixture, group, coverage, price, second_price=None):
+            first = {"market": "1x2", "selection": "home", "line": None, "price": price, "script_coverage": coverage, "edge": .06, "ev": .08}
+            second = {"market": "over_under", "selection": "over", "line": 2.5, "price": second_price, "script_coverage": .65, "edge": .05, "ev": .12} if second_price else None
+            return {"fixture": fixture, "correlation_group": group, "evaluation": {"decision_layer": {"recommendation_tiers": {"first_choice_high_consistency": first, "second_choice_higher_return": second, "high_variance_single": None}}}}
+        rows = [row("a", "g1", .90, 1.5, 1.9), row("b", "g1", .80, 1.7), row("c", "g2", .85, 1.6, 2.0), row("d", "g3", .75, 1.8)]
+        result = main.build_portfolio(rows, 3)
+        first = result["first_choice_combination"]
+        second = result["second_choice_combination"]
+        self.assertEqual(first["decision"], "COMBINE")
+        self.assertEqual(first["leg_count"], 3)
+        self.assertEqual(len({leg["correlation_group"] for leg in first["legs"]}), 3)
+        self.assertEqual(second["decision"], "COMBINE")
+        self.assertTrue(any(leg["market"] == "over_under" for leg in second["legs"]))
+
+    def test_portfolio_does_not_force_fill_single_leg(self):
+        candidate = {"market": "1x2", "selection": "home", "price": 1.6, "script_coverage": .8, "edge": .05, "ev": .07}
+        rows = [{"fixture": "only", "evaluation": {"decision_layer": {"recommendation_tiers": {"first_choice_high_consistency": candidate, "second_choice_higher_return": None, "high_variance_single": None}}}}]
+        result = main.build_portfolio(rows)
+        self.assertEqual(result["portfolio_decision"], "PASS")
+        self.assertEqual(result["first_choice_combination"]["decision"], "PASS")
+
     def test_independent_poisson_model_is_normalized_and_symmetric(self):
         model = main.poisson_probability_model(1.4, 1.4, 0.8, {"source": "verified_team_metrics", "uses_market_odds": False})
         self.assertTrue(model["ok"])
