@@ -278,6 +278,21 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("abnormal_price_move", dynamics["revalidation_trigger"]["reasons"])
         self.assertTrue(dynamics["revalidation_trigger"]["signal_audit"]["decimal_fallback_signal"])
 
+    def test_cross_market_divergence_prefers_probability_direction(self):
+        previous = {"stage": "T-24h", "market_snapshot": {"primary": {
+            "over_under": {"line": 2.5, "over": 1.9, "under": 1.9, "consensus_no_vig_probabilities": {"over": .50, "under": .50}},
+            "btts": {"yes": 1.9, "no": 1.9, "consensus_no_vig_probabilities": {"yes": .50, "no": .50}},
+        }}}
+        current = main.empty_market_snapshot()
+        current["primary"].update({
+            "over_under": {"line": 2.5, "over": 1.85, "under": 1.95, "consensus_no_vig_probabilities": {"over": .54, "under": .46}},
+            "btts": {"yes": 1.85, "no": 1.95, "consensus_no_vig_probabilities": {"yes": .47, "no": .53}},
+        })
+        dynamics = main.compare_market_snapshots([previous], current, "T-12h")
+        self.assertTrue(dynamics["cross_market_divergence_pairs"]["over_under_vs_btts"])
+        self.assertEqual(dynamics["cross_market_directional_signals"]["total_over_strength"], .04)
+        self.assertEqual(dynamics["cross_market_directional_signals"]["btts_yes_strength"], -.03)
+
     def test_consensus_deduplicates_bookmaker_name_variants(self):
         consensus = main._consensus_1x2([
             {"bookmaker": "Book A", "home": 2.0, "draw": 3.4, "away": 4.0},

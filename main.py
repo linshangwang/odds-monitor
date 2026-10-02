@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.78.0"
+VERSION = "0.79.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1442,11 +1442,25 @@ def compare_market_snapshots(history: List[Dict[str, Any]], current: Dict[str, A
     def opposed(a: Optional[float], b: Optional[float]) -> bool:
         return a not in (None, 0) and b not in (None, 0) and a * b < 0
 
+    def probability_direction(market: str, selection: str) -> Optional[float]:
+        row = probability_movements.get(market) or {}
+        return as_float((row.get("deltas") or {}).get(selection)) if row.get("status") == "compared" else None
+
+    directional_signals = {
+        "home_strength": probability_direction("1x2", "home") if probability_direction("1x2", "home") is not None else (-home_delta if home_delta is not None else None),
+        "away_strength": probability_direction("1x2", "away") if probability_direction("1x2", "away") is not None else (-away_delta if away_delta is not None else None),
+        "asian_home_strength": probability_direction("asian_handicap", "home") if probability_direction("asian_handicap", "home") is not None else (-ah_delta if ah_delta is not None else None),
+        "total_over_strength": probability_direction("over_under", "over") if probability_direction("over_under", "over") is not None else ou_delta,
+        "btts_yes_strength": probability_direction("btts", "yes") if probability_direction("btts", "yes") is not None else (-movements["btts"]["yes"] if movements["btts"]["yes"] is not None else None),
+        "home_total_over_strength": probability_direction("home_team_total", "over") if probability_direction("home_team_total", "over") is not None else movements["home_team_total"]["line"],
+        "away_total_over_strength": probability_direction("away_team_total", "over") if probability_direction("away_team_total", "over") is not None else movements["away_team_total"]["line"],
+    }
+
     divergence_pairs = {
-        "1x2_vs_asian_handicap": opposed(-home_delta if home_delta is not None else None, -ah_delta if ah_delta is not None else None),
-        "over_under_vs_btts": opposed(ou_delta, -movements["btts"]["yes"] if movements["btts"]["yes"] is not None else None),
-        "home_1x2_vs_home_team_total": opposed(-home_delta if home_delta is not None else None, movements["home_team_total"]["line"]),
-        "away_1x2_vs_away_team_total": opposed(-away_delta if away_delta is not None else None, movements["away_team_total"]["line"]),
+        "1x2_vs_asian_handicap": opposed(directional_signals["home_strength"], directional_signals["asian_home_strength"]),
+        "over_under_vs_btts": opposed(directional_signals["total_over_strength"], directional_signals["btts_yes_strength"]),
+        "home_1x2_vs_home_team_total": opposed(directional_signals["home_strength"], directional_signals["home_total_over_strength"]),
+        "away_1x2_vs_away_team_total": opposed(directional_signals["away_strength"], directional_signals["away_total_over_strength"]),
     }
     cross_market = any(divergence_pairs.values())
     probability_deltas = [value for row in probability_movements.values() for value in (row.get("deltas") or {}).values()]
@@ -1473,6 +1487,8 @@ def compare_market_snapshots(history: List[Dict[str, Any]], current: Dict[str, A
         "water_movement": {"home_1x2_odd_delta": home_delta, "away_1x2_odd_delta": away_delta},
         "continuous_strengthening": continuous, "reversal": reversal,
         "cross_market_divergence": cross_market, "cross_market_divergence_pairs": divergence_pairs,
+        "cross_market_directional_signals": directional_signals,
+        "cross_market_signal_policy": "bookmaker_level_no_vig_probability_first; line_or_decimal_price_fallback_only_when_probability_incomparable",
         "revalidation_trigger": {"triggered": bool(reasons), "reasons": reasons, "thresholds": {"line": 0.25, "no_vig_probability": 0.03, "decimal_price_fallback": 0.10}, "signal_audit": {"probability_signal": probability_price_signal, "decimal_fallback_signal": decimal_fallback_signal, "decimal_fallback_used_only_when_probability_missing": True}},
         "data_missing": missing,
         "market_saturation": market_saturation(current)
