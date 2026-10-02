@@ -843,12 +843,18 @@ class ShadowV4UpgradeTests(unittest.TestCase):
     def test_snapshot_store_keeps_readable_rolling_backup(self):
         main.write_snapshot_store({"version": "backup-test", "fixtures": {"a": []}})
         self.assertTrue(main.snapshot_backup_path().exists())
-        self.assertEqual(main.load_snapshot_backup_store()["version"], "backup-test")
+        self.assertEqual(main.load_snapshot_store()["version"], "backup-test")
         with open(main.SNAPSHOT_STORE_PATH, "wb") as handle:
             handle.write(b"corrupt-primary")
         with self.assertRaises(main.SnapshotStoreReadError):
             main.load_snapshot_store()
-        self.assertEqual(main.load_snapshot_backup_store()["fixtures"], {"a": []})
+        self.assertIsInstance(main.load_snapshot_backup_store()["fixtures"], dict)
+
+    def test_snapshot_store_backup_is_previous_committed_version(self):
+        main.write_snapshot_store({"version": "first", "fixtures": {"a": []}})
+        main.write_snapshot_store({"version": "second", "fixtures": {"b": []}})
+        self.assertEqual(main.load_snapshot_store()["version"], "second")
+        self.assertEqual(main.load_snapshot_backup_store()["version"], "first")
 
     def test_store_integrity_reports_primary_backup_without_data_payload(self):
         main.write_snapshot_store({"version": "integrity-test", "fixtures": {"a": [{"secret": "not-returned"}]}, "portfolio_runs": {"p": []}})
@@ -861,7 +867,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertGreater(integrity["primary"]["compression_ratio"], 0)
         self.assertEqual(integrity["primary"]["capacity_state"], "normal")
         self.assertTrue(integrity["capacity_ok"])
-        self.assertEqual(integrity["backup"]["portfolio_count"], 1)
+        self.assertIn("portfolio_count", integrity["backup"])
         self.assertNotIn("fixtures", integrity["primary"])
         self.assertNotIn("secret", str(integrity))
         self.assertFalse(integrity["automatic_restore"])

@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.67.0"
+VERSION = "0.68.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -780,7 +780,10 @@ def write_snapshot_store(store: Dict[str, Any]) -> bool:
             raw = json.dumps(store, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             encoded = gzip.compress(raw, compresslevel=6) if SNAPSHOT_STORE_GZIP else raw
             tmp.write_bytes(encoded)
-            backup_tmp.write_bytes(encoded)
+            # Keep the last successfully committed primary as the rollback point.
+            # On the first write, seed the backup with the same valid baseline.
+            previous_encoded = p.read_bytes() if p.exists() else encoded
+            backup_tmp.write_bytes(previous_encoded)
             backup_tmp.replace(backup)
             tmp.replace(p)
             return True
