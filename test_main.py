@@ -935,6 +935,19 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         task = main.load_snapshot_store()["fundamental_revalidation_queue"]["task"]
         self.assertEqual(task["resolution_classification"], "Model-Market Divergence")
 
+    def test_revalidation_resolution_does_not_close_later_stage_tasks(self):
+        main.write_snapshot_store({"version": main.VERSION, "fixtures": {}, "fundamental_revalidation_queue": {
+            "early": {"task_id": "early", "fixture": "fixture-1", "stage": "T-6h", "status": "pending"},
+            "current": {"task_id": "current", "fixture": "fixture-1", "stage": "T-3h", "status": "pending"},
+            "later": {"task_id": "later", "fixture": "fixture-1", "stage": "T-15m", "status": "pending"},
+        }})
+        resolved = main.resolve_revalidation_tasks("fixture-1", {"version_number": 2, "changed_information": []}, resolved_through_stage="T-3h")
+        self.assertEqual(resolved, 2)
+        queue = main.load_snapshot_store()["fundamental_revalidation_queue"]
+        self.assertEqual(queue["early"]["status"], "revalidated")
+        self.assertEqual(queue["current"]["status"], "revalidated")
+        self.assertEqual(queue["later"]["status"], "pending")
+
     def test_first_revalidation_version_does_not_claim_fundamental_change(self):
         main.write_snapshot_store({"version": main.VERSION, "fixtures": {}, "fundamental_revalidation_queue": {
             "task": {"task_id": "task", "fixture": "fixture-1", "status": "pending"}

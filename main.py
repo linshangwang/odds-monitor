@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.59.0"
+VERSION = "0.60.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -922,7 +922,7 @@ def _trim_revalidation_queue(queue: Dict[str, Dict[str, Any]], limit: int = 500)
     }
 
 
-def resolve_revalidation_tasks(fixture: str, version_record: Optional[Dict[str, Any]], model_market_divergence: bool = False) -> int:
+def resolve_revalidation_tasks(fixture: str, version_record: Optional[Dict[str, Any]], model_market_divergence: bool = False, resolved_through_stage: Optional[str] = None) -> int:
     if not version_record or version_record.get("version_number") is None:
         return 0
     changed_information = list(version_record.get("changed_information") or [])
@@ -932,8 +932,11 @@ def resolve_revalidation_tasks(fixture: str, version_record: Optional[Dict[str, 
     with SNAPSHOT_STORE_LOCK:
         store = load_snapshot_store()
         changed = 0
+        through_index = PREMATCH_STAGE_ORDER.index(resolved_through_stage) if resolved_through_stage in PREMATCH_STAGE_ORDER else len(PREMATCH_STAGE_ORDER)
         for task in (store.get("fundamental_revalidation_queue") or {}).values():
-            if task.get("fixture") == str(fixture) and task.get("status") == "pending":
+            task_stage = task.get("stage")
+            task_index = PREMATCH_STAGE_ORDER.index(task_stage) if task_stage in PREMATCH_STAGE_ORDER else len(PREMATCH_STAGE_ORDER)
+            if task.get("fixture") == str(fixture) and task.get("status") == "pending" and task_index <= through_index:
                 task.update({
                     "status": "revalidated", "resolved_at": int(time.time()),
                     "fundamental_version_number": version_record.get("version_number"),
@@ -943,6 +946,7 @@ def resolve_revalidation_tasks(fixture: str, version_record: Optional[Dict[str, 
                     "changed_information": changed_information if substantive_change else [],
                     "probability_change": version_record.get("probability_change"),
                     "best_market_change": version_record.get("best_market_change"),
+                    "resolved_through_stage": resolved_through_stage,
                 })
                 changed += 1
         if changed:
@@ -1897,7 +1901,7 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
         fixture, script, trigger, previous=previous,
         probability_change=probability_change, best_market_change=best_market_change,
     ) if persist_version else None
-    resolved_revalidations = resolve_revalidation_tasks(fixture, version_record, model_market_divergence["triggered"]) if version_record and trigger.get("triggered") and chain_audit.get("decision_eligible") else 0
+    resolved_revalidations = resolve_revalidation_tasks(fixture, version_record, model_market_divergence["triggered"], (latest or {}).get("stage")) if version_record and trigger.get("triggered") and chain_audit.get("decision_eligible") else 0
     return {
         "ok": True, "version": VERSION, "fixture": fixture, "estimator": estimator, "model": model,
         "decision_layer": decision, "decision_summary": build_decision_summary(decision, chain_audit, model),
