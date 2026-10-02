@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.57.0"
+VERSION = "0.58.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -887,14 +887,18 @@ def _enqueue_revalidation(store: Dict[str, Any], fixture: str, row: Dict[str, An
     trigger = get_nested(row, ["market_dynamics", "revalidation_trigger"], {}) or {}
     if not trigger.get("triggered"):
         return None
-    task_id = _content_hash({"fixture": fixture, "stage": row.get("stage"), "source_content_hash": row.get("source_content_hash")})[:24]
+    signal_hash = _content_hash({"market": get_nested(row, ["market_snapshot", "consensus_main_line"]), "reasons": trigger.get("reasons"), "classification": get_nested(row, ["market_dynamics", "classification"])})
+    task_id = _content_hash({"fixture": fixture, "stage": row.get("stage"), "signal_hash": signal_hash})[:24]
     queue = store.setdefault("fundamental_revalidation_queue", {})
     existing = queue.get(task_id)
     if existing:
-        return existing
+        return None
+    for older in queue.values():
+        if older.get("fixture") == fixture and older.get("stage") == row.get("stage") and older.get("status") == "pending":
+            older.update({"status": "superseded", "superseded_at": int(time.time()), "superseded_by": task_id})
     task = {
         "task_id": task_id, "fixture": fixture, "stage": row.get("stage"),
-        "snapshot_at": row.get("snapshot_at"), "created_at": int(time.time()), "status": "pending",
+        "snapshot_at": row.get("snapshot_at"), "created_at": int(time.time()), "status": "pending", "signal_hash": signal_hash,
         "reasons": list(trigger.get("reasons") or []),
         "classification": get_nested(row, ["market_dynamics", "classification"]),
         "policy": "fact_recheck_required; market_move_alone_must_not_modify_fundamentals",
@@ -2424,8 +2428,8 @@ def shadow_import_status(token: Optional[str] = None, authorization: Optional[st
 @app.get("/shadow/revalidation-queue")
 def shadow_revalidation_queue(status: str = "pending", fixture: Optional[str] = None, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
-    if status not in {"pending", "revalidated", "all"}:
-        raise HTTPException(status_code=422, detail="status_must_be_pending_revalidated_or_all")
+    if status not in {"pending", "revalidated", "superseded", "all"}:
+        raise HTTPException(status_code=422, detail="status_must_be_pending_revalidated_superseded_or_all")
     tasks = list((load_snapshot_store().get("fundamental_revalidation_queue") or {}).values())
     if status != "all":
         tasks = [task for task in tasks if task.get("status") == status]

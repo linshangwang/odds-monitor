@@ -869,6 +869,21 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("significant_line_move", task["reasons"])
         self.assertIn("market_move_alone_must_not_modify_fundamentals", task["policy"])
 
+    def test_revalidation_dedupes_metadata_only_change_and_supersedes_new_signal(self):
+        store = {"fundamental_revalidation_queue": {}}
+        row = {"stage": "T-3h", "snapshot_at": 100, "source_content_hash": "metadata-a", "market_snapshot": {"consensus_main_line": {"1x2": {"home": 2.0}}}, "market_dynamics": {"classification": "Market-Only Move", "revalidation_trigger": {"triggered": True, "reasons": ["abnormal_price_move"]}}}
+        first = main._enqueue_revalidation(store, "fixture", row)
+        metadata_only = {**row, "source_content_hash": "metadata-b"}
+        self.assertIsNone(main._enqueue_revalidation(store, "fixture", metadata_only))
+        self.assertEqual(len(store["fundamental_revalidation_queue"]), 1)
+        changed_signal = {**row, "market_snapshot": {"consensus_main_line": {"1x2": {"home": 1.8}}}}
+        second = main._enqueue_revalidation(store, "fixture", changed_signal)
+        self.assertIsNotNone(second)
+        self.assertEqual(len(store["fundamental_revalidation_queue"]), 2)
+        old = store["fundamental_revalidation_queue"][first["task_id"]]
+        self.assertEqual(old["status"], "superseded")
+        self.assertEqual(old["superseded_by"], second["task_id"])
+
     def test_revalidation_queue_prioritizes_late_and_overdue_moves(self):
         tasks = [
             {"task_id": "early", "status": "pending", "stage": "T-24h", "created_at": 9000, "reasons": ["abnormal_price_move"]},
