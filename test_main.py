@@ -98,7 +98,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertAlmostEqual(result["ev"], .10, places=6)
 
     def test_model_market_divergence_uses_probability_gap(self):
-        decision = {"candidates": [
+        decision = {"lineup_confidence": .9, "candidates": [
             {"market": "1x2", "selection": "home", "edge": .035},
             {"market": "btts", "selection": "yes", "edge": -.12},
         ]}
@@ -109,9 +109,19 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["maximum_absolute_probability_gap"], .12)
 
     def test_model_market_divergence_requires_comparable_probabilities(self):
-        result = main.detect_model_market_divergence({"candidates": []})
+        result = main.detect_model_market_divergence({"lineup_confidence": .9, "candidates": []})
         self.assertFalse(result["triggered"])
         self.assertEqual(result["comparison_status"], "data_missing")
+
+    def test_model_market_divergence_is_gated_by_model_fundamentals_and_lineup(self):
+        decision = {"lineup_confidence": .4, "candidates": [{"market": "1x2", "selection": "home", "edge": .2}]}
+        result = main.detect_model_market_divergence(decision, model_ready=False, fundamental_eligible=False)
+        self.assertFalse(result["triggered"])
+        self.assertFalse(result["classification_eligible"])
+        self.assertIn("model_not_ready", result["eligibility_reasons"])
+        self.assertIn("fundamental_chain_insufficient", result["eligibility_reasons"])
+        self.assertIn("lineup_confidence_insufficient", result["eligibility_reasons"])
+        self.assertEqual(result["maximum_absolute_probability_gap"], .2)
 
     def test_decision_layer_enforces_minimums_and_probability_validation(self):
         snapshot = main.empty_market_snapshot()

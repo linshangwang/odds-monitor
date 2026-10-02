@@ -166,6 +166,8 @@ T-X 变盘比较现覆盖全部可用市场：1X2、AH、O/U、BTTS、主队进�
 最终评估会从每个可比较选项的模型概率与市场 no-vig 概率计算绝对差值；最大偏差达到8%时
 标记 `Model-Market Divergence`，同时保留对应市场、选择和偏差方向。没有可比较概率时保持
 `data_missing`，不会仅凭盘口方向生成该分类。
+该分类还必须通过三项可信度门槛：模型状态 ready、基本面链 decision_eligible、阵容置信度达到
+系统最低值。任一项不满足时仍保留概率差供审计，但 `triggered=false`，不会输出伪背离信号。
 总完整度至少需达到0.6，且 Result Utility、Rotation Quality、Execution Ability、Goal Conversion
 四个关键环节不得缺失。证据不足时仍生成概率供审计，但最终建议强制 PASS。
 `available` 或 `partial` 不能只写状态：必须同时包含至少一个实质字段，例如证据、变量值或明确

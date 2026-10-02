@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.47.0"
+VERSION = "0.48.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1675,17 +1675,25 @@ def build_decision_summary(decision: Dict[str, Any], chain_audit: Dict[str, Any]
     }
 
 
-def detect_model_market_divergence(decision: Dict[str, Any], threshold: float = 0.08) -> Dict[str, Any]:
+def detect_model_market_divergence(decision: Dict[str, Any], threshold: float = 0.08, model_ready: bool = True, fundamental_eligible: bool = True) -> Dict[str, Any]:
     comparable = [row for row in decision.get("candidates") or [] if as_float(row.get("edge")) is not None]
     strongest = max(comparable, key=lambda row: abs(as_float(row.get("edge")) or 0.0), default=None)
     gap = abs(as_float((strongest or {}).get("edge")) or 0.0) if strongest else None
+    lineup_confidence = as_float(decision.get("lineup_confidence"))
+    confidence_eligible = lineup_confidence is not None and lineup_confidence >= MIN_LINEUP_CONFIDENCE
+    eligibility_reasons = []
+    if not model_ready: eligibility_reasons.append("model_not_ready")
+    if not fundamental_eligible: eligibility_reasons.append("fundamental_chain_insufficient")
+    if not confidence_eligible: eligibility_reasons.append("lineup_confidence_insufficient")
+    eligible = not eligibility_reasons
     return {
-        "triggered": gap is not None and gap >= threshold,
+        "triggered": eligible and gap is not None and gap >= threshold,
         "threshold": threshold,
         "maximum_absolute_probability_gap": round(gap, 6) if gap is not None else None,
         "market": (strongest or {}).get("market"), "selection": (strongest or {}).get("selection"),
         "direction": "model_above_market" if strongest and as_float(strongest.get("edge")) > 0 else ("model_below_market" if strongest else None),
-        "comparison_status": "compared" if strongest else "data_missing",
+        "comparison_status": "compared" if strongest and eligible else (eligibility_reasons[0] if strongest else "data_missing"),
+        "classification_eligible": eligible, "eligibility_reasons": eligibility_reasons,
     }
 
 
@@ -1730,7 +1738,7 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
         decision["pass_reasons"].append("fundamental_chain_insufficient")
         decision["pass_reasons"] = list(dict.fromkeys(decision["pass_reasons"]))
         decision["decision"] = "PASS"
-    model_market_divergence = detect_model_market_divergence(decision)
+    model_market_divergence = detect_model_market_divergence(decision, model_ready=model.get("status") == "ready", fundamental_eligible=chain_audit.get("decision_eligible") is True)
     decision["model_market_divergence"] = model_market_divergence
     decision["market_move_classification"] = "Model-Market Divergence" if model_market_divergence["triggered"] else get_nested(decision, ["line_movement", "classification"])
     versions = get_fundamental_versions(fixture)
