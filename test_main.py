@@ -111,6 +111,20 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertTrue(dynamics["revalidation_trigger"]["triggered"])
         self.assertIn("significant_line_move", dynamics["revalidation_trigger"]["reasons"])
 
+    def test_likely_information_driven_requires_explicit_evidence_reference(self):
+        dynamics = {"revalidation_trigger": {"triggered": True}, "comparison_status": "compared"}
+        without_evidence = main.classify_market_move_details(dynamics, None, None)
+        self.assertEqual(without_evidence["classification"], "Market-Only Move")
+        dynamics["information_search"] = {"status": "suspected_unconfirmed", "evidence_refs": ["coach_press_conference_pending_confirmation"]}
+        with_evidence = main.classify_market_move_details(dynamics, None, None)
+        self.assertEqual(with_evidence["classification"], "Likely Information-Driven")
+        self.assertFalse(with_evidence["inferred_without_evidence"])
+
+    def test_unreferenced_suspicion_is_not_labeled_information_driven(self):
+        dynamics = {"revalidation_trigger": {"triggered": True}, "information_search": {"status": "suspected_unconfirmed", "evidence_refs": []}}
+        result = main.classify_market_move_details(dynamics, None, None)
+        self.assertEqual(result["classification"], "Market-Only Move")
+
     def test_optional_markets_participate_in_movement_and_divergence(self):
         previous = {"stage": "T-3h", "market_snapshot": {"primary": {
             "over_under": {"line": 2.5, "over": 1.9, "under": 1.9},

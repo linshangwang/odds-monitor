@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.60.0"
+VERSION = "0.61.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1094,13 +1094,14 @@ def import_prematch_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
         seen.add(stage)
         status = "available" if stage_data.get("status") == "available" else "data_missing"
         market_snapshot = imported_market_snapshot(stage_data)
-        source_hash = _content_hash({"stage": stage, "status": status, "market_snapshot": market_snapshot, "missing_reason": stage_data.get("reason"), "latest_observed_at": stage_data.get("latest_observed_at"), "target_at": stage_data.get("target_at"), "kickoff_utc": match.get("kickoff_utc")})
+        source_hash = _content_hash({"stage": stage, "status": status, "market_snapshot": market_snapshot, "missing_reason": stage_data.get("reason"), "latest_observed_at": stage_data.get("latest_observed_at"), "target_at": stage_data.get("target_at"), "kickoff_utc": match.get("kickoff_utc"), "information_search": stage_data.get("information_search")})
         record = {
             "version": VERSION, "fixture": fixture, "external_fixture_id": fixture, "source": "pang_import",
             "stage": stage, "snapshot_at": _parse_timestamp(stage_data.get("latest_observed_at") or stage_data.get("target_at")) or int(time.time()),
             "fixture_info": match, "data_quality": packet.get("data_quality"), "coverage": {"source": "pang", "quote_count": stage_data.get("quote_count"), "bookmaker_count": stage_data.get("bookmaker_count")},
             "import_status": status, "missing_reason": stage_data.get("reason") if status == "data_missing" else None,
             "market_snapshot": market_snapshot, "source_content_hash": source_hash, "market_dynamics": None,
+            "information_search": stage_data.get("information_search") if isinstance(stage_data.get("information_search"), dict) else None,
         }
         record["stage_timing_audit"] = audit_stage_timing(stage, record["snapshot_at"], match.get("kickoff_utc"))
         records.append(record)
@@ -1148,7 +1149,10 @@ def import_prematch_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
                 prior_available.append(row)
             else:
                 dynamics = {"stage": row.get("stage"), "comparison_status": "data_missing", "revalidation_trigger": {"triggered": False, "reasons": []}, "data_missing": list((market_snapshot.get("data_status") or {}).keys()), "reason": get_nested(row, ["stage_timing_audit", "reason"]) or row.get("missing_reason")}
-            dynamics["classification"] = classify_market_move(dynamics, None, None)
+            dynamics["information_search"] = row.get("information_search")
+            classification = classify_market_move_details(dynamics, None, None)
+            dynamics["classification"] = classification["classification"]
+            dynamics["classification_audit"] = classification
             row["market_dynamics"] = dynamics
         accepted_stages = {row.get("stage") for row in accepted}
         queued = [task for row in merged if row.get("stage") in accepted_stages for task in [_enqueue_revalidation(store, fixture, row)] if task]
@@ -1337,16 +1341,26 @@ def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict
         return record
 
 
-def classify_market_move(dynamics: Dict[str, Any], previous_version: Optional[Dict[str, Any]], new_script: Optional[Dict[str, Any]], model_market_divergence: bool = False) -> str:
+def classify_market_move_details(dynamics: Dict[str, Any], previous_version: Optional[Dict[str, Any]], new_script: Optional[Dict[str, Any]], model_market_divergence: bool = False) -> Dict[str, Any]:
     if dynamics.get("cross_market_divergence"):
-        return "Cross-Market Divergence"
-    if model_market_divergence:
-        return "Model-Market Divergence"
-    if previous_version and new_script and get_nested(previous_version, ["script", "content_hash"]) != new_script.get("content_hash"):
-        return "Fundamental Confirmed"
-    if get_nested(dynamics, ["revalidation_trigger", "triggered"]):
-        return "Market-Only Move"
-    return "Likely Information-Driven" if dynamics.get("comparison_status") == "data_missing" else "Market-Only Move"
+        classification, basis = "Cross-Market Divergence", "cross_market_signals_disagree"
+    elif model_market_divergence:
+        classification, basis = "Model-Market Divergence", "eligible_model_probability_differs_from_market"
+    elif previous_version and new_script and get_nested(previous_version, ["script", "content_hash"]) != new_script.get("content_hash"):
+        classification, basis = "Fundamental Confirmed", "verified_fundamental_version_changed"
+    else:
+        information = dynamics.get("information_search") if isinstance(dynamics.get("information_search"), dict) else {}
+        evidence_refs = information.get("evidence_refs") if isinstance(information.get("evidence_refs"), list) else []
+        suspected = information.get("status") == "suspected_unconfirmed" and any(str(ref).strip() for ref in evidence_refs)
+        if get_nested(dynamics, ["revalidation_trigger", "triggered"]) and suspected:
+            classification, basis = "Likely Information-Driven", "explicit_unconfirmed_information_with_evidence_reference"
+        else:
+            classification, basis = "Market-Only Move", "no_verified_fundamental_change"
+    return {"classification": classification, "basis": basis, "inferred_without_evidence": False}
+
+
+def classify_market_move(dynamics: Dict[str, Any], previous_version: Optional[Dict[str, Any]], new_script: Optional[Dict[str, Any]], model_market_divergence: bool = False) -> str:
+    return classify_market_move_details(dynamics, previous_version, new_script, model_market_divergence)["classification"]
 
 
 def no_vig_probabilities(odds: Dict[str, Any], keys: List[str]) -> Optional[Dict[str, float]]:
@@ -2368,8 +2382,9 @@ def shadow_snapshot(fixture: int, stage: str = "manual", raw: bool = False, toke
     trigger = get_nested(dynamics, ["revalidation_trigger"], {}) or {}
     should_version = not versions or bool(trigger.get("triggered")) or normalized in ("T-1h", "T-15m", "Closing")
     fundamental_version = save_fundamental_version(fixture, script, {"stage": normalized, **trigger}, previous_version) if should_version else previous_version
-    move_class = classify_market_move(dynamics, previous_version, script)
-    dynamics["classification"] = move_class
+    classification = classify_market_move_details(dynamics, previous_version, script)
+    dynamics["classification"] = classification["classification"]
+    dynamics["classification_audit"] = classification
     record = {"version": VERSION, "fixture": fixture, "stage": normalized, "requested_stage": stage, "snapshot_at": int(time.time()), "fixture_info": data.get("fixture"), "data_quality": data.get("data_quality"), "coverage": data.get("coverage"), "market_snapshot": market_snapshot, "market_dynamics": dynamics, "pure_fundamental_script_hash": script.get("content_hash"), "fundamental_version_number": (fundamental_version or {}).get("version_number"), "shadow_summary": data.get("shadow_summary")}
     saved = save_snapshot(record)
     print("[SHADOW_SNAPSHOT] " + json.dumps({"stage": normalized, "fixture": fixture, "data_quality": data.get("data_quality"), "market_dynamics": dynamics, "summary": data.get("shadow_summary")}, ensure_ascii=False)[:6000])
@@ -2919,7 +2934,9 @@ def auto_snapshot_cycle() -> None:
                             full_data = collect_prematch_data(int(fx["fixture_id"]), include_raw=False) if (not versions or trigger.get("triggered") or key in ("T-1h", "T-15m", "Closing")) else None
                             script = pure_fundamental_script(full_data) if full_data else get_nested(previous_version or {}, ["script"], {})
                             fundamental_version = save_fundamental_version(int(fx["fixture_id"]), script, {"stage": key, **trigger}, previous_version) if full_data else previous_version
-                            dynamics["classification"] = classify_market_move(dynamics, previous_version, script)
+                            classification = classify_market_move_details(dynamics, previous_version, script)
+                            dynamics["classification"] = classification["classification"]
+                            dynamics["classification_audit"] = classification
                             record = {"version": VERSION, "fixture": int(fx["fixture_id"]), "stage": key, "requested_stage": "auto", "snapshot_at": int(time.time()), "fixture_info": data.get("fixture"), "data_quality": data.get("data_quality"), "coverage": data.get("coverage"), "market_snapshot": market_snapshot, "market_dynamics": dynamics, "pure_fundamental_script_hash": script.get("content_hash"), "fundamental_version_number": (fundamental_version or {}).get("version_number"), "shadow_summary": data.get("shadow_summary")}
                             save_snapshot(record)
                             print("[AUTO_SNAPSHOT] saved " + json.dumps({"fixture": fx["fixture_id"], "stage": key, "due": due.isoformat()}, ensure_ascii=False))

@@ -200,6 +200,8 @@ T-X 变盘比较现覆盖全部可用市场：1X2、AH、O/U、BTTS、主队进�
 本身超过500条，`/shadow/import-status` 返回 `over_capacity=true`，便于及时扩容或处理积压。
 复核结案受当前评估阶段约束：例如使用 T-3h 数据重算时，只能关闭 T-3h 及更早任务；后来产生的
 T-1h、T-15m 或 Closing 信号继续保持 pending，等待对应阶段的新事实复核。
+`Likely Information-Driven` 只在变盘已触发、信息状态为 `suspected_unconfirmed` 且至少存在一个
+证据引用时使用；“暂时找不到原因”不再被包装成信息盘。每次分类附 `classification_audit.basis`。
 总完整度至少需达到0.6，且 Result Utility、Rotation Quality、Execution Ability、Goal Conversion
 四个关键环节不得缺失。证据不足时仍生成概率供审计，但最终建议强制 PASS。
 `available` 或 `partial` 不能只写状态：必须同时包含至少一个实质字段，例如证据、变量值或明确
