@@ -192,6 +192,8 @@ T-X 变盘比较现覆盖全部可用市场：1X2、AH、O/U、BTTS、主队进�
 也不会成为“最新盘口”。缺少开赛时间时返回 `data_missing`，不虚构校验结果。
 完整序列还必须随 Opening→Closing 单调向前；后续节点时间早于或等于前序有效节点时标记
 `non_monotonic_stage_timestamp`。异常节点保留审计，但从共识变化、复核触发和最终决策中隔离。
+导入幂等哈希现包含观测时间、目标时间和开赛时间；比赛信息、开赛时间、阵容历史或数据质量
+单独发生修订时也会持久化并重跑时间校验，不再因赔率内容未变化而被忽略。
 总完整度至少需达到0.6，且 Result Utility、Rotation Quality、Execution Ability、Goal Conversion
 四个关键环节不得缺失。证据不足时仍生成概率供审计，但最终建议强制 PASS。
 `available` 或 `partial` 不能只写状态：必须同时包含至少一个实质字段，例如证据、变量值或明确

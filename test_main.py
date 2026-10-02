@@ -923,6 +923,22 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         opening = [x for x in main.get_fixture_snapshots("uuid-1") if x["stage"] == "Opening"][0]
         self.assertEqual(opening["market_snapshot"]["primary"]["1x2"]["home"], 2.0)
 
+    def test_metadata_and_kickoff_corrections_are_not_ignored(self):
+        packet = self.prematch_packet()
+        packet["match"]["kickoff_utc"] = "2026-09-30T00:00:00+00:00"
+        first = main.import_prematch_packet(packet)
+        self.assertTrue(first["metadata_changed"])
+        corrected = self.prematch_packet()
+        corrected["match"]["kickoff_utc"] = "2026-09-29T23:00:00+00:00"
+        corrected["lineup_history"].append({"observed_at": "2026-09-29T22:00:00+00:00", "status": "official"})
+        second = main.import_prematch_packet(corrected)
+        self.assertTrue(second["changed"])
+        self.assertTrue(second["metadata_changed"])
+        self.assertEqual(second["counts"]["updated"], 2)
+        metadata = main.load_snapshot_store()["external_prematch"]["uuid-1"]
+        self.assertEqual(metadata["match"]["kickoff_utc"], "2026-09-29T23:00:00+00:00")
+        self.assertEqual(len(metadata["lineup_history"]), 2)
+
     def test_imported_fixture_freshness_gates_decisions(self):
         metadata = {"match": {"kickoff_utc": "2026-10-02T12:00:00+00:00"}}
         history = [{"stage": "Opening", "import_status": "available", "snapshot_at": 1000}]

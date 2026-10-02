@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.56.0"
+VERSION = "0.57.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1075,7 +1075,7 @@ def import_prematch_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
         seen.add(stage)
         status = "available" if stage_data.get("status") == "available" else "data_missing"
         market_snapshot = imported_market_snapshot(stage_data)
-        source_hash = _content_hash({"stage": stage, "status": status, "market_snapshot": market_snapshot, "missing_reason": stage_data.get("reason")})
+        source_hash = _content_hash({"stage": stage, "status": status, "market_snapshot": market_snapshot, "missing_reason": stage_data.get("reason"), "latest_observed_at": stage_data.get("latest_observed_at"), "target_at": stage_data.get("target_at"), "kickoff_utc": match.get("kickoff_utc")})
         record = {
             "version": VERSION, "fixture": fixture, "external_fixture_id": fixture, "source": "pang_import",
             "stage": stage, "snapshot_at": _parse_timestamp(stage_data.get("latest_observed_at") or stage_data.get("target_at")) or int(time.time()),
@@ -1087,6 +1087,17 @@ def import_prematch_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
         records.append(record)
     with SNAPSHOT_STORE_LOCK:
         store = load_snapshot_store()
+        external_prematch = store.setdefault("external_prematch", {})
+        previous_meta = external_prematch.get(fixture) or {}
+        next_meta_content = {
+            "schema_version": packet.get("schema_version"), "league": packet.get("league") or previous_meta.get("league"),
+            "exported_at": packet.get("exported_at") or previous_meta.get("exported_at"), "match": match or previous_meta.get("match"),
+            "required_timeline": packet.get("required_timeline") or previous_meta.get("required_timeline") or PREMATCH_STAGE_ORDER,
+            "lineup_history": packet.get("lineup_history") if "lineup_history" in packet else previous_meta.get("lineup_history", []),
+            "data_quality": packet.get("data_quality") or previous_meta.get("data_quality"),
+        }
+        previous_meta_content = {key: previous_meta.get(key) for key in next_meta_content}
+        metadata_changed = not previous_meta or _content_hash(next_meta_content) != _content_hash(previous_meta_content)
         existing = store.setdefault("fixtures", {}).get(fixture, [])
         existing_by_stage = {row.get("stage"): row for row in existing}
         accepted = []
@@ -1123,19 +1134,12 @@ def import_prematch_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
         accepted_stages = {row.get("stage") for row in accepted}
         queued = [task for row in merged if row.get("stage") in accepted_stages for task in [_enqueue_revalidation(store, fixture, row)] if task]
         store["fixtures"][fixture] = sorted(merged, key=lambda x: (STAGE_ORDER.index(x.get("stage")) if x.get("stage") in STAGE_ORDER else 999, x.get("snapshot_at", 0)))
-        external_prematch = store.setdefault("external_prematch", {})
-        if accepted or fixture not in external_prematch:
-            previous_meta = external_prematch.get(fixture) or {}
-            external_prematch[fixture] = {
-                "schema_version": packet.get("schema_version"), "league": packet.get("league") or previous_meta.get("league"), "exported_at": packet.get("exported_at") or previous_meta.get("exported_at"),
-                "match": match or previous_meta.get("match"), "required_timeline": packet.get("required_timeline") or previous_meta.get("required_timeline") or PREMATCH_STAGE_ORDER,
-                "lineup_history": packet.get("lineup_history") if "lineup_history" in packet else previous_meta.get("lineup_history", []),
-                "data_quality": packet.get("data_quality") or previous_meta.get("data_quality"), "imported_at": int(time.time()),
-            }
+        if accepted or metadata_changed:
+            external_prematch[fixture] = {**next_meta_content, "imported_at": int(time.time())}
             store["version"] = VERSION
             write_snapshot_store(store)
     counts = {action: sum(1 for row in imported if row["action"] == action) for action in ("inserted", "updated", "unchanged", "stale_skipped")}
-    return {"fixture": fixture, "match": f"{match.get('home_team_name')} vs {match.get('away_team_name')}", "stages": imported, "counts": counts, "changed": bool(accepted), "revalidation_tasks_created": len(queued)}
+    return {"fixture": fixture, "match": f"{match.get('home_team_name')} vs {match.get('away_team_name')}", "stages": imported, "counts": counts, "changed": bool(accepted or metadata_changed), "metadata_changed": metadata_changed, "revalidation_tasks_created": len(queued)}
 
 
 def line_from_primary(primary: Optional[Dict[str, Any]]) -> Optional[float]:
