@@ -193,6 +193,26 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         option = main.build_portfolio(rows, 4, "aggressive")["first_choice_combination"]["recommended_option"]
         self.assertIn("four_or_more_legs_materially_increase_variance", option["risk_warnings"])
 
+    def test_binary_portfolio_has_half_edge_stress_test_and_context(self):
+        candidate = {"market": "1x2", "selection": "home", "price": 2.0, "model_probability": .55, "market_no_vig_probability": .5, "script_coverage": .9, "edge": .05, "ev": .1}
+        rows = []
+        for index, confidence in enumerate((.9, .8)):
+            decision = {"lineup_confidence": confidence, "crowding": .3 + index * .1, "line_movement": {"status": "available"}, "death_path": [], "recommendation_tiers": {"first_choice_high_consistency": candidate}}
+            rows.append({"fixture": str(index), "evaluation": {"decision_layer": decision}})
+        option = main.build_portfolio(rows, 2)["first_choice_combination"]["recommended_option"]
+        stress = option["half_edge_stress_test"]
+        self.assertEqual(stress["status"], "available")
+        self.assertAlmostEqual(stress["estimated_full_win_probability"], .525 ** 2, places=8)
+        self.assertTrue(stress["remains_positive_ev"])
+        self.assertEqual(option["portfolio_context"]["minimum_lineup_confidence"], .8)
+        self.assertEqual(option["portfolio_context"]["maximum_crowding"], .4)
+
+    def test_asian_portfolio_stress_probability_is_data_missing(self):
+        asian = {"market": "asian_handicap", "selection": "home", "line": -.25, "price": 1.9, "model_probability": .55, "market_no_vig_probability": .5, "script_coverage": .9, "edge": .05, "ev": .08, "settlement_aware": True}
+        rows = [{"fixture": str(index), "evaluation": {"decision_layer": {"recommendation_tiers": {"first_choice_high_consistency": asian}}}} for index in range(2)]
+        option = main.build_portfolio(rows, 2)["first_choice_combination"]["recommended_option"]
+        self.assertEqual(option["half_edge_stress_test"]["status"], "data_missing")
+
     def test_independent_poisson_model_is_normalized_and_symmetric(self):
         model = main.poisson_probability_model(1.4, 1.4, 0.8, {"source": "verified_team_metrics", "uses_market_odds": False})
         self.assertTrue(model["ok"])

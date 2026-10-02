@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.22.0"
+VERSION = "0.23.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1403,7 +1403,15 @@ def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int,
             excluded.append({"fixture": row.get("fixture"), "correlation_group": group, "reason": "max_legs_reached", "requested_tier": tier})
             continue
         seen_groups.add(group)
-        candidates.append({"fixture": row.get("fixture"), "correlation_group": group, "source_tier": source_tier, **candidate})
+        decision_layer_result = get_nested(row, ["evaluation", "decision_layer"]) or {}
+        candidates.append({
+            "fixture": row.get("fixture"), "correlation_group": group, "source_tier": source_tier,
+            "lineup_confidence": decision_layer_result.get("lineup_confidence"),
+            "crowding": decision_layer_result.get("crowding"),
+            "line_movement": decision_layer_result.get("line_movement"),
+            "death_path": decision_layer_result.get("death_path") or [],
+            **candidate,
+        })
         if tier == "second_choice_higher_return" and source_tier == tier:
             upgraded = True
     if len(candidates) < 2 or (tier == "second_choice_higher_return" and not upgraded):
@@ -1424,6 +1432,9 @@ def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int,
         full_win_probability = math.prod(binary_probabilities) if not has_settlement_aware_leg and all(value is not None for value in binary_probabilities) else None
         market_combined_probability = math.prod(market_probabilities) if not has_settlement_aware_leg and all(value is not None for value in market_probabilities) else None
         probability_edge = full_win_probability - market_combined_probability if full_win_probability is not None and market_combined_probability is not None else None
+        stressed_probabilities = [(market + (model - market) * 0.5) for model, market in zip(binary_probabilities, market_probabilities)] if not has_settlement_aware_leg and all(value is not None for value in binary_probabilities + market_probabilities) else None
+        stressed_full_win_probability = math.prod(stressed_probabilities) if stressed_probabilities else None
+        stressed_ev = stressed_full_win_probability * combined_price - 1.0 if stressed_full_win_probability is not None else None
         weakest_leg = min(option_legs, key=lambda candidate: (as_float(candidate.get("script_coverage")) if as_float(candidate.get("script_coverage")) is not None else -1, as_float(candidate.get("edge")) if as_float(candidate.get("edge")) is not None else -999))
         risk_warnings = ["residual_cross_match_correlation_not_modeled"]
         if leg_count >= 4:
@@ -1438,7 +1449,18 @@ def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int,
             "market_no_vig_combined_probability": round(market_combined_probability, 8) if market_combined_probability is not None else {"status": "data_missing", "reason": "settlement_aware_asian_leg_prevents_naive_probability_multiplication" if has_settlement_aware_leg else "one_or_more_market_probability_missing"},
             "combined_probability_edge": round(probability_edge, 8) if probability_edge is not None else {"status": "data_missing", "reason": "comparable_binary_probabilities_unavailable"},
             "book_price_break_even_probability": round(1.0 / combined_price, 8),
-            "weakest_leg": {key: weakest_leg.get(key) for key in ("fixture", "market", "selection", "line", "script_coverage", "edge", "ev")},
+            "half_edge_stress_test": {
+                "status": "available", "method": "shrink_each_model_probability_halfway_to_market_no_vig",
+                "estimated_full_win_probability": round(stressed_full_win_probability, 8), "estimated_ev": round(stressed_ev, 6),
+                "remains_positive_ev": stressed_ev > 0,
+            } if stressed_ev is not None else {"status": "data_missing", "reason": "binary_model_and_market_probabilities_required"},
+            "weakest_leg": {key: weakest_leg.get(key) for key in ("fixture", "market", "selection", "line", "script_coverage", "edge", "ev", "lineup_confidence", "crowding")},
+            "portfolio_context": {
+                "minimum_lineup_confidence": min((as_float(candidate.get("lineup_confidence")) for candidate in option_legs if as_float(candidate.get("lineup_confidence")) is not None), default=None),
+                "maximum_crowding": max((as_float(candidate.get("crowding")) for candidate in option_legs if as_float(candidate.get("crowding")) is not None), default=None),
+                "line_movement_available_for_all_legs": all(isinstance(candidate.get("line_movement"), dict) and candidate.get("line_movement") for candidate in option_legs),
+                "death_path_clear_for_all_legs": all(not candidate.get("death_path") for candidate in option_legs),
+            },
             "risk_warnings": risk_warnings,
             "calculation_assumption": "cross-match independence after correlation_group screening",
         })
