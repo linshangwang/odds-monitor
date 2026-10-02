@@ -163,6 +163,9 @@ T-X 变盘比较现覆盖全部可用市场：1X2、AH、O/U、BTTS、主队进�
 进球数。可选市场缺失时保持 `data_missing`，不会用其他盘口推算补齐。
 价格异动同时保存原始赔率差值和去水后的概率差值；同一盘口线下 no-vig 概率变化达到3%会触发
 复核。盘口线已经变化时，两组价格不强行横向比较，明确标为 `line_changed`。
+最终评估会从每个可比较选项的模型概率与市场 no-vig 概率计算绝对差值；最大偏差达到8%时
+标记 `Model-Market Divergence`，同时保留对应市场、选择和偏差方向。没有可比较概率时保持
+`data_missing`，不会仅凭盘口方向生成该分类。
 总完整度至少需达到0.6，且 Result Utility、Rotation Quality、Execution Ability、Goal Conversion
 四个关键环节不得缺失。证据不足时仍生成概率供审计，但最终建议强制 PASS。
 `available` 或 `partial` 不能只写状态：必须同时包含至少一个实质字段，例如证据、变量值或明确

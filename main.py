@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.46.0"
+VERSION = "0.47.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -827,13 +827,13 @@ def _enqueue_revalidation(store: Dict[str, Any], fixture: str, row: Dict[str, An
     return task
 
 
-def resolve_revalidation_tasks(fixture: str, version_record: Optional[Dict[str, Any]]) -> int:
+def resolve_revalidation_tasks(fixture: str, version_record: Optional[Dict[str, Any]], model_market_divergence: bool = False) -> int:
     if not version_record or version_record.get("version_number") is None:
         return 0
     changed_information = list(version_record.get("changed_information") or [])
     prior_version_exists = int(version_record.get("version_number") or 0) > 1
     substantive_change = prior_version_exists and bool(changed_information)
-    resolution_classification = "Fundamental Confirmed" if substantive_change else "Market-Only Move"
+    resolution_classification = "Fundamental Confirmed" if substantive_change else ("Model-Market Divergence" if model_market_divergence else "Market-Only Move")
     with SNAPSHOT_STORE_LOCK:
         store = load_snapshot_store()
         changed = 0
@@ -1669,8 +1669,23 @@ def build_decision_summary(decision: Dict[str, Any], chain_audit: Dict[str, Any]
         "script_coverage": None if passed else best.get("script_coverage"),
         "model_status": model.get("status"),
         "fundamental_chain_status": chain_audit.get("status"),
+        "market_move_classification": decision.get("market_move_classification"),
         "pass_reasons": decision.get("pass_reasons") or [],
         "explanation": "No bet: one or more mandatory gates failed." if passed else "Selection passed model, price, script and risk gates.",
+    }
+
+
+def detect_model_market_divergence(decision: Dict[str, Any], threshold: float = 0.08) -> Dict[str, Any]:
+    comparable = [row for row in decision.get("candidates") or [] if as_float(row.get("edge")) is not None]
+    strongest = max(comparable, key=lambda row: abs(as_float(row.get("edge")) or 0.0), default=None)
+    gap = abs(as_float((strongest or {}).get("edge")) or 0.0) if strongest else None
+    return {
+        "triggered": gap is not None and gap >= threshold,
+        "threshold": threshold,
+        "maximum_absolute_probability_gap": round(gap, 6) if gap is not None else None,
+        "market": (strongest or {}).get("market"), "selection": (strongest or {}).get("selection"),
+        "direction": "model_above_market" if strongest and as_float(strongest.get("edge")) > 0 else ("model_below_market" if strongest else None),
+        "comparison_status": "compared" if strongest else "data_missing",
     }
 
 
@@ -1715,6 +1730,9 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
         decision["pass_reasons"].append("fundamental_chain_insufficient")
         decision["pass_reasons"] = list(dict.fromkeys(decision["pass_reasons"]))
         decision["decision"] = "PASS"
+    model_market_divergence = detect_model_market_divergence(decision)
+    decision["model_market_divergence"] = model_market_divergence
+    decision["market_move_classification"] = "Model-Market Divergence" if model_market_divergence["triggered"] else get_nested(decision, ["line_movement", "classification"])
     versions = get_fundamental_versions(fixture)
     previous = versions[-1] if versions else None
     previous_probability = get_nested(previous or {}, ["script", "model", "probabilities", "1x2"])
@@ -1733,7 +1751,7 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
         fixture, script, trigger, previous=previous,
         probability_change=probability_change, best_market_change=best_market_change,
     ) if persist_version else None
-    resolved_revalidations = resolve_revalidation_tasks(fixture, version_record) if version_record and trigger.get("triggered") and chain_audit.get("decision_eligible") else 0
+    resolved_revalidations = resolve_revalidation_tasks(fixture, version_record, model_market_divergence["triggered"]) if version_record and trigger.get("triggered") and chain_audit.get("decision_eligible") else 0
     return {
         "ok": True, "version": VERSION, "fixture": fixture, "estimator": estimator, "model": model,
         "decision_layer": decision, "decision_summary": build_decision_summary(decision, chain_audit, model),

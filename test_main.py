@@ -97,6 +97,22 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["decision"], "home")
         self.assertAlmostEqual(result["ev"], .10, places=6)
 
+    def test_model_market_divergence_uses_probability_gap(self):
+        decision = {"candidates": [
+            {"market": "1x2", "selection": "home", "edge": .035},
+            {"market": "btts", "selection": "yes", "edge": -.12},
+        ]}
+        result = main.detect_model_market_divergence(decision)
+        self.assertTrue(result["triggered"])
+        self.assertEqual(result["market"], "btts")
+        self.assertEqual(result["direction"], "model_below_market")
+        self.assertEqual(result["maximum_absolute_probability_gap"], .12)
+
+    def test_model_market_divergence_requires_comparable_probabilities(self):
+        result = main.detect_model_market_divergence({"candidates": []})
+        self.assertFalse(result["triggered"])
+        self.assertEqual(result["comparison_status"], "data_missing")
+
     def test_decision_layer_enforces_minimums_and_probability_validation(self):
         snapshot = main.empty_market_snapshot()
         snapshot["consensus_main_line"]["1x2"] = {"home": 2.0, "draw": 3.5, "away": 4.0}
@@ -797,6 +813,14 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(task["evidence_status"], "verified_fundamental_chain")
         self.assertTrue(task["fundamental_changed"])
         self.assertEqual(task["changed_information"], ["rotation_quality"])
+
+    def test_revalidation_resolution_can_record_model_market_divergence(self):
+        main.write_snapshot_store({"version": main.VERSION, "fixtures": {}, "fundamental_revalidation_queue": {
+            "task": {"task_id": "task", "fixture": "fixture-1", "status": "pending"}
+        }})
+        main.resolve_revalidation_tasks("fixture-1", {"version_number": 2, "changed_information": []}, model_market_divergence=True)
+        task = main.load_snapshot_store()["fundamental_revalidation_queue"]["task"]
+        self.assertEqual(task["resolution_classification"], "Model-Market Divergence")
 
     def test_first_revalidation_version_does_not_claim_fundamental_change(self):
         main.write_snapshot_store({"version": main.VERSION, "fixtures": {}, "fundamental_revalidation_queue": {
