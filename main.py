@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.35.0"
+VERSION = "0.36.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -27,6 +27,8 @@ SHADOW_ACCESS_TOKEN = os.getenv("SHADOW_ACCESS_TOKEN", "")
 SNAPSHOT_STORE_PATH = os.getenv("SNAPSHOT_STORE_PATH", "/tmp/shadow_snapshots.json")
 SNAPSHOT_STORE_GZIP = os.getenv("SNAPSHOT_STORE_GZIP", "true").lower() in ("1", "true", "yes", "on")
 EXTERNAL_DATA_STALE_SECONDS = max(60, int(os.getenv("EXTERNAL_DATA_STALE_SECONDS", "1800")))
+FUNDAMENTAL_VERSION_RETENTION = max(10, min(int(os.getenv("FUNDAMENTAL_VERSION_RETENTION", "100")), 1000))
+PORTFOLIO_RUN_RETENTION = max(10, min(int(os.getenv("PORTFOLIO_RUN_RETENTION", "100")), 1000))
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.03"))
 MIN_EV = float(os.getenv("MIN_EV", "0.03"))
 MIN_SCRIPT_COVERAGE = float(os.getenv("MIN_SCRIPT_COVERAGE", "0.60"))
@@ -1096,14 +1098,16 @@ def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict
         if old_script.get("estimator") != script.get("estimator"):
             changed_sections.append("fundamental_estimator")
             variable_changes["fundamental_estimator"] = {"before": old_script.get("estimator"), "after": script.get("estimator")}
+        next_version = max((int(row.get("version_number") or 0) for row in rows), default=0) + 1
         record = {
-            "version_number": len(rows) + 1, "created_at": int(time.time()), "trigger": trigger,
+            "version_number": next_version, "created_at": int(time.time()), "trigger": trigger,
             "changed_information": changed_sections, "variable_changes": variable_changes,
             "probability_change": probability_change or {"status": "data_missing", "reason": "no independent model probability supplied"},
             "best_market_change": best_market_change or {"status": "data_missing", "reason": "decision inputs incomplete"},
             "script": script,
         }
         rows.append(record)
+        store["fundamental_versions"][str(fixture)] = rows[-FUNDAMENTAL_VERSION_RETENTION:]
         store["version"] = VERSION
         write_snapshot_store(store)
         return record
@@ -1724,8 +1728,9 @@ def save_portfolio_run(portfolio_id: str, fixtures: List[str], portfolio: Dict[s
         signature = _portfolio_recommendation_signature(portfolio)
         previous_signature = (runs[-1].get("recommendation") if runs else None)
         transition = _portfolio_transition(previous_signature, signature)
+        next_version = max((int(run.get("version_number") or 0) for run in runs), default=0) + 1
         record = {
-            "version_number": len(runs) + 1, "created_at": int(time.time()), "portfolio_id": portfolio_id,
+            "version_number": next_version, "created_at": int(time.time()), "portfolio_id": portfolio_id,
             "fixtures": fixtures, "risk_preference": portfolio.get("risk_preference"), "max_legs": max_legs,
             "stage": stage,
             "trigger_reasons": trigger_reasons or ["portfolio_evaluation"],
@@ -1736,7 +1741,7 @@ def save_portfolio_run(portfolio_id: str, fixtures: List[str], portfolio: Dict[s
             "portfolio_decision": portfolio.get("portfolio_decision"),
         }
         runs.append(record)
-        store["portfolio_runs"][portfolio_id] = runs[-100:]
+        store["portfolio_runs"][portfolio_id] = runs[-PORTFOLIO_RUN_RETENTION:]
         store["version"] = VERSION
         write_snapshot_store(store)
         return record
@@ -1792,7 +1797,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "has_thestats_key": bool(THESTATS_API_KEY), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "external_data_stale_seconds": EXTERNAL_DATA_STALE_SECONDS, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}}
+    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "has_thestats_key": bool(THESTATS_API_KEY), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "fundamental_version_retention": FUNDAMENTAL_VERSION_RETENTION, "portfolio_run_retention": PORTFOLIO_RUN_RETENTION, "external_data_stale_seconds": EXTERNAL_DATA_STALE_SECONDS, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}}
 
 
 @app.get("/shadow/nami-capabilities")

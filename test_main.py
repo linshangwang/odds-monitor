@@ -247,6 +247,13 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(len(main.get_portfolio_runs("test-set")), 3)
         self.assertEqual(third["recommendation"]["decision"], "PASS")
 
+    def test_portfolio_run_retention_keeps_monotonic_numbers(self):
+        portfolio = {"risk_preference": "balanced", "portfolio_decision": "PASS", "risk_adjusted_recommendation": {"decision": "PASS", "reason": "test"}}
+        with patch.object(main, "PORTFOLIO_RUN_RETENTION", 3):
+            for _ in range(5):
+                main.save_portfolio_run("retained", ["a"], portfolio, 3, [])
+        self.assertEqual([row["version_number"] for row in main.get_portfolio_runs("retained")], [3, 4, 5])
+
     def test_portfolio_history_timeline_never_backfills_missing_stages(self):
         portfolio = {"risk_preference": "balanced", "portfolio_decision": "PASS", "risk_adjusted_recommendation": {"decision": "PASS", "reason": "test"}}
         opening = main.save_portfolio_run("timeline", ["a", "b"], portfolio, 3, [], "Opening")
@@ -392,6 +399,13 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("probability_change", row)
         self.assertIn("best_market_change", row)
         self.assertEqual(len(main.get_fundamental_versions(1)), 1)
+
+    def test_fundamental_version_retention_keeps_monotonic_numbers(self):
+        script = {"content_hash": "x", "chain": {key: {"status": "data_missing"} for key in main.FUNDAMENTAL_CHAIN}}
+        with patch.object(main, "FUNDAMENTAL_VERSION_RETENTION", 3):
+            for _ in range(5):
+                main.save_fundamental_version(9, script, {"triggered": False})
+        self.assertEqual([row["version_number"] for row in main.get_fundamental_versions(9)], [3, 4, 5])
 
     def test_fundamental_chain_audit_requires_critical_sections_and_minimum_coverage(self):
         chain = {key: {"status": "available", "evidence": f"verified-{key}"} for key in main.FUNDAMENTAL_CHAIN}
