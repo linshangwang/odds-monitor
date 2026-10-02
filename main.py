@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.34.0"
+VERSION = "0.35.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -721,6 +721,37 @@ def load_snapshot_backup_store() -> Dict[str, Any]:
     except Exception as exc:
         print("[SNAPSHOT_STORE] backup read failed: " + type(exc).__name__)
         raise SnapshotStoreReadError("snapshot_store_backup_read_failed") from exc
+
+
+def inspect_snapshot_store_file(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {"exists": False, "readable": False, "status": "data_missing"}
+    try:
+        encoded = path.read_bytes()
+        raw = gzip.decompress(encoded) if encoded.startswith(b"\x1f\x8b") else encoded
+        store = json.loads(raw.decode("utf-8"))
+        if not isinstance(store, dict):
+            raise ValueError("store root must be an object")
+        return {
+            "exists": True, "readable": True, "status": "ok", "gzip": encoded.startswith(b"\x1f\x8b"),
+            "size_bytes": len(encoded), "content_sha256": hashlib.sha256(encoded).hexdigest(),
+            "store_version": store.get("version"),
+            "fixture_count": len(store.get("fixtures") or {}),
+            "portfolio_count": len(store.get("portfolio_runs") or {}),
+        }
+    except Exception as exc:
+        return {"exists": True, "readable": False, "status": "corrupt", "error": type(exc).__name__}
+
+
+def snapshot_store_integrity() -> Dict[str, Any]:
+    primary = inspect_snapshot_store_file(Path(SNAPSHOT_STORE_PATH))
+    backup = inspect_snapshot_store_file(snapshot_backup_path())
+    return {
+        "primary": primary, "backup": backup,
+        "operational": primary.get("readable") is True,
+        "recovery_ready": backup.get("readable") is True,
+        "automatic_restore": False,
+    }
 
 
 def write_snapshot_store(store: Dict[str, Any]) -> bool:
@@ -2037,6 +2068,12 @@ def shadow_data_source_health(probe_nami: bool = False, token: Optional[str] = N
         "pang": {"write_policy": "read_only_source_no_remote_tasks", "sync": store.get("import_sync_status") or {"status": "never_imported"}, "fixture_state_counts": state_counts, "fixtures": fixtures},
         "nami": nami, "decision_gate": {"requires_fresh_prematch_data": True, "stale_action": "PASS"},
     })
+
+
+@app.get("/shadow/store-health")
+def shadow_store_health(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "version": VERSION, "integrity": snapshot_store_integrity()})
 
 
 @app.post("/shadow/model/poisson")

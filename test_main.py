@@ -579,6 +579,26 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             main.load_snapshot_store()
         self.assertEqual(main.load_snapshot_backup_store()["fixtures"], {"a": []})
 
+    def test_store_integrity_reports_primary_backup_without_data_payload(self):
+        main.write_snapshot_store({"version": "integrity-test", "fixtures": {"a": [{"secret": "not-returned"}]}, "portfolio_runs": {"p": []}})
+        integrity = main.snapshot_store_integrity()
+        self.assertTrue(integrity["operational"])
+        self.assertTrue(integrity["recovery_ready"])
+        self.assertEqual(integrity["primary"]["fixture_count"], 1)
+        self.assertEqual(integrity["backup"]["portfolio_count"], 1)
+        self.assertNotIn("fixtures", integrity["primary"])
+        self.assertNotIn("secret", str(integrity))
+        self.assertFalse(integrity["automatic_restore"])
+
+    def test_store_integrity_detects_corrupt_primary_with_readable_backup(self):
+        main.write_snapshot_store({"version": "good", "fixtures": {}})
+        with open(main.SNAPSHOT_STORE_PATH, "wb") as handle:
+            handle.write(b"corrupt")
+        integrity = main.snapshot_store_integrity()
+        self.assertFalse(integrity["operational"])
+        self.assertEqual(integrity["primary"]["status"], "corrupt")
+        self.assertTrue(integrity["recovery_ready"])
+
     def test_shadow_token_supports_header_and_bearer(self):
         self.assertEqual(main.resolve_shadow_token("query", None, "header"), "header")
         self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer-value", None), "bearer-value")
