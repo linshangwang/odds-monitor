@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.66.0"
+VERSION = "0.67.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -29,6 +29,7 @@ SNAPSHOT_STORE_GZIP = os.getenv("SNAPSHOT_STORE_GZIP", "true").lower() in ("1", 
 EXTERNAL_DATA_STALE_SECONDS = max(60, int(os.getenv("EXTERNAL_DATA_STALE_SECONDS", "1800")))
 FUNDAMENTAL_VERSION_RETENTION = max(10, min(int(os.getenv("FUNDAMENTAL_VERSION_RETENTION", "100")), 1000))
 PORTFOLIO_RUN_RETENTION = max(10, min(int(os.getenv("PORTFOLIO_RUN_RETENTION", "100")), 1000))
+SNAPSHOT_STORE_WARN_BYTES = max(1024 * 1024, int(os.getenv("SNAPSHOT_STORE_WARN_BYTES", str(256 * 1024 * 1024))))
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.03"))
 MIN_EV = float(os.getenv("MIN_EV", "0.03"))
 MIN_SCRIPT_COVERAGE = float(os.getenv("MIN_SCRIPT_COVERAGE", "0.60"))
@@ -735,12 +736,21 @@ def inspect_snapshot_store_file(path: Path) -> Dict[str, Any]:
         store = json.loads(raw.decode("utf-8"))
         if not isinstance(store, dict):
             raise ValueError("store root must be an object")
+        fixtures = store.get("fixtures") or {}
+        snapshot_count = sum(len(rows or []) for rows in fixtures.values())
+        queue = store.get("fundamental_revalidation_queue") or {}
         return {
             "exists": True, "readable": True, "status": "ok", "gzip": encoded.startswith(b"\x1f\x8b"),
-            "size_bytes": len(encoded), "content_sha256": hashlib.sha256(encoded).hexdigest(),
+            "size_bytes": len(encoded), "raw_size_bytes": len(raw),
+            "compression_ratio": round(len(encoded) / len(raw), 6) if raw else 1.0,
+            "capacity_state": "warning" if len(encoded) >= SNAPSHOT_STORE_WARN_BYTES else "normal",
+            "warning_threshold_bytes": SNAPSHOT_STORE_WARN_BYTES,
+            "content_sha256": hashlib.sha256(encoded).hexdigest(),
             "store_version": store.get("version"),
-            "fixture_count": len(store.get("fixtures") or {}),
+            "fixture_count": len(fixtures), "snapshot_count": snapshot_count,
             "portfolio_count": len(store.get("portfolio_runs") or {}),
+            "revalidation_task_count": len(queue),
+            "pending_revalidation_count": sum(task.get("status") == "pending" for task in queue.values()),
         }
     except Exception as exc:
         return {"exists": True, "readable": False, "status": "corrupt", "error": type(exc).__name__}
@@ -753,6 +763,7 @@ def snapshot_store_integrity() -> Dict[str, Any]:
         "primary": primary, "backup": backup,
         "operational": primary.get("readable") is True,
         "recovery_ready": backup.get("readable") is True,
+        "capacity_ok": primary.get("capacity_state") in (None, "normal"),
         "automatic_restore": False,
     }
 
@@ -2325,7 +2336,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "has_thestats_key": bool(THESTATS_API_KEY), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "fundamental_version_retention": FUNDAMENTAL_VERSION_RETENTION, "portfolio_run_retention": PORTFOLIO_RUN_RETENTION, "external_data_stale_seconds": EXTERNAL_DATA_STALE_SECONDS, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}}
+    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "has_thestats_key": bool(THESTATS_API_KEY), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "snapshot_store_warn_bytes": SNAPSHOT_STORE_WARN_BYTES, "fundamental_version_retention": FUNDAMENTAL_VERSION_RETENTION, "portfolio_run_retention": PORTFOLIO_RUN_RETENTION, "external_data_stale_seconds": EXTERNAL_DATA_STALE_SECONDS, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}}
 
 
 @app.get("/shadow/nami-capabilities")
