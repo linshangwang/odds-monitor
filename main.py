@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.45.0"
+VERSION = "0.46.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1094,6 +1094,21 @@ def compare_market_snapshots(history: List[Dict[str, Any]], current: Dict[str, A
         "home_team_total": {field: delta("home_team_total", field) for field in ("line", "over", "under")},
         "away_team_total": {field: delta("away_team_total", field) for field in ("line", "over", "under")},
     }
+    market_keys = {
+        "1x2": ("home", "draw", "away"), "asian_handicap": ("home", "away"),
+        "over_under": ("over", "under"), "btts": ("yes", "no"),
+        "home_team_total": ("over", "under"), "away_team_total": ("over", "under"),
+    }
+    probability_movements = {}
+    for market, keys in market_keys.items():
+        current_probs = no_vig_probabilities(curp.get(market) or {}, list(keys))
+        previous_probs = no_vig_probabilities(prevp.get(market) or {}, list(keys))
+        same_line = market in ("1x2", "btts") or line_from_primary(curp.get(market)) == line_from_primary(prevp.get(market))
+        comparable = bool(current_probs and previous_probs and same_line)
+        probability_movements[market] = {
+            "status": "compared" if comparable else ("line_changed" if current_probs and previous_probs and not same_line else "data_missing"),
+            "deltas": {key: round(current_probs[key] - previous_probs[key], 6) for key in keys} if comparable else None,
+        }
     ah_now, ah_prev = line_from_primary(curp.get("asian_handicap")), line_from_primary(prevp.get("asian_handicap"))
     ah_delta, ou_delta = movements["asian_handicap"]["line"], movements["over_under"]["line"]
     home_delta, away_delta = movements["1x2"]["home"], movements["1x2"]["away"]
@@ -1113,8 +1128,9 @@ def compare_market_snapshots(history: List[Dict[str, Any]], current: Dict[str, A
     }
     cross_market = any(divergence_pairs.values())
     price_deltas = [value for market in movements.values() for field, value in market.items() if field != "line"]
+    probability_deltas = [value for row in probability_movements.values() for value in (row.get("deltas") or {}).values()]
     line_deltas = [movements[market]["line"] for market in ("asian_handicap", "over_under", "home_team_total", "away_team_total")]
-    significant_price = any(value is not None and abs(value) >= 0.10 for value in price_deltas)
+    significant_price = any(value is not None and abs(value) >= 0.03 for value in probability_deltas) or any(value is not None and abs(value) >= 0.10 for value in price_deltas)
     significant_line = any(value is not None and abs(value) >= 0.25 for value in line_deltas)
     reasons = []
     if significant_line: reasons.append("significant_line_move")
@@ -1123,12 +1139,12 @@ def compare_market_snapshots(history: List[Dict[str, Any]], current: Dict[str, A
     return {
         "stage": stage, "previous_stage": previous.get("stage") if previous else None,
         "comparison_status": "data_missing" if not previous else "compared",
-        "market_movements": movements,
+        "market_movements": movements, "no_vig_probability_movements": probability_movements,
         "line_crossing": {"asian_handicap_delta": ah_delta, "asian_handicap_crossed_025_or_more": abs(ah_delta) >= 0.25 if ah_delta is not None else None, "over_under_delta": ou_delta, "over_under_crossed_025_or_more": abs(ou_delta) >= 0.25 if ou_delta is not None else None},
         "water_movement": {"home_1x2_odd_delta": home_delta, "away_1x2_odd_delta": away_delta},
         "continuous_strengthening": continuous, "reversal": reversal,
         "cross_market_divergence": cross_market, "cross_market_divergence_pairs": divergence_pairs,
-        "revalidation_trigger": {"triggered": bool(reasons), "reasons": reasons, "thresholds": {"line": 0.25, "decimal_price": 0.10}},
+        "revalidation_trigger": {"triggered": bool(reasons), "reasons": reasons, "thresholds": {"line": 0.25, "no_vig_probability": 0.03, "decimal_price_fallback": 0.10}},
         "data_missing": missing,
         "market_saturation": market_saturation(current)
     }

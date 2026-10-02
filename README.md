@@ -161,6 +161,8 @@ pending 任务标记为 overdue，并在 `/shadow/import-status` 汇总待处理
 T-X 变盘比较现覆盖全部可用市场：1X2、AH、O/U、BTTS、主队进球数和客队进球数；每个市场
 分别记录线路及价格变化。跨市场背离检查包括 1X2↔AH、O/U↔BTTS，以及双方1X2↔对应球队
 进球数。可选市场缺失时保持 `data_missing`，不会用其他盘口推算补齐。
+价格异动同时保存原始赔率差值和去水后的概率差值；同一盘口线下 no-vig 概率变化达到3%会触发
+复核。盘口线已经变化时，两组价格不强行横向比较，明确标为 `line_changed`。
 总完整度至少需达到0.6，且 Result Utility、Rotation Quality、Execution Ability、Goal Conversion
 四个关键环节不得缺失。证据不足时仍生成概率供审计，但最终建议强制 PASS。
 `available` 或 `partial` 不能只写状态：必须同时包含至少一个实质字段，例如证据、变量值或明确

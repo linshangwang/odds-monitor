@@ -67,6 +67,24 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertTrue(dynamics["cross_market_divergence_pairs"]["over_under_vs_btts"])
         self.assertIn("cross_market_divergence", dynamics["revalidation_trigger"]["reasons"])
 
+    def test_price_move_uses_no_vig_probability_and_rejects_line_mismatch(self):
+        previous = {"stage": "T-6h", "market_snapshot": {"primary": {
+            "1x2": {"home": 2.0, "draw": 3.5, "away": 4.0},
+            "over_under": {"line": 2.5, "over": 1.9, "under": 1.9},
+        }}}
+        current = main.empty_market_snapshot()
+        current["primary"].update({
+            "1x2": {"home": 1.85, "draw": 3.7, "away": 4.2},
+            "over_under": {"line": 2.75, "over": 1.9, "under": 1.9},
+        })
+        dynamics = main.compare_market_snapshots([previous], current, "T-3h")
+        probability = dynamics["no_vig_probability_movements"]
+        self.assertEqual(probability["1x2"]["status"], "compared")
+        self.assertGreater(probability["1x2"]["deltas"]["home"], .03)
+        self.assertEqual(probability["over_under"]["status"], "line_changed")
+        self.assertIsNone(probability["over_under"]["deltas"])
+        self.assertIn("abnormal_price_move", dynamics["revalidation_trigger"]["reasons"])
+
     def test_decision_layer_passes_when_inputs_missing(self):
         result = main.decision_layer(main.empty_market_snapshot())
         self.assertEqual(result["decision"], "PASS")
