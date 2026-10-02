@@ -72,6 +72,28 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         invalid = main.decision_layer(snapshot, {"home": .70, "draw": .40, "away": .20}, {"home": .8}, .2, .9, [])
         self.assertIn("model_probability_invalid_or_not_normalized", invalid["pass_reasons"])
 
+    def test_recommendation_tiers_prioritize_consistency_then_return(self):
+        snapshot = main.empty_market_snapshot()
+        snapshot["consensus_main_line"].update({
+            "1x2": {"home": 2.0, "draw": 3.5, "away": 4.0},
+            "btts": {"yes": 2.5, "no": 1.6},
+        })
+        model = {"1x2": {"home": .55, "draw": .25, "away": .20}, "btts": {"yes": .50, "no": .50}}
+        coverage = {"1x2": {"home": .90, "draw": .30, "away": .20}, "btts": {"yes": .65, "no": .20}}
+        result = main.decision_layer(snapshot, model, coverage, .3, .9, [])
+        tiers = result["recommendation_tiers"]
+        self.assertEqual(tiers["first_choice_high_consistency"]["market"], "1x2")
+        self.assertEqual(tiers["second_choice_higher_return"]["market"], "btts")
+        self.assertGreater(tiers["second_choice_higher_return"]["ev"], tiers["first_choice_high_consistency"]["ev"])
+
+    def test_high_variance_candidate_does_not_fill_main_tier(self):
+        snapshot = main.empty_market_snapshot()
+        snapshot["consensus_main_line"]["1x2"] = {"home": 2.0, "draw": 3.5, "away": 4.0}
+        result = main.decision_layer(snapshot, {"home": .55, "draw": .25, "away": .20}, {"home": .50, "draw": .20, "away": .20}, .3, .9, [])
+        self.assertEqual(result["decision"], "PASS")
+        self.assertIsNone(result["recommendation_tiers"]["first_choice_high_consistency"])
+        self.assertEqual(result["recommendation_tiers"]["high_variance_single"]["selection"], "home")
+
     def test_independent_poisson_model_is_normalized_and_symmetric(self):
         model = main.poisson_probability_model(1.4, 1.4, 0.8, {"source": "verified_team_metrics", "uses_market_odds": False})
         self.assertTrue(model["ok"])

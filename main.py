@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.15.0"
+VERSION = "0.16.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -32,6 +32,7 @@ MIN_EV = float(os.getenv("MIN_EV", "0.03"))
 MIN_SCRIPT_COVERAGE = float(os.getenv("MIN_SCRIPT_COVERAGE", "0.60"))
 MAX_CROWDING = float(os.getenv("MAX_CROWDING", "0.80"))
 MIN_LINEUP_CONFIDENCE = float(os.getenv("MIN_LINEUP_CONFIDENCE", "0.70"))
+HIGH_VARIANCE_MIN_SCRIPT_COVERAGE = float(os.getenv("HIGH_VARIANCE_MIN_SCRIPT_COVERAGE", "0.40"))
 AUTO_SNAPSHOT_ENABLED = os.getenv("AUTO_SNAPSHOT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 AUTO_SNAPSHOT_POLL_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_POLL_SECONDS", "300")))
 AUTO_SNAPSHOT_WINDOW_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_WINDOW_SECONDS", "600")))
@@ -1255,7 +1256,14 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
     if model_probabilities and not valid_model_market_count: missing.append("model_probability_invalid_or_not_normalized")
     if not market_probabilities: missing.append("market_no_vig_probability")
     candidates.sort(key=lambda x: (x.get("ev", -999), x.get("edge", -999)), reverse=True)
-    best = candidates[0] if candidates else None
+    best_unfiltered = candidates[0] if candidates else None
+    qualified = [row for row in candidates if row["edge"] >= MIN_EDGE and row["ev"] >= MIN_EV and as_float(row.get("script_coverage")) is not None and row["script_coverage"] >= MIN_SCRIPT_COVERAGE]
+    first_choice = max(qualified, key=lambda row: (row["script_coverage"], row["edge"], row["ev"]), default=None)
+    second_pool = [row for row in qualified if not first_choice or (row["market"], row["selection"], row.get("line")) != (first_choice["market"], first_choice["selection"], first_choice.get("line"))]
+    second_choice = max(second_pool, key=lambda row: (row["ev"], row["edge"], row["script_coverage"]), default=None)
+    high_variance_pool = [row for row in candidates if row["edge"] >= MIN_EDGE and row["ev"] >= MIN_EV and as_float(row.get("script_coverage")) is not None and HIGH_VARIANCE_MIN_SCRIPT_COVERAGE <= row["script_coverage"] < MIN_SCRIPT_COVERAGE]
+    high_variance = max(high_variance_pool, key=lambda row: (row["ev"], row["edge"]), default=None)
+    best = first_choice or best_unfiltered
     pass_reasons = list(missing)
     if best and best["edge"] < MIN_EDGE: pass_reasons.append("edge_below_minimum")
     if best and best["ev"] < MIN_EV: pass_reasons.append("ev_below_minimum")
@@ -1264,16 +1272,26 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
     if crowding is not None and crowding > MAX_CROWDING: pass_reasons.append("crowding_above_maximum")
     if lineup_confidence is not None and lineup_confidence < MIN_LINEUP_CONFIDENCE: pass_reasons.append("lineup_confidence_below_minimum")
     if death_path: pass_reasons.append("death_path_present")
-    decision = "PASS" if pass_reasons or not best else (best["selection"] if best["market"] == "1x2" else f"{best['market']}:{best['selection']}")
+    if pass_reasons:
+        first_choice = second_choice = None
+        if any(reason != "script_coverage_below_minimum" for reason in pass_reasons):
+            high_variance = None
+    decision = "PASS" if pass_reasons or not first_choice else (first_choice["selection"] if first_choice["market"] == "1x2" else f"{first_choice['market']}:{first_choice['selection']}")
     return {
-        "decision": decision, "best_market": best, "candidates": candidates,
+        "decision": decision, "best_market": first_choice, "candidates": candidates,
+        "recommendation_tiers": {
+            "first_choice_high_consistency": first_choice,
+            "second_choice_higher_return": second_choice,
+            "high_variance_single": high_variance,
+            "ranking_rule": "consistency first; price second; high-variance candidates are never used to fill the main tier",
+        },
         "market_no_vig_probability": market_probabilities, "model_probability": model_probabilities,
-        "edge": best.get("edge") if best else None, "ev": best.get("ev") if best else None,
+        "edge": first_choice.get("edge") if first_choice else None, "ev": first_choice.get("ev") if first_choice else None,
         "script_coverage": script_coverage, "crowding": crowding,
         "line_movement": None, "lineup_confidence": lineup_confidence,
         "death_path": death_path or [], "pass_reasons": pass_reasons,
         "settlement_policy": {"supported_line_increment": 0.25, "quarter_lines": "split into adjacent half-lines", "push_half_win_half_loss": "included in model EV", "unsupported_lines": "PASS"},
-        "thresholds": {"minimum_edge": MIN_EDGE, "minimum_ev": MIN_EV, "minimum_script_coverage": MIN_SCRIPT_COVERAGE, "maximum_crowding": MAX_CROWDING, "minimum_lineup_confidence": MIN_LINEUP_CONFIDENCE},
+        "thresholds": {"minimum_edge": MIN_EDGE, "minimum_ev": MIN_EV, "minimum_script_coverage": MIN_SCRIPT_COVERAGE, "high_variance_minimum_script_coverage": HIGH_VARIANCE_MIN_SCRIPT_COVERAGE, "maximum_crowding": MAX_CROWDING, "minimum_lineup_confidence": MIN_LINEUP_CONFIDENCE},
     }
 
 

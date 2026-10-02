@@ -97,12 +97,22 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 MIN_EDGE=0.03
 MIN_EV=0.03
 MIN_SCRIPT_COVERAGE=0.60
+HIGH_VARIANCE_MIN_SCRIPT_COVERAGE=0.40
 MAX_CROWDING=0.80
 MIN_LINEUP_CONFIDENCE=0.70
 ```
 
 模型主胜、平局、客胜概率必须各自在 0–1 内且合计误差不超过 0.02。最佳候选仍需同时满足
 Edge、EV、脚本覆盖率、拥挤度和阵容可信度门槛，且不存在 Death Path；任何一项缺失或不合格均明确记录原因并 `PASS`。
+
+合格结果固定输出三层：
+
+- `first_choice_high_consistency`：优先选择 Script Coverage 和基本面/盘口一致性最高的表达，允许赔率较低。
+- `second_choice_higher_return`：仍通过全部标准门槛，但在其他候选中优先更高 EV。
+- `high_variance_single`：Edge/EV 为正、覆盖率至少达到独立门槛，但未达到主推荐覆盖率，只能作为高博弈单关。
+
+高博弈候选不会为了填充结果而进入第一或第二首选；Crowding、Lineup Confidence、Death Path
+或关键字段出现硬性问题时，三层都清空并返回 `PASS`。
 
 主要接口保持兼容，并新增：
 
