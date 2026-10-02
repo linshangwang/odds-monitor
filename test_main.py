@@ -469,6 +469,26 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("loss", invalid["critical_semantic_issues"]["result_utility"]["away"]["missing_numeric_fields"])
         self.assertEqual(invalid["critical_semantic_issues"]["goal_conversion"]["away"]["reason"], "at_least_one_numeric_metric_required")
 
+    def test_critical_fundamental_numeric_values_reject_nonfinite_order_and_range(self):
+        now_ts = 1790989200
+        chain = {key: {"status": "available", "evidence": key, "source": "trusted-feed", "observed_at": now_ts} for key in main.FUNDAMENTAL_CHAIN}
+        chain["result_utility"].update({"home": {"win": 0, "draw": 1, "loss": -1}, "away": {"win": 1, "draw": 0, "loss": -1}})
+        bad_rotation = {"starting_xi_strength": 1.2, "creativity": .7, "finishing": .75, "chemistry": .8}
+        chain["rotation_quality"].update({"home": bad_rotation, "away": bad_rotation})
+        chain["execution_ability"].update({"home": {"score": "NaN"}, "away": {"score": .6}})
+        chain["goal_conversion"].update({"home": {"rate": -.1}, "away": {"rate": .1}})
+        audit = main.audit_fundamental_chain({"chain": chain}, now_ts=now_ts)
+        self.assertFalse(audit["decision_eligible"])
+        self.assertIn("utility_must_satisfy", audit["critical_semantic_issues"]["result_utility"]["home"]["reason"])
+        self.assertIn("starting_xi_strength", audit["critical_semantic_issues"]["rotation_quality"]["home"]["numeric_fields_outside_0_to_1"])
+        self.assertEqual(audit["critical_semantic_issues"]["execution_ability"]["home"]["reason"], "at_least_one_numeric_metric_required")
+        self.assertIn("rate", audit["critical_semantic_issues"]["goal_conversion"]["home"]["negative_numeric_fields"])
+
+    def test_as_float_rejects_nonfinite_values(self):
+        self.assertIsNone(main.as_float("NaN"))
+        self.assertIsNone(main.as_float("Infinity"))
+        self.assertEqual(main.as_float("1.25"), 1.25)
+
     def test_prematch_pipeline_passes_when_fundamental_chain_is_missing(self):
         main.import_prematch_packet(self.prematch_packet())
         latest = max(row.get("snapshot_at") or 0 for row in main.get_fixture_snapshots("uuid-1") if row.get("import_status") == "available")

@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.39.0"
+VERSION = "0.40.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -372,7 +372,8 @@ def injuries_summary(result: Dict[str, Any], home_id: Optional[int], away_id: Op
 
 def as_float(value: Any) -> Optional[float]:
     try:
-        return float(str(value).strip())
+        parsed = float(str(value).strip())
+        return parsed if math.isfinite(parsed) else None
     except Exception:
         return None
 
@@ -1464,12 +1465,21 @@ def audit_fundamental_chain(script: Dict[str, Any], now_ts: Optional[int] = None
         missing_fields = [outcome for outcome in ("win", "draw", "loss") if as_float(side_values.get(outcome)) is None]
         if missing_fields:
             semantic_issues.setdefault("result_utility", {})[side] = {"missing_numeric_fields": missing_fields}
+        else:
+            win, draw, loss = (as_float(side_values[outcome]) for outcome in ("win", "draw", "loss"))
+            if not (win >= draw >= loss) or win == loss:
+                semantic_issues.setdefault("result_utility", {})[side] = {"reason": "utility_must_satisfy_win_gte_draw_gte_loss_with_nonzero_spread"}
     rotation = chain.get("rotation_quality") or {}
     for side in ("home", "away"):
         side_values = rotation.get(side) if isinstance(rotation.get(side), dict) else {}
-        present = [field for field in ROTATION_QUALITY_FIELDS if side_values.get(field) not in (None, "", [], {})]
+        numeric_rotation_fields = [field for field in ROTATION_QUALITY_FIELDS if field != "lineup_intent"]
+        valid_numeric = [field for field in numeric_rotation_fields if as_float(side_values.get(field)) is not None and 0 <= as_float(side_values.get(field)) <= 1]
+        invalid_numeric = [field for field in numeric_rotation_fields if side_values.get(field) not in (None, "", [], {}) and field not in valid_numeric]
+        present = valid_numeric + (["lineup_intent"] if side_values.get("lineup_intent") not in (None, "", [], {}) else [])
         if len(present) < 4:
             semantic_issues.setdefault("rotation_quality", {})[side] = {"required_minimum_fields": 4, "present_fields": present}
+        if invalid_numeric:
+            semantic_issues.setdefault("rotation_quality", {}).setdefault(side, {})["numeric_fields_outside_0_to_1"] = invalid_numeric
     for section_name in ("execution_ability", "goal_conversion"):
         section = chain.get(section_name) or {}
         for side in ("home", "away"):
@@ -1477,6 +1487,9 @@ def audit_fundamental_chain(script: Dict[str, Any], now_ts: Optional[int] = None
             numeric_fields = [field for field, value in side_values.items() if as_float(value) is not None]
             if not numeric_fields:
                 semantic_issues.setdefault(section_name, {})[side] = {"reason": "at_least_one_numeric_metric_required"}
+            negative_fields = [field for field in numeric_fields if as_float(side_values.get(field)) < 0]
+            if negative_fields:
+                semantic_issues.setdefault(section_name, {}).setdefault(side, {})["negative_numeric_fields"] = negative_fields
     completeness = sum(scores.values()) / len(FUNDAMENTAL_CHAIN)
     eligible = completeness >= 0.6 and not critical_missing and not critical_provenance_missing and not critical_timestamp_issues and not semantic_issues
     return {
@@ -1493,9 +1506,9 @@ def audit_fundamental_chain(script: Dict[str, Any], now_ts: Optional[int] = None
         "critical_semantic_issues": semantic_issues,
         "critical_schema": {
             "result_utility": "home/away each require numeric win, draw, loss",
-            "rotation_quality": "home/away each require at least 4 named quality fields",
-            "execution_ability": "home/away each require at least one numeric metric",
-            "goal_conversion": "home/away each require at least one numeric metric",
+            "rotation_quality": "home/away each require at least 4 named quality fields; numeric scores must be 0..1",
+            "execution_ability": "home/away each require at least one finite nonnegative numeric metric",
+            "goal_conversion": "home/away each require at least one finite nonnegative numeric metric",
         },
         "evidence_rule": "available or partial requires at least one substantive field beyond status/reason/warning",
         "provenance_rule": "critical sections require source or provenance and a valid type-specific observed_at/as_of",
