@@ -172,6 +172,10 @@ T-X 变盘比较现覆盖全部可用市场：1X2、AH、O/U、BTTS、主队进�
 `Pure Fundamental Script` 现在执行市场污染检查：基本面链禁止包含赔率、庄家、市场概率、
 隐含概率、盘口快照或盘口变化字段，source/provenance 也不能以这些市场数据作为事实来源。
 命中后在 `market_contaminated_sections` 列出具体路径，最终结论强制 PASS。
+
+阵容置信度不再直接相信请求值：官方阵容、预计阵容、陈旧阵容和缺失阵容分别设置证据上限，
+未来时间戳或无效时间戳不计入有效证据。模型和最终门槛统一使用 `effective_confidence`，原提交值、
+上限、是否被压低及证据新鲜度保存在 `lineup_confidence_audit`。
 总完整度至少需达到0.6，且 Result Utility、Rotation Quality、Execution Ability、Goal Conversion
 四个关键环节不得缺失。证据不足时仍生成概率供审计，但最终建议强制 PASS。
 `available` 或 `partial` 不能只写状态：必须同时包含至少一个实质字段，例如证据、变量值或明确

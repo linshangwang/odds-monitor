@@ -689,7 +689,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             {"bookmaker_name": "A", "market": "home_team_total", "market_name": "Home Team Total Goals(1st Half)", "selection": "Over 0.5", "line": "0.5", "price": "1.8"},
             {"bookmaker_name": "A", "market": "home_team_total", "market_name": "Home Team Total Goals(1st Half)", "selection": "Under 0.5", "line": "0.5", "price": "2.0"},
         ]}
-        return {"schema_version": "shadow_prematch_packet_v1", "league": "UEFA Nations League", "match": {"match_id": "uuid-1", "home_team_name": "Home", "away_team_name": "Away"}, "required_timeline": main.PREMATCH_STAGE_ORDER, "timeline": [row, {"stage": "T-15m", "status": "data_missing", "reason": "not captured"}], "lineup_history": [{"observed_at": "x"}], "data_quality": {"level": "partial"}}
+        return {"schema_version": "shadow_prematch_packet_v1", "league": "UEFA Nations League", "match": {"match_id": "uuid-1", "home_team_name": "Home", "away_team_name": "Away"}, "required_timeline": main.PREMATCH_STAGE_ORDER, "timeline": [row, {"stage": "T-15m", "status": "data_missing", "reason": "not captured"}], "lineup_history": [{"observed_at": "2026-09-29T00:00:00+00:00", "status": "official"}], "data_quality": {"level": "partial"}}
 
     def test_imported_packet_preserves_uuid_arrays_and_missing_stage(self):
         result = main.import_prematch_packet(self.prematch_packet())
@@ -874,6 +874,23 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(historical["state"], "historical")
         missing = main.imported_fixture_freshness(metadata, [], now_ts=1100)
         self.assertEqual(missing["state"], "data_missing")
+
+    def test_lineup_confidence_is_capped_by_verified_evidence(self):
+        now_ts = 1790989200
+        official = main.audit_lineup_confidence([{"observed_at": now_ts - 600, "status": "official"}], .99, now_ts=now_ts)
+        self.assertEqual(official["evidence_status"], "official_fresh")
+        self.assertEqual(official["effective_confidence"], .95)
+        predicted = main.audit_lineup_confidence([{"observed_at": now_ts - 3600, "type": "predicted"}], .95, now_ts=now_ts)
+        self.assertEqual(predicted["effective_confidence"], .8)
+        missing = main.audit_lineup_confidence([], .9, now_ts=now_ts)
+        self.assertEqual(missing["evidence_status"], "data_missing")
+        self.assertEqual(missing["effective_confidence"], .4)
+
+    def test_future_or_invalid_lineup_observations_are_not_trusted(self):
+        now_ts = 1790989200
+        audit = main.audit_lineup_confidence([{"observed_at": now_ts + 301, "is_official": True}, {"observed_at": "invalid"}], .9, now_ts=now_ts)
+        self.assertEqual(audit["valid_observation_count"], 0)
+        self.assertEqual(audit["effective_confidence"], .4)
 
     def test_import_rejects_unknown_schema(self):
         packet = self.prematch_packet()

@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.49.0"
+VERSION = "0.50.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1732,7 +1732,10 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
     metadata = (store.get("external_prematch") or {}).get(fixture)
     if not metadata:
         raise HTTPException(status_code=404, detail="imported_fixture_not_found")
-    estimator = fundamental_expected_goals(payload)
+    lineup_audit = audit_lineup_confidence(metadata.get("lineup_history"), payload.get("lineup_confidence"))
+    effective_payload = dict(payload)
+    effective_payload["lineup_confidence"] = lineup_audit.get("effective_confidence")
+    estimator = fundamental_expected_goals(effective_payload)
     if not estimator.get("ok"):
         raise HTTPException(status_code=422, detail=estimator)
     xg = estimator["expected_goals"]
@@ -1746,8 +1749,9 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
     freshness = imported_fixture_freshness(metadata, history)
     decision = decision_layer(
         market, model.get("probabilities"), payload.get("script_coverage"),
-        as_float(payload.get("crowding")), as_float(payload.get("lineup_confidence")), payload.get("death_path") or [],
+        as_float(payload.get("crowding")), lineup_audit.get("effective_confidence"), payload.get("death_path") or [],
     )
+    decision["lineup_confidence_audit"] = lineup_audit
     decision["line_movement"] = (latest or {}).get("market_dynamics") or {"status": "data_missing"}
     decision["data_freshness"] = freshness
     if model.get("status") != "ready":
@@ -1758,7 +1762,7 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
     if decision["pass_reasons"]:
         decision["decision"] = "PASS"
 
-    script = _fundamental_evaluation_script(payload, estimator, model)
+    script = _fundamental_evaluation_script(effective_payload, estimator, model)
     chain_audit = audit_fundamental_chain(script)
     decision["fundamental_chain_audit"] = chain_audit
     if not chain_audit["decision_eligible"]:
@@ -2356,6 +2360,41 @@ def imported_fixture_freshness(metadata: Dict[str, Any], history: List[Dict[str,
         "state": state, "decision_eligible": eligible, "reason": reason,
         "latest_snapshot_at": latest, "age_seconds": age, "stale_after_seconds": EXTERNAL_DATA_STALE_SECONDS,
         "kickoff_at": kickoff,
+    }
+
+
+def audit_lineup_confidence(lineup_history: Any, submitted_confidence: Any, now_ts: Optional[int] = None) -> Dict[str, Any]:
+    now_ts = int(time.time()) if now_ts is None else int(now_ts)
+    submitted = as_float(submitted_confidence)
+    rows = lineup_history if isinstance(lineup_history, list) else []
+    valid_rows = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        observed_at = _parse_timestamp(row.get("observed_at") or row.get("as_of") or row.get("updated_at"))
+        if observed_at is None or observed_at > now_ts + 300:
+            continue
+        label = str(row.get("status") or row.get("type") or row.get("lineup_type") or "").lower()
+        official = row.get("is_official") is True or label in {"official", "confirmed", "starting_xi"}
+        valid_rows.append({"observed_at": observed_at, "official": official})
+    latest = max(valid_rows, key=lambda row: row["observed_at"], default=None)
+    if latest:
+        age = now_ts - latest["observed_at"]
+        if latest["official"] and age <= 6 * 3600:
+            evidence_status, cap = "official_fresh", .95
+        elif not latest["official"] and age <= 24 * 3600:
+            evidence_status, cap = "predicted_fresh", .80
+        else:
+            evidence_status, cap = "stale", .60 if latest["official"] else .50
+    else:
+        age, evidence_status, cap = None, "data_missing", .40
+    effective = min(submitted, cap) if submitted is not None else None
+    return {
+        "evidence_status": evidence_status, "submitted_confidence": submitted,
+        "evidence_cap": cap, "effective_confidence": effective,
+        "latest_observed_at": latest["observed_at"] if latest else None,
+        "age_seconds": age, "valid_observation_count": len(valid_rows),
+        "capped": submitted is not None and effective < submitted,
     }
 
 
