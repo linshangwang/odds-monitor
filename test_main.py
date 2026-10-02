@@ -88,7 +88,6 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "1x2": {"home": 1.7, "draw": 4.0, "away": 5.0},
             "over_under": {"line": 2.5, "over": 2.2, "under": 1.7},
             "btts": {"yes": 2.0, "no": 1.8},
-            "asian_handicap": {"line": -0.75, "home": 1.9, "away": 1.9},
         })
         model = main.poisson_probability_model(2.0, 1.2, 0.9, {"source": "verified_team_metrics", "uses_market_odds": False})
         result = main.decision_layer(snapshot, model["probabilities"], {
@@ -98,7 +97,19 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["decision"], "over_under:over")
         self.assertEqual(result["best_market"]["line"], 2.5)
         self.assertIn("over_under", result["market_no_vig_probability"])
-        self.assertFalse(any(row["market"] == "asian_handicap" for row in result["candidates"]))
+
+    def test_asian_quarter_line_ev_includes_half_loss_and_push(self):
+        metrics = main.asian_settlement_metrics({"1": .5, "0": .5}, -.25, "home", 2.0, "asian_handicap")
+        self.assertAlmostEqual(metrics["win_equivalent"], .5, places=6)
+        self.assertAlmostEqual(metrics["loss_equivalent"], .25, places=6)
+        self.assertAlmostEqual(metrics["push_probability"], .25, places=6)
+        self.assertAlmostEqual(metrics["ev"], .25, places=6)
+
+    def test_integer_total_ev_includes_push(self):
+        metrics = main.asian_settlement_metrics({"2": .5, "3": .5}, 2.0, "over", 2.0, "over_under")
+        self.assertAlmostEqual(metrics["win_equivalent"], .5, places=6)
+        self.assertAlmostEqual(metrics["push_probability"], .5, places=6)
+        self.assertAlmostEqual(metrics["ev"], .5, places=6)
 
     def test_poisson_model_rejects_market_derived_or_low_confidence_inputs(self):
         invalid = main.poisson_probability_model(1.5, 1.0, 0.9, {"source": "odds", "uses_market_odds": True})

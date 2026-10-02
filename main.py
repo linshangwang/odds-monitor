@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.14.0"
+VERSION = "0.15.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1076,6 +1076,10 @@ def poisson_probability_model(home_expected_goals: Any, away_expected_goals: Any
             team_totals[team][f"over_{key}"] = round(over, 6)
             team_totals[team][f"under_{key}"] = round(1.0 - over, 6)
     top_scores = sorted(normalized.items(), key=lambda item: item[1], reverse=True)[:8]
+    distributions = {"goal_difference": {}, "total_goals": {}, "home_goals": {}, "away_goals": {}}
+    for (home, away), probability in normalized.items():
+        for name, value in (("goal_difference", home - away), ("total_goals", home + away), ("home_goals", home), ("away_goals", away)):
+            distributions[name][str(value)] = distributions[name].get(str(value), 0.0) + probability
     status = "ready" if confidence >= 0.6 else "insufficient_confidence"
     return {
         "ok": True, "status": status, "method": "independent_poisson_v1", "uses_market_odds": False,
@@ -1086,6 +1090,7 @@ def poisson_probability_model(home_expected_goals: Any, away_expected_goals: Any
             "btts": {"yes": round(btts_yes, 6), "no": round(1.0 - btts_yes, 6)},
             "home_team_totals": team_totals["home"], "away_team_totals": team_totals["away"],
             "top_scores": [{"score": f"{home}-{away}", "probability": round(probability, 6)} for (home, away), probability in top_scores],
+            "settlement_distributions": {name: {key: round(value, 8) for key, value in rows.items()} for name, rows in distributions.items()},
         },
         "truncated_tail_mass": round(1.0 - mass, 10),
         "model_hash": _content_hash({"home_xg": home_xg, "away_xg": away_xg, "confidence": confidence, "provenance": provenance, "method": "independent_poisson_v1"}),
@@ -1163,6 +1168,51 @@ def _coverage_for(script_coverage: Dict[str, Any], market: str, selection: str) 
     return as_float(script_coverage.get(f"{market}.{selection}")) if as_float(script_coverage.get(f"{market}.{selection}")) is not None else as_float(script_coverage.get(selection))
 
 
+def _split_asian_line(line: float) -> Optional[List[float]]:
+    scaled = round(line * 4)
+    if abs(line * 4 - scaled) > 1e-6:
+        return None
+    if abs(scaled) % 2 == 0:
+        return [line]
+    lower = math.floor(line * 2) / 2.0
+    return [lower, lower + 0.5]
+
+
+def asian_settlement_metrics(distribution: Dict[str, Any], line: float, selection: str, price: float, market: str) -> Optional[Dict[str, float]]:
+    split = _split_asian_line(line)
+    if not split or not price or price <= 1.0:
+        return None
+    win_equivalent = loss_equivalent = push_probability = expected_return = 0.0
+    for raw_outcome, raw_probability in distribution.items():
+        outcome, probability = as_float(raw_outcome), as_float(raw_probability)
+        if outcome is None or probability is None:
+            continue
+        component_weight = probability / len(split)
+        for component in split:
+            if market == "asian_handicap":
+                settled = outcome + component if selection == "home" else -outcome - component
+            else:
+                settled = outcome - component if selection == "over" else component - outcome
+            if settled > 1e-9:
+                win_equivalent += component_weight
+                expected_return += component_weight * (price - 1.0)
+            elif settled < -1e-9:
+                loss_equivalent += component_weight
+                expected_return -= component_weight
+            else:
+                push_probability += component_weight
+    denominator = win_equivalent + loss_equivalent
+    if denominator <= 0:
+        return None
+    fair_probability = win_equivalent / denominator
+    fair_price = 1.0 / fair_probability if fair_probability > 0 else None
+    return {
+        "model_probability": round(fair_probability, 6), "model_fair_price": round(fair_price, 6) if fair_price else None,
+        "win_equivalent": round(win_equivalent, 6), "loss_equivalent": round(loss_equivalent, 6),
+        "push_probability": round(push_probability, 6), "ev": round(expected_return, 6),
+    }
+
+
 def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optional[Dict[str, Any]] = None, script_coverage: Optional[Dict[str, Any]] = None, crowding: Optional[float] = None, lineup_confidence: Optional[float] = None, death_path: Optional[List[str]] = None) -> Dict[str, Any]:
     consensus = get_nested(market_snapshot, ["consensus_main_line"]) or get_nested(market_snapshot, ["primary"]) or {}
     missing = []
@@ -1173,14 +1223,27 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
     candidates = []
     market_probabilities = {}
     valid_model_market_count = 0
-    specs = (("1x2", ("home", "draw", "away")), ("over_under", ("over", "under")), ("btts", ("yes", "no")), ("home_team_total", ("over", "under")), ("away_team_total", ("over", "under")))
+    specs = (("1x2", ("home", "draw", "away")), ("asian_handicap", ("home", "away")), ("over_under", ("over", "under")), ("btts", ("yes", "no")), ("home_team_total", ("over", "under")), ("away_team_total", ("over", "under")))
     for market, keys in specs:
         main = consensus.get(market) or {}
         line = as_float(main.get("line")) if market not in ("1x2", "btts") else None
+        distribution_name = {"asian_handicap": "goal_difference", "over_under": "total_goals", "home_team_total": "home_goals", "away_team_total": "away_goals"}.get(market)
+        distribution = get_nested(model_probabilities or {}, ["settlement_distributions", distribution_name]) if distribution_name else None
+        market_probability = no_vig_probabilities(main, list(keys))
+        if distribution and line is not None and market_probability:
+            valid_model_market_count += 1
+            market_probabilities[market] = {"line": line, "probabilities": market_probability}
+            for key in keys:
+                price = as_float(main.get(key))
+                metrics = asian_settlement_metrics(distribution, line, key, price, market)
+                if not metrics:
+                    continue
+                edge = metrics["model_probability"] - market_probability[key]
+                candidates.append({"market": market, "selection": key, "line": line, "price": price, **metrics, "market_no_vig_probability": market_probability[key], "edge": round(edge, 6), "script_coverage": _coverage_for(script_coverage or {}, market, key), "settlement_aware": True})
+            continue
         model_pair = _model_pair(model_probabilities or {}, market, line)
         if model_pair:
             valid_model_market_count += 1
-        market_probability = no_vig_probabilities(main, list(keys))
         if market_probability:
             market_probabilities[market] = {"line": line, "probabilities": market_probability}
         if not model_pair or not market_probability:
@@ -1209,7 +1272,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
         "script_coverage": script_coverage, "crowding": crowding,
         "line_movement": None, "lineup_confidence": lineup_confidence,
         "death_path": death_path or [], "pass_reasons": pass_reasons,
-        "unsupported_market_policy": {"asian_handicap": "PASS until push/half-win/half-loss settlement EV is implemented", "integer_totals": "PASS because push probability requires settlement-aware EV"},
+        "settlement_policy": {"supported_line_increment": 0.25, "quarter_lines": "split into adjacent half-lines", "push_half_win_half_loss": "included in model EV", "unsupported_lines": "PASS"},
         "thresholds": {"minimum_edge": MIN_EDGE, "minimum_ev": MIN_EV, "minimum_script_coverage": MIN_SCRIPT_COVERAGE, "maximum_crowding": MAX_CROWDING, "minimum_lineup_confidence": MIN_LINEUP_CONFIDENCE},
     }
 
