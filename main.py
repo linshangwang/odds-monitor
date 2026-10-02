@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.21.0"
+VERSION = "0.22.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1419,13 +1419,27 @@ def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int,
         leg_evs = [as_float(candidate.get("ev")) for candidate in option_legs]
         estimated_ev = math.prod(1.0 + value for value in leg_evs) - 1.0 if all(value is not None for value in leg_evs) else None
         binary_probabilities = [as_float(candidate.get("model_probability")) for candidate in option_legs]
+        market_probabilities = [as_float(candidate.get("market_no_vig_probability")) for candidate in option_legs]
         has_settlement_aware_leg = any(candidate.get("settlement_aware") for candidate in option_legs)
         full_win_probability = math.prod(binary_probabilities) if not has_settlement_aware_leg and all(value is not None for value in binary_probabilities) else None
+        market_combined_probability = math.prod(market_probabilities) if not has_settlement_aware_leg and all(value is not None for value in market_probabilities) else None
+        probability_edge = full_win_probability - market_combined_probability if full_win_probability is not None and market_combined_probability is not None else None
+        weakest_leg = min(option_legs, key=lambda candidate: (as_float(candidate.get("script_coverage")) if as_float(candidate.get("script_coverage")) is not None else -1, as_float(candidate.get("edge")) if as_float(candidate.get("edge")) is not None else -999))
+        risk_warnings = ["residual_cross_match_correlation_not_modeled"]
+        if leg_count >= 4:
+            risk_warnings.append("four_or_more_legs_materially_increase_variance")
+        if has_settlement_aware_leg:
+            risk_warnings.append("asian_settlement_can_include_push_half_win_or_half_loss")
         risk = "lower_variance" if leg_count == 2 else ("balanced" if leg_count == 3 else "expanded_high_variance")
         suggested_options.append({
             "leg_count": leg_count, "risk_label": risk, "combined_decimal_price": round(combined_price, 4), "legs": option_legs,
             "estimated_combined_ev": round(estimated_ev, 6) if estimated_ev is not None else {"status": "data_missing", "reason": "one_or_more_leg_ev_missing"},
             "estimated_full_win_probability": round(full_win_probability, 8) if full_win_probability is not None else {"status": "data_missing", "reason": "settlement_aware_asian_leg_prevents_naive_full_win_probability" if has_settlement_aware_leg else "one_or_more_leg_probability_missing"},
+            "market_no_vig_combined_probability": round(market_combined_probability, 8) if market_combined_probability is not None else {"status": "data_missing", "reason": "settlement_aware_asian_leg_prevents_naive_probability_multiplication" if has_settlement_aware_leg else "one_or_more_market_probability_missing"},
+            "combined_probability_edge": round(probability_edge, 8) if probability_edge is not None else {"status": "data_missing", "reason": "comparable_binary_probabilities_unavailable"},
+            "book_price_break_even_probability": round(1.0 / combined_price, 8),
+            "weakest_leg": {key: weakest_leg.get(key) for key in ("fixture", "market", "selection", "line", "script_coverage", "edge", "ev")},
+            "risk_warnings": risk_warnings,
             "calculation_assumption": "cross-match independence after correlation_group screening",
         })
     preferred_counts = {"conservative": 2, "balanced": 3, "aggressive": len(candidates)}
