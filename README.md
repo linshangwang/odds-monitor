@@ -213,6 +213,7 @@ pang 导入的六类盘口均优先从完整公司数组重新计算 Consensus M
 Consensus 样本少于两家公司时仍可展示概率和价差，但不能形成最终建议，输出 `consensus_bookmaker_coverage_below_minimum` 并 PASS；阈值可通过 `MIN_CONSENSUS_BOOKMAKERS` 调整。
 标记为 `upstream_consensus_fallback` 的盘口同样只用于展示与监控，不能形成最终建议；系统必须取得公司数组并自行重算后才能解除该 PASS 门槛。
 系统同时计算同一主盘口各公司的价格离散度。任一选项的最大价差超过默认 0.25 时，标记 `dispersion_eligible=false` 并强制 PASS；阈值可通过 `MAX_CONSENSUS_PRICE_SPREAD` 调整。
+多个盘口档位覆盖数与水位平衡度相同时，以全部有效报价的中位档位作为决胜基准，不再机械偏向绝对值更小的浅盘。
 总完整度至少需达到0.6，且 Result Utility、Rotation Quality、Execution Ability、Goal Conversion
 四个关键环节不得缺失。证据不足时仍生成概率供审计，但最终建议强制 PASS。
 `available` 或 `partial` 不能只写状态：必须同时包含至少一个实质字段，例如证据、变量值或明确

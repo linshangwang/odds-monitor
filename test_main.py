@@ -223,6 +223,18 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["decision"], "PASS")
         self.assertIn("consensus_price_dispersion_above_maximum", result["pass_reasons"])
 
+    def test_consensus_line_tie_uses_market_center_not_shallowest_line(self):
+        consensus = main._consensus_line([{
+            "bookmaker": "A",
+            "lines": [
+                {"line": 2.0, "over": 1.9, "under": 1.9},
+                {"line": 2.5, "over": 1.9, "under": 1.9},
+                {"line": 3.0, "over": 1.9, "under": 1.9},
+            ],
+        }], ("over", "under"))
+        self.assertEqual(consensus["line"], 2.5)
+        self.assertEqual(consensus["tie_break_reference_line"], 2.5)
+
     def test_model_market_divergence_uses_probability_gap(self):
         decision = {"lineup_confidence": .9, "candidates": [
             {"market": "1x2", "selection": "home", "edge": .035},

@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.72.0"
+VERSION = "0.73.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -449,15 +449,18 @@ def _consensus_line(markets: List[Dict[str, Any]], price_keys: Tuple[str, str]) 
     if not by_line:
         return None
     # The main line is the line quoted by the largest number of books. Ties are
-    # broken by the most balanced median two-way prices, then sample size.
+    # broken by the most balanced median two-way prices, then proximity to the
+    # median quoted line. This avoids a systematic bias toward shallower lines.
+    reference_line = float(median([value for value, rows in by_line.items() for _ in rows]))
     ranked = []
     for value, rows in by_line.items():
         left, right = _median([r.get(price_keys[0]) for r in rows]), _median([r.get(price_keys[1]) for r in rows])
         balance = abs(left - right) if left is not None and right is not None else 999.0
-        ranked.append((-len(rows), balance, abs(value), value, rows, left, right))
+        ranked.append((-len(rows), balance, abs(value - reference_line), value, rows, left, right))
     _, _, _, value, rows, left, right = sorted(ranked, key=lambda x: x[:4])[0]
     return {
         "method": "modal_line_then_balanced_median_prices", "line": value,
+        "tie_break_reference_line": round(reference_line, 4),
         price_keys[0]: left, price_keys[1]: right,
         "bookmaker_count": len(rows), "bookmakers": sorted({str(r.get('bookmaker')) for r in rows if r.get('bookmaker')}),
         **_price_dispersion(rows, price_keys),
