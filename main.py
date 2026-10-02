@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.18.0"
+VERSION = "0.19.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1376,7 +1376,7 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
     }
 
 
-def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int, allow_fallback: bool = False) -> Dict[str, Any]:
+def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int, allow_fallback: bool = False, risk_preference: str = "balanced") -> Dict[str, Any]:
     candidates = []
     seen_groups = set()
     upgraded = False
@@ -1408,19 +1408,30 @@ def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int,
         combined_price = math.prod(candidate["price"] for candidate in option_legs)
         risk = "lower_variance" if leg_count == 2 else ("balanced" if leg_count == 3 else "expanded_high_variance")
         suggested_options.append({"leg_count": leg_count, "risk_label": risk, "combined_decimal_price": round(combined_price, 4), "legs": option_legs})
-    recommended_count = min(3, len(candidates))
+    preferred_counts = {"conservative": 2, "balanced": 3, "aggressive": len(candidates)}
+    recommended_count = min(preferred_counts[risk_preference], len(candidates))
     recommended = next(option for option in suggested_options if option["leg_count"] == recommended_count)
+    recommendation_reasons = {
+        "conservative": "minimum eligible leg count selected to reduce accumulator variance",
+        "balanced": "three legs selected when available to balance combined price and variance",
+        "aggressive": "all eligible independent legs selected within max_legs; variance increases rapidly",
+    }
     return {
         "decision": "COMBINE", "legs": recommended["legs"], "combined_decimal_price": recommended["combined_decimal_price"],
         "leg_count": recommended_count, "available_leg_count": len(candidates), "suggested_options": suggested_options,
+        "risk_preference": risk_preference, "recommended_option": recommended,
+        "recommendation_reason": recommendation_reasons[risk_preference],
         "selection_guidance": "2 legs lower variance; 3 legs balanced default; 4+ legs are optional expanded high variance",
         "independence_assumption": "screened by correlation_group; residual correlation is not modeled",
         "combined_ev": {"status": "data_missing", "reason": "Asian pushes and residual cross-match correlation prevent naive probability multiplication"},
     }
 
 
-def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6) -> Dict[str, Any]:
+def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6, risk_preference: str = "balanced") -> Dict[str, Any]:
     max_legs = max(2, min(int(max_legs), 10))
+    risk_preference = str(risk_preference or "balanced").strip().lower()
+    if risk_preference not in {"conservative", "balanced", "aggressive"}:
+        risk_preference = "balanced"
     valid_rows = [row for row in evaluation_rows if row.get("fixture") and isinstance(row.get("evaluation"), dict)]
     high_variance = []
     for row in valid_rows:
@@ -1428,13 +1439,14 @@ def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6) ->
         if candidate:
             high_variance.append({"fixture": row["fixture"], **candidate})
     high_variance.sort(key=lambda row: (row.get("ev", -999), row.get("edge", -999)), reverse=True)
-    first = _combination_from_rows(valid_rows, "first_choice_high_consistency", max_legs)
-    second = _combination_from_rows(valid_rows, "second_choice_higher_return", max_legs, allow_fallback=True)
+    first = _combination_from_rows(valid_rows, "first_choice_high_consistency", max_legs, risk_preference=risk_preference)
+    second = _combination_from_rows(valid_rows, "second_choice_higher_return", max_legs, allow_fallback=True, risk_preference=risk_preference)
     return {
         "first_choice_combination": first, "second_choice_combination": second,
         "high_variance_singles": high_variance,
         "portfolio_decision": "PASS" if first["decision"] == "PASS" and second["decision"] == "PASS" and not high_variance else "READY",
-        "rules": {"minimum_combination_legs": 2, "maximum_requested_legs": max_legs, "hard_cap": 10, "default_recommendation_legs": 3, "one_leg_per_correlation_group": True, "forced_fill": False},
+        "risk_preference": risk_preference,
+        "rules": {"minimum_combination_legs": 2, "maximum_requested_legs": max_legs, "hard_cap": 10, "default_risk_preference": "balanced", "one_leg_per_correlation_group": True, "forced_fill": False},
     }
 
 
@@ -1810,7 +1822,7 @@ async def shadow_portfolio_evaluate(request: Request, token: Optional[str] = Non
     for match in matches:
         evaluation = evaluate_imported_prematch(match, persist_version=True)
         rows.append({"fixture": evaluation["fixture"], "correlation_group": match.get("correlation_group") or evaluation["fixture"], "evaluation": evaluation})
-    return JSONResponse({"ok": True, "version": VERSION, "evaluations": rows, "portfolio": build_portfolio(rows, payload.get("max_legs", 6))})
+    return JSONResponse({"ok": True, "version": VERSION, "evaluations": rows, "portfolio": build_portfolio(rows, payload.get("max_legs", 6), payload.get("risk_preference", "balanced"))})
 
 
 def build_imported_ai_packet(fixture: str, include_companies: bool = False, include_lineups: bool = False) -> Dict[str, Any]:

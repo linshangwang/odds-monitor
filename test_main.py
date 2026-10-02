@@ -127,6 +127,24 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual([option["leg_count"] for option in combination["suggested_options"]], [2, 3, 4, 5])
         self.assertEqual(combination["suggested_options"][-1]["risk_label"], "expanded_high_variance")
 
+    def test_portfolio_selects_recommended_option_by_risk_preference(self):
+        rows = []
+        for index in range(5):
+            candidate = {"market": "1x2", "selection": "home", "price": 1.5, "script_coverage": .9, "edge": .06, "ev": .08}
+            rows.append({"fixture": f"r{index}", "correlation_group": f"rg{index}", "evaluation": {"decision_layer": {"recommendation_tiers": {"first_choice_high_consistency": candidate, "second_choice_higher_return": None, "high_variance_single": None}}}})
+        conservative = main.build_portfolio(rows, 5, "conservative")["first_choice_combination"]
+        balanced = main.build_portfolio(rows, 5, "balanced")["first_choice_combination"]
+        aggressive = main.build_portfolio(rows, 5, "aggressive")["first_choice_combination"]
+        self.assertEqual((conservative["leg_count"], balanced["leg_count"], aggressive["leg_count"]), (2, 3, 5))
+        self.assertEqual(aggressive["recommended_option"]["risk_label"], "expanded_high_variance")
+
+    def test_unknown_portfolio_risk_preference_falls_back_to_balanced(self):
+        candidate = {"market": "1x2", "selection": "home", "price": 1.5, "script_coverage": .9, "edge": .06, "ev": .08}
+        rows = [{"fixture": str(index), "evaluation": {"decision_layer": {"recommendation_tiers": {"first_choice_high_consistency": candidate}}}} for index in range(3)]
+        result = main.build_portfolio(rows, 6, "unknown")
+        self.assertEqual(result["risk_preference"], "balanced")
+        self.assertEqual(result["first_choice_combination"]["leg_count"], 3)
+
     def test_independent_poisson_model_is_normalized_and_symmetric(self):
         model = main.poisson_probability_model(1.4, 1.4, 0.8, {"source": "verified_team_metrics", "uses_market_odds": False})
         self.assertTrue(model["ok"])
