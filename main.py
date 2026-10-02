@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.27.0"
+VERSION = "0.28.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1560,7 +1560,27 @@ def _portfolio_transition(before: Optional[Dict[str, Any]], after: Dict[str, Any
     }
 
 
-def save_portfolio_run(portfolio_id: str, fixtures: List[str], portfolio: Dict[str, Any], max_legs: int, trigger_reasons: List[str], stage: str = "manual") -> Dict[str, Any]:
+def _portfolio_change_drivers(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    drivers = []
+    for row in rows:
+        evaluation = row.get("evaluation") or {}
+        decision = evaluation.get("decision_layer") or {}
+        trigger = get_nested(evaluation, ["fundamental_version", "trigger"]) or {}
+        line_movement = decision.get("line_movement") or {}
+        reasons = list(dict.fromkeys([str(reason) for reason in (trigger.get("reasons") or []) + (decision.get("pass_reasons") or []) if reason]))
+        classification = line_movement.get("classification")
+        evidence_available = bool(reasons or classification or decision.get("best_market"))
+        drivers.append({
+            "fixture": row.get("fixture"), "evidence_status": "available" if evidence_available else "data_missing",
+            "revalidation_triggered": bool(trigger.get("triggered")), "reasons": reasons,
+            "market_move_classification": classification or "data_missing",
+            "decision": decision.get("decision"), "best_market": decision.get("best_market"),
+            "fundamental_version": get_nested(evaluation, ["fundamental_version", "version_number"]),
+        })
+    return drivers
+
+
+def save_portfolio_run(portfolio_id: str, fixtures: List[str], portfolio: Dict[str, Any], max_legs: int, trigger_reasons: List[str], stage: str = "manual", change_drivers: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     with SNAPSHOT_STORE_LOCK:
         store = load_snapshot_store()
         runs = store.setdefault("portfolio_runs", {}).setdefault(portfolio_id, [])
@@ -1575,6 +1595,7 @@ def save_portfolio_run(portfolio_id: str, fixtures: List[str], portfolio: Dict[s
             "recommendation": signature,
             "recommendation_change": {"changed": previous_signature != signature, "before": previous_signature, "after": signature},
             "transition": transition,
+            "change_drivers": change_drivers or [],
             "portfolio_decision": portfolio.get("portfolio_decision"),
         }
         runs.append(record)
@@ -2011,7 +2032,7 @@ async def shadow_portfolio_evaluate(request: Request, token: Optional[str] = Non
     stage = normalize_stage(str(payload.get("stage") or "manual"))
     if stage != "manual" and stage not in PREMATCH_STAGE_ORDER:
         raise HTTPException(status_code=422, detail="stage_must_be_opening_or_supported_t_minus_checkpoint")
-    portfolio_run = save_portfolio_run(portfolio_id, fixtures, portfolio, max_legs, trigger_reasons, stage)
+    portfolio_run = save_portfolio_run(portfolio_id, fixtures, portfolio, max_legs, trigger_reasons, stage, _portfolio_change_drivers(rows))
     return JSONResponse({"ok": True, "version": VERSION, "portfolio_id": portfolio_id, "evaluations": rows, "portfolio": portfolio, "portfolio_run": portfolio_run})
 
 

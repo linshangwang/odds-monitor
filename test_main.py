@@ -267,6 +267,22 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(main._portfolio_transition(passed, active)["classification"], "Recovery from PASS")
         self.assertEqual(main._portfolio_transition(active, active)["classification"], "No Change")
 
+    def test_portfolio_change_drivers_preserve_facts_without_market_inference(self):
+        rows = [{
+            "fixture": "fixture-a",
+            "evaluation": {
+                "fundamental_version": {"version_number": 3, "trigger": {"triggered": True, "reasons": ["significant_line_move"]}},
+                "decision_layer": {"decision": "PASS", "pass_reasons": ["lineup_confidence_below_minimum"], "line_movement": {"classification": "Market-Only Move"}, "best_market": None},
+            },
+        }, {"fixture": "fixture-b", "evaluation": {"decision_layer": {"decision": "PASS"}}}]
+        drivers = main._portfolio_change_drivers(rows)
+        self.assertEqual(drivers[0]["market_move_classification"], "Market-Only Move")
+        self.assertIn("significant_line_move", drivers[0]["reasons"])
+        self.assertIn("lineup_confidence_below_minimum", drivers[0]["reasons"])
+        self.assertEqual(drivers[0]["fundamental_version"], 3)
+        self.assertEqual(drivers[1]["evidence_status"], "data_missing")
+        self.assertEqual(drivers[1]["market_move_classification"], "data_missing")
+
     def test_independent_poisson_model_is_normalized_and_symmetric(self):
         model = main.poisson_probability_model(1.4, 1.4, 0.8, {"source": "verified_team_metrics", "uses_market_odds": False})
         self.assertTrue(model["ok"])
