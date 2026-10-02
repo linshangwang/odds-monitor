@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.41.0"
+VERSION = "0.42.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -803,6 +803,46 @@ def save_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
     return {"saved": True, "path": SNAPSHOT_STORE_PATH, "fixture": record["fixture"], "stage": record["stage"]}
 
 
+def _enqueue_revalidation(store: Dict[str, Any], fixture: str, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    trigger = get_nested(row, ["market_dynamics", "revalidation_trigger"], {}) or {}
+    if not trigger.get("triggered"):
+        return None
+    task_id = _content_hash({"fixture": fixture, "stage": row.get("stage"), "source_content_hash": row.get("source_content_hash")})[:24]
+    queue = store.setdefault("fundamental_revalidation_queue", {})
+    existing = queue.get(task_id)
+    if existing:
+        return existing
+    task = {
+        "task_id": task_id, "fixture": fixture, "stage": row.get("stage"),
+        "snapshot_at": row.get("snapshot_at"), "created_at": int(time.time()), "status": "pending",
+        "reasons": list(trigger.get("reasons") or []),
+        "classification": get_nested(row, ["market_dynamics", "classification"]),
+        "policy": "fact_recheck_required; market_move_alone_must_not_modify_fundamentals",
+    }
+    queue[task_id] = task
+    if len(queue) > 500:
+        oldest = sorted(queue.values(), key=lambda item: int(item.get("created_at") or 0))[:-500]
+        for item in oldest:
+            queue.pop(item["task_id"], None)
+    return task
+
+
+def resolve_revalidation_tasks(fixture: str, version_number: Optional[int]) -> int:
+    if version_number is None:
+        return 0
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        changed = 0
+        for task in (store.get("fundamental_revalidation_queue") or {}).values():
+            if task.get("fixture") == str(fixture) and task.get("status") == "pending":
+                task.update({"status": "revalidated", "resolved_at": int(time.time()), "fundamental_version_number": version_number})
+                changed += 1
+        if changed:
+            store["version"] = VERSION
+            write_snapshot_store(store)
+        return changed
+
+
 def _parse_timestamp(value: Any) -> Optional[int]:
     if value in (None, ""):
         return None
@@ -962,6 +1002,8 @@ def import_prematch_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
                 dynamics = {"stage": row.get("stage"), "comparison_status": "data_missing", "revalidation_trigger": {"triggered": False, "reasons": []}, "data_missing": list((market_snapshot.get("data_status") or {}).keys())}
             dynamics["classification"] = classify_market_move(dynamics, None, None)
             row["market_dynamics"] = dynamics
+        accepted_stages = {row.get("stage") for row in accepted}
+        queued = [task for row in merged if row.get("stage") in accepted_stages for task in [_enqueue_revalidation(store, fixture, row)] if task]
         store["fixtures"][fixture] = sorted(merged, key=lambda x: (STAGE_ORDER.index(x.get("stage")) if x.get("stage") in STAGE_ORDER else 999, x.get("snapshot_at", 0)))
         external_prematch = store.setdefault("external_prematch", {})
         if accepted or fixture not in external_prematch:
@@ -975,7 +1017,7 @@ def import_prematch_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
             store["version"] = VERSION
             write_snapshot_store(store)
     counts = {action: sum(1 for row in imported if row["action"] == action) for action in ("inserted", "updated", "unchanged", "stale_skipped")}
-    return {"fixture": fixture, "match": f"{match.get('home_team_name')} vs {match.get('away_team_name')}", "stages": imported, "counts": counts, "changed": bool(accepted)}
+    return {"fixture": fixture, "match": f"{match.get('home_team_name')} vs {match.get('away_team_name')}", "stages": imported, "counts": counts, "changed": bool(accepted), "revalidation_tasks_created": len(queued)}
 
 
 def line_from_primary(primary: Optional[Dict[str, Any]]) -> Optional[float]:
@@ -1624,10 +1666,12 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
         fixture, script, trigger, previous=previous,
         probability_change=probability_change, best_market_change=best_market_change,
     ) if persist_version else None
+    resolved_revalidations = resolve_revalidation_tasks(fixture, (version_record or {}).get("version_number")) if version_record and trigger.get("triggered") and chain_audit.get("decision_eligible") else 0
     return {
         "ok": True, "version": VERSION, "fixture": fixture, "estimator": estimator, "model": model,
         "decision_layer": decision, "decision_summary": build_decision_summary(decision, chain_audit, model),
         "fundamental_chain_audit": chain_audit, "fundamental_version": version_record,
+        "revalidation_tasks_resolved": resolved_revalidations,
     }
 
 
@@ -2156,6 +2200,20 @@ def shadow_import_status(token: Optional[str] = None, authorization: Optional[st
             for fixture, row in metadata.items()
         ],
     })
+
+
+@app.get("/shadow/revalidation-queue")
+def shadow_revalidation_queue(status: str = "pending", fixture: Optional[str] = None, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    if status not in {"pending", "revalidated", "all"}:
+        raise HTTPException(status_code=422, detail="status_must_be_pending_revalidated_or_all")
+    tasks = list((load_snapshot_store().get("fundamental_revalidation_queue") or {}).values())
+    if status != "all":
+        tasks = [task for task in tasks if task.get("status") == status]
+    if fixture:
+        tasks = [task for task in tasks if task.get("fixture") == str(fixture)]
+    tasks.sort(key=lambda task: int(task.get("created_at") or 0), reverse=True)
+    return JSONResponse({"ok": True, "version": VERSION, "status": status, "fixture": fixture, "count": len(tasks), "tasks": tasks})
 
 
 def imported_fixture_freshness(metadata: Dict[str, Any], history: List[Dict[str, Any]], now_ts: Optional[int] = None) -> Dict[str, Any]:

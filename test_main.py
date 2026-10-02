@@ -715,6 +715,26 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(second["counts"]["unchanged"], 2)
         self.assertFalse(second["changed"])
 
+    def test_imported_market_move_creates_deduplicated_revalidation_task(self):
+        packet = self.prematch_packet()
+        moved = dict(packet["timeline"][0])
+        moved["stage"] = "T-12h"
+        moved["latest_observed_at"] = "2026-09-29T12:00:00+00:00"
+        moved["consensus_main_line"] = {key: dict(value) for key, value in moved["consensus_main_line"].items()}
+        moved["consensus_main_line"]["asian_handicap"] = dict(moved["consensus_main_line"]["asian_handicap"])
+        moved["consensus_main_line"]["asian_handicap"]["line"] = -0.5
+        packet["timeline"] = [packet["timeline"][0], moved]
+        first = main.import_prematch_packet(packet)
+        second = main.import_prematch_packet(packet)
+        queue = main.load_snapshot_store()["fundamental_revalidation_queue"]
+        self.assertEqual(first["revalidation_tasks_created"], 1)
+        self.assertEqual(second["revalidation_tasks_created"], 0)
+        self.assertEqual(len(queue), 1)
+        task = next(iter(queue.values()))
+        self.assertEqual(task["status"], "pending")
+        self.assertIn("significant_line_move", task["reasons"])
+        self.assertIn("market_move_alone_must_not_modify_fundamentals", task["policy"])
+
     def test_incremental_import_skips_stale_stage(self):
         packet = self.prematch_packet()
         main.import_prematch_packet(packet)
