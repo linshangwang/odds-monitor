@@ -735,6 +735,17 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("significant_line_move", task["reasons"])
         self.assertIn("market_move_alone_must_not_modify_fundamentals", task["policy"])
 
+    def test_revalidation_queue_prioritizes_late_and_overdue_moves(self):
+        tasks = [
+            {"task_id": "early", "status": "pending", "stage": "T-24h", "created_at": 9000, "reasons": ["abnormal_price_move"]},
+            {"task_id": "late", "status": "pending", "stage": "T-15m", "created_at": 7000, "reasons": ["cross_market_divergence"]},
+        ]
+        viewed = main.revalidation_queue_view(tasks, now_ts=10000)
+        self.assertEqual(viewed[0]["task_id"], "late")
+        self.assertEqual(viewed[0]["priority"], "critical")
+        self.assertTrue(viewed[0]["overdue"])
+        self.assertFalse(viewed[1]["overdue"])
+
     def test_incremental_import_skips_stale_stage(self):
         packet = self.prematch_packet()
         main.import_prematch_packet(packet)

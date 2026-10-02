@@ -152,6 +152,8 @@ Selection Change、Robustness Change、Risk Downgrade to PASS 和 Recovery from 
 外部盘口导入若触发显著变盘或跨市场背离，会写入持久化的基本面复核队列；同一比赛、节点和
 数据版本自动去重。可通过受保护的 `GET /shadow/revalidation-queue` 查看 pending/revalidated/all，
 只有实际完成新的基本面版本计算后任务才会转为 `revalidated`，盘口变化本身不会改写基本面。
+队列会结合 T-X 节点、触发类型和等待时间生成 normal/high/critical 优先级；等待超过30分钟的
+pending 任务标记为 overdue，并在 `/shadow/import-status` 汇总待处理与逾期数量。
 总完整度至少需达到0.6，且 Result Utility、Rotation Quality、Execution Ability、Goal Conversion
 四个关键环节不得缺失。证据不足时仍生成概率供审计，但最终建议强制 PASS。
 `available` 或 `partial` 不能只写状态：必须同时包含至少一个实质字段，例如证据、变量值或明确

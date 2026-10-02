@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.42.0"
+VERSION = "0.43.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -841,6 +841,27 @@ def resolve_revalidation_tasks(fixture: str, version_number: Optional[int]) -> i
             store["version"] = VERSION
             write_snapshot_store(store)
         return changed
+
+
+def revalidation_queue_view(tasks: List[Dict[str, Any]], now_ts: Optional[int] = None) -> List[Dict[str, Any]]:
+    now_ts = int(time.time()) if now_ts is None else int(now_ts)
+    stage_weight = {stage: index for index, stage in enumerate(PREMATCH_STAGE_ORDER, start=1)}
+    reason_weight = {"cross_market_divergence": 5, "significant_line_move": 4, "abnormal_price_move": 3}
+    result = []
+    for original in tasks:
+        task = dict(original)
+        age = max(0, now_ts - int(task.get("created_at") or now_ts))
+        score = stage_weight.get(task.get("stage"), 0) + max((reason_weight.get(reason, 1) for reason in task.get("reasons") or []), default=0)
+        if age >= 1800:
+            score += 2
+        task.update({
+            "age_seconds": age,
+            "overdue": task.get("status") == "pending" and age >= 1800,
+            "priority_score": score,
+            "priority": "critical" if score >= 12 else ("high" if score >= 8 else "normal"),
+        })
+        result.append(task)
+    return sorted(result, key=lambda task: (task.get("status") != "pending", -task["priority_score"], task.get("created_at") or 0))
 
 
 def _parse_timestamp(value: Any) -> Optional[int]:
@@ -2193,8 +2214,10 @@ def shadow_import_status(token: Optional[str] = None, authorization: Optional[st
     require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     store = load_snapshot_store()
     metadata = store.get("external_prematch", {})
+    queue = list((store.get("fundamental_revalidation_queue") or {}).values())
     return JSONResponse({
         "ok": True, "version": VERSION, "sync": store.get("import_sync_status") or {"status": "never_imported"},
+        "revalidation": {"pending": sum(task.get("status") == "pending" for task in queue), "overdue": sum(task.get("overdue") for task in revalidation_queue_view(queue) if task.get("status") == "pending")},
         "fixture_count": len(metadata), "fixtures": [
             {"fixture": fixture, "league": row.get("league"), "imported_at": row.get("imported_at"), "match": row.get("match")}
             for fixture, row in metadata.items()
@@ -2212,7 +2235,7 @@ def shadow_revalidation_queue(status: str = "pending", fixture: Optional[str] = 
         tasks = [task for task in tasks if task.get("status") == status]
     if fixture:
         tasks = [task for task in tasks if task.get("fixture") == str(fixture)]
-    tasks.sort(key=lambda task: int(task.get("created_at") or 0), reverse=True)
+    tasks = revalidation_queue_view(tasks)
     return JSONResponse({"ok": True, "version": VERSION, "status": status, "fixture": fixture, "count": len(tasks), "tasks": tasks})
 
 
