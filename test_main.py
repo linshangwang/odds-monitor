@@ -234,6 +234,20 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertTrue(consensus["dispersion_eligible"])
         self.assertLess(consensus["maximum_no_vig_probability_spread"], .05)
 
+    def test_decision_uses_bookmaker_level_no_vig_consensus(self):
+        consensus = main._consensus_1x2([
+            {"bookmaker": "A", "home": 2.0, "draw": 3.0, "away": 4.0},
+            {"bookmaker": "B", "home": 1.8, "draw": 4.0, "away": 5.0},
+        ])
+        consensus["dispersion_eligible"] = True
+        snapshot = main.empty_market_snapshot()
+        snapshot["consensus_main_line"]["1x2"] = consensus
+        result = main.decision_layer(snapshot, {"home": .60, "draw": .23, "away": .17}, {"home": .8, "draw": .3, "away": .2}, .4, .9, [])
+        market = result["market_no_vig_probability"]["1x2"]
+        self.assertEqual(market["method"], "bookmaker_level_no_vig_consensus")
+        self.assertEqual(market["probabilities"], consensus["consensus_no_vig_probabilities"])
+        self.assertAlmostEqual(sum(market["probabilities"].values()), 1.0, places=5)
+
     def test_consensus_line_tie_uses_market_center_not_shallowest_line(self):
         consensus = main._consensus_line([{
             "bookmaker": "A",

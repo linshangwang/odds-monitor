@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.74.0"
+VERSION = "0.75.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -430,6 +430,11 @@ def _price_dispersion(rows: List[Dict[str, Any]], keys: Tuple[str, ...]) -> Dict
         for key in keys
     }
     maximum_probability_spread = max(probability_spreads.values(), default=0.0)
+    median_probabilities = {key: _median([row[key] for row in probability_rows]) for key in keys} if probability_rows else {}
+    median_total = sum(value or 0.0 for value in median_probabilities.values())
+    consensus_probabilities = {
+        key: round((median_probabilities[key] or 0.0) / median_total, 6) for key in keys
+    } if len(median_probabilities) == len(keys) and median_total > 0 else None
     return {
         "price_spread_by_selection": spreads,
         "maximum_price_spread": maximum,
@@ -437,6 +442,8 @@ def _price_dispersion(rows: List[Dict[str, Any]], keys: Tuple[str, ...]) -> Dict
         "maximum_allowed_price_spread": MAX_CONSENSUS_PRICE_SPREAD,
         "no_vig_probability_spread_by_selection": probability_spreads,
         "maximum_no_vig_probability_spread": maximum_probability_spread,
+        "consensus_no_vig_probabilities": consensus_probabilities,
+        "probability_aggregation_method": "median_of_bookmaker_level_no_vig_probabilities_then_normalized",
         "dispersion_eligible": maximum_probability_spread <= MAX_CONSENSUS_NO_VIG_PROBABILITY_SPREAD,
         "maximum_allowed_no_vig_probability_spread": MAX_CONSENSUS_NO_VIG_PROBABILITY_SPREAD,
     }
@@ -1749,10 +1756,13 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
         line = as_float(main.get("line")) if market not in ("1x2", "btts") else None
         distribution_name = {"asian_handicap": "goal_difference", "over_under": "total_goals", "home_team_total": "home_goals", "away_team_total": "away_goals"}.get(market)
         distribution = get_nested(model_probabilities or {}, ["settlement_distributions", distribution_name]) if distribution_name else None
-        market_probability = no_vig_probabilities(main, list(keys))
+        embedded_probability = main.get("consensus_no_vig_probabilities") if isinstance(main.get("consensus_no_vig_probabilities"), dict) else None
+        embedded_valid = embedded_probability and all(as_float(embedded_probability.get(key)) is not None and 0 <= as_float(embedded_probability.get(key)) <= 1 for key in keys) and abs(sum(as_float(embedded_probability.get(key)) for key in keys) - 1.0) <= 0.02
+        market_probability = ({key: as_float(embedded_probability.get(key)) for key in keys} if embedded_valid else no_vig_probabilities(main, list(keys)))
+        market_probability_method = "bookmaker_level_no_vig_consensus" if embedded_valid else "no_vig_from_consensus_median_prices"
         if distribution and line is not None and market_probability:
             valid_model_market_count += 1
-            market_probabilities[market] = {"line": line, "probabilities": market_probability}
+            market_probabilities[market] = {"line": line, "probabilities": market_probability, "method": market_probability_method}
             for key in keys:
                 price = as_float(main.get(key))
                 metrics = asian_settlement_metrics(distribution, line, key, price, market)
@@ -1765,7 +1775,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
         if model_pair:
             valid_model_market_count += 1
         if market_probability:
-            market_probabilities[market] = {"line": line, "probabilities": market_probability}
+            market_probabilities[market] = {"line": line, "probabilities": market_probability, "method": market_probability_method}
         if not model_pair or not market_probability:
             continue
         for key in keys:
