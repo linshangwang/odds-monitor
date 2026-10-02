@@ -248,6 +248,19 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(market["probabilities"], consensus["consensus_no_vig_probabilities"])
         self.assertAlmostEqual(sum(market["probabilities"].values()), 1.0, places=5)
 
+    def test_consensus_deduplicates_bookmaker_name_variants(self):
+        consensus = main._consensus_1x2([
+            {"bookmaker": "Book A", "home": 2.0, "draw": 3.4, "away": 4.0},
+            {"bookmaker": "  book   a ", "home": 2.2, "draw": 3.2, "away": 3.8},
+        ])
+        self.assertEqual(consensus["bookmaker_count"], 1)
+        self.assertEqual(consensus["home"], 2.1)
+        snapshot = main.empty_market_snapshot()
+        snapshot["consensus_main_line"]["1x2"] = consensus
+        result = main.decision_layer(snapshot, {"home": .55, "draw": .25, "away": .20}, {"home": .8, "draw": .3, "away": .2}, .4, .9, [])
+        self.assertEqual(result["decision"], "PASS")
+        self.assertIn("consensus_bookmaker_coverage_below_minimum", result["pass_reasons"])
+
     def test_consensus_line_tie_uses_market_center_not_shallowest_line(self):
         consensus = main._consensus_line([{
             "bookmaker": "A",

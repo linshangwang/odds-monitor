@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.75.0"
+VERSION = "0.76.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -411,6 +411,22 @@ def _median(values: List[Any]) -> Optional[float]:
     return round(float(median(nums)), 4) if nums else None
 
 
+def _bookmaker_identity(value: Any) -> str:
+    return " ".join(str(value or "unknown").strip().casefold().split())
+
+
+def _dedupe_bookmaker_rows(rows: List[Dict[str, Any]], keys: Tuple[str, ...]) -> List[Dict[str, Any]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(_bookmaker_identity(row.get("bookmaker")), []).append(row)
+    deduped = []
+    for identity, duplicates in grouped.items():
+        merged = {key: _median([row.get(key) for row in duplicates]) for key in keys}
+        merged.update({"bookmaker": str(duplicates[0].get("bookmaker") or identity), "bookmaker_identity": identity, "duplicate_quote_count": len(duplicates)})
+        deduped.append(merged)
+    return deduped
+
+
 def _price_dispersion(rows: List[Dict[str, Any]], keys: Tuple[str, ...]) -> Dict[str, Any]:
     spreads = {}
     for key in keys:
@@ -450,7 +466,7 @@ def _price_dispersion(rows: List[Dict[str, Any]], keys: Tuple[str, ...]) -> Dict
 
 
 def _consensus_1x2(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    complete = [x for x in rows if all((as_float(x.get(k)) or 0) > 1.0 for k in ("home", "draw", "away"))]
+    complete = [x for x in _dedupe_bookmaker_rows(rows, ("home", "draw", "away")) if all((as_float(x.get(k)) or 0) > 1.0 for k in ("home", "draw", "away"))]
     if not complete:
         return None
     return {
@@ -463,13 +479,14 @@ def _consensus_1x2(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 
 
 def _consensus_line(markets: List[Dict[str, Any]], price_keys: Tuple[str, str]) -> Optional[Dict[str, Any]]:
-    by_line: Dict[float, List[Dict[str, Any]]] = {}
+    raw_by_line: Dict[float, List[Dict[str, Any]]] = {}
     for market in markets:
         for line in market.get("lines", []) or []:
             value = as_float(line.get("line"))
             if value is None or any((as_float(line.get(key)) or 0) <= 1.0 for key in price_keys):
                 continue
-            by_line.setdefault(value, []).append({"bookmaker": market.get("bookmaker"), **line})
+            raw_by_line.setdefault(value, []).append({"bookmaker": market.get("bookmaker"), **line})
+    by_line = {value: _dedupe_bookmaker_rows(rows, price_keys) for value, rows in raw_by_line.items()}
     if not by_line:
         return None
     # The main line is the line quoted by the largest number of books. Ties are
@@ -552,7 +569,7 @@ def extract_market_snapshot(odds_result: Dict[str, Any]) -> Dict[str, Any]:
         "away_team_total": _consensus_line(snapshot["markets"]["away_team_total"], ("over", "under")),
     }
     btts = snapshot["markets"]["btts"]
-    complete_btts = [row for row in btts if (as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1]
+    complete_btts = [row for row in _dedupe_bookmaker_rows(btts, ("yes", "no")) if (as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1]
     consensus["btts"] = ({"method": "median_all_complete_bookmakers", "bookmaker_count": len(complete_btts), "yes": _median([x.get("yes") for x in complete_btts]), "no": _median([x.get("no") for x in complete_btts]), **_price_dispersion(complete_btts, ("yes", "no"))} if complete_btts else None)
     snapshot["consensus_main_line"] = consensus
     snapshot["primary"] = dict(consensus)
@@ -1160,17 +1177,18 @@ def imported_market_snapshot(stage: Dict[str, Any]) -> Dict[str, Any]:
         return snapshot
     consensus = _import_consensus(stage.get("consensus_main_line") or {})
     markets = _import_company_markets(stage.get("company_market_array") or [])
+    complete_imported_btts = [row for row in _dedupe_bookmaker_rows(markets["btts"], ("yes", "no")) if (as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1]
     recalculated_markets = {
         "1x2": _consensus_1x2(markets["1x2"]),
         "asian_handicap": _consensus_line(markets["asian_handicap"], ("home", "away")),
         "over_under": _consensus_line(markets["over_under"], ("over", "under")),
         "btts": ({
             "method": "median_all_complete_bookmakers",
-            "bookmaker_count": len([row for row in markets["btts"] if (as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1]),
-            "yes": _median([row.get("yes") for row in markets["btts"] if (as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1]),
-            "no": _median([row.get("no") for row in markets["btts"] if (as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1]),
-            **_price_dispersion([row for row in markets["btts"] if (as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1], ("yes", "no")),
-        } if any((as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1 for row in markets["btts"]) else None),
+            "bookmaker_count": len(complete_imported_btts),
+            "yes": _median([row.get("yes") for row in complete_imported_btts]),
+            "no": _median([row.get("no") for row in complete_imported_btts]),
+            **_price_dispersion(complete_imported_btts, ("yes", "no")),
+        } if complete_imported_btts else None),
         "home_team_total": _consensus_line(markets["home_team_total"], ("over", "under")),
         "away_team_total": _consensus_line(markets["away_team_total"], ("over", "under")),
     }
