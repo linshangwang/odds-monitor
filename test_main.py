@@ -168,6 +168,20 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         if result["decision"] == "COMBINE":
             self.assertTrue(any(leg["source_tier"] == "second_choice_higher_return" for leg in result["legs"]))
 
+    def test_portfolio_estimates_binary_combined_probability_and_ev(self):
+        candidate = {"market": "1x2", "selection": "home", "price": 2.0, "model_probability": .55, "script_coverage": .9, "edge": .05, "ev": .10}
+        rows = [{"fixture": str(index), "evaluation": {"decision_layer": {"recommendation_tiers": {"first_choice_high_consistency": candidate}}}} for index in range(3)]
+        option = main.build_portfolio(rows, 3)["first_choice_combination"]["recommended_option"]
+        self.assertAlmostEqual(option["estimated_full_win_probability"], .55 ** 3, places=8)
+        self.assertAlmostEqual(option["estimated_combined_ev"], 1.1 ** 3 - 1, places=6)
+
+    def test_portfolio_does_not_multiply_conditional_asian_win_probability(self):
+        asian = {"market": "asian_handicap", "selection": "home", "line": -.25, "price": 1.9, "model_probability": .55, "script_coverage": .9, "edge": .05, "ev": .08, "settlement_aware": True, "push_probability": .2}
+        rows = [{"fixture": str(index), "evaluation": {"decision_layer": {"recommendation_tiers": {"first_choice_high_consistency": asian}}}} for index in range(2)]
+        option = main.build_portfolio(rows, 2)["first_choice_combination"]["recommended_option"]
+        self.assertEqual(option["estimated_full_win_probability"]["status"], "data_missing")
+        self.assertAlmostEqual(option["estimated_combined_ev"], 1.08 ** 2 - 1, places=6)
+
     def test_independent_poisson_model_is_normalized_and_symmetric(self):
         model = main.poisson_probability_model(1.4, 1.4, 0.8, {"source": "verified_team_metrics", "uses_market_odds": False})
         self.assertTrue(model["ok"])

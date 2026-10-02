@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.20.0"
+VERSION = "0.21.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1416,8 +1416,18 @@ def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int,
     for leg_count in range(2, len(candidates) + 1):
         option_legs = candidates[:leg_count]
         combined_price = math.prod(candidate["price"] for candidate in option_legs)
+        leg_evs = [as_float(candidate.get("ev")) for candidate in option_legs]
+        estimated_ev = math.prod(1.0 + value for value in leg_evs) - 1.0 if all(value is not None for value in leg_evs) else None
+        binary_probabilities = [as_float(candidate.get("model_probability")) for candidate in option_legs]
+        has_settlement_aware_leg = any(candidate.get("settlement_aware") for candidate in option_legs)
+        full_win_probability = math.prod(binary_probabilities) if not has_settlement_aware_leg and all(value is not None for value in binary_probabilities) else None
         risk = "lower_variance" if leg_count == 2 else ("balanced" if leg_count == 3 else "expanded_high_variance")
-        suggested_options.append({"leg_count": leg_count, "risk_label": risk, "combined_decimal_price": round(combined_price, 4), "legs": option_legs})
+        suggested_options.append({
+            "leg_count": leg_count, "risk_label": risk, "combined_decimal_price": round(combined_price, 4), "legs": option_legs,
+            "estimated_combined_ev": round(estimated_ev, 6) if estimated_ev is not None else {"status": "data_missing", "reason": "one_or_more_leg_ev_missing"},
+            "estimated_full_win_probability": round(full_win_probability, 8) if full_win_probability is not None else {"status": "data_missing", "reason": "settlement_aware_asian_leg_prevents_naive_full_win_probability" if has_settlement_aware_leg else "one_or_more_leg_probability_missing"},
+            "calculation_assumption": "cross-match independence after correlation_group screening",
+        })
     preferred_counts = {"conservative": 2, "balanced": 3, "aggressive": len(candidates)}
     recommended_count = min(preferred_counts[risk_preference], len(candidates))
     recommended = next(option for option in suggested_options if option["leg_count"] == recommended_count)
@@ -1434,7 +1444,8 @@ def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int,
         "selection_audit": {"selected": candidates, "excluded": excluded},
         "selection_guidance": "2 legs lower variance; 3 legs balanced default; 4+ legs are optional expanded high variance",
         "independence_assumption": "screened by correlation_group; residual correlation is not modeled",
-        "combined_ev": {"status": "data_missing", "reason": "Asian pushes and residual cross-match correlation prevent naive probability multiplication"},
+        "combined_ev": recommended["estimated_combined_ev"],
+        "combined_ev_status": "estimated_under_independence" if isinstance(recommended["estimated_combined_ev"], float) else "data_missing",
     }
 
 
