@@ -795,7 +795,10 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         opening = rows[0]
         self.assertEqual(opening["market_snapshot"]["primary"]["asian_handicap"]["line"], -0.25)
+        self.assertEqual(opening["market_snapshot"]["primary"]["asian_handicap"]["source"], "upstream_consensus_fallback")
         self.assertEqual(opening["market_snapshot"]["primary"]["home_team_total"]["line"], 2.5)
+        self.assertEqual(opening["market_snapshot"]["primary"]["1x2"]["source"], "complete_company_array")
+        self.assertEqual(opening["market_snapshot"]["consensus_audit"]["1x2"], "recalculated_from_company_array")
         self.assertEqual(len(opening["market_snapshot"]["markets"]["home_team_total"][0]["lines"]), 1)
         self.assertEqual(opening["market_snapshot"]["markets"]["1x2"][0]["home"], 2.0)
         missing = [x for x in rows if x["stage"] == "T-15m"][0]
@@ -809,6 +812,14 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("company_market_array", expanded["market"]["timeline"][0])
         self.assertEqual(len(expanded["fundamentals"]["lineup_history"]), 1)
         self.assertEqual(packet["decision_layer"]["decision"], "PASS")
+
+    def test_imported_consensus_ignores_conflicting_upstream_main_line_when_array_complete(self):
+        packet = self.prematch_packet()
+        packet["timeline"][0]["consensus_main_line"]["1x2"]["median_prices"] = {"home": 9.0, "draw": 9.0, "away": 9.0}
+        main.import_prematch_packet(packet)
+        snapshot = main.get_fixture_snapshots("uuid-1")[0]["market_snapshot"]
+        self.assertEqual(snapshot["consensus_main_line"]["1x2"]["home"], 2.0)
+        self.assertEqual(snapshot["consensus_main_line"]["1x2"]["method"], "median_all_complete_bookmakers")
 
     def test_snapshot_store_is_gzip_and_reads_plain_legacy_json(self):
         main.write_snapshot_store({"version": "test", "fixtures": {}})

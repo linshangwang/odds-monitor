@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.68.0"
+VERSION = "0.69.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -409,7 +409,7 @@ def _median(values: List[Any]) -> Optional[float]:
 
 
 def _consensus_1x2(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    complete = [x for x in rows if all(as_float(x.get(k)) for k in ("home", "draw", "away"))]
+    complete = [x for x in rows if all((as_float(x.get(k)) or 0) > 1.0 for k in ("home", "draw", "away"))]
     if not complete:
         return None
     return {
@@ -425,7 +425,7 @@ def _consensus_line(markets: List[Dict[str, Any]], price_keys: Tuple[str, str]) 
     for market in markets:
         for line in market.get("lines", []) or []:
             value = as_float(line.get("line"))
-            if value is None:
+            if value is None or any((as_float(line.get(key)) or 0) <= 1.0 for key in price_keys):
                 continue
             by_line.setdefault(value, []).append({"bookmaker": market.get("bookmaker"), **line})
     if not by_line:
@@ -1060,6 +1060,8 @@ def _import_consensus(source: Dict[str, Any]) -> Dict[str, Any]:
         if market not in ("1x2", "btts"):
             item["line"] = as_float(row.get("line"))
         item["method"] = "imported_consensus_main_line"
+        item["source"] = "upstream_consensus_fallback"
+        item["fallback_reason"] = "complete_company_array_unavailable"
         item["bookmaker_count"] = row.get("bookmaker_coverage")
         result[market] = item
     return result
@@ -1111,11 +1113,29 @@ def imported_market_snapshot(stage: Dict[str, Any]) -> Dict[str, Any]:
         return snapshot
     consensus = _import_consensus(stage.get("consensus_main_line") or {})
     markets = _import_company_markets(stage.get("company_market_array") or [])
-    for key in ("home_team_total", "away_team_total"):
-        recalculated = _consensus_line(markets[key], ("over", "under"))
+    recalculated_markets = {
+        "1x2": _consensus_1x2(markets["1x2"]),
+        "asian_handicap": _consensus_line(markets["asian_handicap"], ("home", "away")),
+        "over_under": _consensus_line(markets["over_under"], ("over", "under")),
+        "btts": ({
+            "method": "median_all_complete_bookmakers",
+            "bookmaker_count": len([row for row in markets["btts"] if (as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1]),
+            "yes": _median([row.get("yes") for row in markets["btts"] if (as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1]),
+            "no": _median([row.get("no") for row in markets["btts"] if (as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1]),
+        } if any((as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1 for row in markets["btts"]) else None),
+        "home_team_total": _consensus_line(markets["home_team_total"], ("over", "under")),
+        "away_team_total": _consensus_line(markets["away_team_total"], ("over", "under")),
+    }
+    consensus_audit = {}
+    for key, recalculated in recalculated_markets.items():
         if recalculated:
-            recalculated["method"] = "full_time_company_array_consensus"
+            recalculated["source"] = "complete_company_array"
             consensus[key] = recalculated
+            consensus_audit[key] = "recalculated_from_company_array"
+        elif consensus.get(key):
+            consensus_audit[key] = "upstream_fallback_company_array_unavailable"
+        else:
+            consensus_audit[key] = "data_missing"
     snapshot.update({
         "available": any(consensus.values()),
         "updated_at": stage.get("latest_observed_at"),
@@ -1123,6 +1143,7 @@ def imported_market_snapshot(stage: Dict[str, Any]) -> Dict[str, Any]:
         "markets": markets,
         "primary": dict(consensus),
         "consensus_main_line": consensus,
+        "consensus_audit": consensus_audit,
         "data_status": {key: ("available" if value else "data_missing") for key, value in consensus.items()},
     })
     return snapshot
