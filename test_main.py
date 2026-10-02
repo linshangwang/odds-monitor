@@ -409,10 +409,10 @@ class ShadowV4UpgradeTests(unittest.TestCase):
 
     def test_fundamental_chain_audit_requires_critical_sections_and_minimum_coverage(self):
         chain = {key: {"status": "available", "evidence": f"verified-{key}", "source": "trusted-feed", "observed_at": "2026-10-03T00:00:00Z"} for key in main.FUNDAMENTAL_CHAIN}
-        eligible = main.audit_fundamental_chain({"chain": chain})
+        eligible = main.audit_fundamental_chain({"chain": chain}, now_ts=1790989200)
         self.assertTrue(eligible["decision_eligible"])
         chain["goal_conversion"] = {"status": "data_missing"}
-        insufficient = main.audit_fundamental_chain({"chain": chain})
+        insufficient = main.audit_fundamental_chain({"chain": chain}, now_ts=1790989200)
         self.assertFalse(insufficient["decision_eligible"])
         self.assertIn("goal_conversion", insufficient["critical_missing"])
 
@@ -430,11 +430,22 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         chain = {key: {"status": "available", "evidence": f"verified-{key}", "source": "trusted-feed", "observed_at": "2026-10-03T00:00:00Z"} for key in main.FUNDAMENTAL_CHAIN}
         chain["rotation_quality"].pop("source")
         chain["goal_conversion"].pop("observed_at")
-        audit = main.audit_fundamental_chain({"chain": chain})
+        audit = main.audit_fundamental_chain({"chain": chain}, now_ts=1790989200)
         self.assertFalse(audit["decision_eligible"])
         self.assertIn("rotation_quality", audit["critical_provenance_missing"])
         self.assertIn("goal_conversion", audit["timestamp_missing_sections"])
         self.assertNotIn("goal_conversion", audit["critical_provenance_missing"])
+
+    def test_critical_fundamental_timestamps_use_type_specific_freshness(self):
+        now_ts = 1790989200
+        chain = {key: {"status": "available", "evidence": key, "source": "trusted-feed", "observed_at": now_ts - 3600} for key in main.FUNDAMENTAL_CHAIN}
+        chain["rotation_quality"]["observed_at"] = now_ts - main.CRITICAL_FUNDAMENTAL_MAX_AGE_SECONDS["rotation_quality"] - 1
+        chain["goal_conversion"]["observed_at"] = now_ts + 600
+        audit = main.audit_fundamental_chain({"chain": chain}, now_ts=now_ts)
+        self.assertFalse(audit["decision_eligible"])
+        self.assertEqual(audit["critical_timestamp_issues"]["rotation_quality"]["issue"], "stale")
+        self.assertEqual(audit["critical_timestamp_issues"]["goal_conversion"]["issue"], "future_timestamp")
+        self.assertNotIn("execution_ability", audit["critical_timestamp_issues"])
 
     def test_prematch_pipeline_passes_when_fundamental_chain_is_missing(self):
         main.import_prematch_packet(self.prematch_packet())

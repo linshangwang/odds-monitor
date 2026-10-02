@@ -152,7 +152,9 @@ Selection Change、Robustness Change、Risk Downgrade to PASS 和 Recovery from 
 `unsubstantiated_sections` 和 `invalid_status_sections`。
 四个关键基本面环节还必须提供 `source` 或 `provenance`，否则不能进入最终推荐。
 所有可用/部分可用环节的 `observed_at` 或 `as_of` 会单独审计为时间戳覆盖率；由于赛季统计、
-阵容消息和临场事件的合理时效不同，当前不会用同一个固定过期阈值机械淘汰全部证据。
+阵容消息和临场事件的合理时效不同，关键环节采用分类阈值：Result Utility 48小时、Rotation
+Quality 24小时、Execution Ability 与 Goal Conversion 14天。关键时间戳缺失、无效、明显在
+未来或超过对应时效时强制 PASS；非关键环节继续只做缺失审计。
 
 组合接口对外严格校验：请求体必须是对象，`max_legs` 必须为2–10的整数，风险偏好只能是
 conservative、balanced、aggressive，复核原因必须是数组。异常输入返回明确的400/422，

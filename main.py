@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.37.0"
+VERSION = "0.38.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1045,6 +1045,12 @@ FUNDAMENTAL_CHAIN = [
     "tactical_matchup", "game_state_elasticity", "first_goal_state_transition",
     "open_game_beneficiary", "time_segment_strength", "goal_conversion"
 ]
+CRITICAL_FUNDAMENTAL_MAX_AGE_SECONDS = {
+    "result_utility": 48 * 3600,
+    "rotation_quality": 24 * 3600,
+    "execution_ability": 14 * 24 * 3600,
+    "goal_conversion": 14 * 24 * 3600,
+}
 MOVE_CLASSES = ["Fundamental Confirmed", "Likely Information-Driven", "Market-Only Move", "Cross-Market Divergence", "Model-Market Divergence"]
 
 
@@ -1407,7 +1413,8 @@ def _fundamental_evaluation_script(payload: Dict[str, Any], estimator: Dict[str,
     }
 
 
-def audit_fundamental_chain(script: Dict[str, Any]) -> Dict[str, Any]:
+def audit_fundamental_chain(script: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
+    now_ts = int(time.time()) if now_ts is None else int(now_ts)
     chain = script.get("chain") or {}
     weights = {"available": 1.0, "partial": 0.5}
     allowed_statuses = {"available", "partial", "data_missing"}
@@ -1436,8 +1443,21 @@ def audit_fundamental_chain(script: Dict[str, Any]) -> Dict[str, Any]:
     critical = ["result_utility", "rotation_quality", "execution_ability", "goal_conversion"]
     critical_missing = [key for key in critical if scores.get(key, 0.0) == 0.0]
     critical_provenance_missing = [key for key in critical if key in provenance_missing_sections]
+    critical_timestamp_issues = {}
+    for key in critical:
+        section = chain.get(key) if isinstance(chain.get(key), dict) else {}
+        raw_timestamp = section.get("observed_at") or section.get("as_of")
+        observed_at = _parse_timestamp(raw_timestamp)
+        max_age = CRITICAL_FUNDAMENTAL_MAX_AGE_SECONDS[key]
+        if observed_at is None:
+            issue, age = "missing_or_invalid", None
+        else:
+            age = now_ts - observed_at
+            issue = "future_timestamp" if age < -300 else ("stale" if age > max_age else None)
+        if issue:
+            critical_timestamp_issues[key] = {"issue": issue, "observed_at": raw_timestamp, "age_seconds": age, "max_age_seconds": max_age}
     completeness = sum(scores.values()) / len(FUNDAMENTAL_CHAIN)
-    eligible = completeness >= 0.6 and not critical_missing and not critical_provenance_missing
+    eligible = completeness >= 0.6 and not critical_missing and not critical_provenance_missing and not critical_timestamp_issues
     return {
         "status": "eligible" if eligible else "insufficient",
         "decision_eligible": eligible, "completeness_score": round(completeness, 4),
@@ -1447,8 +1467,10 @@ def audit_fundamental_chain(script: Dict[str, Any]) -> Dict[str, Any]:
         "provenance_missing_sections": provenance_missing_sections,
         "critical_provenance_missing": critical_provenance_missing,
         "timestamp_missing_sections": timestamp_missing_sections,
+        "critical_timestamp_issues": critical_timestamp_issues,
+        "critical_max_age_seconds": CRITICAL_FUNDAMENTAL_MAX_AGE_SECONDS,
         "evidence_rule": "available or partial requires at least one substantive field beyond status/reason/warning",
-        "provenance_rule": "critical sections require source or provenance; observed_at/as_of is audited separately",
+        "provenance_rule": "critical sections require source or provenance and a valid type-specific observed_at/as_of",
         "policy": "probability generation remains available; final recommendation must PASS when insufficient",
     }
 
