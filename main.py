@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.77.0"
+VERSION = "0.78.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1449,10 +1449,17 @@ def compare_market_snapshots(history: List[Dict[str, Any]], current: Dict[str, A
         "away_1x2_vs_away_team_total": opposed(-away_delta if away_delta is not None else None, movements["away_team_total"]["line"]),
     }
     cross_market = any(divergence_pairs.values())
-    price_deltas = [value for market in movements.values() for field, value in market.items() if field != "line"]
     probability_deltas = [value for row in probability_movements.values() for value in (row.get("deltas") or {}).values()]
+    fallback_price_deltas = [
+        value
+        for market, movement in movements.items()
+        if probability_movements.get(market, {}).get("status") == "data_missing"
+        for field, value in movement.items() if field != "line"
+    ]
     line_deltas = [movements[market]["line"] for market in ("asian_handicap", "over_under", "home_team_total", "away_team_total")]
-    significant_price = any(value is not None and abs(value) >= 0.03 for value in probability_deltas) or any(value is not None and abs(value) >= 0.10 for value in price_deltas)
+    probability_price_signal = any(value is not None and abs(value) >= 0.03 for value in probability_deltas)
+    decimal_fallback_signal = any(value is not None and abs(value) >= 0.10 for value in fallback_price_deltas)
+    significant_price = probability_price_signal or decimal_fallback_signal
     significant_line = any(value is not None and abs(value) >= 0.25 for value in line_deltas)
     reasons = []
     if significant_line: reasons.append("significant_line_move")
@@ -1466,7 +1473,7 @@ def compare_market_snapshots(history: List[Dict[str, Any]], current: Dict[str, A
         "water_movement": {"home_1x2_odd_delta": home_delta, "away_1x2_odd_delta": away_delta},
         "continuous_strengthening": continuous, "reversal": reversal,
         "cross_market_divergence": cross_market, "cross_market_divergence_pairs": divergence_pairs,
-        "revalidation_trigger": {"triggered": bool(reasons), "reasons": reasons, "thresholds": {"line": 0.25, "no_vig_probability": 0.03, "decimal_price_fallback": 0.10}},
+        "revalidation_trigger": {"triggered": bool(reasons), "reasons": reasons, "thresholds": {"line": 0.25, "no_vig_probability": 0.03, "decimal_price_fallback": 0.10}, "signal_audit": {"probability_signal": probability_price_signal, "decimal_fallback_signal": decimal_fallback_signal, "decimal_fallback_used_only_when_probability_missing": True}},
         "data_missing": missing,
         "market_saturation": market_saturation(current)
     }

@@ -260,6 +260,24 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(movement["previous_method"], "bookmaker_level_no_vig_consensus")
         self.assertAlmostEqual(movement["deltas"]["home"], .04)
 
+    def test_high_odds_price_change_does_not_override_small_probability_move(self):
+        previous_market = {"home": 1.2, "draw": 6.0, "away": 15.0, "consensus_no_vig_probabilities": {"home": .78, "draw": .16, "away": .06}}
+        current_market = {"home": 1.2, "draw": 6.0, "away": 15.4, "consensus_no_vig_probabilities": {"home": .781, "draw": .159, "away": .06}}
+        previous = {"stage": "T-24h", "market_snapshot": {"primary": {"1x2": previous_market}}}
+        current = main.empty_market_snapshot()
+        current["primary"]["1x2"] = current_market
+        dynamics = main.compare_market_snapshots([previous], current, "T-12h")
+        self.assertNotIn("abnormal_price_move", dynamics["revalidation_trigger"]["reasons"])
+        self.assertFalse(dynamics["revalidation_trigger"]["signal_audit"]["decimal_fallback_signal"])
+
+    def test_decimal_price_fallback_remains_when_probability_is_unavailable(self):
+        previous = {"stage": "T-24h", "market_snapshot": {"primary": {"1x2": {"home": 2.0}}}}
+        current = main.empty_market_snapshot()
+        current["primary"]["1x2"] = {"home": 1.85}
+        dynamics = main.compare_market_snapshots([previous], current, "T-12h")
+        self.assertIn("abnormal_price_move", dynamics["revalidation_trigger"]["reasons"])
+        self.assertTrue(dynamics["revalidation_trigger"]["signal_audit"]["decimal_fallback_signal"])
+
     def test_consensus_deduplicates_bookmaker_name_variants(self):
         consensus = main._consensus_1x2([
             {"bookmaker": "Book A", "home": 2.0, "draw": 3.4, "away": 4.0},
