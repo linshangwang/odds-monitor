@@ -187,6 +187,9 @@ T-X 变盘比较现覆盖全部可用市场：1X2、AH、O/U、BTTS、主队进�
 即使稍后补传或修订，也不会覆盖 T-3h、T-1h、T-15m 或 Closing 的决策位置。
 数据新鲜度也绑定该最新阶段，而不是所有记录中最大的写入时间；超过当前时间5分钟的快照标记
 `invalid_timestamp` 并强制 PASS，防止时间漂移或错误时间戳污染临场判断。
+导入时还会核对节点标签与开赛时间：各 T-X 节点采用明确允许误差，严重错位标记
+`stage_timestamp_mismatch`。原始快照继续保存，但该节点不计入完整时间轴的 available 数量，
+也不会成为“最新盘口”。缺少开赛时间时返回 `data_missing`，不虚构校验结果。
 总完整度至少需达到0.6，且 Result Utility、Rotation Quality、Execution Ability、Goal Conversion
 四个关键环节不得缺失。证据不足时仍生成概率供审计，但最终建议强制 PASS。
 `available` 或 `partial` 不能只写状态：必须同时包含至少一个实质字段，例如证据、变量值或明确

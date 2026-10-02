@@ -55,6 +55,24 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(main.latest_prematch_snapshot(rows)["stage"], "T-15m")
         self.assertIsNone(main.latest_prematch_snapshot([{"stage": "FT", "snapshot_at": 10000}]))
 
+    def test_stage_timing_rejects_mislabeled_tx_snapshot(self):
+        kickoff = 100000
+        valid = main.audit_stage_timing("T-1h", kickoff - 3600, kickoff)
+        self.assertEqual(valid["status"], "valid")
+        invalid = main.audit_stage_timing("T-1h", kickoff - 36000, kickoff)
+        self.assertEqual(invalid["status"], "invalid")
+        self.assertFalse(invalid["decision_eligible"])
+        selected = main.latest_prematch_snapshot([
+            {"stage": "T-3h", "snapshot_at": 100, "stage_timing_audit": {"status": "valid"}},
+            {"stage": "T-1h", "snapshot_at": 200, "stage_timing_audit": {"status": "invalid"}},
+        ])
+        self.assertEqual(selected["stage"], "T-3h")
+
+    def test_stage_timing_is_unverifiable_not_invented_without_kickoff(self):
+        audit = main.audit_stage_timing("T-15m", 1000, None)
+        self.assertEqual(audit["status"], "data_missing")
+        self.assertTrue(audit["decision_eligible"])
+
     def test_consensus_uses_all_books_not_first_book_primary(self):
         result = api_football_odds([
             {"name": "Outlier", "bets": [{"name": "Match Winner", "values": [{"value": "Home", "odd": "9.0"}, {"value": "Draw", "odd": "9.0"}, {"value": "Away", "odd": "1.1"}]}, {"name": "Asian Handicap", "values": [{"value": "Home -1", "odd": "1.9"}, {"value": "Away -1", "odd": "1.9"}]}]},

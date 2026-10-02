@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.54.0"
+VERSION = "0.55.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -794,8 +794,29 @@ def get_fixture_snapshots(fixture: Any) -> List[Dict[str, Any]]:
 
 
 def latest_prematch_snapshot(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    eligible = [row for row in rows if row.get("stage") in PREMATCH_STAGE_ORDER]
+    eligible = [row for row in rows if row.get("stage") in PREMATCH_STAGE_ORDER and get_nested(row, ["stage_timing_audit", "status"]) != "invalid"]
     return max(eligible, key=lambda row: (PREMATCH_STAGE_ORDER.index(row["stage"]), int(row.get("snapshot_at") or 0)), default=None)
+
+
+def audit_stage_timing(stage: str, observed_at: Any, kickoff_at: Any) -> Dict[str, Any]:
+    observed, kickoff = _parse_timestamp(observed_at), _parse_timestamp(kickoff_at)
+    if observed is None or kickoff is None:
+        return {"status": "data_missing", "decision_eligible": True, "reason": "kickoff_or_observation_time_missing"}
+    seconds_before = kickoff - observed
+    if stage == "Opening":
+        valid = seconds_before > 0
+        expected, tolerance = None, None
+    else:
+        expected_map = {"T-24h": 86400, "T-12h": 43200, "T-6h": 21600, "T-3h": 10800, "T-1h": 3600, "T-15m": 900, "Closing": 0}
+        tolerance_map = {"T-24h": 21600, "T-12h": 10800, "T-6h": 5400, "T-3h": 2700, "T-1h": 1800, "T-15m": 900, "Closing": 900}
+        expected, tolerance = expected_map.get(stage), tolerance_map.get(stage)
+        valid = expected is not None and -300 <= seconds_before and abs(seconds_before - expected) <= tolerance
+    return {
+        "status": "valid" if valid else "invalid", "decision_eligible": valid,
+        "stage": stage, "observed_at": observed, "kickoff_at": kickoff,
+        "seconds_before_kickoff": seconds_before, "expected_seconds_before_kickoff": expected,
+        "tolerance_seconds": tolerance, "reason": None if valid else "stage_timestamp_mismatch",
+    }
 
 
 def complete_prematch_timeline(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -804,7 +825,7 @@ def complete_prematch_timeline(rows: List[Dict[str, Any]]) -> List[Dict[str, Any
     for stage in PREMATCH_STAGE_ORDER:
         row = by_stage.get(stage)
         if row:
-            usable = row.get("import_status") != "data_missing" and bool(get_nested(row, ["market_snapshot", "available"]))
+            usable = row.get("import_status") != "data_missing" and bool(get_nested(row, ["market_snapshot", "available"])) and get_nested(row, ["stage_timing_audit", "status"]) != "invalid"
             timeline.append({**row, "timeline_status": "available" if usable else "data_missing", "synthetic_placeholder": False})
         else:
             timeline.append({
@@ -1044,6 +1065,7 @@ def import_prematch_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
             "import_status": status, "missing_reason": stage_data.get("reason") if status == "data_missing" else None,
             "market_snapshot": market_snapshot, "source_content_hash": source_hash, "market_dynamics": None,
         }
+        record["stage_timing_audit"] = audit_stage_timing(stage, record["snapshot_at"], match.get("kickoff_utc"))
         records.append(record)
     with SNAPSHOT_STORE_LOCK:
         store = load_snapshot_store()
@@ -1070,11 +1092,11 @@ def import_prematch_packet(packet: Dict[str, Any]) -> Dict[str, Any]:
         prior_available: List[Dict[str, Any]] = []
         for row in merged:
             market_snapshot = row.get("market_snapshot") or empty_market_snapshot()
-            if row.get("import_status") == "available":
+            if row.get("import_status") == "available" and get_nested(row, ["stage_timing_audit", "status"]) != "invalid":
                 dynamics = compare_market_snapshots(prior_available, market_snapshot, row.get("stage"))
                 prior_available.append(row)
             else:
-                dynamics = {"stage": row.get("stage"), "comparison_status": "data_missing", "revalidation_trigger": {"triggered": False, "reasons": []}, "data_missing": list((market_snapshot.get("data_status") or {}).keys())}
+                dynamics = {"stage": row.get("stage"), "comparison_status": "data_missing", "revalidation_trigger": {"triggered": False, "reasons": []}, "data_missing": list((market_snapshot.get("data_status") or {}).keys()), "reason": get_nested(row, ["stage_timing_audit", "reason"]) or row.get("missing_reason")}
             dynamics["classification"] = classify_market_move(dynamics, None, None)
             row["market_dynamics"] = dynamics
         accepted_stages = {row.get("stage") for row in accepted}
