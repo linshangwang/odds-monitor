@@ -80,6 +80,25 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertAlmostEqual(sum(one_x_two.values()), 1.0, places=5)
         self.assertAlmostEqual(one_x_two["home"], one_x_two["away"], places=6)
         self.assertFalse(model["uses_market_odds"])
+        self.assertAlmostEqual(sum(model["probabilities"]["home_team_totals"][key] for key in ("over_1_5", "under_1_5")), 1.0, places=5)
+
+    def test_cross_market_decision_can_prefer_total_over_1x2(self):
+        snapshot = main.empty_market_snapshot()
+        snapshot["consensus_main_line"].update({
+            "1x2": {"home": 1.7, "draw": 4.0, "away": 5.0},
+            "over_under": {"line": 2.5, "over": 2.2, "under": 1.7},
+            "btts": {"yes": 2.0, "no": 1.8},
+            "asian_handicap": {"line": -0.75, "home": 1.9, "away": 1.9},
+        })
+        model = main.poisson_probability_model(2.0, 1.2, 0.9, {"source": "verified_team_metrics", "uses_market_odds": False})
+        result = main.decision_layer(snapshot, model["probabilities"], {
+            "1x2": {"home": .7, "draw": .3, "away": .2},
+            "over_under": {"over": .85, "under": .2}, "btts": {"yes": .7, "no": .2},
+        }, .3, .9, [])
+        self.assertEqual(result["decision"], "over_under:over")
+        self.assertEqual(result["best_market"]["line"], 2.5)
+        self.assertIn("over_under", result["market_no_vig_probability"])
+        self.assertFalse(any(row["market"] == "asian_handicap" for row in result["candidates"]))
 
     def test_poisson_model_rejects_market_derived_or_low_confidence_inputs(self):
         invalid = main.poisson_probability_model(1.5, 1.0, 0.9, {"source": "odds", "uses_market_odds": True})

@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.13.0"
+VERSION = "0.14.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1065,6 +1065,16 @@ def poisson_probability_model(home_expected_goals: Any, away_expected_goals: Any
     totals = {"over_2_5": sum(p for (home, away), p in normalized.items() if home + away >= 3)}
     totals["under_2_5"] = 1.0 - totals["over_2_5"]
     btts_yes = sum(p for (home, away), p in normalized.items() if home > 0 and away > 0)
+    half_lines = (0.5, 1.5, 2.5, 3.5, 4.5)
+    team_totals = {}
+    for team, index in (("home", 0), ("away", 1)):
+        team_totals[team] = {}
+        for line in half_lines:
+            threshold = int(line + 0.5)
+            over = sum(p for score, p in normalized.items() if score[index] >= threshold)
+            key = str(line).replace(".", "_")
+            team_totals[team][f"over_{key}"] = round(over, 6)
+            team_totals[team][f"under_{key}"] = round(1.0 - over, 6)
     top_scores = sorted(normalized.items(), key=lambda item: item[1], reverse=True)[:8]
     status = "ready" if confidence >= 0.6 else "insufficient_confidence"
     return {
@@ -1074,6 +1084,7 @@ def poisson_probability_model(home_expected_goals: Any, away_expected_goals: Any
             "1x2": {key: round(value, 6) for key, value in one_x_two.items()},
             "over_under_2_5": {key: round(value, 6) for key, value in totals.items()},
             "btts": {"yes": round(btts_yes, 6), "no": round(1.0 - btts_yes, 6)},
+            "home_team_totals": team_totals["home"], "away_team_totals": team_totals["away"],
             "top_scores": [{"score": f"{home}-{away}", "probability": round(probability, 6)} for (home, away), probability in top_scores],
         },
         "truncated_tail_mass": round(1.0 - mass, 10),
@@ -1122,29 +1133,64 @@ def fundamental_expected_goals(inputs: Dict[str, Any]) -> Dict[str, Any]:
         "audit": audit,
         "estimator_hash": _content_hash({"rates": rates, "samples": samples, "metric_type": metric_type, "home_adjustment": home_adjustment, "away_adjustment": away_adjustment, "lineup_confidence": lineup_confidence, "provenance": provenance}),
     }
-def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optional[Dict[str, float]] = None, script_coverage: Optional[Dict[str, float]] = None, crowding: Optional[float] = None, lineup_confidence: Optional[float] = None, death_path: Optional[List[str]] = None) -> Dict[str, Any]:
-    main = get_nested(market_snapshot, ["consensus_main_line", "1x2"]) or get_nested(market_snapshot, ["primary", "1x2"]) or {}
-    market_probability = no_vig_probabilities(main, ["home", "draw", "away"])
+def _model_pair(model_probabilities: Dict[str, Any], market: str, line: Optional[float]) -> Optional[Dict[str, float]]:
+    if market == "1x2":
+        source = model_probabilities.get("1x2") if isinstance(model_probabilities.get("1x2"), dict) else model_probabilities
+        keys = ("home", "draw", "away")
+    elif market == "btts":
+        source, keys = model_probabilities.get("btts"), ("yes", "no")
+    elif market == "over_under" and line == 2.5:
+        raw, keys = model_probabilities.get("over_under_2_5"), ("over", "under")
+        source = {"over": (raw or {}).get("over_2_5"), "under": (raw or {}).get("under_2_5")}
+    elif market in ("home_team_total", "away_team_total") and line is not None and line % 1 == 0.5:
+        raw = model_probabilities.get("home_team_totals" if market == "home_team_total" else "away_team_totals") or {}
+        suffix, keys = str(line).replace(".", "_"), ("over", "under")
+        source = {"over": raw.get(f"over_{suffix}"), "under": raw.get(f"under_{suffix}")}
+    else:
+        return None
+    if not isinstance(source, dict):
+        return None
+    values = {key: as_float(source.get(key)) for key in keys}
+    if not all(value is not None and 0 <= value <= 1 for value in values.values()) or abs(sum(values.values()) - 1.0) > 0.02:
+        return None
+    return values
+
+
+def _coverage_for(script_coverage: Dict[str, Any], market: str, selection: str) -> Optional[float]:
+    nested = script_coverage.get(market)
+    if isinstance(nested, dict) and as_float(nested.get(selection)) is not None:
+        return as_float(nested.get(selection))
+    return as_float(script_coverage.get(f"{market}.{selection}")) if as_float(script_coverage.get(f"{market}.{selection}")) is not None else as_float(script_coverage.get(selection))
+
+
+def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optional[Dict[str, Any]] = None, script_coverage: Optional[Dict[str, Any]] = None, crowding: Optional[float] = None, lineup_confidence: Optional[float] = None, death_path: Optional[List[str]] = None) -> Dict[str, Any]:
+    consensus = get_nested(market_snapshot, ["consensus_main_line"]) or get_nested(market_snapshot, ["primary"]) or {}
     missing = []
-    if not market_probability: missing.append("market_no_vig_probability")
-    valid_model = False
-    if model_probabilities:
-        values = [as_float(model_probabilities.get(key)) for key in ("home", "draw", "away")]
-        valid_model = all(value is not None and 0 <= value <= 1 for value in values) and abs(sum(values) - 1.0) <= 0.02
     if not model_probabilities: missing.append("model_probability")
-    elif not valid_model: missing.append("model_probability_invalid_or_not_normalized")
     if script_coverage is None: missing.append("script_coverage")
     if crowding is None: missing.append("crowding")
     if lineup_confidence is None: missing.append("lineup_confidence")
     candidates = []
-    if market_probability and valid_model:
-        for key in ("home", "draw", "away"):
-            model_p = as_float(model_probabilities.get(key))
-            price = as_float(main.get(key))
-            if model_p is None or price is None: continue
-            edge = model_p - market_probability[key]
-            ev = model_p * price - 1.0
-            candidates.append({"selection": key, "model_probability": round(model_p, 6), "market_no_vig_probability": market_probability[key], "edge": round(edge, 6), "ev": round(ev, 6), "script_coverage": (script_coverage or {}).get(key)})
+    market_probabilities = {}
+    valid_model_market_count = 0
+    specs = (("1x2", ("home", "draw", "away")), ("over_under", ("over", "under")), ("btts", ("yes", "no")), ("home_team_total", ("over", "under")), ("away_team_total", ("over", "under")))
+    for market, keys in specs:
+        main = consensus.get(market) or {}
+        line = as_float(main.get("line")) if market not in ("1x2", "btts") else None
+        model_pair = _model_pair(model_probabilities or {}, market, line)
+        if model_pair:
+            valid_model_market_count += 1
+        market_probability = no_vig_probabilities(main, list(keys))
+        if market_probability:
+            market_probabilities[market] = {"line": line, "probabilities": market_probability}
+        if not model_pair or not market_probability:
+            continue
+        for key in keys:
+            model_p, price = model_pair[key], as_float(main.get(key))
+            edge, ev = model_p - market_probability[key], model_p * price - 1.0
+            candidates.append({"market": market, "selection": key, "line": line, "price": price, "model_probability": round(model_p, 6), "market_no_vig_probability": market_probability[key], "edge": round(edge, 6), "ev": round(ev, 6), "script_coverage": _coverage_for(script_coverage or {}, market, key)})
+    if model_probabilities and not valid_model_market_count: missing.append("model_probability_invalid_or_not_normalized")
+    if not market_probabilities: missing.append("market_no_vig_probability")
     candidates.sort(key=lambda x: (x.get("ev", -999), x.get("edge", -999)), reverse=True)
     best = candidates[0] if candidates else None
     pass_reasons = list(missing)
@@ -1155,14 +1201,15 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
     if crowding is not None and crowding > MAX_CROWDING: pass_reasons.append("crowding_above_maximum")
     if lineup_confidence is not None and lineup_confidence < MIN_LINEUP_CONFIDENCE: pass_reasons.append("lineup_confidence_below_minimum")
     if death_path: pass_reasons.append("death_path_present")
-    decision = "PASS" if pass_reasons or not best else best["selection"]
+    decision = "PASS" if pass_reasons or not best else (best["selection"] if best["market"] == "1x2" else f"{best['market']}:{best['selection']}")
     return {
         "decision": decision, "best_market": best, "candidates": candidates,
-        "market_no_vig_probability": market_probability, "model_probability": model_probabilities,
+        "market_no_vig_probability": market_probabilities, "model_probability": model_probabilities,
         "edge": best.get("edge") if best else None, "ev": best.get("ev") if best else None,
         "script_coverage": script_coverage, "crowding": crowding,
         "line_movement": None, "lineup_confidence": lineup_confidence,
         "death_path": death_path or [], "pass_reasons": pass_reasons,
+        "unsupported_market_policy": {"asian_handicap": "PASS until push/half-win/half-loss settlement EV is implemented", "integer_totals": "PASS because push probability requires settlement-aware EV"},
         "thresholds": {"minimum_edge": MIN_EDGE, "minimum_ev": MIN_EV, "minimum_script_coverage": MIN_SCRIPT_COVERAGE, "maximum_crowding": MAX_CROWDING, "minimum_lineup_confidence": MIN_LINEUP_CONFIDENCE},
     }
 
@@ -1210,7 +1257,7 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
     market = (latest or {}).get("market_snapshot") or empty_market_snapshot()
     freshness = imported_fixture_freshness(metadata, history)
     decision = decision_layer(
-        market, get_nested(model, ["probabilities", "1x2"]), payload.get("script_coverage"),
+        market, model.get("probabilities"), payload.get("script_coverage"),
         as_float(payload.get("crowding")), as_float(payload.get("lineup_confidence")), payload.get("death_path") or [],
     )
     decision["line_movement"] = (latest or {}).get("market_dynamics") or {"status": "data_missing"}
@@ -1556,10 +1603,11 @@ async def shadow_poisson_model(request: Request, token: Optional[str] = None, au
             raise HTTPException(status_code=404, detail="imported_fixture_not_found")
         history = get_fixture_snapshots(fixture)
         available = [row for row in history if row.get("import_status") == "available"]
-        market = (available[-1].get("market_snapshot") if available else None) or empty_market_snapshot()
+        latest = max(available, key=lambda row: int(row.get("snapshot_at") or 0), default=None)
+        market = (latest or {}).get("market_snapshot") or empty_market_snapshot()
         freshness = imported_fixture_freshness(metadata, history)
     decision = decision_layer(
-        market, model.get("probabilities", {}).get("1x2"), payload.get("script_coverage"),
+        market, model.get("probabilities"), payload.get("script_coverage"),
         as_float(payload.get("crowding")), as_float(payload.get("lineup_confidence")), payload.get("death_path") or [],
     )
     if model.get("status") != "ready":

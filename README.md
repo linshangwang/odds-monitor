@@ -189,7 +189,8 @@ POST 支持 `Content-Encoding: gzip`，可直接发送压缩 JSON，
 ## 独立概率模型
 
 `/shadow/model/poisson` 接受明确的主客队预期进球、输入置信度及来源说明，
-输出比分分布、1X2、2.5大小球和BTTS概率。来源必须明确声明
+输出比分分布、1X2、2.5大小球、BTTS，以及主客队 0.5/1.5/2.5/3.5/4.5
+半球线 Team Total 概率。来源必须明确声明
 `uses_market_odds=false`，禁止使用盘口反推模型；置信度低于0.6、数据过期、
 比赛已开赛或最终决策字段不完整时继续返回 `PASS`。
 
@@ -234,6 +235,11 @@ POST 支持 `Content-Encoding: gzip`，可直接发送压缩 JSON，
 ```
 
 未提供的基本面链环节明确保存为 `data_missing`，不会根据盘口补写。
+
+最终决策层会同时比较可获得的 1X2、2.5 大小球、BTTS 和半球线 Home/Away
+Team Total，分别计算去水概率、Edge、EV 与 Script Coverage，再选择最佳盘口表达。
+旧调用方继续可以只传平面的 `{home, draw, away}` 概率。亚洲让球以及整数/四分之一球
+总盘暂时明确 `PASS`，因为必须先实现走盘、半赢和半输的结算 EV，不能用二项胜负公式代替。
 
 ## 本地只读同步器
 
