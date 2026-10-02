@@ -23,6 +23,19 @@ class ShadowV4UpgradeTests(unittest.TestCase):
     def test_complete_timeline_contains_opening(self):
         self.assertEqual(main.PREMATCH_STAGE_ORDER, ["Opening", "T-24h", "T-12h", "T-6h", "T-3h", "T-1h", "T-15m", "Closing"])
 
+    def test_complete_timeline_marks_uncaptured_stages_without_backfill(self):
+        captured = {"stage": "T-1h", "import_status": "available", "market_snapshot": {"available": True, "primary": {"1x2": {"home": 2.0}}}}
+        timeline = main.complete_prematch_timeline([captured])
+        self.assertEqual([row["stage"] for row in timeline], main.PREMATCH_STAGE_ORDER)
+        self.assertEqual(len(timeline), 8)
+        opening = timeline[0]
+        self.assertEqual(opening["timeline_status"], "data_missing")
+        self.assertTrue(opening["synthetic_placeholder"])
+        self.assertFalse(opening["backfilled_from_current"])
+        t_one = next(row for row in timeline if row["stage"] == "T-1h")
+        self.assertEqual(t_one["timeline_status"], "available")
+        self.assertFalse(t_one["synthetic_placeholder"])
+
     def test_consensus_uses_all_books_not_first_book_primary(self):
         result = api_football_odds([
             {"name": "Outlier", "bets": [{"name": "Match Winner", "values": [{"value": "Home", "odd": "9.0"}, {"value": "Draw", "odd": "9.0"}, {"value": "Away", "odd": "1.1"}]}, {"name": "Asian Handicap", "values": [{"value": "Home -1", "odd": "1.9"}, {"value": "Away -1", "odd": "1.9"}]}]},

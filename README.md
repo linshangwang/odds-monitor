@@ -176,6 +176,10 @@ T-X 变盘比较现覆盖全部可用市场：1X2、AH、O/U、BTTS、主队进�
 阵容置信度不再直接相信请求值：官方阵容、预计阵容、陈旧阵容和缺失阵容分别设置证据上限，
 未来时间戳或无效时间戳不计入有效证据。模型和最终门槛统一使用 `effective_confidence`，原提交值、
 上限、是否被压低及证据新鲜度保存在 `lineup_confidence_audit`。
+
+`GET /shadow/snapshots` 在保留原 `snapshots` 数组的同时新增固定八节点
+`complete_prematch_timeline`。没有采集到的历史节点以 `synthetic_placeholder=true`、
+`timeline_status=data_missing`、`backfilled_from_current=false` 返回，并附时间轴覆盖统计。
 总完整度至少需达到0.6，且 Result Utility、Rotation Quality、Execution Ability、Goal Conversion
 四个关键环节不得缺失。证据不足时仍生成概率供审计，但最终建议强制 PASS。
 `available` 或 `partial` 不能只写状态：必须同时包含至少一个实质字段，例如证据、变量值或明确

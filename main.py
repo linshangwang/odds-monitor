@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.50.0"
+VERSION = "0.51.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -791,6 +791,23 @@ def write_snapshot_store(store: Dict[str, Any]) -> bool:
 def get_fixture_snapshots(fixture: Any) -> List[Dict[str, Any]]:
     rows = load_snapshot_store().get("fixtures", {}).get(str(fixture), [])
     return sorted(rows, key=lambda x: (STAGE_ORDER.index(x.get("stage")) if x.get("stage") in STAGE_ORDER else 999, x.get("snapshot_at", 0)))
+
+
+def complete_prematch_timeline(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_stage = {row.get("stage"): row for row in rows if row.get("stage") in PREMATCH_STAGE_ORDER}
+    timeline = []
+    for stage in PREMATCH_STAGE_ORDER:
+        row = by_stage.get(stage)
+        if row:
+            timeline.append({**row, "timeline_status": row.get("import_status") or ("available" if get_nested(row, ["market_snapshot", "available"]) else "data_missing"), "synthetic_placeholder": False})
+        else:
+            timeline.append({
+                "stage": stage, "timeline_status": "data_missing", "import_status": "data_missing",
+                "missing_reason": "historical_stage_not_captured", "snapshot_at": None,
+                "market_snapshot": empty_market_snapshot(), "market_dynamics": None,
+                "synthetic_placeholder": True, "backfilled_from_current": False,
+            })
+    return timeline
 
 
 def save_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -2269,7 +2286,8 @@ def shadow_snapshot(fixture: int, stage: str = "manual", raw: bool = False, toke
 def shadow_snapshots(fixture: int, token: Optional[str] = None):
     require_shadow_token(token)
     rows = get_fixture_snapshots(fixture)
-    return JSONResponse({"ok": True, "version": VERSION, "fixture": fixture, "stage_order": STAGE_ORDER, "count": len(rows), "snapshots": rows})
+    complete_timeline = complete_prematch_timeline(rows)
+    return JSONResponse({"ok": True, "version": VERSION, "fixture": fixture, "stage_order": STAGE_ORDER, "count": len(rows), "snapshots": rows, "complete_prematch_timeline": complete_timeline, "timeline_coverage": {"available": sum(row["timeline_status"] == "available" for row in complete_timeline), "data_missing": sum(row["timeline_status"] == "data_missing" for row in complete_timeline), "required": len(PREMATCH_STAGE_ORDER)}})
 
 
 @app.post("/shadow/import-prematch-packets")
