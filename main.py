@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.30.0"
+VERSION = "0.31.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1558,6 +1558,16 @@ def _risk_adjusted_combination(first: Dict[str, Any], second: Dict[str, Any], ri
     }
 
 
+def normalize_max_legs(value: Any, default: int = 6) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(2, min(parsed, 10))
+
+
 def _portfolio_recommendation_signature(portfolio: Dict[str, Any]) -> Dict[str, Any]:
     recommendation = portfolio.get("risk_adjusted_recommendation") or {}
     option = recommendation.get("recommended_option") or {}
@@ -1665,7 +1675,7 @@ def portfolio_run_timeline(runs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6, risk_preference: str = "balanced") -> Dict[str, Any]:
-    max_legs = max(2, min(int(max_legs), 10))
+    max_legs = normalize_max_legs(max_legs)
     risk_preference = str(risk_preference or "balanced").strip().lower()
     if risk_preference not in {"conservative", "balanced", "aggressive"}:
         risk_preference = "balanced"
@@ -2051,28 +2061,48 @@ async def shadow_portfolio_evaluate(request: Request, token: Optional[str] = Non
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="invalid_json_body")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="json_body_must_be_an_object")
     matches = payload.get("matches")
     if not isinstance(matches, list) or not 1 <= len(matches) <= 10:
         raise HTTPException(status_code=422, detail="matches_must_contain_1_to_10_items")
     fixtures = [str(row.get("fixture") or "").strip() for row in matches if isinstance(row, dict)]
     if len(fixtures) != len(matches) or any(not fixture for fixture in fixtures) or len(set(fixtures)) != len(fixtures):
         raise HTTPException(status_code=422, detail="unique_fixture_required_for_each_match")
-    rows = []
-    for match in matches:
-        evaluation = evaluate_imported_prematch(match, persist_version=True)
-        rows.append({"fixture": evaluation["fixture"], "correlation_group": match.get("correlation_group") or evaluation["fixture"], "evaluation": evaluation})
-    max_legs = max(2, min(int(payload.get("max_legs", 6)), 10))
-    portfolio = build_portfolio(rows, max_legs, payload.get("risk_preference", "balanced"))
+    raw_max_legs = payload.get("max_legs", 6)
+    if isinstance(raw_max_legs, bool):
+        raise HTTPException(status_code=422, detail="max_legs_must_be_an_integer_from_2_to_10")
+    try:
+        requested_max_legs = int(raw_max_legs)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="max_legs_must_be_an_integer_from_2_to_10")
+    if requested_max_legs < 2 or requested_max_legs > 10:
+        raise HTTPException(status_code=422, detail="max_legs_must_be_an_integer_from_2_to_10")
+    risk_preference = str(payload.get("risk_preference", "balanced")).strip().lower()
+    if risk_preference not in {"conservative", "balanced", "aggressive"}:
+        raise HTTPException(status_code=422, detail="risk_preference_must_be_conservative_balanced_or_aggressive")
+    max_legs = requested_max_legs
     supplied_id = str(payload.get("portfolio_id") or "").strip()
     portfolio_id = supplied_id or "auto-" + _content_hash({"fixtures": sorted(fixtures)})[:16]
     if len(portfolio_id) > 100 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in portfolio_id):
         raise HTTPException(status_code=422, detail="portfolio_id_must_use_1_to_100_safe_characters")
-    trigger_reasons = list(dict.fromkeys(
-        str(reason) for match in matches for reason in get_nested(match, ["revalidation_trigger", "reasons"], []) if reason
-    ))
+    trigger_reasons = []
+    for match in matches:
+        reasons = get_nested(match, ["revalidation_trigger", "reasons"], [])
+        if reasons is None:
+            continue
+        if not isinstance(reasons, list):
+            raise HTTPException(status_code=422, detail="revalidation_trigger_reasons_must_be_an_array")
+        trigger_reasons.extend(str(reason) for reason in reasons if reason)
+    trigger_reasons = list(dict.fromkeys(trigger_reasons))
     stage = normalize_stage(str(payload.get("stage") or "manual"))
     if stage != "manual" and stage not in PREMATCH_STAGE_ORDER:
         raise HTTPException(status_code=422, detail="stage_must_be_opening_or_supported_t_minus_checkpoint")
+    rows = []
+    for match in matches:
+        evaluation = evaluate_imported_prematch(match, persist_version=True)
+        rows.append({"fixture": evaluation["fixture"], "correlation_group": match.get("correlation_group") or evaluation["fixture"], "evaluation": evaluation})
+    portfolio = build_portfolio(rows, max_legs, risk_preference)
     portfolio_run = save_portfolio_run(portfolio_id, fixtures, portfolio, max_legs, trigger_reasons, stage, _portfolio_change_drivers(rows))
     return JSONResponse({"ok": True, "version": VERSION, "portfolio_id": portfolio_id, "evaluations": rows, "portfolio": portfolio, "portfolio_run": portfolio_run})
 

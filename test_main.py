@@ -145,6 +145,12 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["risk_preference"], "balanced")
         self.assertEqual(result["first_choice_combination"]["leg_count"], 3)
 
+    def test_normalize_max_legs_is_safe_for_malformed_internal_values(self):
+        self.assertEqual(main.normalize_max_legs("bad"), 6)
+        self.assertEqual(main.normalize_max_legs(True), 6)
+        self.assertEqual(main.normalize_max_legs(1), 2)
+        self.assertEqual(main.normalize_max_legs(99), 10)
+
     def test_portfolio_audit_explains_correlation_and_leg_cap_exclusions(self):
         def row(fixture, group, coverage):
             candidate = {"market": "1x2", "selection": "home", "price": 1.6, "script_coverage": coverage, "edge": .06, "ev": .08}

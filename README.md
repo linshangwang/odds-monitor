@@ -150,6 +150,10 @@ Selection Change、Robustness Change、Risk Downgrade to PASS 和 Recovery from 
 `available` 或 `partial` 不能只写状态：必须同时包含至少一个实质字段，例如证据、变量值或明确
 结论；只有状态的空壳环节按 `data_missing` 计分。未知状态也不会计分，并分别列入
 `unsubstantiated_sections` 和 `invalid_status_sections`。
+
+组合接口对外严格校验：请求体必须是对象，`max_legs` 必须为2–10的整数，风险偏好只能是
+conservative、balanced、aggressive，复核原因必须是数组。异常输入返回明确的400/422，
+不会因类型错误产生500；内部旧调用仍使用安全默认值并限制在2–10腿。
 再输出综合过关第一首选、综合过关次首选和高博弈单关。2 腿是偏稳健建议，3 腿是默认
 平衡建议，4 腿以上作为可选扩展高波动方案；用户可用 `max_legs` 指定 2–10 的展示上限，
 不是只能选择 2–3 腿。同一 `correlation_group` 最多一腿，同一比赛不能重复提交。
