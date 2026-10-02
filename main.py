@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.76.0"
+VERSION = "0.77.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1422,13 +1422,14 @@ def compare_market_snapshots(history: List[Dict[str, Any]], current: Dict[str, A
     }
     probability_movements = {}
     for market, keys in market_keys.items():
-        current_probs = no_vig_probabilities(curp.get(market) or {}, list(keys))
-        previous_probs = no_vig_probabilities(prevp.get(market) or {}, list(keys))
+        current_probs, current_method = market_no_vig_probabilities(curp.get(market) or {}, list(keys))
+        previous_probs, previous_method = market_no_vig_probabilities(prevp.get(market) or {}, list(keys))
         same_line = market in ("1x2", "btts") or line_from_primary(curp.get(market)) == line_from_primary(prevp.get(market))
         comparable = bool(current_probs and previous_probs and same_line)
         probability_movements[market] = {
             "status": "compared" if comparable else ("line_changed" if current_probs and previous_probs and not same_line else "data_missing"),
             "deltas": {key: round(current_probs[key] - previous_probs[key], 6) for key in keys} if comparable else None,
+            "current_method": current_method, "previous_method": previous_method,
         }
     ah_now, ah_prev = line_from_primary(curp.get("asian_handicap")), line_from_primary(prevp.get("asian_handicap"))
     ah_delta, ou_delta = movements["asian_handicap"]["line"], movements["over_under"]["line"]
@@ -1581,6 +1582,15 @@ def no_vig_probabilities(odds: Dict[str, Any], keys: List[str]) -> Optional[Dict
         return None
     total = sum(implied.values())
     return {key: round(value / total, 6) for key, value in implied.items()}
+
+
+def market_no_vig_probabilities(market: Dict[str, Any], keys: List[str]) -> Tuple[Optional[Dict[str, float]], str]:
+    embedded = market.get("consensus_no_vig_probabilities") if isinstance(market.get("consensus_no_vig_probabilities"), dict) else None
+    embedded_values = {key: as_float((embedded or {}).get(key)) for key in keys}
+    embedded_valid = bool(embedded) and all(value is not None and 0 <= value <= 1 for value in embedded_values.values()) and abs(sum(embedded_values.values()) - 1.0) <= 0.02
+    if embedded_valid:
+        return {key: round(embedded_values[key], 6) for key in keys}, "bookmaker_level_no_vig_consensus"
+    return no_vig_probabilities(market, keys), "no_vig_from_consensus_median_prices"
 
 
 def poisson_probability_model(home_expected_goals: Any, away_expected_goals: Any, input_confidence: Any, provenance: Any, max_goals: int = 10) -> Dict[str, Any]:
@@ -1774,10 +1784,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
         line = as_float(main.get("line")) if market not in ("1x2", "btts") else None
         distribution_name = {"asian_handicap": "goal_difference", "over_under": "total_goals", "home_team_total": "home_goals", "away_team_total": "away_goals"}.get(market)
         distribution = get_nested(model_probabilities or {}, ["settlement_distributions", distribution_name]) if distribution_name else None
-        embedded_probability = main.get("consensus_no_vig_probabilities") if isinstance(main.get("consensus_no_vig_probabilities"), dict) else None
-        embedded_valid = embedded_probability and all(as_float(embedded_probability.get(key)) is not None and 0 <= as_float(embedded_probability.get(key)) <= 1 for key in keys) and abs(sum(as_float(embedded_probability.get(key)) for key in keys) - 1.0) <= 0.02
-        market_probability = ({key: as_float(embedded_probability.get(key)) for key in keys} if embedded_valid else no_vig_probabilities(main, list(keys)))
-        market_probability_method = "bookmaker_level_no_vig_consensus" if embedded_valid else "no_vig_from_consensus_median_prices"
+        market_probability, market_probability_method = market_no_vig_probabilities(main, list(keys))
         if distribution and line is not None and market_probability:
             valid_model_market_count += 1
             market_probabilities[market] = {"line": line, "probabilities": market_probability, "method": market_probability_method}

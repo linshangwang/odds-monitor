@@ -248,6 +248,18 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(market["probabilities"], consensus["consensus_no_vig_probabilities"])
         self.assertAlmostEqual(sum(market["probabilities"].values()), 1.0, places=5)
 
+    def test_timeline_movement_uses_same_bookmaker_level_no_vig_consensus(self):
+        previous_market = {"home": 2.0, "draw": 3.5, "away": 4.0, "consensus_no_vig_probabilities": {"home": .50, "draw": .28, "away": .22}}
+        current_market = {"home": 1.9, "draw": 3.6, "away": 4.2, "consensus_no_vig_probabilities": {"home": .54, "draw": .27, "away": .19}}
+        previous = {"stage": "T-24h", "market_snapshot": {"primary": {"1x2": previous_market}}}
+        current = main.empty_market_snapshot()
+        current["primary"]["1x2"] = current_market
+        dynamics = main.compare_market_snapshots([previous], current, "T-12h")
+        movement = dynamics["no_vig_probability_movements"]["1x2"]
+        self.assertEqual(movement["current_method"], "bookmaker_level_no_vig_consensus")
+        self.assertEqual(movement["previous_method"], "bookmaker_level_no_vig_consensus")
+        self.assertAlmostEqual(movement["deltas"]["home"], .04)
+
     def test_consensus_deduplicates_bookmaker_name_variants(self):
         consensus = main._consensus_1x2([
             {"bookmaker": "Book A", "home": 2.0, "draw": 3.4, "away": 4.0},
