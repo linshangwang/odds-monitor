@@ -1033,6 +1033,23 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(len(expanded["fundamentals"]["lineup_history"]), 1)
         self.assertEqual(packet["decision_layer"]["decision"], "PASS")
 
+    def test_imported_ai_packet_excludes_invalid_latest_node(self):
+        packet = self.prematch_packet()
+        invalid_late = dict(packet["timeline"][0])
+        invalid_late["stage"] = "T-15m"
+        invalid_late["latest_observed_at"] = "2030-01-01T00:00:00+00:00"
+        packet["timeline"] = [packet["timeline"][0], invalid_late]
+        main.import_prematch_packet(packet)
+        store = main.load_snapshot_store()
+        late = next(row for row in store["fixtures"]["uuid-1"] if row["stage"] == "T-15m")
+        late["stage_timing_audit"] = {"status": "invalid", "decision_eligible": False}
+        main.write_snapshot_store(store)
+        result = main.build_imported_ai_packet("uuid-1")
+        self.assertEqual(result["market"]["available_prematch_stage_count"], 1)
+        self.assertIn("T-15m", result["market"]["missing_stages"])
+        self.assertEqual(result["market"]["current"]["consensus_main_line"]["1x2"]["home"], 2.0)
+        self.assertIn("line_movement_requires_two_real_comparable_stages", result["decision_layer"]["pass_reasons"])
+
     def test_imported_consensus_ignores_conflicting_upstream_main_line_when_array_complete(self):
         packet = self.prematch_packet()
         packet["timeline"][0]["consensus_main_line"]["1x2"]["median_prices"] = {"home": 9.0, "draw": 9.0, "away": 9.0}

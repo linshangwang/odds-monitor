@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.88.0"
+VERSION = "0.89.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -3025,11 +3025,12 @@ def build_imported_ai_packet(fixture: str, include_companies: bool = False, incl
     if not metadata:
         raise HTTPException(status_code=404, detail="imported_fixture_not_found")
     history = get_fixture_snapshots(fixture)
-    by_stage = {row.get("stage"): row for row in history if row.get("stage") in PREMATCH_STAGE_ORDER}
+    complete_timeline = complete_prematch_timeline(history)
+    by_stage = {row.get("stage"): row for row in complete_timeline}
     timeline = []
     for stage in PREMATCH_STAGE_ORDER:
         row = by_stage.get(stage)
-        if not row or row.get("import_status") != "available":
+        if not row or row.get("timeline_status") != "available":
             timeline.append({
                 "stage": stage, "status": "data_missing",
                 "reason": (row or {}).get("missing_reason") or "historical checkpoint was not captured; current odds were not backfilled",
@@ -3042,8 +3043,8 @@ def build_imported_ai_packet(fixture: str, include_companies: bool = False, incl
             **({"company_market_array": market.get("markets")} if include_companies else {}),
             "market_dynamics": row.get("market_dynamics"), "collection_profile": row.get("coverage"),
         })
-    available = [row for row in history if row.get("import_status") == "available"]
-    latest = available[-1] if available else None
+    available = [row for row in complete_timeline if row.get("timeline_status") == "available"]
+    latest = latest_prematch_snapshot(available)
     match = metadata.get("match") or {}
     lineup_history = metadata.get("lineup_history") or []
     fundamentals = {
@@ -3060,7 +3061,7 @@ def build_imported_ai_packet(fixture: str, include_companies: bool = False, incl
     current = (latest or {}).get("market_snapshot") or empty_market_snapshot()
     current_output = current if include_companies else {key: value for key, value in current.items() if key != "markets"}
     decision = decision_layer(current)
-    decision["line_movement"] = (latest or {}).get("market_dynamics") or {"status": "data_missing"}
+    decision = apply_line_movement_gate(decision, history)
     freshness = imported_fixture_freshness(metadata, history)
     decision["data_freshness"] = freshness
     if not freshness["decision_eligible"]:
@@ -3073,9 +3074,9 @@ def build_imported_ai_packet(fixture: str, include_companies: bool = False, incl
         "source": "pang_import", "fixture": match, "data_quality": metadata.get("data_quality"), "data_freshness": freshness,
         "fundamentals": fundamentals,
         "market": {
-            "current": current_output, "saved_stage_count": len(history), "saved_stages": [x.get("stage") for x in history],
+            "current": current_output, "saved_stage_count": len(history), "available_prematch_stage_count": len(available), "saved_stages": [x.get("stage") for x in history],
             "required_timeline": PREMATCH_STAGE_ORDER,
-            "missing_stages": [stage for stage in PREMATCH_STAGE_ORDER if stage not in by_stage or by_stage[stage].get("import_status") != "available"],
+            "missing_stages": [row.get("stage") for row in complete_timeline if row.get("timeline_status") != "available"],
             "timeline": timeline, "latest_dynamics": (latest or {}).get("market_dynamics"),
         },
         "analysis_rules": {
