@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.20.0"
+VERSION = "1.21.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -640,6 +640,21 @@ def data_quality(coverage: Dict[str, Any]) -> Dict[str, Any]:
     return {"level": level, "missing_must": missing_must, "missing_strong": missing_strong}
 
 
+def coverage_summary(result: Dict[str, Any]) -> Dict[str, Any]:
+    result = result if isinstance(result, dict) else {}
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    response = data.get("response")
+    request_ok = result.get("ok") is True
+    return {
+        "ok": request_ok,
+        "status_code": result.get("status_code"),
+        "results": data.get("results"),
+        "has_data": bool(response) and request_ok,
+        "response_present_but_unusable": bool(response) and not request_ok,
+        "request_url": result.get("request_url"),
+    }
+
+
 def lineup_summary(result: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize API-Football confirmed XI without confusing empty/predicted data with fetch failures."""
     fetched_at = int(time.time())
@@ -719,11 +734,7 @@ def collect_prematch_data(fixture_id: int, include_raw: bool = False) -> Dict[st
         calls["away_team_season_stats"] = call_api_football("/teams/statistics", {"league": league_id, "season": season, "team": away_id})
     if league_id and season:
         calls["standings"] = call_api_football("/standings", {"league": league_id, "season": season})
-    coverage = {}
-    for name, result in calls.items():
-        data = result.get("data") or {}
-        response = data.get("response") if isinstance(data, dict) else None
-        coverage[name] = {"ok": result.get("ok"), "status_code": result.get("status_code"), "results": data.get("results") if isinstance(data, dict) else None, "has_data": bool(response), "request_url": result.get("request_url")}
+    coverage = {name: coverage_summary(result) for name, result in calls.items()}
     market_snapshot = extract_market_snapshot(calls.get("odds_prematch", {}))
     normalized_lineups = lineup_summary(calls.get("lineups", {}))
     structured = {"standings": {"home": standings_for_team(calls.get("standings", {}), home_id), "away": standings_for_team(calls.get("standings", {}), away_id)}, "recent_form_last_10": {"home": recent_form(response_list(calls.get("home_recent_10", {})), home_id), "away": recent_form(response_list(calls.get("away_recent_10", {})), away_id)}, "season_stats": {"home": season_stats_summary(calls.get("home_team_season_stats", {})), "away": season_stats_summary(calls.get("away_team_season_stats", {}))}, "head_to_head_count": len(response_list(calls.get("head_to_head_last_10", {}))), "injuries": injuries_summary(calls.get("injuries", {}), home_id, away_id), "prediction": prediction_summary(calls.get("predictions", {})), "odds": odds_summary(calls.get("odds_prematch", {})), "odds_market_snapshot": market_snapshot, "lineups": normalized_lineups, "lineups_available": normalized_lineups.get("available", False), "lineups_confirmed": normalized_lineups.get("confirmed", False), "snapshot_requirements": {"required_markets": ["1x2", "asian_handicap", "over_under"], "optional_markets": ["btts", "home_team_total", "away_team_total"], "metrics_supported": ["line_crossing", "continuous_strengthening", "reversal", "market_saturation", "cross_market_divergence", "fundamental_revalidation"]}}
@@ -746,11 +757,7 @@ def collect_stage_snapshot_data(fixture_id: int, stage: str) -> Dict[str, Any]:
     if stage in ("T-1h", "T-15m", "Closing"):
         calls["injuries"] = call_api_football("/injuries", {"fixture": fixture_id})
         calls["lineups"] = call_api_football("/fixtures/lineups", {"fixture": fixture_id})
-    coverage = {}
-    for name, result in calls.items():
-        data = result.get("data") or {}
-        response = data.get("response") if isinstance(data, dict) else None
-        coverage[name] = {"ok": result.get("ok"), "status_code": result.get("status_code"), "results": data.get("results") if isinstance(data, dict) else None, "has_data": bool(response), "request_url": result.get("request_url")}
+    coverage = {name: coverage_summary(result) for name, result in calls.items()}
     market_snapshot = extract_market_snapshot(calls.get("odds_prematch", {}))
     home_id, away_id = ctx.get("home_id"), ctx.get("away_id")
     normalized_lineups = lineup_summary(calls.get("lineups", {})) if "lineups" in calls else {"available": False, "confirmed": False, "status": "not_requested_at_this_stage", "source": "api_football", "confidence": 0.0, "teams": []}

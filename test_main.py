@@ -56,6 +56,20 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(real_stats["chain"]["goal_conversion"]["status"], "partial")
         self.assertEqual(real_stats["chain"]["goal_conversion"]["usable_stats_sides"], ["home"])
 
+    def test_failed_upstream_response_body_does_not_count_as_coverage(self):
+        failed = main.coverage_summary({"ok": False, "status_code": 403, "data": {"results": 1, "response": [{"error": "forbidden"}]}})
+        self.assertFalse(failed["has_data"])
+        self.assertTrue(failed["response_present_but_unusable"])
+        quality = main.data_quality({
+            "standings": failed, "home_recent_10": failed, "away_recent_10": failed,
+            "home_team_season_stats": failed, "away_team_season_stats": failed,
+        })
+        self.assertEqual(quality["level"], "low")
+
+        successful = main.coverage_summary({"ok": True, "status_code": 200, "data": {"results": 1, "response": [{"id": 1}]}})
+        self.assertTrue(successful["has_data"])
+        self.assertFalse(successful["response_present_but_unusable"])
+
     def test_injury_fetch_failure_is_not_treated_as_zero_injuries(self):
         failed = main.injuries_summary({"ok": False, "status_code": 503}, 1, 2)
         self.assertFalse(failed["available"])
