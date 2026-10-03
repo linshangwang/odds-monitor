@@ -331,6 +331,14 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(audit["T-24h"]["status"], "valid")
         self.assertEqual(audit["T-12h"]["status"], "valid")
 
+    def test_auto_snapshot_never_catches_up_missed_historical_stage(self):
+        kickoff = main.datetime(2026, 10, 10, 20, 0, tzinfo=main.timezone.utc)
+        stage = next(row for row in main.TRACKING_STAGES if row["key"] == "T-24h")
+        due = kickoff + stage["offset"]
+        self.assertTrue(main.auto_snapshot_stage_due(due + main.timedelta(minutes=5), kickoff, stage))
+        self.assertFalse(main.auto_snapshot_stage_due(due + main.timedelta(hours=7), kickoff, stage))
+        self.assertFalse(main.auto_snapshot_stage_due(due - main.timedelta(hours=7), kickoff, stage))
+
     def test_consensus_deduplicates_bookmaker_name_variants(self):
         consensus = main._consensus_1x2([
             {"bookmaker": "Book A", "home": 2.0, "draw": 3.4, "away": 4.0},

@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.84.0"
+VERSION = "0.85.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -3207,6 +3207,14 @@ async def sportradar_push_statistics(request: Request):
     return {"ok": True, "received": "statistics", "count": len(LAST_PUSH_STATISTICS)}
 
 
+def auto_snapshot_stage_due(now: datetime, kickoff: datetime, stage: Dict[str, Any]) -> bool:
+    due = kickoff + stage["offset"]
+    delta = (now - due).total_seconds()
+    if abs(delta) > AUTO_SNAPSHOT_WINDOW_SECONDS:
+        return False
+    return audit_stage_timing(stage["key"], int(now.timestamp()), int(kickoff.timestamp())).get("status") != "invalid"
+
+
 def auto_snapshot_cycle() -> None:
     now = datetime.now(timezone.utc)
     dates = sorted({(now + timedelta(days=i)).astimezone(ZoneInfo(AUTO_FETCH_TIMEZONE)).date().isoformat() for i in range(AUTO_SNAPSHOT_DAYS_AHEAD + 1)})
@@ -3226,17 +3234,7 @@ def auto_snapshot_cycle() -> None:
                     if key == "FT" or key in saved_stages:
                         continue
                     due = kickoff + stage["offset"]
-                    delta = (now - due).total_seconds()
-                    # Catch up a missed stage until the next stage becomes due. This prevents
-                    # deploys/rate-limit cooldowns from permanently losing a checkpoint.
-                    stage_index = STAGE_ORDER.index(key)
-                    next_due = None
-                    for later in TRACKING_STAGES[stage_index + 1:]:
-                        if later["key"] != "FT":
-                            next_due = kickoff + later["offset"]
-                            break
-                    catchup_open = delta >= 0 and (next_due is None or now < next_due)
-                    if catchup_open:
+                    if auto_snapshot_stage_due(now, kickoff, stage):
                         try:
                             data = collect_stage_snapshot_data(int(fx["fixture_id"]), key)
                             if not data.get("ok"):
