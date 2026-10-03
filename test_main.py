@@ -40,6 +40,22 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIsNone(rotation["starting_xi_strength"])
         self.assertIn("not_scored", rotation["reason"])
 
+    def test_empty_stat_shells_do_not_inflate_fundamental_coverage(self):
+        empty_shells = main.pure_fundamental_script({"structured_inputs": {
+            "season_stats": {"home": {"available": False}, "away": {"available": False}},
+            "recent_form_last_10": {"home": {"available": False}, "away": {"available": False}},
+        }})
+        self.assertEqual(empty_shells["chain"]["execution_ability"]["status"], "data_missing")
+        self.assertEqual(empty_shells["chain"]["goal_conversion"]["status"], "data_missing")
+
+        real_stats = main.pure_fundamental_script({"structured_inputs": {
+            "season_stats": {"home": {"available": True, "goals_for_avg": 1.4}, "away": {"available": False}},
+            "recent_form_last_10": {"home": {"available": True}, "away": {"available": False}},
+        }})
+        self.assertEqual(real_stats["chain"]["execution_ability"]["status"], "partial")
+        self.assertEqual(real_stats["chain"]["goal_conversion"]["status"], "partial")
+        self.assertEqual(real_stats["chain"]["goal_conversion"]["usable_stats_sides"], ["home"])
+
     def test_injury_fetch_failure_is_not_treated_as_zero_injuries(self):
         failed = main.injuries_summary({"ok": False, "status_code": 503}, 1, 2)
         self.assertFalse(failed["available"])

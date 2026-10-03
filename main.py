@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.19.0"
+VERSION = "1.20.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1764,6 +1764,13 @@ def pure_fundamental_script(data: Dict[str, Any]) -> Dict[str, Any]:
     form = si.get("recent_form_last_10") or {}
     stats = si.get("season_stats") or {}
     standings = si.get("standings") or {}
+    usable_stats_sides = [side for side in ("home", "away") if isinstance(stats.get(side), dict) and stats[side].get("available") is True]
+    usable_form_sides = [side for side in ("home", "away") if isinstance(form.get(side), dict) and form[side].get("available") is True]
+    execution_evidence_available = bool(usable_stats_sides or usable_form_sides)
+    conversion_evidence_available = any(
+        as_float((stats.get(side) or {}).get(field)) is not None
+        for side in usable_stats_sides for field in ("goals_for_avg", "failed_to_score")
+    )
     evidence = {
         "standings": standings, "recent_form_last_10": form, "season_stats": stats,
         "injuries": injuries, "lineups_available": lineup_available, "lineups_confirmed": lineup_confirmed,
@@ -1772,13 +1779,13 @@ def pure_fundamental_script(data: Dict[str, Any]) -> Dict[str, Any]:
         "result_utility": {"status": "data_missing", "home_win_draw_loss_utility": None, "away_win_draw_loss_utility": None, "reason": "competition objective/qualification rules are not supplied by current feeds"},
         "tactical_risk_appetite": {"status": "data_missing", "value": None, "depends_on": "result_utility and verified coach intent"},
         "rotation_quality": {"status": "partial" if lineup_confirmed else "data_missing", "starting_xi_strength": None, "creativity": None, "finishing": None, "chemistry": None, "bench_strength": None, "bench_upgrade": None, "lineup_intent": None, "reason": "confirmed_xi_present_but_quality_dimensions_not_scored" if lineup_confirmed else ("partial_or_unconfirmed_lineup_not_sufficient" if lineup_available else "lineup_data_missing")},
-        "execution_ability": {"status": "partial" if stats else "data_missing", "source": "season_stats and recent_form; no event-level xG/xThreat feed"},
+        "execution_ability": {"status": "partial" if execution_evidence_available else "data_missing", "source": "season_stats and recent_form; no event-level xG/xThreat feed", "usable_stats_sides": usable_stats_sides, "usable_form_sides": usable_form_sides},
         "tactical_matchup": {"status": "data_missing", "value": None, "reason": "formation/style/event-level data unavailable"},
         "game_state_elasticity": {"status": "data_missing", "states": {"0_0_persists": None, "home_scores_first": None, "away_scores_first": None, "draw_at_60": None, "trailing_last_30": None}},
         "first_goal_state_transition": {"status": "data_missing", "home_first": None, "away_first": None},
         "open_game_beneficiary": {"status": "data_missing", "team": None, "reason": "requires tactical risk and transition/conversion evidence"},
         "time_segment_strength": {"status": "data_missing", "segments": {"0_15": None, "16_30": None, "31_45": None, "46_60": None, "61_75": None, "76_90": None}},
-        "goal_conversion": {"status": "partial" if stats else "data_missing", "strength_edge": None, "goal_edge": None, "margin_edge": None, "warning": "Strength Edge != Goal Edge != Margin Edge"},
+        "goal_conversion": {"status": "partial" if conversion_evidence_available else "data_missing", "strength_edge": None, "goal_edge": None, "margin_edge": None, "usable_stats_sides": usable_stats_sides if conversion_evidence_available else [], "warning": "Strength Edge != Goal Edge != Margin Edge"},
     }
     content = json.dumps({"fixture": data.get("fixture"), "evidence": evidence, "chain": chain}, ensure_ascii=False, sort_keys=True, default=str)
     return {
