@@ -525,6 +525,31 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIsNone(probabilities)
         self.assertEqual(method, "invalid_or_missing_market_prices")
 
+    def test_decision_layer_handles_embedded_probabilities_without_prices(self):
+        snapshot = main.empty_market_snapshot()
+        snapshot["consensus_main_line"]["1x2"] = {
+            "consensus_no_vig_probabilities": {"home": .5, "draw": .3, "away": .2},
+            "bookmaker_count": 3, "source": "company_array_consensus",
+        }
+        result = main.decision_layer(snapshot, {"home": .6, "draw": .25, "away": .15}, {"home": .8, "draw": .4, "away": .3}, .2, .9, [])
+        self.assertEqual(result["decision"], "PASS")
+        self.assertIn("market_price_for_ev_missing_or_invalid", result["pass_reasons"])
+        self.assertEqual(result["candidate_generation_audit"]["generated_candidate_count"], 0)
+        self.assertEqual(result["candidate_generation_audit"]["invalid_market_price_count"], 3)
+
+    def test_invalid_price_in_one_market_does_not_block_valid_other_market(self):
+        snapshot = main.empty_market_snapshot()
+        snapshot["consensus_main_line"].update({
+            "1x2": {"consensus_no_vig_probabilities": {"home": .5, "draw": .3, "away": .2}, "bookmaker_count": 3, "source": "company_array_consensus"},
+            "btts": {"yes": 2.2, "no": 1.8, "bookmaker_count": 3, "source": "company_array_consensus"},
+        })
+        model = {"1x2": {"home": .6, "draw": .25, "away": .15}, "btts": {"yes": .55, "no": .45}}
+        coverage = {"1x2": {"home": .8}, "btts": {"yes": .8, "no": .3}}
+        result = main.decision_layer(snapshot, model, coverage, .2, .9, [])
+        self.assertEqual(result["best_market"]["market"], "btts")
+        self.assertNotIn("market_price_for_ev_missing_or_invalid", result["pass_reasons"])
+        self.assertEqual(result["candidate_generation_audit"]["invalid_market_price_count"], 3)
+
     def test_decision_layer_enforces_minimums_and_probability_validation(self):
         snapshot = main.empty_market_snapshot()
         snapshot["consensus_main_line"]["1x2"] = {"home": 2.0, "draw": 3.5, "away": 4.0}

@@ -160,6 +160,8 @@ Model-Market Divergence 只允许使用时间有效且新鲜的当前盘口；�
 `candidate_audit` 明确记录原始、合格及被排除的候选数量。
 市场去水前会校验赔率均大于1且总隐含概率位于合理区间（默认0.80–1.40）；极端返还率、
 0%/100% 嵌入式概率或非有限值均标记为不可比较，不生成 Edge/EV。
+即使已有合法去水概率，缺少实际可下注赔率时也不会计算 EV；该市场安全跳过，并通过
+`candidate_generation_audit` 记录无效价格数量。没有任何可比候选时明确给出 PASS 原因。
 
 外部盘口导入若触发显著变盘或跨市场背离，会写入持久化的基本面复核队列；同一比赛、节点和
 数据版本自动去重。可通过受保护的 `GET /shadow/revalidation-queue` 查看 pending/revalidated/all，

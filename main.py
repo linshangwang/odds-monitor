@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -2000,6 +2000,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
     candidates = []
     market_probabilities = {}
     valid_model_market_count = 0
+    invalid_market_price_count = 0
     specs = (("1x2", ("home", "draw", "away")), ("asian_handicap", ("home", "away")), ("over_under", ("over", "under")), ("btts", ("yes", "no")), ("home_team_total", ("over", "under")), ("away_team_total", ("over", "under")))
     for market, keys in specs:
         main = consensus.get(market) or {}
@@ -2016,6 +2017,9 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
             market_probabilities[market] = {"line": line, "probabilities": market_probability, "method": market_probability_method}
             for key in keys:
                 price = as_float(main.get(key))
+                if price is None or price <= 1.0:
+                    invalid_market_price_count += 1
+                    continue
                 metrics = asian_settlement_metrics(distribution, line, key, price, market)
                 if not metrics:
                     continue
@@ -2031,10 +2035,14 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
             continue
         for key in keys:
             model_p, price = model_pair[key], as_float(main.get(key))
+            if price is None or price <= 1.0:
+                invalid_market_price_count += 1
+                continue
             edge, ev = model_p - market_probability[key], model_p * price - 1.0
             candidates.append({"market": market, "selection": key, "line": line, "price": price, "model_probability": round(model_p, 6), "market_no_vig_probability": market_probability[key], "edge": round(edge, 6), "ev": round(ev, 6), "script_coverage": _coverage_for(script_coverage or {}, market, key), "bookmaker_count": bookmaker_count, "market_coverage_eligible": market_coverage_eligible, "consensus_source_eligible": consensus_source_eligible, "dispersion_eligible": dispersion_eligible})
     if model_probabilities and not valid_model_market_count: missing.append("model_probability_invalid_or_not_normalized")
     if not market_probabilities: missing.append("market_no_vig_probability")
+    if not candidates and invalid_market_price_count: missing.append("market_price_for_ev_missing_or_invalid")
     candidates.sort(key=lambda x: (x.get("ev", -999), x.get("edge", -999)), reverse=True)
     best_unfiltered = candidates[0] if candidates else None
     qualified = [row for row in candidates if row["market_coverage_eligible"] and row["consensus_source_eligible"] and row["dispersion_eligible"] and row["edge"] >= MIN_EDGE and row["ev"] >= MIN_EV and as_float(row.get("script_coverage")) is not None and MIN_SCRIPT_COVERAGE <= row["script_coverage"] <= 1.0]
@@ -2077,6 +2085,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
         "script_coverage": script_coverage, "crowding": crowding_value,
         "line_movement": None, "lineup_confidence": lineup_confidence_value,
         "death_path": normalized_death_path, "death_path_audit": {"valid": death_path_valid, "maximum_items": 20, "maximum_item_length": 300}, "pass_reasons": pass_reasons,
+        "candidate_generation_audit": {"generated_candidate_count": len(candidates), "invalid_market_price_count": invalid_market_price_count},
         "settlement_policy": {"supported_line_increment": 0.25, "quarter_lines": "split into adjacent half-lines", "push_half_win_half_loss": "included in model EV", "unsupported_lines": "PASS"},
         "thresholds": {"minimum_edge": MIN_EDGE, "minimum_ev": MIN_EV, "minimum_script_coverage": MIN_SCRIPT_COVERAGE, "high_variance_minimum_script_coverage": HIGH_VARIANCE_MIN_SCRIPT_COVERAGE, "maximum_crowding": MAX_CROWDING, "minimum_lineup_confidence": MIN_LINEUP_CONFIDENCE, "minimum_consensus_bookmakers": MIN_CONSENSUS_BOOKMAKERS, "maximum_consensus_price_spread_reference": MAX_CONSENSUS_PRICE_SPREAD, "maximum_consensus_no_vig_probability_spread": MAX_CONSENSUS_NO_VIG_PROBABILITY_SPREAD, "minimum_market_implied_probability_total": MIN_MARKET_IMPLIED_PROBABILITY_TOTAL, "maximum_market_implied_probability_total": MAX_MARKET_IMPLIED_PROBABILITY_TOTAL},
     }
