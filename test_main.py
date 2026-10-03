@@ -481,6 +481,26 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         invalid = main.decision_layer(snapshot, {"home": .70, "draw": .40, "away": .20}, {"home": .8}, .2, .9, [])
         self.assertIn("model_probability_invalid_or_not_normalized", invalid["pass_reasons"])
 
+    def test_decision_layer_rejects_invalid_risk_gate_ranges_and_death_path_shape(self):
+        snapshot = main.empty_market_snapshot()
+        snapshot["consensus_main_line"]["1x2"] = {"home": 2.0, "draw": 3.5, "away": 4.0}
+        model = {"home": .55, "draw": .25, "away": .20}
+        invalid = main.decision_layer(snapshot, model, {"home": 1.2, "draw": .4, "away": .3}, -.1, 1.1, "not-a-list")
+        self.assertEqual(invalid["decision"], "PASS")
+        self.assertIn("script_coverage_out_of_range", invalid["pass_reasons"])
+        self.assertIn("crowding_out_of_range", invalid["pass_reasons"])
+        self.assertIn("lineup_confidence_out_of_range", invalid["pass_reasons"])
+        self.assertIn("death_path_invalid", invalid["pass_reasons"])
+        self.assertFalse(invalid["death_path_audit"]["valid"])
+        self.assertIsNone(invalid["recommendation_tiers"]["high_variance_single"])
+
+    def test_decision_layer_requires_explicit_death_path_evaluation(self):
+        snapshot = main.empty_market_snapshot()
+        snapshot["consensus_main_line"]["1x2"] = {"home": 2.0, "draw": 3.5, "away": 4.0}
+        result = main.decision_layer(snapshot, {"home": .55, "draw": .25, "away": .20}, {"home": .8, "draw": .4, "away": .3}, .2, .9, None)
+        self.assertEqual(result["decision"], "PASS")
+        self.assertIn("death_path", result["pass_reasons"])
+
     def test_recommendation_tiers_prioritize_consistency_then_return(self):
         snapshot = main.empty_market_snapshot()
         snapshot["consensus_main_line"].update({

@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.97.0"
+VERSION = "0.98.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1975,6 +1975,13 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
     if script_coverage is None: missing.append("script_coverage")
     if crowding is None: missing.append("crowding")
     if lineup_confidence is None: missing.append("lineup_confidence")
+    if death_path is None: missing.append("death_path")
+    crowding_value = as_float(crowding)
+    lineup_confidence_value = as_float(lineup_confidence)
+    crowding_valid = crowding is None or (crowding_value is not None and 0.0 <= crowding_value <= 1.0)
+    lineup_confidence_valid = lineup_confidence is None or (lineup_confidence_value is not None and 0.0 <= lineup_confidence_value <= 1.0)
+    death_path_valid = death_path is None or (isinstance(death_path, list) and len(death_path) <= 20 and all(isinstance(item, str) and 0 < len(item.strip()) <= 300 for item in death_path))
+    normalized_death_path = [item.strip() for item in death_path] if death_path_valid and isinstance(death_path, list) else []
     candidates = []
     market_probabilities = {}
     valid_model_market_count = 0
@@ -2015,7 +2022,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
     if not market_probabilities: missing.append("market_no_vig_probability")
     candidates.sort(key=lambda x: (x.get("ev", -999), x.get("edge", -999)), reverse=True)
     best_unfiltered = candidates[0] if candidates else None
-    qualified = [row for row in candidates if row["market_coverage_eligible"] and row["consensus_source_eligible"] and row["dispersion_eligible"] and row["edge"] >= MIN_EDGE and row["ev"] >= MIN_EV and as_float(row.get("script_coverage")) is not None and row["script_coverage"] >= MIN_SCRIPT_COVERAGE]
+    qualified = [row for row in candidates if row["market_coverage_eligible"] and row["consensus_source_eligible"] and row["dispersion_eligible"] and row["edge"] >= MIN_EDGE and row["ev"] >= MIN_EV and as_float(row.get("script_coverage")) is not None and MIN_SCRIPT_COVERAGE <= row["script_coverage"] <= 1.0]
     first_choice = max(qualified, key=lambda row: (row["script_coverage"], row["edge"], row["ev"]), default=None)
     second_pool = [row for row in qualified if not first_choice or (row["market"], row["selection"], row.get("line")) != (first_choice["market"], first_choice["selection"], first_choice.get("line"))]
     second_choice = max(second_pool, key=lambda row: (row["ev"], row["edge"], row["script_coverage"]), default=None)
@@ -2026,13 +2033,17 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
     if best and best["edge"] < MIN_EDGE: pass_reasons.append("edge_below_minimum")
     if best and best["ev"] < MIN_EV: pass_reasons.append("ev_below_minimum")
     if best and as_float(best.get("script_coverage")) is None: pass_reasons.append("script_coverage_for_selection_missing")
+    elif best and not 0.0 <= as_float(best.get("script_coverage")) <= 1.0: pass_reasons.append("script_coverage_out_of_range")
     elif best and as_float(best.get("script_coverage")) < MIN_SCRIPT_COVERAGE: pass_reasons.append("script_coverage_below_minimum")
     if best and not best.get("market_coverage_eligible", True): pass_reasons.append("consensus_bookmaker_coverage_below_minimum")
     if best and not best.get("consensus_source_eligible", True): pass_reasons.append("consensus_not_recalculated_from_company_array")
     if best and not best.get("dispersion_eligible", True): pass_reasons.append("consensus_price_dispersion_above_maximum")
-    if crowding is not None and crowding > MAX_CROWDING: pass_reasons.append("crowding_above_maximum")
-    if lineup_confidence is not None and lineup_confidence < MIN_LINEUP_CONFIDENCE: pass_reasons.append("lineup_confidence_below_minimum")
-    if death_path: pass_reasons.append("death_path_present")
+    if not crowding_valid: pass_reasons.append("crowding_out_of_range")
+    elif crowding_value is not None and crowding_value > MAX_CROWDING: pass_reasons.append("crowding_above_maximum")
+    if not lineup_confidence_valid: pass_reasons.append("lineup_confidence_out_of_range")
+    elif lineup_confidence_value is not None and lineup_confidence_value < MIN_LINEUP_CONFIDENCE: pass_reasons.append("lineup_confidence_below_minimum")
+    if not death_path_valid: pass_reasons.append("death_path_invalid")
+    elif normalized_death_path: pass_reasons.append("death_path_present")
     if pass_reasons:
         first_choice = second_choice = None
         if any(reason != "script_coverage_below_minimum" for reason in pass_reasons):
@@ -2048,9 +2059,9 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
         },
         "market_no_vig_probability": market_probabilities, "model_probability": model_probabilities,
         "edge": first_choice.get("edge") if first_choice else None, "ev": first_choice.get("ev") if first_choice else None,
-        "script_coverage": script_coverage, "crowding": crowding,
-        "line_movement": None, "lineup_confidence": lineup_confidence,
-        "death_path": death_path or [], "pass_reasons": pass_reasons,
+        "script_coverage": script_coverage, "crowding": crowding_value,
+        "line_movement": None, "lineup_confidence": lineup_confidence_value,
+        "death_path": normalized_death_path, "death_path_audit": {"valid": death_path_valid, "maximum_items": 20, "maximum_item_length": 300}, "pass_reasons": pass_reasons,
         "settlement_policy": {"supported_line_increment": 0.25, "quarter_lines": "split into adjacent half-lines", "push_half_win_half_loss": "included in model EV", "unsupported_lines": "PASS"},
         "thresholds": {"minimum_edge": MIN_EDGE, "minimum_ev": MIN_EV, "minimum_script_coverage": MIN_SCRIPT_COVERAGE, "high_variance_minimum_script_coverage": HIGH_VARIANCE_MIN_SCRIPT_COVERAGE, "maximum_crowding": MAX_CROWDING, "minimum_lineup_confidence": MIN_LINEUP_CONFIDENCE, "minimum_consensus_bookmakers": MIN_CONSENSUS_BOOKMAKERS, "maximum_consensus_price_spread_reference": MAX_CONSENSUS_PRICE_SPREAD, "maximum_consensus_no_vig_probability_spread": MAX_CONSENSUS_NO_VIG_PROBABILITY_SPREAD},
     }

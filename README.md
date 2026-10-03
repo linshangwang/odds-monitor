@@ -148,6 +148,8 @@ Selection Change、Robustness Change、Risk Downgrade to PASS 和 Recovery from 
 并校验五种比赛状态、首次进球双方路径、六个时间分段、开放局面受益方，以及
 `Strength Edge / Goal Edge / Margin Edge` 三层是否分别给出。结构不完整会明确列入
 `structural_issues` 并强制 PASS。响应同时提供精简的 `decision_summary`，便于前端直接展示。
+最终决策的 Script Coverage、Crowding 和 Lineup Confidence 必须位于 0–1；Death Path 必须
+显式提交为字符串数组。缺失、越界或结构异常都会强制 PASS，不能以异常数值绕过风险门槛。
 
 外部盘口导入若触发显著变盘或跨市场背离，会写入持久化的基本面复核队列；同一比赛、节点和
 数据版本自动去重。可通过受保护的 `GET /shadow/revalidation-queue` 查看 pending/revalidated/all，
