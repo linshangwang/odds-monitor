@@ -120,7 +120,23 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(stored["market_snapshot"]["bookmaker_count"], 4)
         self.assertTrue(stored["team_news_snapshot"]["lineups"]["confirmed"])
         self.assertTrue(stored["team_news_snapshot"]["preservation_audit"]["preserved"])
+        self.assertIn("lineups", stored["team_news_snapshot"]["preservation_audit"]["components"])
         self.assertEqual(stored["team_news_snapshot"]["preservation_audit"]["source_snapshot_at"], 100)
+
+    def test_team_news_components_preserve_injuries_independently(self):
+        market = main.empty_market_snapshot()
+        market["available"] = True
+        old_news = {"captured_at": 100, "lineups": {"available": True, "confirmed": True, "teams": [{"version": "old"}]}, "injuries": {"available": True, "home_count": 1}}
+        new_news = {"captured_at": 200, "lineups": {"available": True, "confirmed": True, "teams": [{"version": "new"}]}, "injuries": {"available": False, "status": "fetch_failed"}}
+        first = {"fixture": 92, "stage": "T-15m", "snapshot_at": 100, "market_snapshot": market, "team_news_snapshot": old_news, "stage_timing_audit": {"status": "valid"}}
+        second = {"fixture": 92, "stage": "T-15m", "snapshot_at": 200, "market_snapshot": market, "team_news_snapshot": new_news, "stage_timing_audit": {"status": "valid"}}
+        main.save_snapshot(first)
+        main.save_snapshot(second)
+        news = main.get_fixture_snapshots(92)[0]["team_news_snapshot"]
+        self.assertEqual(news["lineups"]["teams"][0]["version"], "new")
+        self.assertEqual(news["injuries"]["home_count"], 1)
+        self.assertEqual(news["preservation_audit"]["components"], ["injuries"])
+        self.assertEqual(news["preservation_audit"]["source_team_news_captured_at"], 100)
 
     def test_shadow_token_resolution_prefers_headers_without_breaking_query_compatibility(self):
         self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer", "header"), "header")

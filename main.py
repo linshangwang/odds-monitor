@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.17.0"
+VERSION = "1.18.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1081,17 +1081,35 @@ def snapshot_stage_usable(row: Dict[str, Any]) -> bool:
     )
 
 
-def team_news_quality(row: Dict[str, Any]) -> int:
-    news = row.get("team_news_snapshot") if isinstance(row.get("team_news_snapshot"), dict) else {}
-    lineups = news.get("lineups") if isinstance(news.get("lineups"), dict) else {}
-    injuries = news.get("injuries") if isinstance(news.get("injuries"), dict) else {}
-    if lineups.get("confirmed"):
-        return 3
-    if lineups.get("available"):
-        return 2
-    if injuries.get("available"):
-        return 1
-    return 0
+def preserve_higher_quality_team_news(existing: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    old_news = existing.get("team_news_snapshot") if isinstance(existing.get("team_news_snapshot"), dict) else {}
+    new_news = incoming.get("team_news_snapshot") if isinstance(incoming.get("team_news_snapshot"), dict) else {}
+    if not old_news:
+        return incoming
+    old_lineups = old_news.get("lineups") if isinstance(old_news.get("lineups"), dict) else {}
+    new_lineups = new_news.get("lineups") if isinstance(new_news.get("lineups"), dict) else {}
+    old_injuries = old_news.get("injuries") if isinstance(old_news.get("injuries"), dict) else {}
+    new_injuries = new_news.get("injuries") if isinstance(new_news.get("injuries"), dict) else {}
+    lineup_score = lambda value: 2 if value.get("confirmed") else (1 if value.get("available") else 0)
+    injury_score = lambda value: 1 if value.get("available") else 0
+    preserved_components = []
+    merged = dict(new_news)
+    if lineup_score(old_lineups) > lineup_score(new_lineups):
+        merged["lineups"] = old_lineups
+        preserved_components.append("lineups")
+    if injury_score(old_injuries) > injury_score(new_injuries):
+        merged["injuries"] = old_injuries
+        preserved_components.append("injuries")
+    if preserved_components:
+        merged["preservation_audit"] = {
+            "preserved": True, "reason": "higher_quality_same_stage_team_news",
+            "components": preserved_components,
+            "source_snapshot_at": existing.get("snapshot_at"),
+            "market_snapshot_at": incoming.get("snapshot_at"),
+            "source_team_news_captured_at": old_news.get("captured_at"),
+        }
+        return {**incoming, "team_news_snapshot": merged}
+    return incoming
 
 
 def save_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -1106,14 +1124,8 @@ def save_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
                 "revalidation_task_created": False, "revalidation_task_id": None,
                 "downstream_revalidation_tasks_created": 0,
             }
-        if existing_stage and team_news_quality(existing_stage) > team_news_quality(record):
-            preserved_news = dict(existing_stage.get("team_news_snapshot") or {})
-            preserved_news["preservation_audit"] = {
-                "preserved": True, "reason": "higher_quality_same_stage_team_news",
-                "source_snapshot_at": existing_stage.get("snapshot_at"),
-                "market_snapshot_at": record.get("snapshot_at"),
-            }
-            record = {**record, "team_news_snapshot": preserved_news}
+        if existing_stage:
+            record = preserve_higher_quality_team_news(existing_stage, record)
         existing_at = _parse_timestamp((existing_stage or {}).get("snapshot_at"))
         incoming_at = _parse_timestamp(record.get("snapshot_at"))
         if existing_stage and existing_at is not None and (incoming_at is None or incoming_at < existing_at):
