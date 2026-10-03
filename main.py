@@ -5,6 +5,7 @@ import os
 import time
 import threading
 import hashlib
+import hmac
 from statistics import median
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -18,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.96.0"
+VERSION = "0.97.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -114,7 +115,7 @@ class SnapshotStoreReadError(RuntimeError):
 
 
 def require_shadow_token(token: Optional[str]) -> None:
-    if SHADOW_ACCESS_TOKEN and token != SHADOW_ACCESS_TOKEN:
+    if SHADOW_ACCESS_TOKEN and not hmac.compare_digest(str(token or ""), str(SHADOW_ACCESS_TOKEN)):
         raise HTTPException(status_code=401, detail="Invalid or missing token")
 
 

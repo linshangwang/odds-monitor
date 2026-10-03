@@ -28,6 +28,19 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer", None), "bearer")
         self.assertEqual(main.resolve_shadow_token("query", None, None), "query")
 
+    def test_shadow_token_validation_uses_constant_time_comparison(self):
+        original = main.SHADOW_ACCESS_TOKEN
+        main.SHADOW_ACCESS_TOKEN = "configured-token"
+        try:
+            with patch("main.hmac.compare_digest", wraps=main.hmac.compare_digest) as compared:
+                main.require_shadow_token("configured-token")
+                compared.assert_called_once_with("configured-token", "configured-token")
+            with self.assertRaises(main.HTTPException) as rejected:
+                main.require_shadow_token("wrong-token")
+            self.assertEqual(rejected.exception.status_code, 401)
+        finally:
+            main.SHADOW_ACCESS_TOKEN = original
+
     def test_all_shadow_endpoints_expose_header_authentication(self):
         schema = main.app.openapi()
         for path, operations in schema["paths"].items():

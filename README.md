@@ -324,6 +324,7 @@ python -m unittest -v
 真实密钥只放在 Railway Variables，禁止写入仓库或日志。
 所有受保护接口均支持 `Authorization: Bearer <token>` 和 `X-Shadow-Token: <token>`。
 旧的 `?token=` 查询参数继续兼容，但不建议使用，以免令牌进入浏览器历史或代理访问日志。
+服务端使用恒定时间方式校验访问令牌，减少基于响应耗时推测令牌内容的风险。
 
 ## pang 赛前数据导入
 
