@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.95.0"
+VERSION = "0.96.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -2646,8 +2646,8 @@ def health():
 
 
 @app.get("/shadow/nami-capabilities")
-def shadow_nami_capabilities(token: Optional[str] = None):
-    require_shadow_token(token)
+def shadow_nami_capabilities(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     return JSONResponse(nami_capability_check())
 
 
@@ -2662,13 +2662,13 @@ def api_football_fixtures(date: str, timezone_name: str = Query("Asia/Shanghai",
 
 
 @app.get("/thestats/raw")
-def thestats_raw(path: str, token: Optional[str] = None):
-    require_shadow_token(token)
+def thestats_raw(path: str, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     return JSONResponse(call_thestats(path))
 
 @app.get("/shadow/historical-odds-test")
-def shadow_historical_odds_test(token: Optional[str] = None):
-    require_shadow_token(token)
+def shadow_historical_odds_test(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
 
     auth = call_the_odds_api("/sports")
 
@@ -2765,20 +2765,20 @@ def prematch_target_fixtures(date: str, timezone_name: str = Query("Asia/Shangha
 
 
 @app.get("/shadow/target-fixtures")
-def shadow_target_fixtures(date: str, timezone_name: str = Query("Asia/Shanghai", alias="timezone"), token: Optional[str] = None):
-    require_shadow_token(token)
+def shadow_target_fixtures(date: str, timezone_name: str = Query("Asia/Shanghai", alias="timezone"), token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     return JSONResponse(target_fixtures_for_date(date, timezone_name))
 
 
 @app.get("/shadow/analyze-fixture")
-def shadow_analyze_fixture(fixture: int, raw: bool = False, token: Optional[str] = None):
-    require_shadow_token(token)
+def shadow_analyze_fixture(fixture: int, raw: bool = False, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     return JSONResponse(collect_prematch_data(fixture, include_raw=raw))
 
 
 @app.get("/shadow/analyze")
-def shadow_analyze(date: str, max_games: int = 5, timezone_name: str = Query("Asia/Shanghai", alias="timezone"), token: Optional[str] = None):
-    require_shadow_token(token)
+def shadow_analyze(date: str, max_games: int = 5, timezone_name: str = Query("Asia/Shanghai", alias="timezone"), token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     fixtures = target_fixtures_for_date(date, timezone_name)
     rows = fixtures.get("fixtures", [])
     selected = ([x for x in rows if x.get("status") in ["NS", "TBD"]] or rows)[:max_games]
@@ -2787,16 +2787,16 @@ def shadow_analyze(date: str, max_games: int = 5, timezone_name: str = Query("As
 
 
 @app.get("/shadow/tracking-plan")
-def shadow_tracking_plan(date: str, timezone_name: str = Query("Asia/Shanghai", alias="timezone"), token: Optional[str] = None):
-    require_shadow_token(token)
+def shadow_tracking_plan(date: str, timezone_name: str = Query("Asia/Shanghai", alias="timezone"), token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     fixtures = target_fixtures_for_date(date, timezone_name)
     plans = [tracking_plan_for_fixture(x) for x in fixtures.get("fixtures", [])]
     return JSONResponse({"ok": True, "version": VERSION, "date": date, "target_count": fixtures.get("target_count"), "stage_order": STAGE_ORDER, "plans": plans})
 
 
 @app.get("/shadow/snapshot")
-def shadow_snapshot(fixture: int, stage: str = "manual", raw: bool = False, token: Optional[str] = None):
-    require_shadow_token(token)
+def shadow_snapshot(fixture: int, stage: str = "manual", raw: bool = False, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     normalized = normalize_stage(stage)
     if normalized not in STAGE_ORDER and normalized != "manual":
         raise HTTPException(status_code=400, detail={"error": "unsupported_stage", "allowed": STAGE_ORDER, "received": stage})
@@ -2827,8 +2827,8 @@ def shadow_snapshot(fixture: int, stage: str = "manual", raw: bool = False, toke
 
 
 @app.get("/shadow/snapshots")
-def shadow_snapshots(fixture: int, token: Optional[str] = None):
-    require_shadow_token(token)
+def shadow_snapshots(fixture: int, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     rows = get_fixture_snapshots(fixture)
     complete_timeline = complete_prematch_timeline(rows)
     return JSONResponse({"ok": True, "version": VERSION, "fixture": fixture, "stage_order": STAGE_ORDER, "count": len(rows), "snapshots": rows, "complete_prematch_timeline": complete_timeline, "timeline_coverage": {"available": sum(row["timeline_status"] == "available" for row in complete_timeline), "data_missing": sum(row["timeline_status"] == "data_missing" for row in complete_timeline), "required": len(PREMATCH_STAGE_ORDER)}})
@@ -3199,8 +3199,8 @@ def build_imported_ai_packet(fixture: str, include_companies: bool = False, incl
 
 
 @app.get("/shadow/imported-prematch/{fixture}")
-def shadow_imported_prematch(fixture: str, include_companies: bool = False, include_lineups: bool = False, token: Optional[str] = None):
-    require_shadow_token(token)
+def shadow_imported_prematch(fixture: str, include_companies: bool = False, include_lineups: bool = False, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     return JSONResponse(build_imported_ai_packet(fixture, include_companies=include_companies, include_lineups=include_lineups))
 
 
@@ -3286,15 +3286,15 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
 
 
 @app.get("/shadow/ai-packet")
-def shadow_ai_packet(fixture: int, token: Optional[str] = None):
-    require_shadow_token(token)
+def shadow_ai_packet(fixture: int, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     return JSONResponse(build_shadow_ai_packet(fixture))
 
 
 @app.post("/shadow/evaluate")
-async def shadow_evaluate(request: Request, token: Optional[str] = None):
+async def shadow_evaluate(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     """Evaluate explicit independent model inputs without mutating fundamentals."""
-    require_shadow_token(token)
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     payload = await request.json()
     fixture = int(payload.get("fixture"))
     history = get_fixture_snapshots(fixture)
@@ -3309,8 +3309,8 @@ async def shadow_evaluate(request: Request, token: Optional[str] = None):
 
 
 @app.get("/shadow/report", response_class=PlainTextResponse)
-def shadow_report(fixture: int, token: Optional[str] = None):
-    require_shadow_token(token)
+def shadow_report(fixture: int, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     data = collect_prematch_data(fixture, include_raw=False)
     fx, si = data.get("fixture", {}), data.get("structured_inputs", {})
     lines = [f"【比赛】{fx.get('home')} vs {fx.get('away')} / {fx.get('league')} / {fx.get('league_round')}", f"【状态】{fx.get('status')}  开赛时间UTC：{fx.get('date')}", f"【数据完整度】{data.get('data_quality')}", f"【近期状态】主队：{get_nested(si, ['recent_form_last_10', 'home'])}", f"【近期状态】客队：{get_nested(si, ['recent_form_last_10', 'away'])}", f"【积分】主队：{get_nested(si, ['standings', 'home'])}", f"【积分】客队：{get_nested(si, ['standings', 'away'])}", f"【赛季统计】主队：{get_nested(si, ['season_stats', 'home'])}", f"【赛季统计】客队：{get_nested(si, ['season_stats', 'away'])}", f"【伤停】{si.get('injuries')}", f"【预测】{si.get('prediction')}", f"【赔率摘要】{si.get('odds')}", f"【盘口快照】{si.get('odds_market_snapshot')}", f"【影子摘要】{data.get('shadow_summary')}", "【注意】这是数据摘要，不是最终投注建议；临场前必须按 T-24h → T-12h → T-6h → T-3h → T-1h → T-15m → Closing → FT 追踪刷新。"]

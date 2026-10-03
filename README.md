@@ -322,6 +322,8 @@ python -m unittest -v
 ```
 
 真实密钥只放在 Railway Variables，禁止写入仓库或日志。
+所有受保护接口均支持 `Authorization: Bearer <token>` 和 `X-Shadow-Token: <token>`。
+旧的 `?token=` 查询参数继续兼容，但不建议使用，以免令牌进入浏览器历史或代理访问日志。
 
 ## pang 赛前数据导入
 
@@ -329,15 +331,17 @@ python -m unittest -v
 不调用 API-Football 或 Nami，也不会覆盖其他比赛。相同比赛和节点重复导入时会更新该节点。
 
 ```text
-POST /shadow/import-prematch-packets?token=SHADOW_ACCESS_TOKEN
-GET  /shadow/import-status?token=SHADOW_ACCESS_TOKEN
-GET  /shadow/data-source-health?token=SHADOW_ACCESS_TOKEN
-POST /shadow/model/poisson?token=SHADOW_ACCESS_TOKEN
-POST /shadow/model/fundamental-xg?token=SHADOW_ACCESS_TOKEN
-POST /shadow/model/prematch-evaluate?token=SHADOW_ACCESS_TOKEN
-POST /shadow/portfolio/evaluate?token=SHADOW_ACCESS_TOKEN
-GET  /shadow/imported-prematch/{MATCH_UUID}?token=SHADOW_ACCESS_TOKEN
+POST /shadow/import-prematch-packets
+GET  /shadow/import-status
+GET  /shadow/data-source-health
+POST /shadow/model/poisson
+POST /shadow/model/fundamental-xg
+POST /shadow/model/prematch-evaluate
+POST /shadow/portfolio/evaluate
+GET  /shadow/imported-prematch/{MATCH_UUID}
 ```
+
+以上请求推荐通过 Header 携带令牌，不在 URL 中传递。
 
 POST 请求可直接传一个数据包、数据包数组，或 `{ "packets": [...] }`。
 外部 UUID 与原有数字 fixture ID 分开使用；缺失节点保留为 `data_missing`，不会用当前盘口反推。

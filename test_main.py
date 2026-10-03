@@ -23,6 +23,23 @@ class ShadowV4UpgradeTests(unittest.TestCase):
     def test_complete_timeline_contains_opening(self):
         self.assertEqual(main.PREMATCH_STAGE_ORDER, ["Opening", "T-24h", "T-12h", "T-6h", "T-3h", "T-1h", "T-15m", "Closing"])
 
+    def test_shadow_token_resolution_prefers_headers_without_breaking_query_compatibility(self):
+        self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer", "header"), "header")
+        self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer", None), "bearer")
+        self.assertEqual(main.resolve_shadow_token("query", None, None), "query")
+
+    def test_all_shadow_endpoints_expose_header_authentication(self):
+        schema = main.app.openapi()
+        for path, operations in schema["paths"].items():
+            if not path.startswith("/shadow/"):
+                continue
+            for operation in operations.values():
+                if not isinstance(operation, dict):
+                    continue
+                headers = {item.get("name") for item in operation.get("parameters", []) if item.get("in") == "header"}
+                self.assertIn("authorization", headers, path)
+                self.assertIn("x-shadow-token", headers, path)
+
     def test_complete_timeline_marks_uncaptured_stages_without_backfill(self):
         captured = {"stage": "T-1h", "import_status": "available", "market_snapshot": {"available": True, "primary": {"1x2": {"home": 2.0}}}}
         timeline = main.complete_prematch_timeline([captured])
