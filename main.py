@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.81.0"
+VERSION = "0.82.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -956,7 +956,34 @@ def save_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
         store = load_snapshot_store(); store.setdefault("fixtures", {}).setdefault(str(record["fixture"]), [])
         rows = [r for r in store["fixtures"][str(record["fixture"])] if r.get("stage") != record.get("stage")]
         rows.append(record)
-        store["fixtures"][str(record["fixture"])] = sorted(rows, key=lambda x: (STAGE_ORDER.index(x.get("stage")) if x.get("stage") in STAGE_ORDER else 999, x.get("snapshot_at", 0)))
+        rows = sorted(rows, key=lambda x: (STAGE_ORDER.index(x.get("stage")) if x.get("stage") in STAGE_ORDER else 999, x.get("snapshot_at", 0)))
+        changed_index = PREMATCH_STAGE_ORDER.index(record.get("stage")) if record.get("stage") in PREMATCH_STAGE_ORDER else None
+        downstream_revalidation_tasks = []
+        if changed_index is not None:
+            versions = store.get("fundamental_versions", {}).get(str(record["fixture"]), [])
+            by_version = {int(version.get("version_number") or 0): version for version in versions}
+            for row in rows:
+                row_stage = row.get("stage")
+                if row_stage not in PREMATCH_STAGE_ORDER or PREMATCH_STAGE_ORDER.index(row_stage) <= changed_index:
+                    continue
+                dynamics = compare_market_snapshots(rows, row.get("market_snapshot") or empty_market_snapshot(), row_stage)
+                dynamics["information_search"] = row.get("information_search") or get_nested(row, ["market_dynamics", "information_search"])
+                version_number = int(row.get("fundamental_version_number") or 0)
+                current_version, previous_version = by_version.get(version_number), by_version.get(version_number - 1)
+                old_matches = get_nested(row, ["market_dynamics", "classification_audit", "matched_classifications"], []) or []
+                classification = classify_market_move_details(dynamics, previous_version, get_nested(current_version or {}, ["script"]), "Model-Market Divergence" in old_matches)
+                if "Fundamental Confirmed" in old_matches and "Fundamental Confirmed" not in classification["matched_classifications"]:
+                    classification["matched_classifications"].insert(0, "Fundamental Confirmed")
+                    classification["classification_bases"]["Fundamental Confirmed"] = "verified_fundamental_version_changed_preserved_from_persisted_audit"
+                    classification["classification"] = "Fundamental Confirmed"
+                    classification["basis"] = classification["classification_bases"]["Fundamental Confirmed"]
+                dynamics["classification"] = classification["classification"]
+                dynamics["classification_audit"] = classification
+                row["market_dynamics"] = dynamics
+                task = _enqueue_revalidation(store, str(record["fixture"]), row)
+                if task:
+                    downstream_revalidation_tasks.append(task.get("task_id"))
+        store["fixtures"][str(record["fixture"])] = rows
         revalidation_task = _enqueue_revalidation(store, str(record["fixture"]), record)
         store["version"] = VERSION
         write_snapshot_store(store)
@@ -964,6 +991,7 @@ def save_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
         "saved": True, "path": SNAPSHOT_STORE_PATH, "fixture": record["fixture"], "stage": record["stage"],
         "revalidation_task_created": bool(revalidation_task),
         "revalidation_task_id": (revalidation_task or {}).get("task_id"),
+        "downstream_revalidation_tasks_created": len(downstream_revalidation_tasks),
     }
 
 

@@ -1137,6 +1137,21 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(saved["revalidation_task_created"])
         self.assertEqual(main.load_snapshot_store().get("fundamental_revalidation_queue", {}), {})
 
+    def test_corrected_earlier_snapshot_recalculates_later_dynamics(self):
+        initial = {
+            "version": main.VERSION,
+            "fixtures": {"77": [
+                {"fixture": 77, "stage": "T-24h", "snapshot_at": 100, "market_snapshot": {"primary": {"1x2": {"home": 2.0, "draw": 3.5, "away": 4.0}}}, "market_dynamics": {}},
+                {"fixture": 77, "stage": "T-3h", "snapshot_at": 200, "market_snapshot": {"primary": {"1x2": {"home": 1.9, "draw": 3.6, "away": 4.2}}}, "market_dynamics": {"market_movements": {"1x2": {"home": -.1}}}},
+            ]},
+        }
+        main.write_snapshot_store(initial)
+        corrected = {"fixture": 77, "stage": "T-24h", "snapshot_at": 110, "market_snapshot": {"primary": {"1x2": {"home": 2.2, "draw": 3.3, "away": 3.8}}}, "market_dynamics": {"revalidation_trigger": {"triggered": False, "reasons": []}}}
+        main.save_snapshot(corrected)
+        later = next(row for row in main.get_fixture_snapshots(77) if row["stage"] == "T-3h")
+        self.assertEqual(later["market_dynamics"]["previous_stage"], "T-24h")
+        self.assertAlmostEqual(later["market_dynamics"]["market_movements"]["1x2"]["home"], -.3)
+
     def test_revalidation_retention_never_evicts_pending_tasks(self):
         queue = {f"p-{index}": {"task_id": f"p-{index}", "status": "pending", "created_at": index} for index in range(501)}
         queue.update({f"done-{index}": {"task_id": f"done-{index}", "status": "revalidated", "created_at": index} for index in range(20)})
