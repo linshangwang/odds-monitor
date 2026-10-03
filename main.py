@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.13.0"
+VERSION = "1.14.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1088,6 +1088,16 @@ def save_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
         if existing_stage and snapshot_stage_usable(existing_stage) and not snapshot_stage_usable(record):
             return {
                 "saved": False, "preserved_existing": True, "reason": "snapshot_quality_regression_rejected",
+                "path": SNAPSHOT_STORE_PATH, "fixture": record["fixture"], "stage": record["stage"],
+                "existing_snapshot_at": existing_stage.get("snapshot_at"), "rejected_snapshot_at": record.get("snapshot_at"),
+                "revalidation_task_created": False, "revalidation_task_id": None,
+                "downstream_revalidation_tasks_created": 0,
+            }
+        existing_at = _parse_timestamp((existing_stage or {}).get("snapshot_at"))
+        incoming_at = _parse_timestamp(record.get("snapshot_at"))
+        if existing_stage and existing_at is not None and (incoming_at is None or incoming_at < existing_at):
+            return {
+                "saved": False, "preserved_existing": True, "reason": "stale_snapshot_rejected",
                 "path": SNAPSHOT_STORE_PATH, "fixture": record["fixture"], "stage": record["stage"],
                 "existing_snapshot_at": existing_stage.get("snapshot_at"), "rejected_snapshot_at": record.get("snapshot_at"),
                 "revalidation_task_created": False, "revalidation_task_id": None,

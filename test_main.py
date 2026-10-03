@@ -79,6 +79,17 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(stored[0]["snapshot_at"], 100)
         self.assertTrue(stored[0]["market_snapshot"]["available"])
 
+    def test_older_valid_repeat_snapshot_cannot_move_stage_backwards(self):
+        market = main.empty_market_snapshot()
+        market["available"] = True
+        newer = {"fixture": 89, "stage": "T-3h", "snapshot_at": 200, "market_snapshot": market, "stage_timing_audit": {"status": "valid"}}
+        older = {"fixture": 89, "stage": "T-3h", "snapshot_at": 100, "market_snapshot": market, "stage_timing_audit": {"status": "valid"}}
+        self.assertTrue(main.save_snapshot(newer)["saved"])
+        rejected = main.save_snapshot(older)
+        self.assertFalse(rejected["saved"])
+        self.assertEqual(rejected["reason"], "stale_snapshot_rejected")
+        self.assertEqual(main.get_fixture_snapshots(89)[0]["snapshot_at"], 200)
+
     def test_shadow_token_resolution_prefers_headers_without_breaking_query_compatibility(self):
         self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer", "header"), "header")
         self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer", None), "bearer")
