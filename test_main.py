@@ -1011,6 +1011,16 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         finally:
             main.API_FOOTBALL_KEY = original_key
 
+    def test_secret_masking_redacts_overlapping_credentials_longest_first(self):
+        original_user, original_secret = main.NAMI_API_USER, main.NAMI_API_SECRET
+        main.NAMI_API_USER, main.NAMI_API_SECRET = "credential", "credential-with-private-suffix"
+        try:
+            masked = main.mask_secret("credential-with-private-suffix credential")
+            self.assertEqual(masked, "YOUR_SECRET YOUR_SECRET")
+            self.assertNotIn("private-suffix", masked)
+        finally:
+            main.NAMI_API_USER, main.NAMI_API_SECRET = original_user, original_secret
+
     def test_nami_failure_is_optional_and_degraded(self):
         original_user, original_secret = main.NAMI_API_USER, main.NAMI_API_SECRET
         main.NAMI_API_USER, main.NAMI_API_SECRET = "user-value", "secret-value"

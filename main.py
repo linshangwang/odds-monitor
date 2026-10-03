@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.93.0"
+VERSION = "0.94.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -127,9 +127,9 @@ def resolve_shadow_token(query_token: Optional[str], authorization: Optional[str
 
 
 def mask_secret(text: str) -> str:
-    for key in [API_FOOTBALL_KEY, THESTATS_API_KEY, ISPORTS_API_KEY, SHADOW_ACCESS_TOKEN, NAMI_API_USER, NAMI_API_SECRET]:
-        if key:
-            text = text.replace(key, "YOUR_SECRET")
+    configured = {str(key) for key in [API_FOOTBALL_KEY, THESTATS_API_KEY, ISPORTS_API_KEY, SHADOW_ACCESS_TOKEN, NAMI_API_USER, NAMI_API_SECRET] if key}
+    for key in sorted(configured, key=len, reverse=True):
+        text = text.replace(key, "YOUR_SECRET")
     return text
 
 
