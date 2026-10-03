@@ -275,7 +275,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
 
     def test_decision_layer_calculates_no_vig_edge_ev(self):
         snapshot = main.empty_market_snapshot()
-        snapshot["consensus_main_line"]["1x2"] = {"home": 2.0, "draw": 3.5, "away": 4.0}
+        snapshot["consensus_main_line"]["1x2"] = {"home": 2.0, "draw": 3.5, "away": 4.0, "source": "complete_company_array"}
         result = main.decision_layer(snapshot, {"home": .55, "draw": .25, "away": .20}, {"home": .8, "draw": .3, "away": .2}, .4, .9, [])
         self.assertEqual(result["decision"], "home")
         self.assertAlmostEqual(result["ev"], .10, places=6)
@@ -295,6 +295,26 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["decision"], "PASS")
         self.assertIn("consensus_not_recalculated_from_company_array", result["pass_reasons"])
         self.assertFalse(result["candidates"][0]["consensus_source_eligible"])
+
+    def test_decision_layer_does_not_treat_unknown_consensus_source_as_company_array(self):
+        snapshot = main.empty_market_snapshot()
+        snapshot["consensus_main_line"]["1x2"] = {"home": 2.0, "draw": 3.5, "away": 4.0, "bookmaker_count": 4}
+        result = main.decision_layer(snapshot, {"home": .55, "draw": .25, "away": .20}, {"home": .8, "draw": .3, "away": .2}, .4, .9, [])
+        self.assertEqual(result["decision"], "PASS")
+        self.assertIn("consensus_not_recalculated_from_company_array", result["pass_reasons"])
+        self.assertFalse(result["candidates"][0]["consensus_source_eligible"])
+
+    def test_native_consensus_functions_mark_company_array_source(self):
+        one_x_two = main._consensus_1x2([
+            {"bookmaker": "A", "home": 2.0, "draw": 3.5, "away": 4.0},
+            {"bookmaker": "B", "home": 2.1, "draw": 3.4, "away": 3.9},
+        ])
+        line = main._consensus_line([
+            {"bookmaker": "A", "lines": [{"line": 2.5, "over": 1.9, "under": 1.95}]},
+            {"bookmaker": "B", "lines": [{"line": 2.5, "over": 1.92, "under": 1.93}]},
+        ], ("over", "under"))
+        self.assertEqual(one_x_two["source"], "complete_company_array")
+        self.assertEqual(line["source"], "complete_company_array")
 
     def test_consensus_dispersion_blocks_conflicting_bookmaker_prices(self):
         consensus = main._consensus_1x2([
@@ -529,7 +549,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         snapshot = main.empty_market_snapshot()
         snapshot["consensus_main_line"]["1x2"] = {
             "consensus_no_vig_probabilities": {"home": .5, "draw": .3, "away": .2},
-            "bookmaker_count": 3, "source": "company_array_consensus",
+            "bookmaker_count": 3, "source": "complete_company_array",
         }
         result = main.decision_layer(snapshot, {"home": .6, "draw": .25, "away": .15}, {"home": .8, "draw": .4, "away": .3}, .2, .9, [])
         self.assertEqual(result["decision"], "PASS")
@@ -540,8 +560,8 @@ class ShadowV4UpgradeTests(unittest.TestCase):
     def test_invalid_price_in_one_market_does_not_block_valid_other_market(self):
         snapshot = main.empty_market_snapshot()
         snapshot["consensus_main_line"].update({
-            "1x2": {"consensus_no_vig_probabilities": {"home": .5, "draw": .3, "away": .2}, "bookmaker_count": 3, "source": "company_array_consensus"},
-            "btts": {"yes": 2.2, "no": 1.8, "bookmaker_count": 3, "source": "company_array_consensus"},
+            "1x2": {"consensus_no_vig_probabilities": {"home": .5, "draw": .3, "away": .2}, "bookmaker_count": 3, "source": "complete_company_array"},
+            "btts": {"yes": 2.2, "no": 1.8, "bookmaker_count": 3, "source": "complete_company_array"},
         })
         model = {"1x2": {"home": .6, "draw": .25, "away": .15}, "btts": {"yes": .55, "no": .45}}
         coverage = {"1x2": {"home": .8}, "btts": {"yes": .8, "no": .3}}
@@ -571,13 +591,33 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         snapshot["consensus_main_line"]["1x2"] = {
             "home": 4.0, "draw": 3.5, "away": 2.0,
             "consensus_no_vig_probabilities": {"home": .5, "draw": .3, "away": .2},
-            "bookmaker_count": 3, "source": "company_array_consensus",
+            "bookmaker_count": 3, "source": "complete_company_array",
         }
         result = main.decision_layer(snapshot, {"home": .55, "draw": .25, "away": .2}, {"home": .8}, .2, .9, [])
         audit = result["market_probability_audit"]["1x2"]
         self.assertEqual(audit["status"], "data_missing")
         self.assertEqual(audit["method"], "embedded_probability_price_mismatch")
         self.assertIn("market_no_vig_probability", result["pass_reasons"])
+
+    def test_valid_settlement_model_is_not_blamed_for_invalid_market_prices(self):
+        snapshot = main.empty_market_snapshot()
+        snapshot["consensus_main_line"]["over_under"] = {"line": 2.75, "over": 1.01, "under": 1.01, "bookmaker_count": 3, "source": "complete_company_array"}
+        model = {"settlement_distributions": {"total_goals": {0: .05, 1: .15, 2: .25, 3: .25, 4: .2, 5: .1}}}
+        result = main.decision_layer(snapshot, model, {"over_under": {"over": .8, "under": .8}}, .2, .9, [])
+        self.assertEqual(result["model_probability_audit"]["over_under"]["status"], "available")
+        self.assertEqual(result["model_probability_audit"]["over_under"]["method"], "settlement_distribution")
+        self.assertNotIn("model_probability_invalid_or_not_normalized", result["pass_reasons"])
+        self.assertIn("market_no_vig_probability", result["pass_reasons"])
+
+    def test_model_probability_audit_marks_unsupported_market_line(self):
+        snapshot = main.empty_market_snapshot()
+        snapshot["consensus_main_line"]["over_under"] = {"line": 2.6, "over": 1.9, "under": 1.9, "source": "complete_company_array"}
+        model = {"settlement_distributions": {"total_goals": {0: .1, 1: .2, 2: .3, 3: .25, 4: .15}}}
+        result = main.decision_layer(snapshot, model, {"over_under": {"over": .8, "under": .8}}, .2, .9, [])
+        audit = result["model_probability_audit"]["over_under"]
+        self.assertEqual(audit["status"], "data_missing")
+        self.assertEqual(audit["reason"], "model_probability_not_available_for_market_line")
+        self.assertIn("model_probability_invalid_or_not_normalized", result["pass_reasons"])
 
     def test_decision_layer_enforces_minimums_and_probability_validation(self):
         snapshot = main.empty_market_snapshot()
@@ -629,8 +669,8 @@ class ShadowV4UpgradeTests(unittest.TestCase):
     def test_recommendation_tiers_prioritize_consistency_then_return(self):
         snapshot = main.empty_market_snapshot()
         snapshot["consensus_main_line"].update({
-            "1x2": {"home": 2.0, "draw": 3.5, "away": 4.0},
-            "btts": {"yes": 2.5, "no": 1.6},
+            "1x2": {"home": 2.0, "draw": 3.5, "away": 4.0, "source": "complete_company_array"},
+            "btts": {"yes": 2.5, "no": 1.6, "source": "complete_company_array"},
         })
         model = {"1x2": {"home": .55, "draw": .25, "away": .20}, "btts": {"yes": .50, "no": .50}}
         coverage = {"1x2": {"home": .90, "draw": .30, "away": .20}, "btts": {"yes": .65, "no": .20}}
@@ -642,7 +682,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
 
     def test_high_variance_candidate_does_not_fill_main_tier(self):
         snapshot = main.empty_market_snapshot()
-        snapshot["consensus_main_line"]["1x2"] = {"home": 2.0, "draw": 3.5, "away": 4.0}
+        snapshot["consensus_main_line"]["1x2"] = {"home": 2.0, "draw": 3.5, "away": 4.0, "source": "complete_company_array"}
         result = main.decision_layer(snapshot, {"home": .55, "draw": .25, "away": .20}, {"home": .50, "draw": .20, "away": .20}, .3, .9, [])
         self.assertEqual(result["decision"], "PASS")
         self.assertIsNone(result["recommendation_tiers"]["first_choice_high_consistency"])
@@ -863,9 +903,9 @@ class ShadowV4UpgradeTests(unittest.TestCase):
     def test_cross_market_decision_can_prefer_total_over_1x2(self):
         snapshot = main.empty_market_snapshot()
         snapshot["consensus_main_line"].update({
-            "1x2": {"home": 1.7, "draw": 4.0, "away": 5.0},
-            "over_under": {"line": 2.5, "over": 2.2, "under": 1.7},
-            "btts": {"yes": 2.0, "no": 1.8},
+            "1x2": {"home": 1.7, "draw": 4.0, "away": 5.0, "source": "complete_company_array"},
+            "over_under": {"line": 2.5, "over": 2.2, "under": 1.7, "source": "complete_company_array"},
+            "btts": {"yes": 2.0, "no": 1.8, "source": "complete_company_array"},
         })
         model = main.poisson_probability_model(2.0, 1.2, 0.9, {"source": "verified_team_metrics", "uses_market_odds": False})
         result = main.decision_layer(snapshot, model["probabilities"], {

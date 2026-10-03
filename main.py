@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -486,7 +486,7 @@ def _consensus_1x2(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not complete:
         return None
     return {
-        "method": "median_all_complete_bookmakers", "bookmaker_count": len(complete),
+        "method": "median_all_complete_bookmakers", "source": "complete_company_array", "bookmaker_count": len(complete),
         "home": _median([x.get("home") for x in complete]),
         "draw": _median([x.get("draw") for x in complete]),
         "away": _median([x.get("away") for x in complete]),
@@ -516,7 +516,7 @@ def _consensus_line(markets: List[Dict[str, Any]], price_keys: Tuple[str, str]) 
         ranked.append((-len(rows), balance, abs(value - reference_line), value, rows, left, right))
     _, _, _, value, rows, left, right = sorted(ranked, key=lambda x: x[:4])[0]
     return {
-        "method": "modal_line_then_balanced_median_prices", "line": value,
+        "method": "modal_line_then_balanced_median_prices", "source": "complete_company_array", "line": value,
         "tie_break_reference_line": round(reference_line, 4),
         price_keys[0]: left, price_keys[1]: right,
         "bookmaker_count": len(rows), "bookmakers": sorted({str(r.get('bookmaker')) for r in rows if r.get('bookmaker')}),
@@ -586,7 +586,7 @@ def extract_market_snapshot(odds_result: Dict[str, Any]) -> Dict[str, Any]:
     }
     btts = snapshot["markets"]["btts"]
     complete_btts = [row for row in _dedupe_bookmaker_rows(btts, ("yes", "no")) if (as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1]
-    consensus["btts"] = ({"method": "median_all_complete_bookmakers", "bookmaker_count": len(complete_btts), "yes": _median([x.get("yes") for x in complete_btts]), "no": _median([x.get("no") for x in complete_btts]), **_price_dispersion(complete_btts, ("yes", "no"))} if complete_btts else None)
+    consensus["btts"] = ({"method": "median_all_complete_bookmakers", "source": "complete_company_array", "bookmaker_count": len(complete_btts), "yes": _median([x.get("yes") for x in complete_btts]), "no": _median([x.get("no") for x in complete_btts]), **_price_dispersion(complete_btts, ("yes", "no"))} if complete_btts else None)
     snapshot["consensus_main_line"] = consensus
     snapshot["primary"] = dict(consensus)
     snapshot["data_status"] = {key: ("available" if value else "data_missing") for key, value in consensus.items()}
@@ -2007,6 +2007,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
     candidates = []
     market_probabilities = {}
     market_probability_audit = {}
+    model_probability_audit = {}
     valid_model_market_count = 0
     invalid_market_price_count = 0
     specs = (("1x2", ("home", "draw", "away")), ("asian_handicap", ("home", "away")), ("over_under", ("over", "under")), ("btts", ("yes", "no")), ("home_team_total", ("over", "under")), ("away_team_total", ("over", "under")))
@@ -2014,7 +2015,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
         main = consensus.get(market) or {}
         bookmaker_count = int(as_float(main.get("bookmaker_count")) or 0) if main.get("bookmaker_count") is not None else None
         market_coverage_eligible = bookmaker_count is None or bookmaker_count >= MIN_CONSENSUS_BOOKMAKERS
-        consensus_source_eligible = main.get("source") != "upstream_consensus_fallback"
+        consensus_source_eligible = main.get("source") == "complete_company_array"
         dispersion_eligible = main.get("dispersion_eligible") is not False
         line = as_float(main.get("line")) if market not in ("1x2", "btts") else None
         distribution_name = {"asian_handicap": "goal_difference", "over_under": "total_goals", "home_team_total": "home_goals", "away_team_total": "away_goals"}.get(market)
@@ -2026,8 +2027,11 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
             "line": line,
             "selection_count": len(keys),
         }
-        if distribution and line is not None and market_probability:
+        settlement_supported = isinstance(distribution, dict) and line is not None and _split_asian_line(line) is not None
+        if settlement_supported:
             valid_model_market_count += 1
+            model_probability_audit[market] = {"status": "available", "method": "settlement_distribution", "line": line, "reason": None}
+        if settlement_supported and market_probability:
             market_probabilities[market] = {"line": line, "probabilities": market_probability, "method": market_probability_method}
             for key in keys:
                 price = as_float(main.get(key))
@@ -2040,9 +2044,14 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
                 edge = metrics["model_probability"] - market_probability[key]
                 candidates.append({"market": market, "selection": key, "line": line, "price": price, **metrics, "market_no_vig_probability": market_probability[key], "edge": round(edge, 6), "script_coverage": _coverage_for(script_coverage or {}, market, key), "settlement_aware": True, "bookmaker_count": bookmaker_count, "market_coverage_eligible": market_coverage_eligible, "consensus_source_eligible": consensus_source_eligible, "dispersion_eligible": dispersion_eligible})
             continue
+        if settlement_supported:
+            continue
         model_pair = _model_pair(model_probabilities or {}, market, line)
         if model_pair:
             valid_model_market_count += 1
+            model_probability_audit[market] = {"status": "available", "method": "direct_market_probability", "line": line, "reason": None}
+        else:
+            model_probability_audit[market] = {"status": "data_missing", "method": None, "line": line, "reason": "model_probability_not_available_for_market_line" if main else "market_not_available"}
         if market_probability:
             market_probabilities[market] = {"line": line, "probabilities": market_probability, "method": market_probability_method}
         if not model_pair or not market_probability:
@@ -2094,7 +2103,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
             "high_variance_single": high_variance,
             "ranking_rule": "consistency first; price second; high-variance candidates are never used to fill the main tier",
         },
-        "market_no_vig_probability": market_probabilities, "market_probability_audit": market_probability_audit, "model_probability": model_probabilities,
+        "market_no_vig_probability": market_probabilities, "market_probability_audit": market_probability_audit, "model_probability": model_probabilities, "model_probability_audit": model_probability_audit,
         "edge": first_choice.get("edge") if first_choice else None, "ev": first_choice.get("ev") if first_choice else None,
         "script_coverage": script_coverage, "crowding": crowding_value,
         "line_movement": None, "lineup_confidence": lineup_confidence_value,

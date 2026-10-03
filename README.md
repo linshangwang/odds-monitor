@@ -166,6 +166,10 @@ Model-Market Divergence 只允许使用时间有效且新鲜的当前盘口；�
 共识概率阈值，或完整赔率组返还率异常时，整组市场拒绝进入模型比较。
 决策响应的 `market_probability_audit` 会按市场给出 available/data_missing、计算方法、盘口线和
 选项数量，明确区分概率价格错位、赔率组异常与普通数据缺失。
+Consensus Main Line 只有明确标记为 `complete_company_array` 才能进入下注决策；来源缺失、未知
+或 `upstream_consensus_fallback` 均保留用于展示和审计，但强制 PASS。
+`model_probability_audit` 独立记录每个市场的模型概率来源（直接概率或结算分布）及当前盘口线
+是否受支持；市场赔率失败不会再被误报成模型概率失败。
 
 外部盘口导入若触发显著变盘或跨市场背离，会写入持久化的基本面复核队列；同一比赛、节点和
 数据版本自动去重。可通过受保护的 `GET /shadow/revalidation-queue` 查看 pending/revalidated/all，
