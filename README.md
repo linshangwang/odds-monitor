@@ -160,6 +160,8 @@ pending 任务标记为 overdue，并在 `/shadow/import-status` 汇总待处理
 任务结案会保存所用基本面版本、证据状态、变化字段、概率变化和最优盘口变化；只有相对旧版本
 发现真实事实变化时才标记 `Fundamental Confirmed`，首次建模不会被误判为基本面变化，否则归为
 `Market-Only Move`。
+每个基本面版本同时保存 `previous_version_number` 与 `recalculation_audit`，明确区分首次基线、
+重复重算和真实基本面变化，并记录规范化的触发节点、原因、概率变化及最优盘口变化。
 
 T-X 变盘比较现覆盖全部可用市场：1X2、AH、O/U、BTTS、主队进球数和客队进球数；每个市场
 分别记录线路及价格变化。跨市场背离检查包括 1X2↔AH、O/U↔BTTS，以及双方1X2↔对应球队

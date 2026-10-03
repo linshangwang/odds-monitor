@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.89.0"
+VERSION = "0.90.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1614,6 +1614,19 @@ def get_fundamental_versions(fixture: int) -> List[Dict[str, Any]]:
     return sorted(rows, key=lambda x: (x.get("version_number", 0), x.get("created_at", 0)))
 
 
+def normalize_revalidation_trigger(trigger: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    raw = trigger if isinstance(trigger, dict) else {}
+    reasons = raw.get("reasons")
+    if not isinstance(reasons, list):
+        reasons = [reasons] if reasons else []
+    normalized = dict(raw)
+    normalized["triggered"] = bool(raw.get("triggered"))
+    normalized["reasons"] = list(dict.fromkeys(str(reason).strip() for reason in reasons if str(reason).strip()))
+    normalized["stage"] = normalize_stage(raw.get("stage")) if raw.get("stage") else None
+    normalized["source"] = str(raw.get("source") or ("market_revalidation" if normalized["triggered"] else "pipeline_evaluation"))
+    return normalized
+
+
 def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict[str, Any], previous: Optional[Dict[str, Any]] = None, probability_change: Optional[Dict[str, Any]] = None, best_market_change: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     with SNAPSHOT_STORE_LOCK:
         store = load_snapshot_store()
@@ -1625,11 +1638,27 @@ def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict
             changed_sections.append("fundamental_estimator")
             variable_changes["fundamental_estimator"] = {"before": old_script.get("estimator"), "after": script.get("estimator")}
         next_version = max((int(row.get("version_number") or 0) for row in rows), default=0) + 1
+        normalized_trigger = normalize_revalidation_trigger(trigger)
+        probability_change = probability_change or {"status": "data_missing", "reason": "no independent model probability supplied"}
+        best_market_change = best_market_change or {"status": "data_missing", "reason": "decision inputs incomplete"}
+        prior_version_number = (previous or {}).get("version_number")
+        script_changed = bool(previous) and (old_script.get("content_hash") != script.get("content_hash") or bool(changed_sections))
         record = {
-            "version_number": next_version, "created_at": int(time.time()), "trigger": trigger,
+            "version_number": next_version, "previous_version_number": prior_version_number,
+            "created_at": int(time.time()), "trigger": normalized_trigger,
             "changed_information": changed_sections, "variable_changes": variable_changes,
-            "probability_change": probability_change or {"status": "data_missing", "reason": "no independent model probability supplied"},
-            "best_market_change": best_market_change or {"status": "data_missing", "reason": "decision inputs incomplete"},
+            "probability_change": probability_change,
+            "best_market_change": best_market_change,
+            "recalculation_audit": {
+                "performed": True,
+                "baseline_created": not bool(previous),
+                "fundamental_changed": script_changed,
+                "probability_changed": probability_change.get("before") != probability_change.get("after") if "after" in probability_change else None,
+                "best_market_changed": best_market_change.get("changed") if "changed" in best_market_change else None,
+                "triggered_by_market_revalidation": normalized_trigger["triggered"],
+                "trigger_reasons": normalized_trigger["reasons"],
+                "stage": normalized_trigger.get("stage"),
+            },
             "script": script,
         }
         rows.append(record)

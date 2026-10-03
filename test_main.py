@@ -777,9 +777,30 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         script = {"content_hash": "x", "chain": {key: {"status": "data_missing"} for key in main.FUNDAMENTAL_CHAIN}}
         row = main.save_fundamental_version(1, script, {"stage": "Opening", "triggered": False})
         self.assertEqual(row["version_number"], 1)
+        self.assertIsNone(row["previous_version_number"])
         self.assertIn("probability_change", row)
         self.assertIn("best_market_change", row)
+        self.assertTrue(row["recalculation_audit"]["baseline_created"])
+        self.assertFalse(row["recalculation_audit"]["fundamental_changed"])
+        self.assertEqual(row["recalculation_audit"]["stage"], "Opening")
         self.assertEqual(len(main.get_fundamental_versions(1)), 1)
+
+    def test_fundamental_recalculation_audit_records_real_changes_and_normalizes_trigger(self):
+        first_script = {"content_hash": "x", "chain": {key: {"status": "data_missing"} for key in main.FUNDAMENTAL_CHAIN}}
+        first = main.save_fundamental_version(2, first_script, {"triggered": False})
+        second_script = {**first_script, "content_hash": "y", "chain": {**first_script["chain"], "goal_conversion": {"status": "available"}}}
+        second = main.save_fundamental_version(
+            2, second_script, {"stage": "t-1h", "triggered": True, "reasons": "significant_line_move"}, first,
+            probability_change={"before": {"home": .4}, "after": {"home": .45}, "delta": {"home": .05}},
+            best_market_change={"before": None, "after": {"market": "1x2", "selection": "home"}, "changed": True},
+        )
+        self.assertEqual(second["previous_version_number"], 1)
+        self.assertEqual(second["trigger"]["reasons"], ["significant_line_move"])
+        self.assertEqual(second["trigger"]["source"], "market_revalidation")
+        self.assertTrue(second["recalculation_audit"]["fundamental_changed"])
+        self.assertTrue(second["recalculation_audit"]["probability_changed"])
+        self.assertTrue(second["recalculation_audit"]["best_market_changed"])
+        self.assertEqual(second["recalculation_audit"]["stage"], "T-1h")
 
     def test_fundamental_version_retention_keeps_monotonic_numbers(self):
         script = {"content_hash": "x", "chain": {key: {"status": "data_missing"} for key in main.FUNDAMENTAL_CHAIN}}
