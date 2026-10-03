@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -2514,13 +2514,24 @@ def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int,
         "balanced": "three legs selected when available to balance combined price and variance",
         "aggressive": "all eligible independent legs selected within max_legs; variance increases rapidly",
     }
+    priority_ranking = [
+        {
+            "rank": index,
+            "role": "core_top_three" if index <= 3 else "optional_extension",
+            **{key: candidate.get(key) for key in ("fixture", "market", "selection", "line", "price", "script_coverage", "edge", "ev")},
+        }
+        for index, candidate in enumerate(candidates, start=1)
+    ]
     return {
         "decision": "COMBINE", "legs": recommended["legs"], "combined_decimal_price": recommended["combined_decimal_price"],
         "leg_count": recommended_count, "available_leg_count": len(candidates), "suggested_options": suggested_options,
         "risk_preference": risk_preference, "recommended_option": recommended,
         "recommendation_reason": recommendation_reasons[risk_preference],
+        "priority_ranking": priority_ranking,
+        "core_priority_count": min(3, len(priority_ranking)),
+        "optional_extension_count": max(0, len(priority_ranking) - 3),
         "selection_audit": {"selected": candidates, "excluded": excluded},
-        "selection_guidance": "2 legs lower variance; 3 legs balanced default; 4+ legs are optional expanded high variance",
+        "selection_guidance": "ranks 1-3 form the core priority set; rank 4+ are optional extensions with materially higher variance",
         "independence_assumption": "screened by correlation_group; residual correlation is not modeled",
         "combined_ev": recommended["estimated_combined_ev"],
         "combined_ev_status": "estimated_under_independence" if isinstance(recommended["estimated_combined_ev"], float) else "data_missing",

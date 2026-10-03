@@ -719,6 +719,10 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(combination["leg_count"], 3)
         self.assertEqual(combination["available_leg_count"], 5)
         self.assertEqual([option["leg_count"] for option in combination["suggested_options"]], [2, 3, 4, 5])
+        self.assertEqual([row["rank"] for row in combination["priority_ranking"]], [1, 2, 3, 4, 5])
+        self.assertEqual([row["role"] for row in combination["priority_ranking"]], ["core_top_three", "core_top_three", "core_top_three", "optional_extension", "optional_extension"])
+        self.assertEqual(combination["core_priority_count"], 3)
+        self.assertEqual(combination["optional_extension_count"], 2)
         self.assertEqual(combination["suggested_options"][-1]["risk_label"], "expanded_high_variance")
 
     def test_portfolio_selects_recommended_option_by_risk_preference(self):
