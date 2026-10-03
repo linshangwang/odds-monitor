@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1807,6 +1807,13 @@ def market_no_vig_probabilities(market: Dict[str, Any], keys: List[str]) -> Tupl
     embedded_values = {key: as_float((embedded or {}).get(key)) for key in keys}
     embedded_valid = bool(embedded) and all(value is not None and 0 < value < 1 for value in embedded_values.values()) and abs(sum(embedded_values.values()) - 1.0) <= 0.02
     if embedded_valid:
+        price_derived = no_vig_probabilities(market, keys)
+        supplied_prices = [as_float(market.get(key)) for key in keys]
+        all_prices_present = all(price is not None for price in supplied_prices)
+        if all_prices_present and price_derived is None:
+            return None, "embedded_probability_prices_invalid"
+        if price_derived and max(abs(embedded_values[key] - price_derived[key]) for key in keys) > MAX_CONSENSUS_NO_VIG_PROBABILITY_SPREAD:
+            return None, "embedded_probability_price_mismatch"
         return {key: round(embedded_values[key], 6) for key in keys}, "bookmaker_level_no_vig_consensus"
     fallback = no_vig_probabilities(market, keys)
     return fallback, "no_vig_from_consensus_median_prices" if fallback else "invalid_or_missing_market_prices"

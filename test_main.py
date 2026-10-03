@@ -550,6 +550,22 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertNotIn("market_price_for_ev_missing_or_invalid", result["pass_reasons"])
         self.assertEqual(result["candidate_generation_audit"]["invalid_market_price_count"], 3)
 
+    def test_embedded_probabilities_must_match_offered_price_shape(self):
+        mismatched = {"home": 4.0, "draw": 3.5, "away": 2.0, "consensus_no_vig_probabilities": {"home": .5, "draw": .3, "away": .2}}
+        probabilities, method = main.market_no_vig_probabilities(mismatched, ["home", "draw", "away"])
+        self.assertIsNone(probabilities)
+        self.assertEqual(method, "embedded_probability_price_mismatch")
+        aligned = {"home": 2.0, "draw": 3.5, "away": 4.0, "consensus_no_vig_probabilities": {"home": .48, "draw": .28, "away": .24}}
+        probabilities, method = main.market_no_vig_probabilities(aligned, ["home", "draw", "away"])
+        self.assertIsNotNone(probabilities)
+        self.assertEqual(method, "bookmaker_level_no_vig_consensus")
+
+    def test_embedded_probabilities_reject_implausible_complete_price_set(self):
+        market = {"yes": 1.01, "no": 1.01, "consensus_no_vig_probabilities": {"yes": .5, "no": .5}}
+        probabilities, method = main.market_no_vig_probabilities(market, ["yes", "no"])
+        self.assertIsNone(probabilities)
+        self.assertEqual(method, "embedded_probability_prices_invalid")
+
     def test_decision_layer_enforces_minimums_and_probability_validation(self):
         snapshot = main.empty_market_snapshot()
         snapshot["consensus_main_line"]["1x2"] = {"home": 2.0, "draw": 3.5, "away": 4.0}
