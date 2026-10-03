@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.16.0"
+VERSION = "1.17.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1081,6 +1081,19 @@ def snapshot_stage_usable(row: Dict[str, Any]) -> bool:
     )
 
 
+def team_news_quality(row: Dict[str, Any]) -> int:
+    news = row.get("team_news_snapshot") if isinstance(row.get("team_news_snapshot"), dict) else {}
+    lineups = news.get("lineups") if isinstance(news.get("lineups"), dict) else {}
+    injuries = news.get("injuries") if isinstance(news.get("injuries"), dict) else {}
+    if lineups.get("confirmed"):
+        return 3
+    if lineups.get("available"):
+        return 2
+    if injuries.get("available"):
+        return 1
+    return 0
+
+
 def save_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
     with SNAPSHOT_STORE_LOCK:
         store = load_snapshot_store(); store.setdefault("fixtures", {}).setdefault(str(record["fixture"]), [])
@@ -1093,6 +1106,14 @@ def save_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
                 "revalidation_task_created": False, "revalidation_task_id": None,
                 "downstream_revalidation_tasks_created": 0,
             }
+        if existing_stage and team_news_quality(existing_stage) > team_news_quality(record):
+            preserved_news = dict(existing_stage.get("team_news_snapshot") or {})
+            preserved_news["preservation_audit"] = {
+                "preserved": True, "reason": "higher_quality_same_stage_team_news",
+                "source_snapshot_at": existing_stage.get("snapshot_at"),
+                "market_snapshot_at": record.get("snapshot_at"),
+            }
+            record = {**record, "team_news_snapshot": preserved_news}
         existing_at = _parse_timestamp((existing_stage or {}).get("snapshot_at"))
         incoming_at = _parse_timestamp(record.get("snapshot_at"))
         if existing_stage and existing_at is not None and (incoming_at is None or incoming_at < existing_at):

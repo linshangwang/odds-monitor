@@ -104,6 +104,24 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(rejected["reason"], "snapshot_timestamp_conflict_rejected")
         self.assertEqual(main.get_fixture_snapshots(90)[0]["market_snapshot"]["bookmaker_count"], 2)
 
+    def test_fresh_market_does_not_erase_confirmed_same_stage_lineup(self):
+        first_market = main.empty_market_snapshot()
+        first_market["available"] = True
+        later_market = main.empty_market_snapshot()
+        later_market["available"] = True
+        later_market["bookmaker_count"] = 4
+        confirmed_news = {"captured_at": 100, "stage": "T-1h", "lineups": {"available": True, "confirmed": True, "teams": [{"team_name": "H", "starter_count": 11}]}, "injuries": {"available": True}}
+        failed_news = {"captured_at": 200, "stage": "T-1h", "lineups": {"available": False, "confirmed": False, "status": "fetch_failed", "teams": []}, "injuries": {"available": False}}
+        first = {"fixture": 91, "stage": "T-1h", "snapshot_at": 100, "market_snapshot": first_market, "team_news_snapshot": confirmed_news, "stage_timing_audit": {"status": "valid"}}
+        later = {"fixture": 91, "stage": "T-1h", "snapshot_at": 200, "market_snapshot": later_market, "team_news_snapshot": failed_news, "stage_timing_audit": {"status": "valid"}}
+        self.assertTrue(main.save_snapshot(first)["saved"])
+        self.assertTrue(main.save_snapshot(later)["saved"])
+        stored = main.get_fixture_snapshots(91)[0]
+        self.assertEqual(stored["market_snapshot"]["bookmaker_count"], 4)
+        self.assertTrue(stored["team_news_snapshot"]["lineups"]["confirmed"])
+        self.assertTrue(stored["team_news_snapshot"]["preservation_audit"]["preserved"])
+        self.assertEqual(stored["team_news_snapshot"]["preservation_audit"]["source_snapshot_at"], 100)
+
     def test_shadow_token_resolution_prefers_headers_without_breaking_query_compatibility(self):
         self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer", "header"), "header")
         self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer", None), "bearer")
