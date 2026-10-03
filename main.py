@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.94.0"
+VERSION = "0.95.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -171,7 +171,7 @@ def call_api_football(path: str, params: Optional[Dict[str, Any]] = None) -> Dic
             print("[API_FOOTBALL] 429 received; cooldown_seconds=3600")
         return {"ok": resp.ok, "status_code": resp.status_code, "request_url": mask_secret(resp.url), "data": safe_json_response(resp)}
     except requests.RequestException as exc:
-        return {"ok": False, "error": str(exc), "request_url": mask_secret(url)}
+        return {"ok": False, "error": mask_secret(str(exc)), "request_url": mask_secret(url)}
 
 
 def call_thestats(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -185,7 +185,7 @@ def call_thestats(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
         resp = requests.get(url, params=params or {}, headers=headers, timeout=REQUEST_TIMEOUT)
         return {"ok": resp.ok, "status_code": resp.status_code, "request_url": mask_secret(resp.url), "data": safe_json_response(resp)}
     except requests.RequestException as exc:
-        return {"ok": False, "error": str(exc), "request_url": mask_secret(url)}
+        return {"ok": False, "error": mask_secret(str(exc)), "request_url": mask_secret(url)}
 
 def call_the_odds_api(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not THE_ODDS_API_KEY:

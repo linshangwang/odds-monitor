@@ -1021,6 +1021,20 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         finally:
             main.NAMI_API_USER, main.NAMI_API_SECRET = original_user, original_secret
 
+    def test_external_api_exception_messages_do_not_leak_credentials(self):
+        original_api_key, original_stats_key = main.API_FOOTBALL_KEY, main.THESTATS_API_KEY
+        main.API_FOOTBALL_KEY, main.THESTATS_API_KEY = "football-private-key", "stats-private-key"
+        try:
+            with patch("main.requests.get", side_effect=main.requests.RequestException("failed football-private-key stats-private-key")):
+                football = main.call_api_football("/fixtures")
+                stats = main.call_thestats("/events")
+            self.assertNotIn("football-private-key", str(football))
+            self.assertNotIn("stats-private-key", str(football))
+            self.assertNotIn("football-private-key", str(stats))
+            self.assertNotIn("stats-private-key", str(stats))
+        finally:
+            main.API_FOOTBALL_KEY, main.THESTATS_API_KEY = original_api_key, original_stats_key
+
     def test_nami_failure_is_optional_and_degraded(self):
         original_user, original_secret = main.NAMI_API_USER, main.NAMI_API_SECRET
         main.NAMI_API_USER, main.NAMI_API_SECRET = "user-value", "secret-value"
