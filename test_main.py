@@ -1450,6 +1450,21 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["market"]["current"]["consensus_main_line"]["1x2"]["home"], 2.0)
         self.assertIn("line_movement_requires_two_real_comparable_stages", result["decision_layer"]["pass_reasons"])
 
+    def test_imported_missing_stage_cannot_erase_valid_pang_history(self):
+        main.import_prematch_packet(self.prematch_packet())
+        degraded = self.prematch_packet()
+        degraded["timeline"][0] = {
+            "stage": "Opening", "status": "data_missing",
+            "latest_observed_at": "2026-09-29T01:00:00+00:00", "reason": "temporary upstream gap",
+        }
+        result = main.import_prematch_packet(degraded)
+        opening_result = next(row for row in result["stages"] if row["stage"] == "Opening")
+        self.assertEqual(opening_result["action"], "quality_regression_skipped")
+        self.assertEqual(result["counts"]["quality_regression_skipped"], 1)
+        opening = next(row for row in main.get_fixture_snapshots("uuid-1") if row["stage"] == "Opening")
+        self.assertEqual(opening["import_status"], "available")
+        self.assertTrue(opening["market_snapshot"]["available"])
+
     def test_imported_consensus_ignores_conflicting_upstream_main_line_when_array_complete(self):
         packet = self.prematch_packet()
         packet["timeline"][0]["consensus_main_line"]["1x2"]["median_prices"] = {"home": 9.0, "draw": 9.0, "away": 9.0}

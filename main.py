@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.14.0"
+VERSION = "1.15.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1520,6 +1520,8 @@ def import_prematch_packet(packet: Dict[str, Any], store_override: Optional[Dict
                 old_hash = _content_hash({"stage": old.get("stage"), "status": old.get("import_status"), "market_snapshot": old.get("market_snapshot"), "missing_reason": old.get("missing_reason")})
             if old_hash == record["source_content_hash"]:
                 action = "unchanged"
+            elif old and snapshot_stage_usable(old) and not snapshot_stage_usable(record):
+                action = "quality_regression_skipped"
             elif old and int(record.get("snapshot_at") or 0) < int(old.get("snapshot_at") or 0):
                 action = "stale_skipped"
             else:
@@ -1554,7 +1556,7 @@ def import_prematch_packet(packet: Dict[str, Any], store_override: Optional[Dict
             store["version"] = VERSION
             if persist:
                 write_snapshot_store(store)
-    counts = {action: sum(1 for row in imported if row["action"] == action) for action in ("inserted", "updated", "unchanged", "stale_skipped")}
+    counts = {action: sum(1 for row in imported if row["action"] == action) for action in ("inserted", "updated", "unchanged", "stale_skipped", "quality_regression_skipped")}
     return {"fixture": fixture, "match": f"{match.get('home_team_name')} vs {match.get('away_team_name')}", "stages": imported, "counts": counts, "changed": bool(accepted or metadata_changed), "metadata_changed": metadata_changed, "revalidation_tasks_created": len(queued)}
 
 
