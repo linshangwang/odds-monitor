@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.90.0"
+VERSION = "0.91.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1632,9 +1632,10 @@ def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict
         store = load_snapshot_store()
         rows = store.setdefault("fundamental_versions", {}).setdefault(str(fixture), [])
         old_script = (previous or {}).get("script") or {}
-        changed_sections = [key for key in FUNDAMENTAL_CHAIN if get_nested(old_script, ["chain", key]) != get_nested(script, ["chain", key])]
+        has_previous = bool(previous)
+        changed_sections = [key for key in FUNDAMENTAL_CHAIN if has_previous and get_nested(old_script, ["chain", key]) != get_nested(script, ["chain", key])]
         variable_changes = {key: {"before": get_nested(old_script, ["chain", key]), "after": get_nested(script, ["chain", key])} for key in changed_sections}
-        if old_script.get("estimator") != script.get("estimator"):
+        if has_previous and old_script.get("estimator") != script.get("estimator"):
             changed_sections.append("fundamental_estimator")
             variable_changes["fundamental_estimator"] = {"before": old_script.get("estimator"), "after": script.get("estimator")}
         next_version = max((int(row.get("version_number") or 0) for row in rows), default=0) + 1
@@ -1642,7 +1643,7 @@ def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict
         probability_change = probability_change or {"status": "data_missing", "reason": "no independent model probability supplied"}
         best_market_change = best_market_change or {"status": "data_missing", "reason": "decision inputs incomplete"}
         prior_version_number = (previous or {}).get("version_number")
-        script_changed = bool(previous) and (old_script.get("content_hash") != script.get("content_hash") or bool(changed_sections))
+        script_changed = has_previous and (old_script.get("content_hash") != script.get("content_hash") or bool(changed_sections))
         record = {
             "version_number": next_version, "previous_version_number": prior_version_number,
             "created_at": int(time.time()), "trigger": normalized_trigger,
@@ -1651,10 +1652,11 @@ def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict
             "best_market_change": best_market_change,
             "recalculation_audit": {
                 "performed": True,
-                "baseline_created": not bool(previous),
+                "baseline_created": not has_previous,
+                "comparison_available": has_previous,
                 "fundamental_changed": script_changed,
-                "probability_changed": probability_change.get("before") != probability_change.get("after") if "after" in probability_change else None,
-                "best_market_changed": best_market_change.get("changed") if "changed" in best_market_change else None,
+                "probability_changed": probability_change.get("before") != probability_change.get("after") if has_previous and "after" in probability_change else None,
+                "best_market_changed": best_market_change.get("changed") if has_previous and "changed" in best_market_change else None,
                 "triggered_by_market_revalidation": normalized_trigger["triggered"],
                 "trigger_reasons": normalized_trigger["reasons"],
                 "stage": normalized_trigger.get("stage"),

@@ -162,6 +162,8 @@ pending 任务标记为 overdue，并在 `/shadow/import-status` 汇总待处理
 `Market-Only Move`。
 每个基本面版本同时保存 `previous_version_number` 与 `recalculation_audit`，明确区分首次基线、
 重复重算和真实基本面变化，并记录规范化的触发节点、原因、概率变化及最优盘口变化。
+首次基线没有可比较的前序版本，因此 `changed_information` 保持为空，概率和最佳盘口变化状态
+保持不可比较，不会把“首次生成”误报成“发生变化”。
 
 T-X 变盘比较现覆盖全部可用市场：1X2、AH、O/U、BTTS、主队进球数和客队进球数；每个市场
 分别记录线路及价格变化。跨市场背离检查包括 1X2↔AH、O/U↔BTTS，以及双方1X2↔对应球队
