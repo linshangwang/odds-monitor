@@ -492,6 +492,28 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("market_data_not_fresh_or_valid", result["eligibility_reasons"])
         self.assertEqual(result["maximum_absolute_probability_gap"], .2)
 
+    def test_model_market_divergence_excludes_ineligible_consensus_candidates(self):
+        decision = {"lineup_confidence": .9, "candidates": [
+            {"market": "1x2", "selection": "home", "edge": .2, "market_coverage_eligible": False, "consensus_source_eligible": True, "dispersion_eligible": True},
+            {"market": "btts", "selection": "yes", "edge": -.15, "market_coverage_eligible": True, "consensus_source_eligible": False, "dispersion_eligible": True},
+        ]}
+        result = main.detect_model_market_divergence(decision)
+        self.assertFalse(result["triggered"])
+        self.assertFalse(result["classification_eligible"])
+        self.assertIn("market_consensus_ineligible", result["eligibility_reasons"])
+        self.assertEqual(result["candidate_audit"]["eligible_comparable_count"], 0)
+        self.assertEqual(result["candidate_audit"]["excluded_ineligible_consensus_count"], 2)
+
+    def test_model_market_divergence_uses_only_eligible_candidate_when_mixed(self):
+        decision = {"lineup_confidence": .9, "candidates": [
+            {"market": "1x2", "selection": "home", "edge": .3, "market_coverage_eligible": False},
+            {"market": "over_under", "selection": "over", "edge": .09, "market_coverage_eligible": True, "consensus_source_eligible": True, "dispersion_eligible": True},
+        ]}
+        result = main.detect_model_market_divergence(decision)
+        self.assertTrue(result["triggered"])
+        self.assertEqual(result["market"], "over_under")
+        self.assertEqual(result["maximum_absolute_probability_gap"], .09)
+
     def test_decision_layer_enforces_minimums_and_probability_validation(self):
         snapshot = main.empty_market_snapshot()
         snapshot["consensus_main_line"]["1x2"] = {"home": 2.0, "draw": 3.5, "away": 4.0}

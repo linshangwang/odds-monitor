@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -2278,7 +2278,8 @@ def build_decision_summary(decision: Dict[str, Any], chain_audit: Dict[str, Any]
 
 
 def detect_model_market_divergence(decision: Dict[str, Any], threshold: float = 0.08, model_ready: bool = True, fundamental_eligible: bool = True, market_data_eligible: bool = True) -> Dict[str, Any]:
-    comparable = [row for row in decision.get("candidates") or [] if as_float(row.get("edge")) is not None]
+    raw_comparable = [row for row in decision.get("candidates") or [] if as_float(row.get("edge")) is not None]
+    comparable = [row for row in raw_comparable if row.get("market_coverage_eligible", True) and row.get("consensus_source_eligible", True) and row.get("dispersion_eligible", True)]
     strongest = max(comparable, key=lambda row: abs(as_float(row.get("edge")) or 0.0), default=None)
     gap = abs(as_float((strongest or {}).get("edge")) or 0.0) if strongest else None
     lineup_confidence = as_float(decision.get("lineup_confidence"))
@@ -2287,6 +2288,7 @@ def detect_model_market_divergence(decision: Dict[str, Any], threshold: float = 
     if not model_ready: eligibility_reasons.append("model_not_ready")
     if not fundamental_eligible: eligibility_reasons.append("fundamental_chain_insufficient")
     if not market_data_eligible: eligibility_reasons.append("market_data_not_fresh_or_valid")
+    if raw_comparable and not comparable: eligibility_reasons.append("market_consensus_ineligible")
     if not confidence_eligible: eligibility_reasons.append("lineup_confidence_insufficient")
     eligible = not eligibility_reasons
     return {
@@ -2295,8 +2297,9 @@ def detect_model_market_divergence(decision: Dict[str, Any], threshold: float = 
         "maximum_absolute_probability_gap": round(gap, 6) if gap is not None else None,
         "market": (strongest or {}).get("market"), "selection": (strongest or {}).get("selection"),
         "direction": "model_above_market" if strongest and as_float(strongest.get("edge")) > 0 else ("model_below_market" if strongest else None),
-        "comparison_status": "compared" if strongest and eligible else (eligibility_reasons[0] if strongest else "data_missing"),
+        "comparison_status": "compared" if strongest and eligible else (eligibility_reasons[0] if raw_comparable and eligibility_reasons else "data_missing"),
         "classification_eligible": eligible, "eligibility_reasons": eligibility_reasons,
+        "candidate_audit": {"raw_comparable_count": len(raw_comparable), "eligible_comparable_count": len(comparable), "excluded_ineligible_consensus_count": len(raw_comparable) - len(comparable)},
     }
 
 
