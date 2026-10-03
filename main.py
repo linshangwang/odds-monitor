@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.15.0"
+VERSION = "1.16.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1103,6 +1103,14 @@ def save_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
                 "revalidation_task_created": False, "revalidation_task_id": None,
                 "downstream_revalidation_tasks_created": 0,
             }
+        if existing_stage and existing_at is not None and incoming_at == existing_at and _content_hash(existing_stage.get("market_snapshot")) != _content_hash(record.get("market_snapshot")):
+            return {
+                "saved": False, "preserved_existing": True, "reason": "snapshot_timestamp_conflict_rejected",
+                "path": SNAPSHOT_STORE_PATH, "fixture": record["fixture"], "stage": record["stage"],
+                "existing_snapshot_at": existing_stage.get("snapshot_at"), "rejected_snapshot_at": record.get("snapshot_at"),
+                "revalidation_task_created": False, "revalidation_task_id": None,
+                "downstream_revalidation_tasks_created": 0,
+            }
         rows = [r for r in store["fixtures"][str(record["fixture"])] if r.get("stage") != record.get("stage")]
         rows.append(record)
         rows = sorted(rows, key=lambda x: (STAGE_ORDER.index(x.get("stage")) if x.get("stage") in STAGE_ORDER else 999, x.get("snapshot_at", 0)))
@@ -1524,6 +1532,8 @@ def import_prematch_packet(packet: Dict[str, Any], store_override: Optional[Dict
                 action = "quality_regression_skipped"
             elif old and int(record.get("snapshot_at") or 0) < int(old.get("snapshot_at") or 0):
                 action = "stale_skipped"
+            elif old and int(record.get("snapshot_at") or 0) == int(old.get("snapshot_at") or 0) and _content_hash(old.get("market_snapshot")) != _content_hash(record.get("market_snapshot")):
+                action = "timestamp_conflict_skipped"
             else:
                 action = "inserted" if not old else "updated"
                 accepted.append(record)
@@ -1556,7 +1566,7 @@ def import_prematch_packet(packet: Dict[str, Any], store_override: Optional[Dict
             store["version"] = VERSION
             if persist:
                 write_snapshot_store(store)
-    counts = {action: sum(1 for row in imported if row["action"] == action) for action in ("inserted", "updated", "unchanged", "stale_skipped", "quality_regression_skipped")}
+    counts = {action: sum(1 for row in imported if row["action"] == action) for action in ("inserted", "updated", "unchanged", "stale_skipped", "quality_regression_skipped", "timestamp_conflict_skipped")}
     return {"fixture": fixture, "match": f"{match.get('home_team_name')} vs {match.get('away_team_name')}", "stages": imported, "counts": counts, "changed": bool(accepted or metadata_changed), "metadata_changed": metadata_changed, "revalidation_tasks_created": len(queued)}
 
 

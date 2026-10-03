@@ -90,6 +90,20 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(rejected["reason"], "stale_snapshot_rejected")
         self.assertEqual(main.get_fixture_snapshots(89)[0]["snapshot_at"], 200)
 
+    def test_same_timestamp_conflicting_snapshot_is_rejected(self):
+        first_market = main.empty_market_snapshot()
+        first_market["available"] = True
+        first_market["bookmaker_count"] = 2
+        changed_market = main.empty_market_snapshot()
+        changed_market["available"] = True
+        changed_market["bookmaker_count"] = 3
+        first = {"fixture": 90, "stage": "T-6h", "snapshot_at": 100, "market_snapshot": first_market, "stage_timing_audit": {"status": "valid"}}
+        conflict = {"fixture": 90, "stage": "T-6h", "snapshot_at": 100, "market_snapshot": changed_market, "stage_timing_audit": {"status": "valid"}}
+        self.assertTrue(main.save_snapshot(first)["saved"])
+        rejected = main.save_snapshot(conflict)
+        self.assertEqual(rejected["reason"], "snapshot_timestamp_conflict_rejected")
+        self.assertEqual(main.get_fixture_snapshots(90)[0]["market_snapshot"]["bookmaker_count"], 2)
+
     def test_shadow_token_resolution_prefers_headers_without_breaking_query_compatibility(self):
         self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer", "header"), "header")
         self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer", None), "bearer")
@@ -1464,6 +1478,17 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         opening = next(row for row in main.get_fixture_snapshots("uuid-1") if row["stage"] == "Opening")
         self.assertEqual(opening["import_status"], "available")
         self.assertTrue(opening["market_snapshot"]["available"])
+
+    def test_imported_same_timestamp_conflict_is_not_silently_overwritten(self):
+        main.import_prematch_packet(self.prematch_packet())
+        conflict = self.prematch_packet()
+        conflict["timeline"][0]["company_market_array"][0]["price"] = "1.7"
+        result = main.import_prematch_packet(conflict)
+        opening_result = next(row for row in result["stages"] if row["stage"] == "Opening")
+        self.assertEqual(opening_result["action"], "timestamp_conflict_skipped")
+        self.assertEqual(result["counts"]["timestamp_conflict_skipped"], 1)
+        opening = next(row for row in main.get_fixture_snapshots("uuid-1") if row["stage"] == "Opening")
+        self.assertEqual(opening["market_snapshot"]["markets"]["1x2"][0]["home"], 2.0)
 
     def test_imported_consensus_ignores_conflicting_upstream_main_line_when_array_complete(self):
         packet = self.prematch_packet()
