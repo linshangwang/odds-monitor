@@ -339,6 +339,25 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(main.auto_snapshot_stage_due(due + main.timedelta(hours=7), kickoff, stage))
         self.assertFalse(main.auto_snapshot_stage_due(due - main.timedelta(hours=7), kickoff, stage))
 
+    def test_auto_snapshot_stage_due_allows_valid_late_catchup(self):
+        kickoff = main.datetime(2026, 1, 2, 12, tzinfo=main.timezone.utc)
+        stage = next(item for item in main.TRACKING_STAGES if item["key"] == "T-24h")
+        due = kickoff + stage["offset"]
+        self.assertTrue(main.auto_snapshot_stage_due(due + main.timedelta(hours=1), kickoff, stage))
+        opening = next(item for item in main.TRACKING_STAGES if item["key"] == "Opening")
+        self.assertTrue(main.auto_snapshot_stage_due(kickoff - main.timedelta(hours=30), kickoff, opening))
+
+    def test_invalid_or_empty_saved_stage_remains_retryable(self):
+        history = [
+            {"stage": "T-24h", "market_snapshot": {"available": True}, "stage_timing_audit": {"status": "invalid"}},
+            {"stage": "T-12h", "market_snapshot": {"available": False}, "stage_timing_audit": {"status": "valid"}},
+            {"stage": "T-6h", "market_snapshot": {"available": True}, "stage_timing_audit": {"status": "valid"}, "sequence_timing_audit": {"status": "valid"}},
+        ]
+        completed = main.completed_auto_snapshot_stages(history)
+        self.assertNotIn("T-24h", completed)
+        self.assertNotIn("T-12h", completed)
+        self.assertIn("T-6h", completed)
+
     def test_consensus_deduplicates_bookmaker_name_variants(self):
         consensus = main._consensus_1x2([
             {"bookmaker": "Book A", "home": 2.0, "draw": 3.4, "away": 4.0},

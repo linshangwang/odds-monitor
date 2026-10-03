@@ -3210,9 +3210,26 @@ async def sportradar_push_statistics(request: Request):
 def auto_snapshot_stage_due(now: datetime, kickoff: datetime, stage: Dict[str, Any]) -> bool:
     due = kickoff + stage["offset"]
     delta = (now - due).total_seconds()
-    if abs(delta) > AUTO_SNAPSHOT_WINDOW_SECONDS:
+    if delta < -AUTO_SNAPSHOT_WINDOW_SECONDS:
         return False
-    return audit_stage_timing(stage["key"], int(now.timestamp()), int(kickoff.timestamp())).get("status") != "invalid"
+    key = stage["key"]
+    if key == "Opening":
+        next_due = kickoff + next(item["offset"] for item in TRACKING_STAGES if item["key"] == "T-24h")
+        return now < next_due
+    if key == "Closing" and now >= kickoff:
+        return False
+    return audit_stage_timing(key, int(now.timestamp()), int(kickoff.timestamp())).get("status") == "valid"
+
+
+def completed_auto_snapshot_stages(history: List[Dict[str, Any]]) -> set:
+    return {
+        row.get("stage") for row in history
+        if row.get("stage") in PREMATCH_STAGE_ORDER
+        and row.get("import_status") != "data_missing"
+        and bool(get_nested(row, ["market_snapshot", "available"]))
+        and get_nested(row, ["stage_timing_audit", "status"]) != "invalid"
+        and get_nested(row, ["sequence_timing_audit", "status"]) != "invalid"
+    }
 
 
 def auto_snapshot_cycle() -> None:
@@ -3228,7 +3245,7 @@ def auto_snapshot_cycle() -> None:
                 if not kickoff:
                     continue
                 history = get_fixture_snapshots(int(fx["fixture_id"]))
-                saved_stages = {r.get("stage") for r in history}
+                saved_stages = completed_auto_snapshot_stages(history)
                 for stage in TRACKING_STAGES:
                     key = stage["key"]
                     if key == "FT" or key in saved_stages:
@@ -3259,6 +3276,7 @@ def auto_snapshot_cycle() -> None:
                             snapshot_at = int(time.time())
                             record = {"version": VERSION, "fixture": int(fx["fixture_id"]), "stage": key, "requested_stage": "auto", "snapshot_at": snapshot_at, "fixture_info": data.get("fixture"), "data_quality": data.get("data_quality"), "coverage": data.get("coverage"), "market_snapshot": market_snapshot, "market_dynamics": dynamics, "pure_fundamental_script_hash": script.get("content_hash"), "fundamental_version_number": (fundamental_version or {}).get("version_number"), "shadow_summary": data.get("shadow_summary"), "stage_timing_audit": audit_stage_timing(key, snapshot_at, fx.get("date") or get_nested(data, ["fixture", "date"]))}
                             saved = save_snapshot(record)
+                            saved_stages.add(key)
                             if saved.get("revalidation_task_created"):
                                 chain_audit = audit_fundamental_chain(script)
                                 if chain_audit.get("decision_eligible"):
