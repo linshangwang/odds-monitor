@@ -501,6 +501,22 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["decision"], "PASS")
         self.assertIn("death_path", result["pass_reasons"])
 
+    def test_imported_pipeline_does_not_invent_empty_death_path(self):
+        main.import_prematch_packet(self.prematch_packet())
+        latest = max(row.get("snapshot_at") or 0 for row in main.get_fixture_snapshots("uuid-1") if row.get("import_status") == "available")
+        payload = {
+            "fixture": "uuid-1", "league_home_rate": 1.5, "league_away_rate": 1.2,
+            "home_attack_rate": 1.8, "home_defense_rate": 1.0, "away_attack_rate": 1.1, "away_defense_rate": 1.5,
+            "home_sample_size": 10, "away_sample_size": 10, "league_sample_size": 100, "metric_type": "xg",
+            "home_adjustment": 1.0, "away_adjustment": 1.0, "lineup_confidence": .85,
+            "provenance": {"source": "verified_event_data", "uses_market_odds": False},
+            "script_coverage": {"home": .8, "draw": .4, "away": .3}, "crowding": .3,
+        }
+        with patch("main.time.time", return_value=latest + 60):
+            result = main.evaluate_imported_prematch(payload, persist_version=False)
+        self.assertIn("death_path", result["decision_layer"]["pass_reasons"])
+        self.assertEqual(result["decision_layer"]["death_path"], [])
+
     def test_recommendation_tiers_prioritize_consistency_then_return(self):
         snapshot = main.empty_market_snapshot()
         snapshot["consensus_main_line"].update({

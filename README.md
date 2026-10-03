@@ -150,6 +150,8 @@ Selection Change、Robustness Change、Risk Downgrade to PASS 和 Recovery from 
 `structural_issues` 并强制 PASS。响应同时提供精简的 `decision_summary`，便于前端直接展示。
 最终决策的 Script Coverage、Crowding 和 Lineup Confidence 必须位于 0–1；Death Path 必须
 显式提交为字符串数组。缺失、越界或结构异常都会强制 PASS，不能以异常数值绕过风险门槛。
+上层评估接口不会把缺失的 Death Path 自动补成空数组；只有调用方明确提交 `[]` 才表示已完成
+检查且未发现死亡路径。
 
 外部盘口导入若触发显著变盘或跨市场背离，会写入持久化的基本面复核队列；同一比赛、节点和
 数据版本自动去重。可通过受保护的 `GET /shadow/revalidation-queue` 查看 pending/revalidated/all，

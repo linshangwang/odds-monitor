@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.98.0"
+VERSION = "0.99.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -2314,7 +2314,7 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
     freshness = imported_fixture_freshness(metadata, history)
     decision = decision_layer(
         market, model.get("probabilities"), payload.get("script_coverage"),
-        as_float(payload.get("crowding")), lineup_audit.get("effective_confidence"), payload.get("death_path") or [],
+        as_float(payload.get("crowding")), lineup_audit.get("effective_confidence"), payload.get("death_path") if "death_path" in payload else None,
     )
     decision["lineup_confidence_audit"] = lineup_audit
     decision = apply_line_movement_gate(decision, history)
@@ -3037,7 +3037,7 @@ async def shadow_poisson_model(request: Request, token: Optional[str] = None, au
         freshness = imported_fixture_freshness(metadata, history)
     decision = decision_layer(
         market, model.get("probabilities"), payload.get("script_coverage"),
-        as_float(payload.get("crowding")), as_float(payload.get("lineup_confidence")), payload.get("death_path") or [],
+        as_float(payload.get("crowding")), as_float(payload.get("lineup_confidence")), payload.get("death_path") if "death_path" in payload else None,
     )
     if model.get("status") != "ready":
         decision["pass_reasons"].append("model_input_confidence_below_0_6")
@@ -3314,7 +3314,7 @@ async def shadow_evaluate(request: Request, token: Optional[str] = None, authori
     current = ((latest or {}).get("market_snapshot")) or empty_market_snapshot()
     result = decision_layer(
         current, payload.get("model_probabilities"), payload.get("script_coverage"),
-        as_float(payload.get("crowding")), as_float(payload.get("lineup_confidence")), payload.get("death_path") or []
+        as_float(payload.get("crowding")), as_float(payload.get("lineup_confidence")), payload.get("death_path") if "death_path" in payload else None
     )
     result = apply_line_movement_gate(result, history)
     return JSONResponse({"ok": True, "version": VERSION, "fixture": fixture, "evaluation": result})
