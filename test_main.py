@@ -31,6 +31,15 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(snapshot["lineups"]["teams"][0]["starting_xi"][0]["name"], "Player")
         self.assertIsNone(main.team_news_snapshot(data, "T-3h"))
 
+    def test_rotation_quality_requires_confirmed_xi_and_never_claims_unscored_available(self):
+        partial = main.pure_fundamental_script({"structured_inputs": {"lineups_available": True, "lineups": {"available": True, "confirmed": False}}})
+        self.assertEqual(partial["chain"]["rotation_quality"]["status"], "data_missing")
+        confirmed = main.pure_fundamental_script({"structured_inputs": {"lineups_available": True, "lineups_confirmed": True, "lineups": {"available": True, "confirmed": True}}})
+        rotation = confirmed["chain"]["rotation_quality"]
+        self.assertEqual(rotation["status"], "partial")
+        self.assertIsNone(rotation["starting_xi_strength"])
+        self.assertIn("not_scored", rotation["reason"])
+
     def test_injury_fetch_failure_is_not_treated_as_zero_injuries(self):
         failed = main.injuries_summary({"ok": False, "status_code": 503}, 1, 2)
         self.assertFalse(failed["available"])
