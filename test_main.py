@@ -70,6 +70,22 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertTrue(successful["has_data"])
         self.assertFalse(successful["response_present_but_unusable"])
 
+    def test_api_football_http_200_business_error_is_not_success(self):
+        original_key, original_cooldown = main.API_FOOTBALL_KEY, main.API_FOOTBALL_RATE_LIMIT_UNTIL
+        main.API_FOOTBALL_KEY, main.API_FOOTBALL_RATE_LIMIT_UNTIL = "configured", 0
+        response = unittest.mock.Mock()
+        response.ok, response.status_code, response.url = True, 200, "https://example.test/fixtures"
+        response.json.return_value = {"errors": {"requests": "Daily request limit reached"}, "response": [{"id": 1}]}
+        try:
+            with patch("main.requests.get", return_value=response), patch("main.time.time", return_value=1000):
+                result = main.call_api_football("/fixtures")
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["error"], "api_football_business_error")
+            self.assertEqual(main.API_FOOTBALL_RATE_LIMIT_UNTIL, 4600)
+            self.assertFalse(main.coverage_summary(result)["has_data"])
+        finally:
+            main.API_FOOTBALL_KEY, main.API_FOOTBALL_RATE_LIMIT_UNTIL = original_key, original_cooldown
+
     def test_injury_fetch_failure_is_not_treated_as_zero_injuries(self):
         failed = main.injuries_summary({"ok": False, "status_code": 503}, 1, 2)
         self.assertFalse(failed["available"])

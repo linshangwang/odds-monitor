@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.21.0"
+VERSION = "1.22.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -156,6 +156,15 @@ def safe_json_response(resp: requests.Response) -> Any:
         return {"raw_text": mask_secret(resp.text[:2000])}
 
 
+def api_football_business_error(payload: Any) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return "invalid_payload"
+    errors = payload.get("errors")
+    if errors in (None, {}, []):
+        return None
+    return "api_football_business_error"
+
+
 def call_api_football(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     global API_FOOTBALL_RATE_LIMIT_UNTIL
     if not API_FOOTBALL_KEY:
@@ -169,10 +178,15 @@ def call_api_football(path: str, params: Optional[Dict[str, Any]] = None) -> Dic
     headers = {"x-apisports-key": API_FOOTBALL_KEY, "Accept": "application/json"}
     try:
         resp = requests.get(url, params=params or {}, headers=headers, timeout=REQUEST_TIMEOUT)
+        payload = safe_json_response(resp)
+        business_error = api_football_business_error(payload)
         if resp.status_code == 429:
             API_FOOTBALL_RATE_LIMIT_UNTIL = int(time.time()) + 3600
             print("[API_FOOTBALL] 429 received; cooldown_seconds=3600")
-        return {"ok": resp.ok, "status_code": resp.status_code, "request_url": mask_secret(resp.url), "data": safe_json_response(resp)}
+        elif business_error and any(word in str((payload or {}).get("errors", "")).lower() for word in ("limit", "quota", "rate")):
+            API_FOOTBALL_RATE_LIMIT_UNTIL = int(time.time()) + 3600
+            print("[API_FOOTBALL] business rate-limit received; cooldown_seconds=3600")
+        return {"ok": bool(resp.ok and not business_error), "status_code": resp.status_code, "request_url": mask_secret(resp.url), "data": payload, "error": business_error}
     except requests.RequestException as exc:
         return {"ok": False, "error": mask_secret(str(exc)), "request_url": mask_secret(url)}
 
