@@ -43,6 +43,25 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(confirmed_empty["status"], "confirmed_empty")
         self.assertEqual(confirmed_empty["home_count"], 0)
 
+    def test_bootstrap_refuses_missing_odds_and_persists_timing_when_available(self):
+        kickoff = main.datetime.now(main.timezone.utc) + main.timedelta(hours=1)
+        fixture = {"fixture_id": 77, "status": "NS", "date": kickoff.isoformat(), "home": "H", "away": "A"}
+        missing = {"ok": True, "coverage": {"odds_prematch": {"ok": False, "has_data": False}}, "structured_inputs": {"odds_market_snapshot": main.empty_market_snapshot()}}
+        with patch.object(main, "choose_bootstrap_candidate", return_value=fixture), patch.object(main, "get_fixture_snapshots", return_value=[]), patch.object(main, "collect_stage_snapshot_data", return_value=missing), patch.object(main, "save_snapshot") as save:
+            result = main.bootstrap_current_snapshot_once()
+        self.assertEqual(result["reason"], "odds_data_missing")
+        save.assert_not_called()
+
+        market = main.empty_market_snapshot()
+        market["available"] = True
+        available = {"ok": True, "coverage": {"odds_prematch": {"ok": True, "has_data": True}}, "structured_inputs": {"odds_market_snapshot": market, "injuries": {"available": True}, "lineups": {"available": True, "confirmed": True, "teams": []}}, "data_quality": {}, "shadow_summary": {}}
+        with patch.object(main, "choose_bootstrap_candidate", return_value=fixture), patch.object(main, "get_fixture_snapshots", return_value=[]), patch.object(main, "collect_stage_snapshot_data", return_value=available), patch.object(main, "save_snapshot", side_effect=lambda row: row) as save:
+            result = main.bootstrap_current_snapshot_once()
+        saved = save.call_args.args[0]
+        self.assertEqual(result["status"], "saved")
+        self.assertEqual(saved["stage_timing_audit"]["status"], "valid")
+        self.assertIsNotNone(saved["team_news_snapshot"])
+
     def test_shadow_token_resolution_prefers_headers_without_breaking_query_compatibility(self):
         self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer", "header"), "header")
         self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer", None), "bearer")

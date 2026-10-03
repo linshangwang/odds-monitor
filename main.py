@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.11.0"
+VERSION = "1.12.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -3616,13 +3616,21 @@ def bootstrap_current_snapshot_once() -> Dict[str, Any]:
         return {"fixture": fixture_id, "status": "skipped", "reason": "before_t24h"}
     stage = due[-1]["key"]
     data = collect_stage_snapshot_data(fixture_id, stage)
+    if not data.get("ok"):
+        return {"fixture": fixture_id, "status": "skipped", "reason": data.get("error") or "collection_failed"}
+    odds_coverage = get_nested(data, ["coverage", "odds_prematch"], {}) or {}
     market_snapshot = get_nested(data, ["structured_inputs", "odds_market_snapshot"], empty_market_snapshot())
+    if not odds_coverage.get("ok") or not odds_coverage.get("has_data") or not market_snapshot.get("available"):
+        return {"fixture": fixture_id, "status": "skipped", "reason": "odds_data_missing"}
     dynamics = compare_market_snapshots([], market_snapshot, stage)
+    snapshot_at = int(time.time())
     record = {
         "version": VERSION, "fixture": fixture_id, "stage": stage, "requested_stage": "bootstrap_current_once",
-        "snapshot_at": int(time.time()), "fixture_info": fx, "data_quality": data.get("data_quality"),
+        "snapshot_at": snapshot_at, "fixture_info": fx, "data_quality": data.get("data_quality"),
         "coverage": data.get("coverage"), "market_snapshot": market_snapshot,
-        "market_dynamics": dynamics, "shadow_summary": data.get("shadow_summary")
+        "market_dynamics": dynamics, "team_news_snapshot": team_news_snapshot(data, stage),
+        "shadow_summary": data.get("shadow_summary"),
+        "stage_timing_audit": audit_stage_timing(stage, snapshot_at, fx.get("date")),
     }
     saved = save_snapshot(record)
     return {"fixture": fixture_id, "match": f"{fx.get('home')} vs {fx.get('away')}", "status": "saved", "stage": stage, "hours_to_kickoff": round(fx.get("_hours_to_kickoff", 0), 2), "saved": saved}
