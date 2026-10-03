@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.85.0"
+VERSION = "0.86.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -3210,15 +3210,9 @@ async def sportradar_push_statistics(request: Request):
 def auto_snapshot_stage_due(now: datetime, kickoff: datetime, stage: Dict[str, Any]) -> bool:
     due = kickoff + stage["offset"]
     delta = (now - due).total_seconds()
-    if delta < -AUTO_SNAPSHOT_WINDOW_SECONDS:
+    if abs(delta) > AUTO_SNAPSHOT_WINDOW_SECONDS:
         return False
-    key = stage["key"]
-    if key == "Opening":
-        next_due = kickoff + next(item["offset"] for item in TRACKING_STAGES if item["key"] == "T-24h")
-        return now < next_due
-    if key == "Closing" and now >= kickoff:
-        return False
-    return audit_stage_timing(key, int(now.timestamp()), int(kickoff.timestamp())).get("status") == "valid"
+    return audit_stage_timing(stage["key"], int(now.timestamp()), int(kickoff.timestamp())).get("status") != "invalid"
 
 
 def completed_auto_snapshot_stages(history: List[Dict[str, Any]]) -> set:

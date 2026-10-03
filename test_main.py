@@ -339,13 +339,11 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(main.auto_snapshot_stage_due(due + main.timedelta(hours=7), kickoff, stage))
         self.assertFalse(main.auto_snapshot_stage_due(due - main.timedelta(hours=7), kickoff, stage))
 
-    def test_auto_snapshot_stage_due_allows_valid_late_catchup(self):
+    def test_auto_snapshot_stage_due_rejects_late_but_tolerance_valid_quote(self):
         kickoff = main.datetime(2026, 1, 2, 12, tzinfo=main.timezone.utc)
         stage = next(item for item in main.TRACKING_STAGES if item["key"] == "T-24h")
         due = kickoff + stage["offset"]
-        self.assertTrue(main.auto_snapshot_stage_due(due + main.timedelta(hours=1), kickoff, stage))
-        opening = next(item for item in main.TRACKING_STAGES if item["key"] == "Opening")
-        self.assertTrue(main.auto_snapshot_stage_due(kickoff - main.timedelta(hours=30), kickoff, opening))
+        self.assertFalse(main.auto_snapshot_stage_due(due + main.timedelta(hours=1), kickoff, stage))
 
     def test_invalid_or_empty_saved_stage_remains_retryable(self):
         history = [
