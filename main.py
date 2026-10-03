@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -2277,7 +2277,7 @@ def build_decision_summary(decision: Dict[str, Any], chain_audit: Dict[str, Any]
     }
 
 
-def detect_model_market_divergence(decision: Dict[str, Any], threshold: float = 0.08, model_ready: bool = True, fundamental_eligible: bool = True) -> Dict[str, Any]:
+def detect_model_market_divergence(decision: Dict[str, Any], threshold: float = 0.08, model_ready: bool = True, fundamental_eligible: bool = True, market_data_eligible: bool = True) -> Dict[str, Any]:
     comparable = [row for row in decision.get("candidates") or [] if as_float(row.get("edge")) is not None]
     strongest = max(comparable, key=lambda row: abs(as_float(row.get("edge")) or 0.0), default=None)
     gap = abs(as_float((strongest or {}).get("edge")) or 0.0) if strongest else None
@@ -2286,6 +2286,7 @@ def detect_model_market_divergence(decision: Dict[str, Any], threshold: float = 
     eligibility_reasons = []
     if not model_ready: eligibility_reasons.append("model_not_ready")
     if not fundamental_eligible: eligibility_reasons.append("fundamental_chain_insufficient")
+    if not market_data_eligible: eligibility_reasons.append("market_data_not_fresh_or_valid")
     if not confidence_eligible: eligibility_reasons.append("lineup_confidence_insufficient")
     eligible = not eligibility_reasons
     return {
@@ -2342,7 +2343,12 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
     decision["fundamental_chain_audit"] = chain_audit
     if not chain_audit["decision_eligible"]:
         force_pass_decision(decision, "fundamental_chain_insufficient")
-    model_market_divergence = detect_model_market_divergence(decision, model_ready=model.get("status") == "ready", fundamental_eligible=chain_audit.get("decision_eligible") is True)
+    model_market_divergence = detect_model_market_divergence(
+        decision,
+        model_ready=model.get("status") == "ready",
+        fundamental_eligible=chain_audit.get("decision_eligible") is True,
+        market_data_eligible=bool(latest) and freshness.get("decision_eligible") is True,
+    )
     decision["model_market_divergence"] = model_market_divergence
     decision["market_move_classification"] = "Model-Market Divergence" if model_market_divergence["triggered"] else get_nested(decision, ["line_movement", "classification"])
     versions = get_fundamental_versions(fixture)

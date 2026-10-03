@@ -484,6 +484,14 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("lineup_confidence_insufficient", result["eligibility_reasons"])
         self.assertEqual(result["maximum_absolute_probability_gap"], .2)
 
+    def test_model_market_divergence_rejects_stale_or_invalid_market_data(self):
+        decision = {"lineup_confidence": .9, "candidates": [{"market": "1x2", "selection": "home", "edge": .2}]}
+        result = main.detect_model_market_divergence(decision, market_data_eligible=False)
+        self.assertFalse(result["triggered"])
+        self.assertFalse(result["classification_eligible"])
+        self.assertIn("market_data_not_fresh_or_valid", result["eligibility_reasons"])
+        self.assertEqual(result["maximum_absolute_probability_gap"], .2)
+
     def test_decision_layer_enforces_minimums_and_probability_validation(self):
         snapshot = main.empty_market_snapshot()
         snapshot["consensus_main_line"]["1x2"] = {"home": 2.0, "draw": 3.5, "away": 4.0}

@@ -154,6 +154,8 @@ Selection Change、Robustness Change、Risk Downgrade to PASS 和 Recovery from 
 检查且未发现死亡路径。
 任一后置硬门槛触发 PASS（盘口时间轴、数据新鲜度、模型置信度或基本面证据链）时，系统会
 统一清空最佳盘口、Edge、EV 和所有推荐层，避免前端同时显示“PASS”和残留下注建议。
+Model-Market Divergence 只允许使用时间有效且新鲜的当前盘口；过期、未来时间戳或不存在有效
+当前节点时仍可展示概率差供审计，但不得触发背离分类。
 
 外部盘口导入若触发显著变盘或跨市场背离，会写入持久化的基本面复核队列；同一比赛、节点和
 数据版本自动去重。可通过受保护的 `GET /shadow/revalidation-queue` 查看 pending/revalidated/all，
