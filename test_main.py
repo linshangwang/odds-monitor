@@ -214,6 +214,21 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(gated["decision"], "home")
         self.assertTrue(gated["line_movement_audit"]["decision_eligible"])
 
+    def test_shadow_ai_packet_ignores_ft_and_invalid_prematch_nodes(self):
+        snapshots = [
+            {"stage": "T-24h", "snapshot_at": 100, "market_snapshot": {"available": True, "primary": {"asian_handicap": {"line": -.25}}}, "market_dynamics": {"comparison_status": "data_missing"}},
+            {"stage": "T-3h", "snapshot_at": 200, "stage_timing_audit": {"status": "invalid"}, "market_snapshot": {"available": True, "primary": {"asian_handicap": {"line": -1.0}}}, "market_dynamics": {"comparison_status": "compared"}},
+            {"stage": "FT", "snapshot_at": 300, "market_snapshot": {"available": True, "primary": {"asian_handicap": {"line": -2.0}}}, "market_dynamics": {"comparison_status": "compared"}},
+        ]
+        data = {"ok": True, "fixture": {"home": "H", "away": "A"}, "structured_inputs": {"odds_market_snapshot": main.empty_market_snapshot()}, "coverage": {}, "data_quality": {}, "shadow_summary": {}}
+        with patch.object(main, "collect_prematch_data", return_value=data), patch.object(main, "get_fixture_snapshots", return_value=snapshots), patch.object(main, "get_fundamental_versions", return_value=[]):
+            packet = main.build_shadow_ai_packet(1)
+        self.assertEqual(packet["market"]["available_prematch_stage_count"], 1)
+        self.assertIn("T-3h", packet["market"]["missing_stages"])
+        self.assertEqual(packet["market"]["total_asian_handicap_move"], 0.0)
+        self.assertEqual(packet["decision_layer"]["decision"], "PASS")
+        self.assertIn("line_movement_requires_two_real_comparable_stages", packet["decision_layer"]["pass_reasons"])
+
     def test_decision_layer_calculates_no_vig_edge_ev(self):
         snapshot = main.empty_market_snapshot()
         snapshot["consensus_main_line"]["1x2"] = {"home": 2.0, "draw": 3.5, "away": 4.0}

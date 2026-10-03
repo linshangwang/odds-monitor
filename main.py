@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.87.0"
+VERSION = "0.88.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -3098,12 +3098,13 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
     """Build one AI-ready prematch packet from persisted market history + one current fundamentals fetch."""
     data = collect_prematch_data(fixture, include_raw=False)
     history = get_fixture_snapshots(fixture)
-    by_stage = {row.get("stage"): row for row in history if row.get("stage") in PREMATCH_STAGE_ORDER}
+    complete_timeline = complete_prematch_timeline(history)
+    by_stage = {row.get("stage"): row for row in complete_timeline}
     timeline = []
     for stage in PREMATCH_STAGE_ORDER:
         row = by_stage.get(stage)
-        if not row:
-            timeline.append({"stage": stage, "status": "data_missing", "reason": "historical checkpoint was not captured; current odds were not backfilled"})
+        if not row or row.get("timeline_status") != "available":
+            timeline.append({"stage": stage, "status": "data_missing", "reason": (row or {}).get("missing_reason") or "historical checkpoint was not captured or failed timing audit; current odds were not backfilled"})
             continue
         ms = row.get("market_snapshot") or {}
         primary = ms.get("consensus_main_line") or ms.get("primary") or {}
@@ -3119,8 +3120,9 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
             "market_dynamics": row.get("market_dynamics"),
             "collection_profile": get_nested(row, ["coverage"], {})
         })
-    latest = history[-1] if history else None
-    first = history[0] if history else None
+    available_history = [row for row in complete_timeline if row.get("timeline_status") == "available"]
+    latest = latest_prematch_snapshot(available_history)
+    first = min(available_history, key=lambda row: PREMATCH_STAGE_ORDER.index(row.get("stage")), default=None)
     first_ah = line_from_primary(get_nested(first or {}, ["market_snapshot", "primary", "asian_handicap"]))
     latest_ah = line_from_primary(get_nested(latest or {}, ["market_snapshot", "primary", "asian_handicap"]))
     total_ah_move = latest_ah - first_ah if first_ah is not None and latest_ah is not None else None
@@ -3128,7 +3130,7 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
     script = pure_fundamental_script(data)
     versions = get_fundamental_versions(fixture)
     decision = decision_layer(si.get("odds_market_snapshot") or empty_market_snapshot())
-    decision["line_movement"] = latest.get("market_dynamics") if latest else {"status": "data_missing"}
+    decision = apply_line_movement_gate(decision, history)
     upstream_ok = bool(data.get("ok")) and bool(data.get("fixture"))
     return {
         "ok": upstream_ok,
@@ -3151,9 +3153,10 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
         "market": {
             "current": si.get("odds_market_snapshot"),
             "saved_stage_count": len(history),
+            "available_prematch_stage_count": len(available_history),
             "saved_stages": [x.get("stage") for x in history],
             "required_timeline": PREMATCH_STAGE_ORDER,
-            "missing_stages": [x for x in PREMATCH_STAGE_ORDER if x not in by_stage],
+            "missing_stages": [row.get("stage") for row in complete_timeline if row.get("timeline_status") != "available"],
             "timeline": timeline,
             "total_asian_handicap_move": total_ah_move,
             "latest_dynamics": latest.get("market_dynamics") if latest else None,
