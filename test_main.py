@@ -86,6 +86,31 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         finally:
             main.API_FOOTBALL_KEY, main.API_FOOTBALL_RATE_LIMIT_UNTIL = original_key, original_cooldown
 
+    def test_other_providers_reject_explicit_http_200_business_errors(self):
+        original_stats, original_odds = main.THESTATS_API_KEY, main.THE_ODDS_API_KEY
+        main.THESTATS_API_KEY, main.THE_ODDS_API_KEY = "stats-key", "odds-key"
+        response = unittest.mock.Mock()
+        response.ok, response.status_code, response.url, response.headers = True, 200, "https://example.test", {}
+        try:
+            response.json.return_value = {"success": False, "error": "subscription required"}
+            with patch("main.requests.get", return_value=response):
+                stats = main.call_thestats("/events")
+            self.assertFalse(stats["ok"])
+            self.assertEqual(stats["error"], "thestats_business_error")
+
+            response.json.return_value = {"status": "error", "message": "invalid market"}
+            with patch("main.requests.get", return_value=response):
+                odds = main.call_the_odds_api("/sports")
+            self.assertFalse(odds["ok"])
+            self.assertEqual(odds["error"], "the_odds_api_business_error")
+
+            response.json.return_value = [{"key": "soccer"}]
+            with patch("main.requests.get", return_value=response):
+                valid = main.call_the_odds_api("/sports")
+            self.assertTrue(valid["ok"])
+        finally:
+            main.THESTATS_API_KEY, main.THE_ODDS_API_KEY = original_stats, original_odds
+
     def test_injury_fetch_failure_is_not_treated_as_zero_injuries(self):
         failed = main.injuries_summary({"ok": False, "status_code": 503}, 1, 2)
         self.assertFalse(failed["available"])

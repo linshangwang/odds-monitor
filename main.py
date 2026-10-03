@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.22.0"
+VERSION = "1.23.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -165,6 +165,20 @@ def api_football_business_error(payload: Any) -> Optional[str]:
     return "api_football_business_error"
 
 
+def root_business_error(payload: Any, source: str) -> Optional[str]:
+    if not isinstance(payload, (dict, list)):
+        return f"{source}_invalid_payload"
+    if isinstance(payload, list):
+        return None
+    if payload.get("error") not in (None, "", {}, []):
+        return f"{source}_business_error"
+    if payload.get("errors") not in (None, "", {}, []):
+        return f"{source}_business_error"
+    if payload.get("success") is False or str(payload.get("status") or "").lower() in ("error", "failed", "failure"):
+        return f"{source}_business_error"
+    return None
+
+
 def call_api_football(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     global API_FOOTBALL_RATE_LIMIT_UNTIL
     if not API_FOOTBALL_KEY:
@@ -200,7 +214,9 @@ def call_thestats(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
     headers = {"Authorization": f"Bearer {THESTATS_API_KEY}", "Accept": "application/json"}
     try:
         resp = requests.get(url, params=params or {}, headers=headers, timeout=REQUEST_TIMEOUT)
-        return {"ok": resp.ok, "status_code": resp.status_code, "request_url": mask_secret(resp.url), "data": safe_json_response(resp)}
+        payload = safe_json_response(resp)
+        business_error = root_business_error(payload, "thestats")
+        return {"ok": bool(resp.ok and not business_error), "status_code": resp.status_code, "request_url": mask_secret(resp.url), "data": payload, "error": business_error}
     except requests.RequestException as exc:
         return {"ok": False, "error": mask_secret(str(exc)), "request_url": mask_secret(url)}
 
@@ -217,10 +233,13 @@ def call_the_odds_api(path: str, params: Optional[Dict[str, Any]] = None) -> Dic
 
     try:
         resp = requests.get(url, params=query, timeout=REQUEST_TIMEOUT)
+        payload = safe_json_response(resp)
+        business_error = root_business_error(payload, "the_odds_api")
         return {
-            "ok": resp.ok,
+            "ok": bool(resp.ok and not business_error),
             "status_code": resp.status_code,
-            "data": safe_json_response(resp),
+            "data": payload,
+            "error": business_error,
             "quota_remaining": resp.headers.get("x-requests-remaining"),
             "quota_used": resp.headers.get("x-requests-used")
         }

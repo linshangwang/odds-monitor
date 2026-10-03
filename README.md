@@ -98,6 +98,7 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 - `Execution Ability` 与 `Goal Conversion` 只认真实可用统计和实际数值；仅存在 `{available:false}` 空结构不会提升基本面覆盖率。
 - 上游覆盖率同时要求请求成功与有效响应；错误响应即使携带内容也标记 `response_present_but_unusable`，不能提升 `data_quality`。
 - API-Football 的 HTTP 200 还会检查业务层 `errors`；权限/配额/参数错误不再算成功，配额类错误会启动冷却以避免持续无效调用。
+- TheStats 与 The Odds API 同样检查顶层业务错误；HTTP 200 中明确的 `error/errors`、`success:false` 或失败状态不会被当作有效数据。
 - 每个节点保存 1X2、亚洲让球、大小球，并在上游提供时保存 BTTS、主队进球数、客队进球数。
 - `primary` 字段继续保留以兼容旧调用方，但内容改为基于完整公司数组计算的 `consensus_main_line`，不再机械取第一家公司。
 - 显著跨档、异常价格或跨市场背离会触发基本面重新采集，并保存基本面版本、触发原因、变量变化、概率变化和最优盘口变化。
