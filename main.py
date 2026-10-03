@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.23.0"
+VERSION = "1.24.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -179,6 +179,20 @@ def root_business_error(payload: Any, source: str) -> Optional[str]:
     return None
 
 
+def nami_business_error(payload: Any) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return "nami_invalid_payload"
+    for key in ("err", "error", "errors"):
+        if payload.get(key) not in (None, "", {}, []):
+            return mask_secret(str(payload.get(key)))
+    code = payload.get("code")
+    if code not in (None, 0, "0", ""):
+        return mask_secret(str(payload.get("message") or payload.get("msg") or f"nami_code_{code}"))
+    if payload.get("success") is False or str(payload.get("status") or "").lower() in ("error", "failed", "failure"):
+        return mask_secret(str(payload.get("message") or payload.get("msg") or "nami_business_error"))
+    return None
+
+
 def call_api_football(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     global API_FOOTBALL_RATE_LIMIT_UNTIL
     if not API_FOOTBALL_KEY:
@@ -264,7 +278,7 @@ def call_nami(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, A
             payload = redact_secrets(response.json())
         except Exception:
             payload = {"error": "non_json_response"}
-        upstream_error = payload.get("err") if isinstance(payload, dict) else None
+        upstream_error = nami_business_error(payload)
         ok = bool(response.ok and not upstream_error)
         return {
             "ok": ok, "available": ok, "degraded": not ok, "required": False,

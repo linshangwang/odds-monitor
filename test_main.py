@@ -1494,6 +1494,27 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         finally:
             main.NAMI_API_USER, main.NAMI_API_SECRET = original_user, original_secret
 
+    def test_nami_nonzero_code_and_false_success_degrade_without_breaking_system(self):
+        original_user, original_secret = main.NAMI_API_USER, main.NAMI_API_SECRET
+        main.NAMI_API_USER, main.NAMI_API_SECRET = "user-value", "secret-value"
+        response = unittest.mock.Mock()
+        response.ok, response.status_code = True, 200
+        try:
+            for payload in (
+                {"code": 1001, "message": "product not entitled", "results": {"match": [{"id": 1}]}},
+                {"success": False, "msg": "temporary upstream failure"},
+            ):
+                response.json.return_value = payload
+                with patch("main.requests.get", return_value=response):
+                    result = main.call_nami("/api/v5/football/match/schedule/diary")
+                self.assertFalse(result["ok"])
+                self.assertFalse(result["available"])
+                self.assertTrue(result["degraded"])
+                self.assertEqual(result["fallback"], "continue_without_nami")
+                self.assertTrue(main.health()["ok"])
+        finally:
+            main.NAMI_API_USER, main.NAMI_API_SECRET = original_user, original_secret
+
     def test_nami_capability_uses_entitled_v5_realtime_endpoint(self):
         payload = {
             "code": 0,
