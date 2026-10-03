@@ -514,6 +514,17 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["market"], "over_under")
         self.assertEqual(result["maximum_absolute_probability_gap"], .09)
 
+    def test_no_vig_rejects_implausible_market_overround(self):
+        self.assertIsNone(main.no_vig_probabilities({"home": 1000, "draw": 1000, "away": 1000}, ["home", "draw", "away"]))
+        self.assertIsNone(main.no_vig_probabilities({"yes": 1.01, "no": 1.01}, ["yes", "no"]))
+        valid = main.no_vig_probabilities({"home": 2.0, "draw": 3.5, "away": 4.0}, ["home", "draw", "away"])
+        self.assertAlmostEqual(sum(valid.values()), 1.0, places=5)
+
+    def test_market_no_vig_rejects_zero_probability_and_reports_invalid_fallback(self):
+        probabilities, method = main.market_no_vig_probabilities({"consensus_no_vig_probabilities": {"yes": 1.0, "no": 0.0}}, ["yes", "no"])
+        self.assertIsNone(probabilities)
+        self.assertEqual(method, "invalid_or_missing_market_prices")
+
     def test_decision_layer_enforces_minimums_and_probability_validation(self):
         snapshot = main.empty_market_snapshot()
         snapshot["consensus_main_line"]["1x2"] = {"home": 2.0, "draw": 3.5, "away": 4.0}

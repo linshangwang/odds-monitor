@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -40,6 +40,8 @@ HIGH_VARIANCE_MIN_SCRIPT_COVERAGE = float(os.getenv("HIGH_VARIANCE_MIN_SCRIPT_CO
 MIN_CONSENSUS_BOOKMAKERS = max(1, int(os.getenv("MIN_CONSENSUS_BOOKMAKERS", "2")))
 MAX_CONSENSUS_PRICE_SPREAD = max(0.01, float(os.getenv("MAX_CONSENSUS_PRICE_SPREAD", "0.25")))
 MAX_CONSENSUS_NO_VIG_PROBABILITY_SPREAD = max(0.005, float(os.getenv("MAX_CONSENSUS_NO_VIG_PROBABILITY_SPREAD", "0.05")))
+MIN_MARKET_IMPLIED_PROBABILITY_TOTAL = min(1.0, max(0.5, float(os.getenv("MIN_MARKET_IMPLIED_PROBABILITY_TOTAL", "0.80"))))
+MAX_MARKET_IMPLIED_PROBABILITY_TOTAL = max(1.0, min(2.0, float(os.getenv("MAX_MARKET_IMPLIED_PROBABILITY_TOTAL", "1.40"))))
 AUTO_SNAPSHOT_ENABLED = os.getenv("AUTO_SNAPSHOT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 AUTO_SNAPSHOT_POLL_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_POLL_SECONDS", "300")))
 AUTO_SNAPSHOT_WINDOW_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_WINDOW_SECONDS", "600")))
@@ -1795,16 +1797,19 @@ def no_vig_probabilities(odds: Dict[str, Any], keys: List[str]) -> Optional[Dict
     if len(implied) != len(keys):
         return None
     total = sum(implied.values())
+    if not MIN_MARKET_IMPLIED_PROBABILITY_TOTAL <= total <= MAX_MARKET_IMPLIED_PROBABILITY_TOTAL:
+        return None
     return {key: round(value / total, 6) for key, value in implied.items()}
 
 
 def market_no_vig_probabilities(market: Dict[str, Any], keys: List[str]) -> Tuple[Optional[Dict[str, float]], str]:
     embedded = market.get("consensus_no_vig_probabilities") if isinstance(market.get("consensus_no_vig_probabilities"), dict) else None
     embedded_values = {key: as_float((embedded or {}).get(key)) for key in keys}
-    embedded_valid = bool(embedded) and all(value is not None and 0 <= value <= 1 for value in embedded_values.values()) and abs(sum(embedded_values.values()) - 1.0) <= 0.02
+    embedded_valid = bool(embedded) and all(value is not None and 0 < value < 1 for value in embedded_values.values()) and abs(sum(embedded_values.values()) - 1.0) <= 0.02
     if embedded_valid:
         return {key: round(embedded_values[key], 6) for key in keys}, "bookmaker_level_no_vig_consensus"
-    return no_vig_probabilities(market, keys), "no_vig_from_consensus_median_prices"
+    fallback = no_vig_probabilities(market, keys)
+    return fallback, "no_vig_from_consensus_median_prices" if fallback else "invalid_or_missing_market_prices"
 
 
 def poisson_probability_model(home_expected_goals: Any, away_expected_goals: Any, input_confidence: Any, provenance: Any, max_goals: int = 10) -> Dict[str, Any]:
@@ -2073,7 +2078,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
         "line_movement": None, "lineup_confidence": lineup_confidence_value,
         "death_path": normalized_death_path, "death_path_audit": {"valid": death_path_valid, "maximum_items": 20, "maximum_item_length": 300}, "pass_reasons": pass_reasons,
         "settlement_policy": {"supported_line_increment": 0.25, "quarter_lines": "split into adjacent half-lines", "push_half_win_half_loss": "included in model EV", "unsupported_lines": "PASS"},
-        "thresholds": {"minimum_edge": MIN_EDGE, "minimum_ev": MIN_EV, "minimum_script_coverage": MIN_SCRIPT_COVERAGE, "high_variance_minimum_script_coverage": HIGH_VARIANCE_MIN_SCRIPT_COVERAGE, "maximum_crowding": MAX_CROWDING, "minimum_lineup_confidence": MIN_LINEUP_CONFIDENCE, "minimum_consensus_bookmakers": MIN_CONSENSUS_BOOKMAKERS, "maximum_consensus_price_spread_reference": MAX_CONSENSUS_PRICE_SPREAD, "maximum_consensus_no_vig_probability_spread": MAX_CONSENSUS_NO_VIG_PROBABILITY_SPREAD},
+        "thresholds": {"minimum_edge": MIN_EDGE, "minimum_ev": MIN_EV, "minimum_script_coverage": MIN_SCRIPT_COVERAGE, "high_variance_minimum_script_coverage": HIGH_VARIANCE_MIN_SCRIPT_COVERAGE, "maximum_crowding": MAX_CROWDING, "minimum_lineup_confidence": MIN_LINEUP_CONFIDENCE, "minimum_consensus_bookmakers": MIN_CONSENSUS_BOOKMAKERS, "maximum_consensus_price_spread_reference": MAX_CONSENSUS_PRICE_SPREAD, "maximum_consensus_no_vig_probability_spread": MAX_CONSENSUS_NO_VIG_PROBABILITY_SPREAD, "minimum_market_implied_probability_total": MIN_MARKET_IMPLIED_PROBABILITY_TOTAL, "maximum_market_implied_probability_total": MAX_MARKET_IMPLIED_PROBABILITY_TOTAL},
     }
 
 
