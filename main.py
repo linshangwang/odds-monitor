@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.91.0"
+VERSION = "0.92.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -610,6 +610,55 @@ def data_quality(coverage: Dict[str, Any]) -> Dict[str, Any]:
     return {"level": level, "missing_must": missing_must, "missing_strong": missing_strong}
 
 
+def lineup_summary(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize API-Football confirmed XI without confusing empty/predicted data with fetch failures."""
+    fetched_at = int(time.time())
+    if not isinstance(result, dict) or not result.get("ok"):
+        return {
+            "available": False, "confirmed": False, "status": "fetch_failed",
+            "source": "api_football", "fetched_at": fetched_at,
+            "confidence": 0.0, "error": (result or {}).get("error") or ("http_" + str((result or {}).get("status_code"))) if result else "missing_result",
+            "teams": []
+        }
+    rows = response_list(result)
+    if not rows:
+        return {
+            "available": False, "confirmed": False, "status": "not_available_yet",
+            "source": "api_football", "fetched_at": fetched_at,
+            "confidence": 0.0, "teams": []
+        }
+    teams = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        team = row.get("team") or {}
+        coach = row.get("coach") or {}
+        start = row.get("startXI") or []
+        starters = []
+        for item in start:
+            player = (item or {}).get("player") or {}
+            starters.append({
+                "id": player.get("id"), "name": player.get("name"),
+                "number": player.get("number"), "pos": player.get("pos"),
+                "grid": player.get("grid")
+            })
+        teams.append({
+            "team_id": team.get("id"), "team_name": team.get("name"),
+            "formation": row.get("formation"),
+            "coach": {"id": coach.get("id"), "name": coach.get("name")},
+            "starting_xi": starters, "starter_count": len(starters)
+        })
+    counts = [x.get("starter_count", 0) for x in teams]
+    confirmed = len(teams) >= 2 and all(x >= 11 for x in counts[:2])
+    confidence = 1.0 if confirmed else (0.8 if len(teams) >= 2 and all(x > 0 for x in counts[:2]) else 0.5)
+    return {
+        "available": bool(teams), "confirmed": confirmed,
+        "status": "confirmed" if confirmed else "partial",
+        "source": "api_football", "fetched_at": fetched_at,
+        "confidence": confidence, "teams": teams
+    }
+
+
 def collect_prematch_data(fixture_id: int, include_raw: bool = False) -> Dict[str, Any]:
     ctx = parse_fixture_context(fixture_id)
     if ctx.get("error"):
@@ -634,7 +683,7 @@ def collect_prematch_data(fixture_id: int, include_raw: bool = False) -> Dict[st
         response = data.get("response") if isinstance(data, dict) else None
         coverage[name] = {"ok": result.get("ok"), "status_code": result.get("status_code"), "results": data.get("results") if isinstance(data, dict) else None, "has_data": bool(response), "request_url": result.get("request_url")}
     market_snapshot = extract_market_snapshot(calls.get("odds_prematch", {}))
-    structured = {"standings": {"home": standings_for_team(calls.get("standings", {}), home_id), "away": standings_for_team(calls.get("standings", {}), away_id)}, "recent_form_last_10": {"home": recent_form(response_list(calls.get("home_recent_10", {})), home_id), "away": recent_form(response_list(calls.get("away_recent_10", {})), away_id)}, "season_stats": {"home": season_stats_summary(calls.get("home_team_season_stats", {})), "away": season_stats_summary(calls.get("away_team_season_stats", {}))}, "head_to_head_count": len(response_list(calls.get("head_to_head_last_10", {}))), "injuries": injuries_summary(calls.get("injuries", {}), home_id, away_id), "prediction": prediction_summary(calls.get("predictions", {})), "odds": odds_summary(calls.get("odds_prematch", {})), "odds_market_snapshot": market_snapshot, "lineups_available": coverage.get("lineups", {}).get("has_data", False), "snapshot_requirements": {"required_markets": ["1x2", "asian_handicap", "over_under"], "optional_markets": ["btts", "home_team_total", "away_team_total"], "metrics_supported": ["line_crossing", "continuous_strengthening", "reversal", "market_saturation", "cross_market_divergence", "fundamental_revalidation"]}}
+    structured = {"standings": {"home": standings_for_team(calls.get("standings", {}), home_id), "away": standings_for_team(calls.get("standings", {}), away_id)}, "recent_form_last_10": {"home": recent_form(response_list(calls.get("home_recent_10", {})), home_id), "away": recent_form(response_list(calls.get("away_recent_10", {})), away_id)}, "season_stats": {"home": season_stats_summary(calls.get("home_team_season_stats", {})), "away": season_stats_summary(calls.get("away_team_season_stats", {}))}, "head_to_head_count": len(response_list(calls.get("head_to_head_last_10", {}))), "injuries": injuries_summary(calls.get("injuries", {}), home_id, away_id), "prediction": prediction_summary(calls.get("predictions", {})), "odds": odds_summary(calls.get("odds_prematch", {})), "odds_market_snapshot": market_snapshot, "lineups": lineup_summary(calls.get("lineups", {})), "lineups_available": lineup_summary(calls.get("lineups", {})).get("available", False), "snapshot_requirements": {"required_markets": ["1x2", "asian_handicap", "over_under"], "optional_markets": ["btts", "home_team_total", "away_team_total"], "metrics_supported": ["line_crossing", "continuous_strengthening", "reversal", "market_saturation", "cross_market_divergence", "fundamental_revalidation"]}}
     quality = data_quality(coverage)
     return {"ok": True, "version": VERSION, "generated_at": int(time.time()), "fixture": {k: v for k, v in ctx.items() if k not in ["fixture_detail", "fixture_row"]}, "coverage": coverage, "data_quality": quality, "structured_inputs": structured, "shadow_summary": make_shadow_summary(ctx, structured, quality), "football_ai_prompt": make_prompt(ctx), "raw_data_pack": {"fixture_detail": ctx.get("fixture_detail"), **{k: compact_result(v) for k, v in calls.items()}} if include_raw else None}
 
@@ -671,7 +720,8 @@ def collect_stage_snapshot_data(fixture_id: int, stage: str) -> Dict[str, Any]:
         "structured_inputs": {
             "odds_market_snapshot": market_snapshot,
             "injuries": injuries_summary(calls.get("injuries", {}), home_id, away_id) if "injuries" in calls else {"available": False, "reason": "not_requested_at_this_stage"},
-            "lineups_available": coverage.get("lineups", {}).get("has_data", False),
+            "lineups": lineup_summary(calls.get("lineups", {})) if "lineups" in calls else {"available": False, "confirmed": False, "status": "not_requested_at_this_stage", "source": "api_football", "confidence": 0.0, "teams": []},
+            "lineups_available": lineup_summary(calls.get("lineups", {})).get("available", False) if "lineups" in calls else False,
             "collection_profile": "late_market_plus_team_news" if stage in ("T-1h", "T-15m", "Closing") else "market_only"
         },
         "shadow_summary": {
