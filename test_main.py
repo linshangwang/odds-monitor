@@ -23,6 +23,20 @@ class ShadowV4UpgradeTests(unittest.TestCase):
     def test_complete_timeline_contains_opening(self):
         self.assertEqual(main.PREMATCH_STAGE_ORDER, ["Opening", "T-24h", "T-12h", "T-6h", "T-3h", "T-1h", "T-15m", "Closing"])
 
+    def test_opening_is_never_synthesized_from_scheduled_current_odds(self):
+        kickoff = main.datetime.now(main.timezone.utc) + main.timedelta(hours=48)
+        opening = next(stage for stage in main.TRACKING_STAGES if stage["key"] == "Opening")
+        self.assertFalse(main.auto_snapshot_stage_due(main.datetime.now(main.timezone.utc), kickoff, opening))
+        plan = main.tracking_plan_for_fixture({"fixture_id": 1, "home": "H", "away": "A", "date": kickoff.isoformat(), "status": "NS"})
+        opening_plan = next(row for row in plan["tracking"] if row["stage"] == "Opening")
+        self.assertEqual(opening_plan["status"], "requires_verified_opening_source")
+        self.assertFalse(opening_plan["automatic_collection"])
+        self.assertIsNone(opening_plan["action_url"])
+        with patch.object(main, "SHADOW_ACCESS_TOKEN", ""), self.assertRaises(main.HTTPException) as rejected:
+            main.shadow_snapshot(1, "Opening", token=None, authorization=None, x_shadow_token=None)
+        self.assertEqual(rejected.exception.status_code, 400)
+        self.assertEqual(rejected.exception.detail["error"], "verified_opening_source_required")
+
     def test_late_stage_team_news_snapshot_persists_confirmed_xi(self):
         data = {"generated_at": 1000, "structured_inputs": {"injuries": {"available": True}, "lineups": {"available": True, "confirmed": True, "teams": [{"team_name": "Home", "starter_count": 11, "starting_xi": [{"name": "Player"}]}]}}}
         snapshot = main.team_news_snapshot(data, "T-1h")

@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.24.0"
+VERSION = "1.25.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -84,7 +84,7 @@ raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 
 TRACKING_STAGES = [
-    {"key": "Opening", "label": "Opening 开盘", "offset": timedelta(hours=-48), "purpose": "保存首次真实可得盘口；不得由后续盘口反推"},
+    {"key": "Opening", "label": "Opening 开盘", "offset": timedelta(hours=-48), "purpose": "仅保存有来源证明的真实开盘；自动当前赔率不得冒充开盘"},
     {"key": "T-24h", "label": "T-24h 初判", "offset": timedelta(hours=-24), "purpose": "初始基本面与早盘定位"},
     {"key": "T-12h", "label": "T-12h 早盘确认", "offset": timedelta(hours=-12), "purpose": "早盘/水位第一次确认"},
     {"key": "T-6h", "label": "T-6h 盘口/赔率确认", "offset": timedelta(hours=-6), "purpose": "盘口持续性与赔率结构确认"},
@@ -894,7 +894,8 @@ def tracking_plan_for_fixture(summary: Dict[str, Any]) -> Dict[str, Any]:
     items = []
     for stage in TRACKING_STAGES:
         when = dt + stage["offset"]
-        items.append({"stage": stage["key"], "label": stage["label"], "purpose": stage["purpose"], "utc_time": when.isoformat(), "status": "due_or_passed" if now >= when else "pending", "action_url": f"/shadow/snapshot?fixture={summary.get('fixture_id')}&stage={stage['key']}"})
+        external_only = stage["key"] == "Opening"
+        items.append({"stage": stage["key"], "label": stage["label"], "purpose": stage["purpose"], "utc_time": None if external_only else when.isoformat(), "status": "requires_verified_opening_source" if external_only else ("due_or_passed" if now >= when else "pending"), "automatic_collection": not external_only, "action_url": None if external_only else f"/shadow/snapshot?fixture={summary.get('fixture_id')}&stage={stage['key']}"})
     return {"fixture_id": summary.get("fixture_id"), "match": f"{summary.get('home')} vs {summary.get('away')}", "kickoff_utc": dt.isoformat(), "status": summary.get("status"), "tracking": items}
 
 
@@ -3062,6 +3063,8 @@ def shadow_tracking_plan(date: str, timezone_name: str = Query("Asia/Shanghai", 
 def shadow_snapshot(fixture: int, stage: str = "manual", raw: bool = False, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     normalized = normalize_stage(stage)
+    if normalized == "Opening":
+        raise HTTPException(status_code=400, detail={"error": "verified_opening_source_required", "reason": "current_odds_cannot_be_saved_as_opening", "allowed_path": "/shadow/import-prematch-packets"})
     if normalized not in STAGE_ORDER and normalized != "manual":
         raise HTTPException(status_code=400, detail={"error": "unsupported_stage", "allowed": STAGE_ORDER, "received": stage})
     data = collect_prematch_data(fixture, include_raw=raw)
@@ -3593,6 +3596,8 @@ async def sportradar_push_statistics(request: Request):
 
 
 def auto_snapshot_stage_due(now: datetime, kickoff: datetime, stage: Dict[str, Any]) -> bool:
+    if stage.get("key") == "Opening":
+        return False
     due = kickoff + stage["offset"]
     delta = (now - due).total_seconds()
     if abs(delta) > AUTO_SNAPSHOT_WINDOW_SECONDS:
@@ -3746,7 +3751,7 @@ def bootstrap_current_snapshot_once() -> Dict[str, Any]:
         return {"fixture": fixture_id, "match": f"{fx.get('home')} vs {fx.get('away')}", "status": "skipped", "reason": "history_exists", "saved_stage_count": len(history)}
     kickoff = fixture_datetime_utc(fx)
     now = datetime.now(timezone.utc)
-    prematch_stages = [x for x in TRACKING_STAGES if x["key"] != "FT"]
+    prematch_stages = [x for x in TRACKING_STAGES if x["key"] not in ("Opening", "FT")]
     due = [x for x in prematch_stages if now >= kickoff + x["offset"]]
     if not due:
         return {"fixture": fixture_id, "status": "skipped", "reason": "before_t24h"}
