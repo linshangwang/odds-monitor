@@ -1681,6 +1681,10 @@ def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict
     with SNAPSHOT_STORE_LOCK:
         store = load_snapshot_store()
         rows = store.setdefault("fundamental_versions", {}).setdefault(str(fixture), [])
+        requested_previous_version = (previous or {}).get("version_number")
+        persisted_previous = max(rows, key=lambda row: (int(row.get("version_number") or 0), int(row.get("created_at") or 0)), default=None)
+        previous = persisted_previous or previous
+        comparison_rebased = bool(persisted_previous) and requested_previous_version != persisted_previous.get("version_number")
         old_script = (previous or {}).get("script") or {}
         has_previous = bool(previous)
         changed_sections = [key for key in FUNDAMENTAL_CHAIN if has_previous and get_nested(old_script, ["chain", key]) != get_nested(script, ["chain", key])]
@@ -1692,6 +1696,16 @@ def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict
         normalized_trigger = normalize_revalidation_trigger(trigger)
         probability_change = probability_change or {"status": "data_missing", "reason": "no independent model probability supplied"}
         best_market_change = best_market_change or {"status": "data_missing", "reason": "decision inputs incomplete"}
+        if comparison_rebased and "after" in probability_change:
+            before_probability = get_nested(old_script, ["model", "probabilities", "1x2"])
+            after_probability = probability_change.get("after")
+            probability_change = {
+                "before": before_probability, "after": after_probability,
+                "delta": {key: round(after_probability[key] - before_probability[key], 6) for key in ("home", "draw", "away")} if isinstance(before_probability, dict) and isinstance(after_probability, dict) and all(key in before_probability and key in after_probability for key in ("home", "draw", "away")) else None,
+            }
+        if comparison_rebased and "after" in best_market_change:
+            latest_best = get_nested(previous or {}, ["best_market_change", "after"])
+            best_market_change = {**best_market_change, "before": latest_best, "changed": latest_best != best_market_change.get("after")}
         prior_version_number = (previous or {}).get("version_number")
         script_changed = has_previous and (old_script.get("content_hash") != script.get("content_hash") or bool(changed_sections))
         record = {
@@ -1704,6 +1718,8 @@ def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict
                 "performed": True,
                 "baseline_created": not has_previous,
                 "comparison_available": has_previous,
+                "requested_previous_version_number": requested_previous_version,
+                "comparison_rebased_to_latest": comparison_rebased,
                 "fundamental_changed": script_changed,
                 "probability_changed": probability_change.get("before") != probability_change.get("after") if has_previous and "after" in probability_change else None,
                 "best_market_changed": best_market_change.get("changed") if has_previous and "changed" in best_market_change else None,

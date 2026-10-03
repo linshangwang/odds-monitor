@@ -815,6 +815,23 @@ class ShadowV4UpgradeTests(unittest.TestCase):
                 main.save_fundamental_version(9, script, {"triggered": False})
         self.assertEqual([row["version_number"] for row in main.get_fundamental_versions(9)], [3, 4, 5])
 
+    def test_fundamental_version_rebases_stale_concurrent_comparison(self):
+        chain = {key: {"status": "data_missing"} for key in main.FUNDAMENTAL_CHAIN}
+        first = main.save_fundamental_version(10, {"content_hash": "v1", "chain": chain, "model": {"probabilities": {"1x2": {"home": .4, "draw": .3, "away": .3}}}}, {"triggered": False})
+        second = main.save_fundamental_version(10, {"content_hash": "v2", "chain": {**chain, "goal_conversion": {"status": "partial"}}, "model": {"probabilities": {"1x2": {"home": .45, "draw": .3, "away": .25}}}}, {"triggered": True}, first, best_market_change={"before": None, "after": {"market": "1x2", "selection": "home"}, "changed": True})
+        third = main.save_fundamental_version(
+            10, {"content_hash": "v3", "chain": {**chain, "goal_conversion": {"status": "available"}}, "model": {"probabilities": {"1x2": {"home": .5, "draw": .3, "away": .2}}}},
+            {"triggered": True}, first,
+            probability_change={"before": {"home": .4, "draw": .3, "away": .3}, "after": {"home": .5, "draw": .3, "away": .2}},
+            best_market_change={"before": None, "after": {"market": "over_under", "selection": "over"}, "changed": True},
+        )
+        self.assertEqual(third["previous_version_number"], second["version_number"])
+        self.assertTrue(third["recalculation_audit"]["comparison_rebased_to_latest"])
+        self.assertEqual(third["recalculation_audit"]["requested_previous_version_number"], first["version_number"])
+        self.assertEqual(third["probability_change"]["before"]["home"], .45)
+        self.assertAlmostEqual(third["probability_change"]["delta"]["home"], .05)
+        self.assertEqual(third["best_market_change"]["before"]["selection"], "home")
+
     def test_fundamental_chain_audit_requires_critical_sections_and_minimum_coverage(self):
         chain = {key: {"status": "available", "evidence": f"verified-{key}", "source": "trusted-feed", "observed_at": "2026-10-03T00:00:00Z"} for key in main.FUNDAMENTAL_CHAIN}
         chain["result_utility"].update({"home": {"win": 1, "draw": 0, "loss": -1}, "away": {"win": 1, "draw": 0, "loss": -1}})
