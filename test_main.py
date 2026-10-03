@@ -23,6 +23,14 @@ class ShadowV4UpgradeTests(unittest.TestCase):
     def test_complete_timeline_contains_opening(self):
         self.assertEqual(main.PREMATCH_STAGE_ORDER, ["Opening", "T-24h", "T-12h", "T-6h", "T-3h", "T-1h", "T-15m", "Closing"])
 
+    def test_late_stage_team_news_snapshot_persists_confirmed_xi(self):
+        data = {"generated_at": 1000, "structured_inputs": {"injuries": {"available": True}, "lineups": {"available": True, "confirmed": True, "teams": [{"team_name": "Home", "starter_count": 11, "starting_xi": [{"name": "Player"}]}]}}}
+        snapshot = main.team_news_snapshot(data, "T-1h")
+        self.assertEqual(snapshot["captured_at"], 1000)
+        self.assertTrue(snapshot["lineups"]["confirmed"])
+        self.assertEqual(snapshot["lineups"]["teams"][0]["starting_xi"][0]["name"], "Player")
+        self.assertIsNone(main.team_news_snapshot(data, "T-3h"))
+
     def test_shadow_token_resolution_prefers_headers_without_breaking_query_compatibility(self):
         self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer", "header"), "header")
         self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer", None), "bearer")
