@@ -725,6 +725,21 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(combination["optional_extension_count"], 2)
         self.assertEqual(combination["suggested_options"][-1]["risk_label"], "expanded_high_variance")
 
+    def test_portfolio_priority_has_human_readable_match_and_selection(self):
+        candidate = {"market": "over_under", "selection": "under", "line": 2.5, "price": 1.9, "script_coverage": .9, "edge": .06, "ev": .08}
+        rows = [
+            {"fixture": f"f{index}", "match": {"home_team_name": f"Home {index}", "away_team_name": f"Away {index}"}, "evaluation": {"decision_layer": {"recommendation_tiers": {"first_choice_high_consistency": candidate}}}}
+            for index in range(2)
+        ]
+        ranking = main.build_portfolio(rows, 2)["first_choice_combination"]["priority_ranking"]
+        self.assertEqual(ranking[0]["match_label"], "Home 0 vs Away 0")
+        self.assertEqual(ranking[0]["selection_label"], "under 2.5")
+        self.assertEqual(ranking[0]["display_text"], "Home 0 vs Away 0 · under 2.5")
+
+    def test_portfolio_selection_labels_cover_btts_and_handicap(self):
+        self.assertEqual(main.portfolio_selection_label({"market": "btts", "selection": "yes"}), "BTTS yes")
+        self.assertEqual(main.portfolio_selection_label({"market": "asian_handicap", "selection": "home", "line": -.25}), "home -0.25")
+
     def test_portfolio_selects_recommended_option_by_risk_preference(self):
         rows = []
         for index in range(5):

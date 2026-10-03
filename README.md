@@ -293,6 +293,8 @@ conservative、balanced、aggressive，复核原因必须是数组。异常输�
 不是只能选择 2–3 腿。同一 `correlation_group` 最多一腿，同一比赛不能重复提交。
 组合响应新增 `priority_ranking`：第1–3名标记为 `core_top_three`，第4名以后统一标记为
 `optional_extension`，可直接生成“最可信3腿；如需4腿再加入第4名”的展示格式。
+每个优先项同时提供 `match_label`、`selection_label` 和 `display_text`，例如
+`Home vs Away · under 2.5` 或 `Home vs Away · BTTS yes`，前端无需重新解释盘口字段。
 相关性筛选后不足两腿时直接 `PASS`，不会强行凑单。系统只计算组合展示赔率；由于亚洲盘走盘及跨比赛剩余相关性，
 组合 EV 明确标记为 `data_missing`，不做错误的概率相乘。
 

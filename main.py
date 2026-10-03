@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -2411,11 +2411,28 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
     ) if persist_version else None
     resolved_revalidations = resolve_revalidation_tasks(fixture, version_record, model_market_divergence["triggered"], (latest or {}).get("stage")) if version_record and trigger.get("triggered") and chain_audit.get("decision_eligible") else 0
     return {
-        "ok": True, "version": VERSION, "fixture": fixture, "estimator": estimator, "model": model,
+        "ok": True, "version": VERSION, "fixture": fixture, "match": metadata.get("match"), "estimator": estimator, "model": model,
         "decision_layer": decision, "decision_summary": build_decision_summary(decision, chain_audit, model),
         "fundamental_chain_audit": chain_audit, "fundamental_version": version_record,
         "revalidation_tasks_resolved": resolved_revalidations,
     }
+
+
+def portfolio_selection_label(candidate: Dict[str, Any]) -> str:
+    market, selection, line = candidate.get("market"), candidate.get("selection"), candidate.get("line")
+    numeric_line = as_float(line)
+    if market == "1x2":
+        return {"home": "home win", "draw": "draw", "away": "away win"}.get(selection, str(selection or ""))
+    if market == "asian_handicap":
+        return f"{selection} {numeric_line:+g}" if numeric_line is not None else str(selection or "")
+    if market == "over_under":
+        return f"{selection} {numeric_line:g}" if numeric_line is not None else str(selection or "")
+    if market == "btts":
+        return f"BTTS {selection}"
+    if market in ("home_team_total", "away_team_total"):
+        side = "home team total" if market == "home_team_total" else "away team total"
+        return f"{side} {selection} {numeric_line:g}" if numeric_line is not None else f"{side} {selection}"
+    return ":".join(str(value) for value in (market, selection) if value)
 
 
 def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int, allow_fallback: bool = False, risk_preference: str = "balanced") -> Dict[str, Any]:
@@ -2446,14 +2463,20 @@ def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int,
             continue
         seen_groups.add(group)
         decision_layer_result = get_nested(row, ["evaluation", "decision_layer"]) or {}
-        candidates.append({
+        match = get_nested(row, ["evaluation", "match"]) or row.get("match") or {}
+        match_label = row.get("match_label") or (f"{match.get('home_team_name')} vs {match.get('away_team_name')}" if isinstance(match, dict) and match.get("home_team_name") and match.get("away_team_name") else str(row.get("fixture") or ""))
+        enriched = {
             "fixture": row.get("fixture"), "correlation_group": group, "source_tier": source_tier,
+            "match_label": match_label,
             "lineup_confidence": decision_layer_result.get("lineup_confidence"),
             "crowding": decision_layer_result.get("crowding"),
             "line_movement": decision_layer_result.get("line_movement"),
             "death_path": decision_layer_result.get("death_path") or [],
             **candidate,
-        })
+        }
+        enriched["selection_label"] = portfolio_selection_label(enriched)
+        enriched["display_text"] = f"{match_label} · {enriched['selection_label']}"
+        candidates.append(enriched)
         if tier == "second_choice_higher_return" and source_tier == tier:
             upgraded = True
     if len(candidates) < 2 or (tier == "second_choice_higher_return" and not upgraded):
@@ -2518,7 +2541,7 @@ def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int,
         {
             "rank": index,
             "role": "core_top_three" if index <= 3 else "optional_extension",
-            **{key: candidate.get(key) for key in ("fixture", "market", "selection", "line", "price", "script_coverage", "edge", "ev")},
+            **{key: candidate.get(key) for key in ("fixture", "match_label", "market", "selection", "selection_label", "display_text", "line", "price", "script_coverage", "edge", "ev")},
         }
         for index, candidate in enumerate(candidates, start=1)
     ]
@@ -3188,7 +3211,7 @@ async def shadow_portfolio_evaluate(request: Request, token: Optional[str] = Non
     rows = []
     for match in matches:
         evaluation = evaluate_imported_prematch(match, persist_version=True)
-        rows.append({"fixture": evaluation["fixture"], "correlation_group": match.get("correlation_group") or evaluation["fixture"], "evaluation": evaluation})
+        rows.append({"fixture": evaluation["fixture"], "match": evaluation.get("match"), "correlation_group": match.get("correlation_group") or evaluation["fixture"], "evaluation": evaluation})
     portfolio = build_portfolio(rows, max_legs, risk_preference)
     portfolio_run = save_portfolio_run(portfolio_id, fixtures, portfolio, max_legs, trigger_reasons, stage, _portfolio_change_drivers(rows))
     return JSONResponse({"ok": True, "version": VERSION, "portfolio_id": portfolio_id, "evaluations": rows, "portfolio": portfolio, "portfolio_run": portfolio_run})
