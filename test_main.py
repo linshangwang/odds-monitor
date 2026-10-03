@@ -196,6 +196,24 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["decision"], "PASS")
         self.assertIn("model_probability", result["pass_reasons"])
 
+    def test_line_movement_gate_forces_pass_with_one_real_node(self):
+        decision = {"decision": "home", "best_market": {"market": "1x2"}, "edge": .05, "ev": .08, "pass_reasons": []}
+        history = [{"stage": "T-3h", "snapshot_at": 100, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "data_missing"}}]
+        gated = main.apply_line_movement_gate(decision, history)
+        self.assertEqual(gated["decision"], "PASS")
+        self.assertIsNone(gated["best_market"])
+        self.assertIn("line_movement_requires_two_real_comparable_stages", gated["pass_reasons"])
+
+    def test_line_movement_gate_accepts_two_comparable_real_nodes(self):
+        decision = {"decision": "home", "best_market": {"market": "1x2"}, "edge": .05, "ev": .08, "pass_reasons": []}
+        history = [
+            {"stage": "T-24h", "snapshot_at": 100, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "data_missing"}},
+            {"stage": "T-3h", "snapshot_at": 200, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "compared"}},
+        ]
+        gated = main.apply_line_movement_gate(decision, history)
+        self.assertEqual(gated["decision"], "home")
+        self.assertTrue(gated["line_movement_audit"]["decision_eligible"])
+
     def test_decision_layer_calculates_no_vig_edge_ev(self):
         snapshot = main.empty_market_snapshot()
         snapshot["consensus_main_line"]["1x2"] = {"home": 2.0, "draw": 3.5, "away": 4.0}

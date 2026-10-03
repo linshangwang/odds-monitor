@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.86.0"
+VERSION = "0.87.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -951,6 +951,21 @@ def audit_line_movement_timeline(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "missing_stages": [row["stage"] for row in timeline if row.get("timeline_status") == "data_missing"],
         "current_odds_used_as_history": False,
     }
+
+
+def apply_line_movement_gate(decision: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    audit = audit_line_movement_timeline(history)
+    latest = latest_prematch_snapshot(history)
+    decision["line_movement"] = (latest or {}).get("market_dynamics") or {"status": "data_missing"}
+    decision["line_movement_audit"] = audit
+    if not audit.get("decision_eligible"):
+        decision.setdefault("pass_reasons", []).append(audit.get("reason") or "line_movement_insufficient")
+        decision["pass_reasons"] = list(dict.fromkeys(decision["pass_reasons"]))
+        decision["decision"] = "PASS"
+        decision["best_market"] = None
+        decision["edge"] = None
+        decision["ev"] = None
+    return decision
 
 
 def save_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -2175,21 +2190,17 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
     latest = latest_prematch_snapshot(available)
     market = (latest or {}).get("market_snapshot") or empty_market_snapshot()
     freshness = imported_fixture_freshness(metadata, history)
-    line_movement_audit = audit_line_movement_timeline(history)
     decision = decision_layer(
         market, model.get("probabilities"), payload.get("script_coverage"),
         as_float(payload.get("crowding")), lineup_audit.get("effective_confidence"), payload.get("death_path") or [],
     )
     decision["lineup_confidence_audit"] = lineup_audit
-    decision["line_movement"] = (latest or {}).get("market_dynamics") or {"status": "data_missing"}
-    decision["line_movement_audit"] = line_movement_audit
+    decision = apply_line_movement_gate(decision, history)
     decision["data_freshness"] = freshness
     if model.get("status") != "ready":
         decision["pass_reasons"].append("model_input_confidence_below_0_6")
     if not freshness.get("decision_eligible"):
         decision["pass_reasons"].append(freshness.get("reason") or "data_not_fresh")
-    if not line_movement_audit.get("decision_eligible"):
-        decision["pass_reasons"].append(line_movement_audit["reason"])
     decision["pass_reasons"] = list(dict.fromkeys(decision["pass_reasons"]))
     if decision["pass_reasons"]:
         decision["decision"] = "PASS"
@@ -3173,12 +3184,13 @@ async def shadow_evaluate(request: Request, token: Optional[str] = None):
     payload = await request.json()
     fixture = int(payload.get("fixture"))
     history = get_fixture_snapshots(fixture)
-    current = (history[-1].get("market_snapshot") if history else None) or empty_market_snapshot()
+    latest = latest_prematch_snapshot(history)
+    current = ((latest or {}).get("market_snapshot")) or empty_market_snapshot()
     result = decision_layer(
         current, payload.get("model_probabilities"), payload.get("script_coverage"),
         as_float(payload.get("crowding")), as_float(payload.get("lineup_confidence")), payload.get("death_path") or []
     )
-    result["line_movement"] = history[-1].get("market_dynamics") if history else {"status": "data_missing"}
+    result = apply_line_movement_gate(result, history)
     return JSONResponse({"ok": True, "version": VERSION, "fixture": fixture, "evaluation": result})
 
 
