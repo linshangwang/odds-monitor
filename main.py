@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.92.0"
+VERSION = "0.93.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -133,11 +133,24 @@ def mask_secret(text: str) -> str:
     return text
 
 
+def redact_secrets(value: Any) -> Any:
+    """Recursively remove configured credential values from diagnostic payloads."""
+    if isinstance(value, dict):
+        return {mask_secret(str(key)): redact_secrets(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [redact_secrets(child) for child in value]
+    if isinstance(value, tuple):
+        return [redact_secrets(child) for child in value]
+    if isinstance(value, str):
+        return mask_secret(value)
+    return value
+
+
 def safe_json_response(resp: requests.Response) -> Any:
     try:
-        return resp.json()
+        return redact_secrets(resp.json())
     except Exception:
-        return {"raw_text": resp.text[:2000]}
+        return {"raw_text": mask_secret(resp.text[:2000])}
 
 
 def call_api_football(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -212,7 +225,7 @@ def call_nami(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, A
     try:
         response = requests.get(f"{NAMI_API_BASE_URL}{path}", params=query, timeout=NAMI_REQUEST_TIMEOUT)
         try:
-            payload = response.json()
+            payload = redact_secrets(response.json())
         except Exception:
             payload = {"error": "non_json_response"}
         upstream_error = payload.get("err") if isinstance(payload, dict) else None

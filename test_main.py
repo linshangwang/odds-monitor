@@ -980,6 +980,37 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         finally:
             main.NAMI_API_USER, main.NAMI_API_SECRET = original_user, original_secret
 
+    def test_nami_call_redacts_credentials_echoed_by_upstream(self):
+        original_user, original_secret = main.NAMI_API_USER, main.NAMI_API_SECRET
+        main.NAMI_API_USER, main.NAMI_API_SECRET = "user-value", "secret-value"
+        response = unittest.mock.Mock()
+        response.ok, response.status_code = True, 200
+        response.json.return_value = {
+            "query": {"user": "user-value", "secret": "secret-value"},
+            "nested": ["request for user-value used secret-value"],
+        }
+        try:
+            with patch("main.requests.get", return_value=response):
+                result = main.call_nami("/api/v5/football/match/schedule/diary")
+            rendered = str(result)
+            self.assertNotIn("user-value", rendered)
+            self.assertNotIn("secret-value", rendered)
+            self.assertIn("YOUR_SECRET", rendered)
+        finally:
+            main.NAMI_API_USER, main.NAMI_API_SECRET = original_user, original_secret
+
+    def test_safe_json_response_redacts_all_configured_secrets(self):
+        original_key = main.API_FOOTBALL_KEY
+        main.API_FOOTBALL_KEY = "api-key-value"
+        response = unittest.mock.Mock()
+        response.json.return_value = {"debug": {"authorization": "Bearer api-key-value"}}
+        try:
+            result = main.safe_json_response(response)
+            self.assertNotIn("api-key-value", str(result))
+            self.assertIn("YOUR_SECRET", str(result))
+        finally:
+            main.API_FOOTBALL_KEY = original_key
+
     def test_nami_failure_is_optional_and_degraded(self):
         original_user, original_secret = main.NAMI_API_USER, main.NAMI_API_SECRET
         main.NAMI_API_USER, main.NAMI_API_SECRET = "user-value", "secret-value"
