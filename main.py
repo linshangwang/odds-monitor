@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -379,6 +379,16 @@ def season_stats_summary(result: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def injuries_summary(result: Dict[str, Any], home_id: Optional[int], away_id: Optional[int]) -> Dict[str, Any]:
+    fetched_at = int(time.time())
+    if not isinstance(result, dict) or not result.get("ok"):
+        error = (result or {}).get("error") if isinstance(result, dict) else None
+        status_code = (result or {}).get("status_code") if isinstance(result, dict) else None
+        return {
+            "available": False, "status": "fetch_failed", "source": "api_football",
+            "fetched_at": fetched_at, "home_count": None, "away_count": None,
+            "home": [], "away": [],
+            "error": error or (f"http_{status_code}" if status_code is not None else "missing_result"),
+        }
     home, away = [], []
     for item in response_list(result):
         team_id = get_nested(item, ["team", "id"])
@@ -387,7 +397,11 @@ def injuries_summary(result: Dict[str, Any], home_id: Optional[int], away_id: Op
             home.append(x)
         elif team_id == away_id:
             away.append(x)
-    return {"home_count": len(home), "away_count": len(away), "home": home, "away": away}
+    return {
+        "available": True, "status": "available" if home or away else "confirmed_empty",
+        "source": "api_football", "fetched_at": fetched_at,
+        "home_count": len(home), "away_count": len(away), "home": home, "away": away,
+    }
 
 
 def as_float(value: Any) -> Optional[float]:

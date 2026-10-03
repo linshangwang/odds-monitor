@@ -31,6 +31,18 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(snapshot["lineups"]["teams"][0]["starting_xi"][0]["name"], "Player")
         self.assertIsNone(main.team_news_snapshot(data, "T-3h"))
 
+    def test_injury_fetch_failure_is_not_treated_as_zero_injuries(self):
+        failed = main.injuries_summary({"ok": False, "status_code": 503}, 1, 2)
+        self.assertFalse(failed["available"])
+        self.assertEqual(failed["status"], "fetch_failed")
+        self.assertIsNone(failed["home_count"])
+        self.assertEqual(failed["error"], "http_503")
+
+        confirmed_empty = main.injuries_summary({"ok": True, "data": {"response": []}}, 1, 2)
+        self.assertTrue(confirmed_empty["available"])
+        self.assertEqual(confirmed_empty["status"], "confirmed_empty")
+        self.assertEqual(confirmed_empty["home_count"], 0)
+
     def test_shadow_token_resolution_prefers_headers_without_breaking_query_compatibility(self):
         self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer", "header"), "header")
         self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer", None), "bearer")
