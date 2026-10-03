@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.83.0"
+VERSION = "0.84.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -903,7 +903,9 @@ def audit_timeline_sequence(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, A
     previous_stage, previous_at = None, None
     for row in ordered:
         stage, observed_at = row["stage"], _parse_timestamp(row.get("snapshot_at"))
-        usable = row.get("import_status") == "available" and get_nested(row, ["stage_timing_audit", "status"]) != "invalid"
+        explicitly_available = row.get("import_status") == "available"
+        native_available = row.get("import_status") is None and bool(get_nested(row, ["market_snapshot", "available"]))
+        usable = (explicitly_available or native_available) and get_nested(row, ["stage_timing_audit", "status"]) != "invalid"
         if not usable or observed_at is None:
             result[stage] = {"status": "data_missing", "decision_eligible": False, "reason": "stage_unavailable_or_timestamp_missing"}
             continue
@@ -957,6 +959,10 @@ def save_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
         rows = [r for r in store["fixtures"][str(record["fixture"])] if r.get("stage") != record.get("stage")]
         rows.append(record)
         rows = sorted(rows, key=lambda x: (STAGE_ORDER.index(x.get("stage")) if x.get("stage") in STAGE_ORDER else 999, x.get("snapshot_at", 0)))
+        sequence_audit = audit_timeline_sequence(rows)
+        for timeline_row in rows:
+            if timeline_row.get("stage") in PREMATCH_STAGE_ORDER:
+                timeline_row["sequence_timing_audit"] = sequence_audit.get(timeline_row.get("stage"), {"status": "data_missing", "decision_eligible": False})
         changed_index = PREMATCH_STAGE_ORDER.index(record.get("stage")) if record.get("stage") in PREMATCH_STAGE_ORDER else None
         downstream_revalidation_tasks = []
         if changed_index is not None:
@@ -2686,7 +2692,8 @@ def shadow_snapshot(fixture: int, stage: str = "manual", raw: bool = False, toke
     classification = classify_market_move_details(dynamics, previous_version, script)
     dynamics["classification"] = classification["classification"]
     dynamics["classification_audit"] = classification
-    record = {"version": VERSION, "fixture": fixture, "stage": normalized, "requested_stage": stage, "snapshot_at": int(time.time()), "fixture_info": data.get("fixture"), "data_quality": data.get("data_quality"), "coverage": data.get("coverage"), "market_snapshot": market_snapshot, "market_dynamics": dynamics, "pure_fundamental_script_hash": script.get("content_hash"), "fundamental_version_number": (fundamental_version or {}).get("version_number"), "shadow_summary": data.get("shadow_summary")}
+    snapshot_at = int(time.time())
+    record = {"version": VERSION, "fixture": fixture, "stage": normalized, "requested_stage": stage, "snapshot_at": snapshot_at, "fixture_info": data.get("fixture"), "data_quality": data.get("data_quality"), "coverage": data.get("coverage"), "market_snapshot": market_snapshot, "market_dynamics": dynamics, "pure_fundamental_script_hash": script.get("content_hash"), "fundamental_version_number": (fundamental_version or {}).get("version_number"), "shadow_summary": data.get("shadow_summary"), "stage_timing_audit": audit_stage_timing(normalized, snapshot_at, get_nested(data, ["fixture", "date"]))}
     saved = save_snapshot(record)
     chain_audit = audit_fundamental_chain(script)
     if saved.get("revalidation_task_created"):
@@ -3251,7 +3258,8 @@ def auto_snapshot_cycle() -> None:
                             classification = classify_market_move_details(dynamics, previous_version, script)
                             dynamics["classification"] = classification["classification"]
                             dynamics["classification_audit"] = classification
-                            record = {"version": VERSION, "fixture": int(fx["fixture_id"]), "stage": key, "requested_stage": "auto", "snapshot_at": int(time.time()), "fixture_info": data.get("fixture"), "data_quality": data.get("data_quality"), "coverage": data.get("coverage"), "market_snapshot": market_snapshot, "market_dynamics": dynamics, "pure_fundamental_script_hash": script.get("content_hash"), "fundamental_version_number": (fundamental_version or {}).get("version_number"), "shadow_summary": data.get("shadow_summary")}
+                            snapshot_at = int(time.time())
+                            record = {"version": VERSION, "fixture": int(fx["fixture_id"]), "stage": key, "requested_stage": "auto", "snapshot_at": snapshot_at, "fixture_info": data.get("fixture"), "data_quality": data.get("data_quality"), "coverage": data.get("coverage"), "market_snapshot": market_snapshot, "market_dynamics": dynamics, "pure_fundamental_script_hash": script.get("content_hash"), "fundamental_version_number": (fundamental_version or {}).get("version_number"), "shadow_summary": data.get("shadow_summary"), "stage_timing_audit": audit_stage_timing(key, snapshot_at, fx.get("date") or get_nested(data, ["fixture", "date"]))}
                             saved = save_snapshot(record)
                             if saved.get("revalidation_task_created"):
                                 chain_audit = audit_fundamental_chain(script)

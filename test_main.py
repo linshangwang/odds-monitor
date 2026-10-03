@@ -322,6 +322,15 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(dynamics["comparison_status"], "data_missing")
         self.assertIsNone(dynamics["previous_stage"])
 
+    def test_native_timeline_sequence_is_audited_without_import_status(self):
+        rows = [
+            {"stage": "T-24h", "snapshot_at": 100, "market_snapshot": {"available": True}, "stage_timing_audit": {"status": "valid"}},
+            {"stage": "T-12h", "snapshot_at": 200, "market_snapshot": {"available": True}, "stage_timing_audit": {"status": "valid"}},
+        ]
+        audit = main.audit_timeline_sequence(rows)
+        self.assertEqual(audit["T-24h"]["status"], "valid")
+        self.assertEqual(audit["T-12h"]["status"], "valid")
+
     def test_consensus_deduplicates_bookmaker_name_variants(self):
         consensus = main._consensus_1x2([
             {"bookmaker": "Book A", "home": 2.0, "draw": 3.4, "away": 4.0},
