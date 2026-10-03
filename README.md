@@ -152,6 +152,8 @@ Selection Change、Robustness Change、Risk Downgrade to PASS 和 Recovery from 
 显式提交为字符串数组。缺失、越界或结构异常都会强制 PASS，不能以异常数值绕过风险门槛。
 上层评估接口不会把缺失的 Death Path 自动补成空数组；只有调用方明确提交 `[]` 才表示已完成
 检查且未发现死亡路径。
+任一后置硬门槛触发 PASS（盘口时间轴、数据新鲜度、模型置信度或基本面证据链）时，系统会
+统一清空最佳盘口、Edge、EV 和所有推荐层，避免前端同时显示“PASS”和残留下注建议。
 
 外部盘口导入若触发显著变盘或跨市场背离，会写入持久化的基本面复核队列；同一比赛、节点和
 数据版本自动去重。可通过受保护的 `GET /shadow/revalidation-queue` 查看 pending/revalidated/all，

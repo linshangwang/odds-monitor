@@ -227,12 +227,26 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("model_probability", result["pass_reasons"])
 
     def test_line_movement_gate_forces_pass_with_one_real_node(self):
-        decision = {"decision": "home", "best_market": {"market": "1x2"}, "edge": .05, "ev": .08, "pass_reasons": []}
+        candidate = {"market": "1x2", "selection": "home"}
+        decision = {"decision": "home", "best_market": candidate, "edge": .05, "ev": .08, "pass_reasons": [], "recommendation_tiers": {"first_choice_high_consistency": candidate, "second_choice_higher_return": candidate, "high_variance_single": candidate}}
         history = [{"stage": "T-3h", "snapshot_at": 100, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "data_missing"}}]
         gated = main.apply_line_movement_gate(decision, history)
         self.assertEqual(gated["decision"], "PASS")
         self.assertIsNone(gated["best_market"])
+        self.assertIsNone(gated["edge"])
+        self.assertIsNone(gated["ev"])
+        self.assertTrue(all(gated["recommendation_tiers"][key] is None for key in ("first_choice_high_consistency", "second_choice_higher_return", "high_variance_single")))
         self.assertIn("line_movement_requires_two_real_comparable_stages", gated["pass_reasons"])
+
+    def test_force_pass_decision_is_idempotent_and_clears_all_recommendations(self):
+        candidate = {"market": "btts", "selection": "yes"}
+        decision = {"decision": "btts:yes", "best_market": candidate, "edge": .1, "ev": .12, "pass_reasons": ["stale"], "recommendation_tiers": {"first_choice_high_consistency": candidate, "second_choice_higher_return": candidate, "high_variance_single": candidate, "ranking_rule": "test"}}
+        main.force_pass_decision(decision, ["stale", "fundamental_chain_insufficient"])
+        self.assertEqual(decision["pass_reasons"], ["stale", "fundamental_chain_insufficient"])
+        self.assertIsNone(decision["best_market"])
+        self.assertIsNone(decision["edge"])
+        self.assertIsNone(decision["ev"])
+        self.assertTrue(all(value is None for key, value in decision["recommendation_tiers"].items() if key != "ranking_rule"))
 
     def test_line_movement_gate_accepts_two_comparable_real_nodes(self):
         decision = {"decision": "home", "best_market": {"market": "1x2"}, "edge": .05, "ev": .08, "pass_reasons": []}

@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.99.0"
+VERSION = "1.0.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1017,18 +1017,28 @@ def audit_line_movement_timeline(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def force_pass_decision(decision: Dict[str, Any], reasons: Any) -> Dict[str, Any]:
+    additions = reasons if isinstance(reasons, list) else [reasons]
+    decision.setdefault("pass_reasons", []).extend(str(reason) for reason in additions if reason)
+    decision["pass_reasons"] = list(dict.fromkeys(decision["pass_reasons"]))
+    decision["decision"] = "PASS"
+    decision["best_market"] = None
+    decision["edge"] = None
+    decision["ev"] = None
+    tiers = decision.get("recommendation_tiers")
+    if isinstance(tiers, dict):
+        for key in ("first_choice_high_consistency", "second_choice_higher_return", "high_variance_single"):
+            tiers[key] = None
+    return decision
+
+
 def apply_line_movement_gate(decision: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[str, Any]:
     audit = audit_line_movement_timeline(history)
     latest = latest_prematch_snapshot(history)
     decision["line_movement"] = (latest or {}).get("market_dynamics") or {"status": "data_missing"}
     decision["line_movement_audit"] = audit
     if not audit.get("decision_eligible"):
-        decision.setdefault("pass_reasons", []).append(audit.get("reason") or "line_movement_insufficient")
-        decision["pass_reasons"] = list(dict.fromkeys(decision["pass_reasons"]))
-        decision["decision"] = "PASS"
-        decision["best_market"] = None
-        decision["edge"] = None
-        decision["ev"] = None
+        force_pass_decision(decision, audit.get("reason") or "line_movement_insufficient")
     return decision
 
 
@@ -2325,15 +2335,13 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
         decision["pass_reasons"].append(freshness.get("reason") or "data_not_fresh")
     decision["pass_reasons"] = list(dict.fromkeys(decision["pass_reasons"]))
     if decision["pass_reasons"]:
-        decision["decision"] = "PASS"
+        force_pass_decision(decision, [])
 
     script = _fundamental_evaluation_script(effective_payload, estimator, model)
     chain_audit = audit_fundamental_chain(script)
     decision["fundamental_chain_audit"] = chain_audit
     if not chain_audit["decision_eligible"]:
-        decision["pass_reasons"].append("fundamental_chain_insufficient")
-        decision["pass_reasons"] = list(dict.fromkeys(decision["pass_reasons"]))
-        decision["decision"] = "PASS"
+        force_pass_decision(decision, "fundamental_chain_insufficient")
     model_market_divergence = detect_model_market_divergence(decision, model_ready=model.get("status") == "ready", fundamental_eligible=chain_audit.get("decision_eligible") is True)
     decision["model_market_divergence"] = model_market_divergence
     decision["market_move_classification"] = "Model-Market Divergence" if model_market_divergence["triggered"] else get_nested(decision, ["line_movement", "classification"])
@@ -3040,13 +3048,10 @@ async def shadow_poisson_model(request: Request, token: Optional[str] = None, au
         as_float(payload.get("crowding")), as_float(payload.get("lineup_confidence")), payload.get("death_path") if "death_path" in payload else None,
     )
     if model.get("status") != "ready":
-        decision["pass_reasons"].append("model_input_confidence_below_0_6")
-        decision["decision"] = "PASS"
+        force_pass_decision(decision, "model_input_confidence_below_0_6")
     if freshness and not freshness.get("decision_eligible"):
         reason = freshness.get("reason") or "data_not_fresh"
-        if reason not in decision["pass_reasons"]:
-            decision["pass_reasons"].append(reason)
-        decision["decision"] = "PASS"
+        force_pass_decision(decision, reason)
     decision["data_freshness"] = freshness
     return JSONResponse({"ok": True, "version": VERSION, "fixture": fixture or None, "model": model, "decision_layer": decision})
 
@@ -3188,9 +3193,7 @@ def build_imported_ai_packet(fixture: str, include_companies: bool = False, incl
     decision["data_freshness"] = freshness
     if not freshness["decision_eligible"]:
         reason = freshness.get("reason") or "data_not_fresh"
-        if reason not in decision["pass_reasons"]:
-            decision["pass_reasons"].append(reason)
-        decision["decision"] = "PASS"
+        force_pass_decision(decision, reason)
     return {
         "ok": True, "status": "ready", "version": VERSION, "generated_at": int(time.time()),
         "source": "pang_import", "fixture": match, "data_quality": metadata.get("data_quality"), "data_freshness": freshness,
