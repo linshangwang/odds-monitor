@@ -62,6 +62,23 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(saved["stage_timing_audit"]["status"], "valid")
         self.assertIsNotNone(saved["team_news_snapshot"])
 
+    def test_invalid_repeat_snapshot_cannot_overwrite_valid_stage(self):
+        valid_market = main.empty_market_snapshot()
+        valid_market["available"] = True
+        valid = {"fixture": 88, "stage": "T-1h", "snapshot_at": 100, "market_snapshot": valid_market, "stage_timing_audit": {"status": "valid"}}
+        first = main.save_snapshot(valid)
+        self.assertTrue(first["saved"])
+
+        invalid = {"fixture": 88, "stage": "T-1h", "snapshot_at": 200, "market_snapshot": main.empty_market_snapshot(), "stage_timing_audit": {"status": "invalid"}}
+        rejected = main.save_snapshot(invalid)
+        self.assertFalse(rejected["saved"])
+        self.assertTrue(rejected["preserved_existing"])
+        self.assertEqual(rejected["reason"], "snapshot_quality_regression_rejected")
+        stored = main.get_fixture_snapshots(88)
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["snapshot_at"], 100)
+        self.assertTrue(stored[0]["market_snapshot"]["available"])
+
     def test_shadow_token_resolution_prefers_headers_without_breaking_query_compatibility(self):
         self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer", "header"), "header")
         self.assertEqual(main.resolve_shadow_token("query", "Bearer bearer", None), "bearer")

@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1072,9 +1072,27 @@ def apply_line_movement_gate(decision: Dict[str, Any], history: List[Dict[str, A
     return decision
 
 
+def snapshot_stage_usable(row: Dict[str, Any]) -> bool:
+    return (
+        row.get("import_status") != "data_missing"
+        and bool(get_nested(row, ["market_snapshot", "available"]))
+        and get_nested(row, ["stage_timing_audit", "status"]) != "invalid"
+        and get_nested(row, ["sequence_timing_audit", "status"]) != "invalid"
+    )
+
+
 def save_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
     with SNAPSHOT_STORE_LOCK:
         store = load_snapshot_store(); store.setdefault("fixtures", {}).setdefault(str(record["fixture"]), [])
+        existing_stage = next((row for row in store["fixtures"][str(record["fixture"])] if row.get("stage") == record.get("stage")), None)
+        if existing_stage and snapshot_stage_usable(existing_stage) and not snapshot_stage_usable(record):
+            return {
+                "saved": False, "preserved_existing": True, "reason": "snapshot_quality_regression_rejected",
+                "path": SNAPSHOT_STORE_PATH, "fixture": record["fixture"], "stage": record["stage"],
+                "existing_snapshot_at": existing_stage.get("snapshot_at"), "rejected_snapshot_at": record.get("snapshot_at"),
+                "revalidation_task_created": False, "revalidation_task_id": None,
+                "downstream_revalidation_tasks_created": 0,
+            }
         rows = [r for r in store["fixtures"][str(record["fixture"])] if r.get("stage") != record.get("stage")]
         rows.append(record)
         rows = sorted(rows, key=lambda x: (STAGE_ORDER.index(x.get("stage")) if x.get("stage") in STAGE_ORDER else 999, x.get("snapshot_at", 0)))
