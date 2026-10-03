@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "0.82.0"
+VERSION = "0.83.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -966,7 +966,17 @@ def save_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
                 row_stage = row.get("stage")
                 if row_stage not in PREMATCH_STAGE_ORDER or PREMATCH_STAGE_ORDER.index(row_stage) <= changed_index:
                     continue
-                dynamics = compare_market_snapshots(rows, row.get("market_snapshot") or empty_market_snapshot(), row_stage)
+                timing_invalid = get_nested(row, ["stage_timing_audit", "status"]) == "invalid" or get_nested(row, ["sequence_timing_audit", "status"]) == "invalid"
+                if timing_invalid:
+                    dynamics = {
+                        "stage": row_stage, "comparison_status": "data_missing",
+                        "revalidation_trigger": {"triggered": False, "reasons": []},
+                        "reason": "invalid_stage_or_sequence_timing",
+                        "data_missing": list(((row.get("market_snapshot") or {}).get("data_status") or {}).keys()),
+                    }
+                else:
+                    valid_history = [candidate for candidate in rows if get_nested(candidate, ["stage_timing_audit", "status"]) != "invalid" and get_nested(candidate, ["sequence_timing_audit", "status"]) != "invalid"]
+                    dynamics = compare_market_snapshots(valid_history, row.get("market_snapshot") or empty_market_snapshot(), row_stage)
                 dynamics["information_search"] = row.get("information_search") or get_nested(row, ["market_dynamics", "information_search"])
                 version_number = int(row.get("fundamental_version_number") or 0)
                 current_version, previous_version = by_version.get(version_number), by_version.get(version_number - 1)
@@ -980,7 +990,7 @@ def save_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
                 dynamics["classification"] = classification["classification"]
                 dynamics["classification_audit"] = classification
                 row["market_dynamics"] = dynamics
-                task = _enqueue_revalidation(store, str(record["fixture"]), row)
+                task = _enqueue_revalidation(store, str(record["fixture"]), row) if not timing_invalid else None
                 if task:
                     downstream_revalidation_tasks.append(task.get("task_id"))
         store["fixtures"][str(record["fixture"])] = rows
