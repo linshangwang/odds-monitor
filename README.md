@@ -164,6 +164,8 @@ Model-Market Divergence 只允许使用时间有效且新鲜的当前盘口；�
 `candidate_generation_audit` 记录无效价格数量。没有任何可比候选时明确给出 PASS 原因。
 嵌入式 bookmaker-level 去水概率还必须与实际赔率推导出的概率形状一致；最大偏差超过配置的
 共识概率阈值，或完整赔率组返还率异常时，整组市场拒绝进入模型比较。
+决策响应的 `market_probability_audit` 会按市场给出 available/data_missing、计算方法、盘口线和
+选项数量，明确区分概率价格错位、赔率组异常与普通数据缺失。
 
 外部盘口导入若触发显著变盘或跨市场背离，会写入持久化的基本面复核队列；同一比赛、节点和
 数据版本自动去重。可通过受保护的 `GET /shadow/revalidation-queue` 查看 pending/revalidated/all，

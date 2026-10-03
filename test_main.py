@@ -566,6 +566,19 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIsNone(probabilities)
         self.assertEqual(method, "embedded_probability_prices_invalid")
 
+    def test_decision_exposes_per_market_probability_failure_reason(self):
+        snapshot = main.empty_market_snapshot()
+        snapshot["consensus_main_line"]["1x2"] = {
+            "home": 4.0, "draw": 3.5, "away": 2.0,
+            "consensus_no_vig_probabilities": {"home": .5, "draw": .3, "away": .2},
+            "bookmaker_count": 3, "source": "company_array_consensus",
+        }
+        result = main.decision_layer(snapshot, {"home": .55, "draw": .25, "away": .2}, {"home": .8}, .2, .9, [])
+        audit = result["market_probability_audit"]["1x2"]
+        self.assertEqual(audit["status"], "data_missing")
+        self.assertEqual(audit["method"], "embedded_probability_price_mismatch")
+        self.assertIn("market_no_vig_probability", result["pass_reasons"])
+
     def test_decision_layer_enforces_minimums_and_probability_validation(self):
         snapshot = main.empty_market_snapshot()
         snapshot["consensus_main_line"]["1x2"] = {"home": 2.0, "draw": 3.5, "away": 4.0}

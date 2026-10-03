@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -2006,6 +2006,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
     normalized_death_path = [item.strip() for item in death_path] if death_path_valid and isinstance(death_path, list) else []
     candidates = []
     market_probabilities = {}
+    market_probability_audit = {}
     valid_model_market_count = 0
     invalid_market_price_count = 0
     specs = (("1x2", ("home", "draw", "away")), ("asian_handicap", ("home", "away")), ("over_under", ("over", "under")), ("btts", ("yes", "no")), ("home_team_total", ("over", "under")), ("away_team_total", ("over", "under")))
@@ -2019,6 +2020,12 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
         distribution_name = {"asian_handicap": "goal_difference", "over_under": "total_goals", "home_team_total": "home_goals", "away_team_total": "away_goals"}.get(market)
         distribution = get_nested(model_probabilities or {}, ["settlement_distributions", distribution_name]) if distribution_name else None
         market_probability, market_probability_method = market_no_vig_probabilities(main, list(keys))
+        market_probability_audit[market] = {
+            "status": "available" if market_probability else "data_missing",
+            "method": market_probability_method,
+            "line": line,
+            "selection_count": len(keys),
+        }
         if distribution and line is not None and market_probability:
             valid_model_market_count += 1
             market_probabilities[market] = {"line": line, "probabilities": market_probability, "method": market_probability_method}
@@ -2087,7 +2094,7 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
             "high_variance_single": high_variance,
             "ranking_rule": "consistency first; price second; high-variance candidates are never used to fill the main tier",
         },
-        "market_no_vig_probability": market_probabilities, "model_probability": model_probabilities,
+        "market_no_vig_probability": market_probabilities, "market_probability_audit": market_probability_audit, "model_probability": model_probabilities,
         "edge": first_choice.get("edge") if first_choice else None, "ev": first_choice.get("ev") if first_choice else None,
         "script_coverage": script_coverage, "crowding": crowding_value,
         "line_movement": None, "lineup_confidence": lineup_confidence_value,
