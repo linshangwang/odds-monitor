@@ -20,8 +20,9 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.41.0"
+VERSION = "1.42.0"
 RELEASE_CHANNEL = "shadow-usable"
+PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1744,6 +1745,7 @@ def apply_provider_reconciliation(date: str, store_override: Optional[Dict[str, 
         audit = {
             "run_at": now_ts, "date": date, "applied_count": len(applied), "unchanged_count": len(unchanged),
             "rejected_count": len(rejected), "source_counts": report.get("counts"),
+            "matcher_schema_version": PROVIDER_RECONCILIATION_SCHEMA_VERSION,
             "policy": "local_mapping_only; no_pang_writes; conflicts_never_overwritten",
         }
         history = store.setdefault("provider_reconciliation_audit", [])
@@ -4295,7 +4297,7 @@ def auto_provider_reconciliation_cycle(now: Optional[datetime] = None) -> Dict[s
     store = load_snapshot_store()
     if not (store.get("external_prematch") or {}):
         return {"status": "skipped", "reason": "no_pang_fixtures_imported", "date": date_str, "at": int(now.timestamp())}
-    previous = next((row for row in reversed(store.get("provider_reconciliation_audit") or []) if row.get("date") == date_str), None)
+    previous = next((row for row in reversed(store.get("provider_reconciliation_audit") or []) if row.get("date") == date_str and int(row.get("matcher_schema_version") or 1) == PROVIDER_RECONCILIATION_SCHEMA_VERSION), None)
     if previous:
         return {"status": "skipped", "reason": "already_completed_for_date", "date": date_str, "previous": previous, "at": int(now.timestamp())}
     result = apply_provider_reconciliation(date_str)

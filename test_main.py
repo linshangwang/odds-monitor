@@ -163,12 +163,21 @@ class ShadowV4UpgradeTests(unittest.TestCase):
 
     def test_auto_provider_reconciliation_runs_once_per_local_date(self):
         now = main.datetime(2026, 10, 5, tzinfo=main.timezone.utc)
-        already = {"date": "2026-10-05", "applied_count": 1}
+        already = {"date": "2026-10-05", "applied_count": 1, "matcher_schema_version": main.PROVIDER_RECONCILIATION_SCHEMA_VERSION}
         store = {"external_prematch": {"pang-1": {}}, "provider_reconciliation_audit": [already]}
         with patch.object(main, "load_snapshot_store", return_value=store), patch.object(main, "apply_provider_reconciliation") as apply:
             result = main.auto_provider_reconciliation_cycle(now)
         self.assertEqual(result["reason"], "already_completed_for_date")
         apply.assert_not_called()
+
+    def test_auto_provider_reconciliation_reruns_after_matcher_schema_upgrade(self):
+        now = main.datetime(2026, 10, 5, tzinfo=main.timezone.utc)
+        store = {"external_prematch": {"pang-1": {}}, "provider_reconciliation_audit": [{"date": "2026-10-05", "matcher_schema_version": 1}]}
+        applied = {"ok": True, "audit": {"applied_count": 0, "unchanged_count": 0, "rejected_count": 1}}
+        with patch.object(main, "load_snapshot_store", return_value=store), patch.object(main, "apply_provider_reconciliation", return_value=applied) as apply:
+            result = main.auto_provider_reconciliation_cycle(now)
+        apply.assert_called_once_with("2026-10-05")
+        self.assertEqual(result["status"], "completed")
 
     def test_auto_provider_reconciliation_applies_when_due(self):
         now = main.datetime(2026, 10, 5, tzinfo=main.timezone.utc)
