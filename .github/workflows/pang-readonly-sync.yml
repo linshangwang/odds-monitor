@@ -1,0 +1,90 @@
+name: Pang read-only prematch sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "7,37 * * * *"
+
+concurrency:
+  group: pang-readonly-prematch-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      PANG_SSH_HOST: ${{ secrets.PANG_SSH_HOST }}
+      PANG_SSH_PORT: ${{ secrets.PANG_SSH_PORT }}
+      PANG_SSH_USER: ${{ secrets.PANG_SSH_USER }}
+      PANG_SSH_PRIVATE_KEY: ${{ secrets.PANG_SSH_PRIVATE_KEY }}
+      PANG_SSH_KNOWN_HOSTS: ${{ secrets.PANG_SSH_KNOWN_HOSTS }}
+      PANG_REMOTE_PATH: ${{ secrets.PANG_REMOTE_PATH }}
+      SHADOW_ACCESS_TOKEN: ${{ secrets.SHADOW_ACCESS_TOKEN }}
+      SHADOW_ENDPOINT: https://web-production-f1134.up.railway.app
+    steps:
+      - name: Check configuration
+        id: config
+        shell: bash
+        run: |
+          required=(PANG_SSH_HOST PANG_SSH_USER PANG_SSH_PRIVATE_KEY PANG_SSH_KNOWN_HOSTS PANG_REMOTE_PATH SHADOW_ACCESS_TOKEN)
+          missing=0
+          for name in "${required[@]}"; do
+            if [ -z "${!name}" ]; then
+              echo "Missing required secret name: ${name}"
+              missing=1
+            fi
+          done
+          if [ "$missing" -eq 1 ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Read-only sync skipped; no remote connection was attempted."
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.config.outputs.ready == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.config.outputs.ready == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install client dependency
+        if: steps.config.outputs.ready == 'true'
+        run: python -m pip install --disable-pip-version-check requests==2.32.3
+
+      - name: Configure ephemeral read-only SSH client
+        if: steps.config.outputs.ready == 'true'
+        shell: bash
+        run: |
+          install -d -m 700 "$HOME/.ssh"
+          install -m 600 /dev/null "$HOME/.ssh/pang_sync_key"
+          printf '%s\n' "$PANG_SSH_PRIVATE_KEY" > "$HOME/.ssh/pang_sync_key"
+          install -m 600 /dev/null "$HOME/.ssh/known_hosts"
+          printf '%s\n' "$PANG_SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          port="${PANG_SSH_PORT:-22}"
+          printf 'Host pang-readonly\n  HostName %s\n  Port %s\n  User %s\n  IdentityFile %s/.ssh/pang_sync_key\n  IdentitiesOnly yes\n  BatchMode yes\n  StrictHostKeyChecking yes\n  UserKnownHostsFile %s/.ssh/known_hosts\n' \
+            "$PANG_SSH_HOST" "$port" "$PANG_SSH_USER" "$HOME" "$HOME" > "$HOME/.ssh/config"
+          chmod 600 "$HOME/.ssh/config"
+
+      - name: Read existing bundle and import verified prematch packets
+        if: steps.config.outputs.ready == 'true'
+        shell: bash
+        run: |
+          python sync_prematch.py \
+            --ssh-host pang-readonly \
+            --remote-path "$PANG_REMOTE_PATH" \
+            --league "UEFA Nations League" \
+            --require-prematch
+
+      - name: Remove ephemeral SSH material
+        if: always() && steps.config.outputs.ready == 'true'
+        shell: bash
+        run: |
+          rm -f "$HOME/.ssh/pang_sync_key" "$HOME/.ssh/config" "$HOME/.ssh/known_hosts"
+

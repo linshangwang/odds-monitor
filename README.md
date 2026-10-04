@@ -384,6 +384,12 @@ V1.49 在现有 V4 基本面链内部加入五个扩展维度：`Current Athleti
 `Structural Replacement`、`Absolute Attack Quality`、双向 `Open-Game Beneficiary` 与
 `Late-Game Resistance`。审计结果单独输出 `extended_dimension_audit`；旧数据包仍可读取，缺少
 新字段会明确标记 `data_missing`，但不会仅因版本升级而破坏既有接口兼容。
+
+V1.50 增加 GitHub Actions 侧的 pang 只读同步。任务每小时两次运行，但只有在六项 GitHub
+Secrets 全部配置后才连接；否则安全跳过。运行器仅通过固定 SSH 别名执行 `cat` 或
+`gzip -cd` 读取 `PANG_REMOTE_PATH` 指向的既有文件，再调用 Railway 的受保护导入接口。
+它不会上传、编辑、创建文件，也不会在 pang 上安装程序或计划任务。SSH 主机指纹必须由
+`PANG_SSH_KNOWN_HOSTS` 预先固定，禁止自动接受未知主机。
 可通过 `NAMI_REQUEST_TIMEOUT` 单独限制等待时间，默认最多 10 秒。
 所有外部数据源的 JSON 与文本诊断响应都会递归移除已配置的密钥值；即使上游回显请求参数，
 接口响应和日志数据也不会返回真实凭据。
