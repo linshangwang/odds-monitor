@@ -112,6 +112,26 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(fixture["canonical_competition"], "UEFA Nations League")
         self.assertEqual(fixture["fixture_identity"]["normalized"]["league"], "uefanationsleague")
 
+    def test_provider_reconciliation_report_matches_persisted_pang_identity_read_only(self):
+        pang_match = {"match_id": "pang-1", "kickoff_utc": "2026-10-05T12:00:00Z", "home_team_name": "France", "away_team_name": "Italy"}
+        identity = main.fixture_identity_from_match(pang_match, "UEFA Nations League", "pang")
+        store = {"external_prematch": {"pang-1": {"league": "UEFA Nations League", "match": pang_match, "fixture_identity": identity}}}
+        nami_identity = main.fixture_identity_from_match({"id": 88, "match_time": int(main.datetime(2026, 10, 5, 12, 4, tzinfo=main.timezone.utc).timestamp()), "home": "France", "away": "Italy"}, "UEFA Nations League", "nami")
+        schedule = {"ok": True, "fixtures": [{"provider_fixture_id": "88", "target_candidate": True, "canonical_competition": "UEFA Nations League", "home": "France", "away": "Italy", "kickoff_at": nami_identity["kickoff_at"], "fixture_identity": nami_identity}]}
+        before = main._content_hash(store)
+        report = main.provider_reconciliation_report("2026-10-05", store_override=store, nami_schedule_override=schedule)
+        self.assertEqual(report["counts"]["matched"], 1)
+        self.assertEqual(report["rows"][0]["matched_pang_fixture_id"], "pang-1")
+        self.assertTrue(report["rows"][0]["decision_eligible"])
+        self.assertEqual(main._content_hash(store), before)
+
+    def test_provider_reconciliation_unmatched_candidate_remains_blocked(self):
+        identity = main.fixture_identity_from_match({"id": 88, "match_time": 1000, "home": "A", "away": "B"}, "UEFA Nations League", "nami")
+        schedule = {"ok": True, "fixtures": [{"provider_fixture_id": "88", "target_candidate": True, "home": "A", "away": "B", "kickoff_at": 1000, "fixture_identity": identity}]}
+        report = main.provider_reconciliation_report("2026-10-05", store_override={"external_prematch": {}}, nami_schedule_override=schedule)
+        self.assertEqual(report["counts"]["no_match"], 1)
+        self.assertFalse(report["rows"][0]["decision_eligible"])
+
     def test_complete_timeline_contains_opening(self):
         self.assertEqual(main.PREMATCH_STAGE_ORDER, ["Opening", "T-24h", "T-12h", "T-6h", "T-3h", "T-1h", "T-15m", "Closing"])
 

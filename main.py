@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.34.0"
+VERSION = "1.35.0"
 RELEASE_CHANNEL = "shadow-usable"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
@@ -1655,6 +1655,38 @@ def reconcile_fixture_identity(incoming: Dict[str, Any], candidates: List[Dict[s
     return {"status": "no_match", "decision_eligible": False, "matches": [], "reason": "no_strict_provider_match"}
 
 
+def provider_reconciliation_report(date: str, store_override: Optional[Dict[str, Any]] = None, nami_schedule_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Compare Nami target candidates with persisted pang identities without mutating either source."""
+    store = store_override if store_override is not None else load_snapshot_store()
+    pang_candidates = []
+    for fixture, metadata in (store.get("external_prematch") or {}).items():
+        identity = metadata.get("fixture_identity")
+        if not isinstance(identity, dict):
+            identity = fixture_identity_from_match(metadata.get("match") or {}, metadata.get("league"), "pang")
+        identity = {**identity, "source": "pang", "source_fixture_id": str(fixture)}
+        pang_candidates.append(identity)
+    nami_schedule = nami_schedule_override if nami_schedule_override is not None else nami_fixtures_for_date(date)
+    target_rows = [row for row in (nami_schedule.get("fixtures") or []) if row.get("target_candidate")]
+    rows = []
+    for row in target_rows:
+        reconciliation = reconcile_fixture_identity(row.get("fixture_identity") or {}, pang_candidates)
+        rows.append({
+            "nami_fixture_id": row.get("provider_fixture_id"), "competition": row.get("canonical_competition") or row.get("competition"),
+            "home": row.get("home"), "away": row.get("away"), "kickoff_at": row.get("kickoff_at"),
+            "status": reconciliation.get("status"), "decision_eligible": reconciliation.get("decision_eligible", False),
+            "matched_pang_fixture_id": get_nested(reconciliation, ["match", "source_fixture_id"]),
+            "reason": reconciliation.get("reason"), "candidate_count": len(reconciliation.get("matches") or []),
+        })
+    counts = {status: sum(row["status"] == status for row in rows) for status in ("matched", "ambiguous", "no_match", "data_missing")}
+    return {
+        "ok": bool(nami_schedule.get("ok")), "version": VERSION, "date": date,
+        "pang_fixture_count": len(pang_candidates), "nami_target_candidate_count": len(target_rows),
+        "counts": counts, "rows": rows,
+        "decision_gate": "only_unique_matched_rows_can_continue; market_and_timeline_gates_still_apply",
+        "mutation_policy": "read_only_reconciliation_no_pang_writes",
+    }
+
+
 def normalize_information_search(value: Any, snapshot_at: Optional[int] = None) -> Optional[Dict[str, Any]]:
     if not isinstance(value, dict):
         return None
@@ -3201,6 +3233,12 @@ def prematch_target_fixtures(date: str, timezone_name: str = Query("Asia/Shangha
 def shadow_target_fixtures(date: str, timezone_name: str = Query("Asia/Shanghai", alias="timezone"), token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     return JSONResponse(target_fixtures_for_date(date, timezone_name, include_supplemental=True))
+
+
+@app.get("/shadow/provider-reconciliation")
+def shadow_provider_reconciliation(date: str, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse(provider_reconciliation_report(date))
 
 
 @app.get("/shadow/analyze-fixture")
