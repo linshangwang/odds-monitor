@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.28.0"
+VERSION = "1.29.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -47,6 +47,10 @@ AUTO_SNAPSHOT_POLL_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_POLL_SECONDS",
 AUTO_SNAPSHOT_WINDOW_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_WINDOW_SECONDS", "600")))
 AUTO_SNAPSHOT_DAYS_AHEAD = max(1, int(os.getenv("AUTO_SNAPSHOT_DAYS_AHEAD", "2")))
 AUTO_SNAPSHOT_THREAD_STARTED = False
+AUTO_SNAPSHOT_THREAD: Optional[threading.Thread] = None
+AUTO_SNAPSHOT_LAST_CYCLE_AT: Optional[int] = None
+AUTO_SNAPSHOT_LAST_ERROR: Optional[str] = None
+CALIBRATION_MIN_SAMPLE = max(1, int(os.getenv("CALIBRATION_MIN_SAMPLE", "30")))
 API_FOOTBALL_RATE_LIMIT_UNTIL = 0
 SNAPSHOT_STORE_LOCK = threading.RLock()
 
@@ -3367,6 +3371,53 @@ def calibration_report() -> Dict[str, Any]:
     }
 
 
+def operations_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
+    now_ts = int(now_ts or time.time())
+    store = load_snapshot_store()
+    integrity = snapshot_store_integrity()
+    thread_alive = bool(AUTO_SNAPSHOT_THREAD and AUTO_SNAPSHOT_THREAD.is_alive())
+    worker_expected = AUTO_SNAPSHOT_ENABLED
+    fixtures = []
+    for fixture, metadata in (store.get("external_prematch") or {}).items():
+        fixtures.append({"fixture": fixture, "freshness": imported_fixture_freshness(metadata, get_fixture_snapshots(fixture), now_ts=now_ts)})
+    freshness_counts = {state: sum(row["freshness"]["state"] == state for row in fixtures) for state in ("fresh", "stale", "historical", "invalid_timestamp", "data_missing")}
+    queue = revalidation_queue_view(list((store.get("fundamental_revalidation_queue") or {}).values()), now_ts=now_ts)
+    pending = [task for task in queue if task.get("status") == "pending"]
+    overdue = [task for task in pending if task.get("overdue")]
+    calibration = calibration_report()
+    alerts = []
+    if not integrity.get("operational"):
+        alerts.append({"severity": "critical", "code": "snapshot_store_unavailable"})
+    if integrity.get("operational") and not integrity.get("recovery_ready"):
+        alerts.append({"severity": "warning", "code": "snapshot_backup_unavailable"})
+    if not integrity.get("capacity_ok"):
+        alerts.append({"severity": "warning", "code": "snapshot_store_capacity_warning"})
+    if worker_expected and not thread_alive:
+        alerts.append({"severity": "critical", "code": "auto_snapshot_worker_not_running"})
+    worker_cycle_age = now_ts - AUTO_SNAPSHOT_LAST_CYCLE_AT if AUTO_SNAPSHOT_LAST_CYCLE_AT is not None else None
+    if worker_expected and thread_alive and worker_cycle_age is not None and worker_cycle_age > max(AUTO_SNAPSHOT_POLL_SECONDS * 2, 600):
+        alerts.append({"severity": "warning", "code": "auto_snapshot_cycle_stale", "age_seconds": worker_cycle_age})
+    if AUTO_SNAPSHOT_LAST_ERROR:
+        alerts.append({"severity": "warning", "code": "auto_snapshot_last_cycle_failed", "error_type": AUTO_SNAPSHOT_LAST_ERROR})
+    if overdue:
+        alerts.append({"severity": "warning", "code": "overdue_fundamental_revalidation", "count": len(overdue)})
+    unhealthy_freshness = freshness_counts["stale"] + freshness_counts["invalid_timestamp"]
+    if unhealthy_freshness:
+        alerts.append({"severity": "warning", "code": "external_fixture_freshness_issue", "count": unhealthy_freshness})
+    if calibration["settled_count"] < CALIBRATION_MIN_SAMPLE:
+        alerts.append({"severity": "info", "code": "calibration_sample_collecting", "current": calibration["settled_count"], "required": CALIBRATION_MIN_SAMPLE})
+    severities = {alert["severity"] for alert in alerts}
+    status = "blocked" if "critical" in severities else ("degraded" if "warning" in severities else "healthy")
+    return {
+        "version": VERSION, "generated_at": now_ts, "status": status, "alerts": alerts,
+        "store": integrity,
+        "auto_snapshot_worker": {"enabled": worker_expected, "started": AUTO_SNAPSHOT_THREAD_STARTED, "alive": thread_alive, "last_cycle_at": AUTO_SNAPSHOT_LAST_CYCLE_AT, "last_cycle_age_seconds": worker_cycle_age, "last_error": AUTO_SNAPSHOT_LAST_ERROR},
+        "external_fixture_freshness": {"fixture_count": len(fixtures), "state_counts": freshness_counts},
+        "revalidation_queue": {"pending_count": len(pending), "overdue_count": len(overdue)},
+        "calibration": {"settled_count": calibration["settled_count"], "minimum_sample": CALIBRATION_MIN_SAMPLE, "sample_ready": calibration["settled_count"] >= CALIBRATION_MIN_SAMPLE, "average_brier_score": calibration["average_brier_score"], "roi": calibration["roi"]},
+    }
+
+
 def audit_lineup_confidence(lineup_history: Any, submitted_confidence: Any, now_ts: Optional[int] = None) -> Dict[str, Any]:
     now_ts = int(time.time()) if now_ts is None else int(now_ts)
     submitted = as_float(submitted_confidence)
@@ -3658,6 +3709,12 @@ def shadow_calibration_report(token: Optional[str] = None, authorization: Option
     return JSONResponse({"ok": True, "calibration": calibration_report()})
 
 
+@app.get("/shadow/operations/status")
+def shadow_operations_status(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "operations": operations_status_report()})
+
+
 
 def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
     """Build one AI-ready prematch packet from persisted market history + one current fundamentals fetch."""
@@ -3867,20 +3924,26 @@ def auto_snapshot_cycle() -> None:
 
 
 def auto_snapshot_worker() -> None:
+    global AUTO_SNAPSHOT_LAST_CYCLE_AT, AUTO_SNAPSHOT_LAST_ERROR
     while True:
         try:
             auto_snapshot_cycle()
+            AUTO_SNAPSHOT_LAST_CYCLE_AT = int(time.time())
+            AUTO_SNAPSHOT_LAST_ERROR = None
         except Exception as exc:
+            AUTO_SNAPSHOT_LAST_CYCLE_AT = int(time.time())
+            AUTO_SNAPSHOT_LAST_ERROR = type(exc).__name__
             print("[AUTO_SNAPSHOT] cycle failed: " + str(exc))
         time.sleep(AUTO_SNAPSHOT_POLL_SECONDS)
 
 
 def start_auto_snapshot_worker() -> None:
-    global AUTO_SNAPSHOT_THREAD_STARTED
+    global AUTO_SNAPSHOT_THREAD_STARTED, AUTO_SNAPSHOT_THREAD
     if not AUTO_SNAPSHOT_ENABLED or AUTO_SNAPSHOT_THREAD_STARTED:
         return
     AUTO_SNAPSHOT_THREAD_STARTED = True
-    threading.Thread(target=auto_snapshot_worker, name="shadow-auto-snapshot", daemon=True).start()
+    AUTO_SNAPSHOT_THREAD = threading.Thread(target=auto_snapshot_worker, name="shadow-auto-snapshot", daemon=True)
+    AUTO_SNAPSHOT_THREAD.start()
     print("[AUTO_SNAPSHOT] worker started poll_seconds=" + str(AUTO_SNAPSHOT_POLL_SECONDS) + " window_seconds=" + str(AUTO_SNAPSHOT_WINDOW_SECONDS))
 
 

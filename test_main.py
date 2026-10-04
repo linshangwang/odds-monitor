@@ -1680,6 +1680,35 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(report["bet_count"], 0)
         self.assertIsNone(report["roi"])
 
+    def test_operations_status_separates_info_warning_and_critical(self):
+        main.write_snapshot_store({"version": main.VERSION, "fixtures": {}, "fundamental_revalidation_queue": {}})
+        with patch.object(main, "AUTO_SNAPSHOT_ENABLED", False), patch.object(main, "CALIBRATION_MIN_SAMPLE", 3):
+            healthy = main.operations_status_report(now_ts=4000)
+        self.assertEqual(healthy["status"], "healthy")
+        self.assertFalse(healthy["calibration"]["sample_ready"])
+        self.assertIn("calibration_sample_collecting", [alert["code"] for alert in healthy["alerts"]])
+
+        store = main.load_snapshot_store()
+        store["fundamental_revalidation_queue"] = {"task": {"task_id": "task", "fixture": "1", "status": "pending", "stage": "T-1h", "created_at": 100, "reasons": ["significant_line_move"]}}
+        main.write_snapshot_store(store)
+        with patch.object(main, "AUTO_SNAPSHOT_ENABLED", False):
+            degraded = main.operations_status_report(now_ts=4000)
+        self.assertEqual(degraded["status"], "degraded")
+        self.assertEqual(degraded["revalidation_queue"]["overdue_count"], 1)
+
+        with patch.object(main, "AUTO_SNAPSHOT_ENABLED", True), patch.object(main, "AUTO_SNAPSHOT_THREAD", None):
+            blocked = main.operations_status_report(now_ts=4000)
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertIn("auto_snapshot_worker_not_running", [alert["code"] for alert in blocked["alerts"]])
+
+        alive = unittest.mock.Mock()
+        alive.is_alive.return_value = True
+        with patch.object(main, "AUTO_SNAPSHOT_ENABLED", True), patch.object(main, "AUTO_SNAPSHOT_THREAD", alive), patch.object(main, "AUTO_SNAPSHOT_LAST_CYCLE_AT", 1000), patch.object(main, "AUTO_SNAPSHOT_LAST_ERROR", "TimeoutError"):
+            stale = main.operations_status_report(now_ts=4000)
+        codes = [alert["code"] for alert in stale["alerts"]]
+        self.assertIn("auto_snapshot_cycle_stale", codes)
+        self.assertIn("auto_snapshot_last_cycle_failed", codes)
+
     def test_imported_ai_packet_excludes_invalid_latest_node(self):
         packet = self.prematch_packet()
         invalid_late = dict(packet["timeline"][0])
