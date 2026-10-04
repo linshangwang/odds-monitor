@@ -180,6 +180,14 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["applied_count"], 2)
 
+    def test_health_exposes_only_aggregate_auto_reconciliation_status(self):
+        summary = {"status": "completed", "date": "2026-10-05", "applied_count": 2, "rejected_count": 3}
+        with patch.object(main, "AUTO_RECONCILIATION_LAST_RESULT", summary):
+            result = main.health()["auto_provider_reconciliation"]
+        self.assertEqual(result, summary)
+        self.assertNotIn("rows", result)
+        self.assertNotIn("nami_fixture_id", result)
+
     def test_complete_timeline_contains_opening(self):
         self.assertEqual(main.PREMATCH_STAGE_ORDER, ["Opening", "T-24h", "T-12h", "T-6h", "T-3h", "T-1h", "T-15m", "Closing"])
 
