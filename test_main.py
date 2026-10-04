@@ -46,6 +46,38 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(result["data_missing"])
         self.assertEqual(result["source_audit"]["blocker"], "no_fixtures_returned_for_date")
 
+    def test_provider_fixture_identity_matches_without_reusing_provider_id(self):
+        pang = main.fixture_identity_from_match({
+            "match_id": "pang-uuid", "kickoff_utc": "2026-10-04T12:00:00Z",
+            "home_team_name": "Paris Saint-Germain", "away_team_name": "Marseille",
+        }, "France Ligue 1", "pang")
+        nami = main.fixture_identity_from_match({
+            "id": 9988, "match_time": int(main.datetime(2026, 10, 4, 12, 5, tzinfo=main.timezone.utc).timestamp()),
+            "home": "Paris Saint Germain", "away": "Marseille", "league_name": "France Ligue 1",
+        }, source="nami")
+        result = main.reconcile_fixture_identity(nami, [pang])
+        self.assertEqual(result["status"], "matched")
+        self.assertTrue(result["decision_eligible"])
+        self.assertEqual(result["match"]["source_fixture_id"], "pang-uuid")
+        self.assertEqual(nami["source_fixture_id"], "9988")
+
+    def test_provider_fixture_identity_ambiguous_match_forces_pass(self):
+        incoming = main.fixture_identity_from_match({"id": 1, "match_time": 1000, "home": "A", "away": "B"}, "League", "nami")
+        first = main.fixture_identity_from_match({"match_id": "x", "kickoff_utc": 1000, "home": "A", "away": "B"}, "League", "pang")
+        second = main.fixture_identity_from_match({"match_id": "y", "kickoff_utc": 1100, "home": "A", "away": "B"}, "League", "api_football")
+        result = main.reconcile_fixture_identity(incoming, [first, second])
+        self.assertEqual(result["status"], "ambiguous")
+        self.assertFalse(result["decision_eligible"])
+        self.assertEqual(result["reason"], "multiple_provider_candidates")
+
+    def test_imported_packet_persists_provider_identity_namespace(self):
+        packet = self.prematch_packet()
+        packet["match"]["kickoff_utc"] = "2026-10-04T12:00:00Z"
+        main.import_prematch_packet(packet)
+        metadata = main.load_snapshot_store()["external_prematch"]["uuid-1"]
+        self.assertEqual(metadata["provider_fixture_ids"], {"pang": "uuid-1"})
+        self.assertEqual(metadata["fixture_identity"]["status"], "complete")
+
     def test_complete_timeline_contains_opening(self):
         self.assertEqual(main.PREMATCH_STAGE_ORDER, ["Opening", "T-24h", "T-12h", "T-6h", "T-3h", "T-1h", "T-15m", "Closing"])
 

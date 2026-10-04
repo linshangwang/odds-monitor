@@ -6,6 +6,7 @@ import time
 import threading
 import hashlib
 import hmac
+import unicodedata
 from statistics import median
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -19,7 +20,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.31.0"
+VERSION = "1.32.0"
 RELEASE_CHANNEL = "shadow-usable"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
@@ -1545,6 +1546,54 @@ def _content_hash(value: Any) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def normalize_fixture_identity_name(value: Any) -> str:
+    """Normalize a display name for comparison without altering provider-owned ids."""
+    text = unicodedata.normalize("NFKD", str(value or "")).casefold()
+    return "".join(char for char in text if char.isalnum())
+
+
+def fixture_identity_from_match(match: Dict[str, Any], league: Any = None, source: str = "unknown") -> Dict[str, Any]:
+    kickoff = _parse_timestamp(match.get("kickoff_utc") or match.get("date") or match.get("match_time"))
+    home = match.get("home_team_name") or match.get("home") or get_nested(match, ["teams", "home", "name"])
+    away = match.get("away_team_name") or match.get("away") or get_nested(match, ["teams", "away", "name"])
+    league_name = league or match.get("league_name") or match.get("league")
+    normalized = {
+        "home": normalize_fixture_identity_name(home),
+        "away": normalize_fixture_identity_name(away),
+        "league": normalize_fixture_identity_name(league_name),
+    }
+    complete = bool(kickoff is not None and normalized["home"] and normalized["away"])
+    canonical_key = _content_hash({"kickoff_minute": kickoff // 60 if kickoff is not None else None, **normalized})[:32] if complete else None
+    return {
+        "source": source, "source_fixture_id": str(match.get("match_id") or match.get("fixture_id") or match.get("id") or "") or None,
+        "kickoff_at": kickoff, "normalized": normalized, "canonical_key": canonical_key,
+        "status": "complete" if complete else "data_missing",
+        "decision_eligible": complete,
+        "missing": [key for key, value in {"kickoff": kickoff, "home": normalized["home"], "away": normalized["away"]}.items() if value in (None, "")],
+    }
+
+
+def reconcile_fixture_identity(incoming: Dict[str, Any], candidates: List[Dict[str, Any]], kickoff_tolerance_seconds: int = 900) -> Dict[str, Any]:
+    """Strictly reconcile provider fixtures; ambiguity never resolves to a guessed match."""
+    if incoming.get("status") != "complete":
+        return {"status": "data_missing", "decision_eligible": False, "matches": [], "reason": "incoming_identity_incomplete"}
+    matches = []
+    for candidate in candidates or []:
+        if candidate.get("status") != "complete":
+            continue
+        left, right = incoming.get("normalized") or {}, candidate.get("normalized") or {}
+        same_teams = left.get("home") == right.get("home") and left.get("away") == right.get("away")
+        league_compatible = not left.get("league") or not right.get("league") or left.get("league") == right.get("league")
+        kickoff_delta = abs(int(incoming.get("kickoff_at")) - int(candidate.get("kickoff_at")))
+        if same_teams and league_compatible and kickoff_delta <= kickoff_tolerance_seconds:
+            matches.append({"canonical_key": candidate.get("canonical_key"), "source": candidate.get("source"), "source_fixture_id": candidate.get("source_fixture_id"), "kickoff_delta_seconds": kickoff_delta})
+    if len(matches) == 1:
+        return {"status": "matched", "decision_eligible": True, "match": matches[0], "matches": matches, "reason": None}
+    if len(matches) > 1:
+        return {"status": "ambiguous", "decision_eligible": False, "matches": matches, "reason": "multiple_provider_candidates"}
+    return {"status": "no_match", "decision_eligible": False, "matches": [], "reason": "no_strict_provider_match"}
+
+
 def normalize_information_search(value: Any, snapshot_at: Optional[int] = None) -> Optional[Dict[str, Any]]:
     if not isinstance(value, dict):
         return None
@@ -1605,6 +1654,7 @@ def import_prematch_packet(packet: Dict[str, Any], store_override: Optional[Dict
     fixture = str(match.get("match_id") or "").strip()
     if not fixture:
         raise HTTPException(status_code=400, detail="missing_match_id")
+    fixture_identity = fixture_identity_from_match(match, packet.get("league"), "pang")
     timeline = packet.get("timeline")
     if not isinstance(timeline, list):
         raise HTTPException(status_code=400, detail="timeline_must_be_an_array")
@@ -1659,6 +1709,8 @@ def import_prematch_packet(packet: Dict[str, Any], store_override: Optional[Dict
             "required_timeline": packet.get("required_timeline") or previous_meta.get("required_timeline") or PREMATCH_STAGE_ORDER,
             "lineup_history": packet.get("lineup_history") if "lineup_history" in packet else previous_meta.get("lineup_history", []),
             "data_quality": packet.get("data_quality") or previous_meta.get("data_quality"),
+            "fixture_identity": fixture_identity,
+            "provider_fixture_ids": {**(previous_meta.get("provider_fixture_ids") or {}), "pang": fixture},
         }
         previous_meta_content = {key: previous_meta.get(key) for key in next_meta_content}
         metadata_changed = not previous_meta or _content_hash(next_meta_content) != _content_hash(previous_meta_content)
