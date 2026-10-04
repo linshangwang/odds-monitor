@@ -188,6 +188,21 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertNotIn("rows", result)
         self.assertNotIn("nami_fixture_id", result)
 
+    def test_server_import_preflight_rejects_wrong_date_and_finished_match(self):
+        packet = self.prematch_packet()
+        packet["match"]["kickoff_utc"] = "2026-09-30T12:00:00Z"
+        report = main.server_import_preflight([packet], expected_date="2026-10-05", require_prematch=True, now_ts=1791130000)
+        self.assertEqual(report["status"], "rejected")
+        self.assertIn("kickoff_date_mismatch", report["rows"][0]["reasons"])
+        self.assertIn("fixture_not_prematch", report["rows"][0]["reasons"])
+
+    def test_server_import_preflight_rejects_duplicate_fixture_ids(self):
+        packet = self.prematch_packet()
+        packet["match"]["kickoff_utc"] = "2026-10-05T20:00:00Z"
+        report = main.server_import_preflight([packet, packet], expected_date="2026-10-05", now_ts=1)
+        self.assertEqual(report["status"], "rejected")
+        self.assertIn("duplicate_match_id", report["rows"][1]["reasons"])
+
     def test_complete_timeline_contains_opening(self):
         self.assertEqual(main.PREMATCH_STAGE_ORDER, ["Opening", "T-24h", "T-12h", "T-6h", "T-3h", "T-1h", "T-15m", "Closing"])
 

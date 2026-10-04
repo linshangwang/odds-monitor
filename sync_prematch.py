@@ -71,7 +71,7 @@ def compressed_payload(packets: List[Dict[str, Any]]) -> bytes:
     return gzip.compress(raw, compresslevel=6)
 
 
-def upload_packets(endpoint: str, token: str, packets: List[Dict[str, Any]], timeout: int = 45) -> Dict[str, Any]:
+def upload_packets(endpoint: str, token: str, packets: List[Dict[str, Any]], timeout: int = 45, expected_date: Optional[str] = None, require_prematch: bool = False) -> Dict[str, Any]:
     if not endpoint.startswith("https://"):
         raise ValueError("https_endpoint_required")
     if not token:
@@ -82,6 +82,8 @@ def upload_packets(endpoint: str, token: str, packets: List[Dict[str, Any]], tim
         headers={
             "Authorization": f"Bearer {token}", "Content-Type": "application/json",
             "Content-Encoding": "gzip", "X-Sync-Mode": "incremental", "X-Sync-Source": "pang-readonly-local",
+            **({"X-Expected-Match-Date": expected_date} if expected_date else {}),
+            **({"X-Require-Prematch": "true"} if require_prematch else {}),
         },
         timeout=timeout,
     )
@@ -160,7 +162,7 @@ def main() -> int:
     if preflight["status"] != "ready":
         print(json.dumps({**report, "status": "rejected_before_upload"}, ensure_ascii=False))
         return 2
-    result = upload_packets(args.endpoint, os.getenv("SHADOW_ACCESS_TOKEN", ""), packets)
+    result = upload_packets(args.endpoint, os.getenv("SHADOW_ACCESS_TOKEN", ""), packets, expected_date=args.expected_date, require_prematch=args.require_prematch)
     print(json.dumps({**report, "status": "uploaded", "server": result}, ensure_ascii=False))
     return 0
 

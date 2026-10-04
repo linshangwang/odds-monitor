@@ -57,6 +57,16 @@ class ReadOnlyPrematchSyncTests(unittest.TestCase):
         self.assertEqual(report["status"], "ready")
         self.assertEqual(report["ready_count"], 1)
 
+    def test_upload_forwards_strict_preflight_headers(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"ok": True}
+        with patch("sync_prematch.requests.post", return_value=response) as post:
+            sync_prematch.upload_packets("https://example.test", "secret", [self.packet()], expected_date="2026-10-05", require_prematch=True)
+        headers = post.call_args.kwargs["headers"]
+        self.assertEqual(headers["X-Expected-Match-Date"], "2026-10-05")
+        self.assertEqual(headers["X-Require-Prematch"], "true")
+
 
 if __name__ == "__main__":
     unittest.main()

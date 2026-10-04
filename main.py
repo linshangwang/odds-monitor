@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.39.0"
+VERSION = "1.40.0"
 RELEASE_CHANNEL = "shadow-usable"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
@@ -1915,6 +1915,38 @@ def import_prematch_packet_batch(packets: List[Dict[str, Any]]) -> Tuple[List[Di
         return results, store
 
 
+def server_import_preflight(packets: List[Dict[str, Any]], expected_date: Optional[str] = None, require_prematch: bool = False, now_ts: Optional[int] = None) -> Dict[str, Any]:
+    now_ts = int(time.time()) if now_ts is None else int(now_ts)
+    seen, rows = set(), []
+    for packet in packets:
+        match = packet.get("match") if isinstance(packet, dict) else {}
+        match = match if isinstance(match, dict) else {}
+        fixture = str(match.get("match_id") or "").strip()
+        kickoff_raw = match.get("kickoff_utc")
+        try:
+            kickoff_dt = datetime.fromisoformat(str(kickoff_raw).replace("Z", "+00:00"))
+            if kickoff_dt.tzinfo is None:
+                kickoff_dt = kickoff_dt.replace(tzinfo=timezone.utc)
+            kickoff_ts, kickoff_date = int(kickoff_dt.timestamp()), kickoff_dt.date().isoformat()
+        except (TypeError, ValueError):
+            kickoff_ts, kickoff_date = None, None
+        reasons = []
+        if not fixture:
+            reasons.append("missing_match_id")
+        elif fixture in seen:
+            reasons.append("duplicate_match_id")
+        seen.add(fixture)
+        if kickoff_ts is None:
+            reasons.append("missing_or_invalid_kickoff")
+        if expected_date and kickoff_date != expected_date:
+            reasons.append("kickoff_date_mismatch")
+        if require_prematch and kickoff_ts is not None and kickoff_ts <= now_ts:
+            reasons.append("fixture_not_prematch")
+        rows.append({"fixture": fixture or None, "kickoff_date": kickoff_date, "status": "rejected" if reasons else "ready", "reasons": reasons})
+    rejected = [row for row in rows if row["status"] == "rejected"]
+    return {"status": "ready" if packets and not rejected else "rejected", "packet_count": len(packets), "ready_count": len(rows) - len(rejected), "rejected_count": len(rejected), "expected_date": expected_date, "require_prematch": require_prematch, "rows": rows}
+
+
 def line_from_primary(primary: Optional[Dict[str, Any]]) -> Optional[float]:
     return as_float(primary.get("line")) if primary else None
 
@@ -3385,6 +3417,11 @@ async def shadow_import_prematch_packets(request: Request, token: Optional[str] 
         raise HTTPException(status_code=400, detail="one_or_more_packets_required")
     if len(packets) > 100:
         raise HTTPException(status_code=413, detail="maximum_100_packets_per_request")
+    expected_date = request.headers.get("x-expected-match-date") or None
+    require_prematch = str(request.headers.get("x-require-prematch") or "false").lower() in ("1", "true", "yes", "on")
+    preflight = server_import_preflight(packets, expected_date=expected_date, require_prematch=require_prematch)
+    if preflight["status"] != "ready":
+        raise HTTPException(status_code=422, detail={"error": "import_preflight_rejected", "preflight": preflight})
     with SNAPSHOT_STORE_LOCK:
         results, store = import_prematch_packet_batch(packets)
         previous = store.get("import_sync_status") or {}
@@ -3397,7 +3434,7 @@ async def shadow_import_prematch_packets(request: Request, token: Optional[str] 
             "stage_counts": totals, "changed_fixture_count": sum(1 for row in results if row.get("changed")),
         }
         write_snapshot_store(store)
-    return JSONResponse({"ok": True, "version": VERSION, "imported_count": len(results), "stage_counts": totals, "results": results})
+    return JSONResponse({"ok": True, "version": VERSION, "imported_count": len(results), "stage_counts": totals, "preflight": preflight, "results": results})
 
 
 @app.get("/shadow/import-status")
