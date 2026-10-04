@@ -44,6 +44,34 @@ class ReadOnlyPrematchSyncTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "prematch_window_hours_must_be_1_to_168"):
             sync_prematch.select_prematch_window([], 169)
 
+    def test_empty_current_window_is_successful_noop_without_upload(self):
+        old_packet = self.packet()
+        old_packet["match"]["kickoff_utc"] = "2020-01-01T00:00:00+00:00"
+        raw = json.dumps({"packets": [old_packet]}).encode()
+        argv = ["sync_prematch.py", "--input", "bundle.json", "--prematch-window-hours", "72", "--require-prematch"]
+        with patch.object(sync_prematch.sys, "argv", argv), patch("sync_prematch.read_local", return_value=raw), patch("sync_prematch.upload_packets") as upload, patch("builtins.print") as output:
+            self.assertEqual(sync_prematch.main(), 0)
+        upload.assert_not_called()
+        report = json.loads(output.call_args.args[0])
+        self.assertEqual(report["status"], "no_current_prematch_packets")
+        self.assertEqual(report["action"], "safe_noop")
+        self.assertEqual(report["selection"]["excluded_reason_counts"], {"fixture_not_prematch": 1})
+
+    def test_exclusion_report_is_bounded(self):
+        packets = []
+        for index in range(sync_prematch.EXCLUDED_REPORT_LIMIT + 2):
+            item = self.packet()
+            item["match"] = {"match_id": f"old-{index}", "kickoff_utc": "2020-01-01T00:00:00+00:00"}
+            packets.append(item)
+        raw = json.dumps({"packets": packets}).encode()
+        argv = ["sync_prematch.py", "--input", "bundle.json", "--prematch-window-hours", "72"]
+        with patch.object(sync_prematch.sys, "argv", argv), patch("sync_prematch.read_local", return_value=raw), patch("builtins.print") as output:
+            self.assertEqual(sync_prematch.main(), 0)
+        selection = json.loads(output.call_args.args[0])["selection"]
+        self.assertEqual(len(selection["excluded_sample"]), sync_prematch.EXCLUDED_REPORT_LIMIT)
+        self.assertTrue(selection["excluded_truncated"])
+        self.assertEqual(selection["excluded_count"], sync_prematch.EXCLUDED_REPORT_LIMIT + 2)
+
     def test_remote_reader_is_restricted_to_existing_absolute_file(self):
         with self.assertRaises(ValueError):
             sync_prematch.read_pang_file("pang", "/tmp/data.gz;touch /tmp/x")

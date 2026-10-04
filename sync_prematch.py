@@ -20,6 +20,7 @@ import requests
 
 SAFE_REMOTE_PATH = re.compile(r"^/[A-Za-z0-9._/-]+$")
 DEFAULT_ENDPOINT = "https://web-production-f1134.up.railway.app"
+EXCLUDED_REPORT_LIMIT = 50
 
 
 def decode_bundle(raw: bytes) -> Dict[str, Any]:
@@ -182,19 +183,31 @@ def main() -> int:
         parser.error("--remote-path is required with --ssh-host")
     raw = read_local(args.input) if args.input else read_pang_file(args.ssh_host, args.remote_path)
     packets = select_packets(decode_bundle(raw), args.league)
+    source_selected_count = len(packets)
     excluded: List[Dict[str, Any]] = []
     if args.prematch_window_hours is not None:
         packets, excluded = select_prematch_window(packets, args.prematch_window_hours)
+    exclusion_reasons: Dict[str, int] = {}
+    for item in excluded:
+        reason = str(item.get("reason") or "unknown")
+        exclusion_reasons[reason] = exclusion_reasons.get(reason, 0) + 1
     preflight = packet_preflight(packets, args.expected_date, args.require_prematch)
     report = {
         **summary(packets),
         "preflight": preflight,
         "selection": {
             "prematch_window_hours": args.prematch_window_hours,
+            "source_selected_count": source_selected_count,
             "excluded_count": len(excluded),
-            "excluded": excluded,
+            "excluded_reason_counts": exclusion_reasons,
+            "excluded_sample": excluded[:EXCLUDED_REPORT_LIMIT],
+            "excluded_sample_limit": EXCLUDED_REPORT_LIMIT,
+            "excluded_truncated": len(excluded) > EXCLUDED_REPORT_LIMIT,
         },
     }
+    if args.prematch_window_hours is not None and not packets:
+        print(json.dumps({**report, "status": "no_current_prematch_packets", "action": "safe_noop"}, ensure_ascii=False))
+        return 0
     if args.dry_run:
         print(json.dumps({**report, "status": "dry_run"}, ensure_ascii=False))
         return 0 if preflight["status"] == "ready" else 2
