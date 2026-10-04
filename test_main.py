@@ -1767,6 +1767,32 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["competition_count"], 1)
         self.assertEqual(result["team_count"], 2)
 
+    def test_nami_odds_capability_is_optional_and_probe_only(self):
+        payload = {"code": 0, "results": {"asia": [{"id": 1}], "eu": [{"id": 2}, {"id": 3}]}}
+        with patch("main.call_nami", return_value={
+            "ok": True, "available": True, "degraded": False,
+            "status_code": 200, "data": payload, "error": None,
+        }) as mocked:
+            result = main.nami_odds_capability_check()
+        mocked.assert_called_once_with("/api/v5/football/odds/live")
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["required"])
+        self.assertFalse(result["decision_use"])
+        self.assertEqual(result["entitlement"], "available")
+        self.assertEqual(result["results_shape"], "object")
+        self.assertEqual(result["sample_count"], 3)
+
+    def test_nami_odds_missing_entitlement_does_not_break_system(self):
+        with patch("main.call_nami", return_value={
+            "ok": False, "available": False, "degraded": True,
+            "status_code": 200, "data": {"code": 1001}, "error": "套餐未开通",
+        }):
+            result = main.nami_odds_capability_check()
+        self.assertEqual(result["entitlement"], "not_entitled")
+        self.assertEqual(result["error_category"], "product_not_entitled")
+        self.assertEqual(result["fallback"], "continue_without_nami_odds")
+        self.assertTrue(main.health()["ok"])
+
     def prematch_packet(self):
         consensus = {
             "1x2": {"status": "available", "median_prices": {"home": 2.0, "draw": 3.4, "away": 3.8}},

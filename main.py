@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.42.0"
+VERSION = "1.43.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -390,6 +390,46 @@ def parse_nami_schedule(result: Dict[str, Any]) -> Dict[str, Any]:
         "data_status": "available" if result.get("ok") else "data_missing",
         "fixture_count": len(fixtures), "target_candidate_count": sum(bool(row["target_candidate"]) for row in fixtures),
         "fixtures": fixtures, "error": result.get("error"),
+    }
+
+
+def nami_odds_capability_check() -> Dict[str, Any]:
+    """Probe Nami football odds entitlement without making it a system dependency.
+
+    The provider documents odds as a separate product family.  This probe only
+    reports entitlement and response shape; it does not import quotes or allow
+    them to influence a recommendation.
+    """
+    endpoint = "/api/v5/football/odds/live"
+    check = call_nami(endpoint)
+    data = check.get("data") if isinstance(check.get("data"), dict) else {}
+    results = data.get("results")
+    if isinstance(results, list):
+        result_shape, sample_count = "array", len(results)
+    elif isinstance(results, dict):
+        result_shape = "object"
+        sample_count = sum(len(value) for value in results.values() if isinstance(value, list))
+    elif results is None:
+        result_shape, sample_count = "missing", 0
+    else:
+        result_shape, sample_count = type(results).__name__, 0
+    error = str(check.get("error") or "")
+    error_lower = error.lower()
+    not_entitled = any(token in error_lower for token in ("entitle", "permission", "product", "套餐", "权限", "未开通"))
+    return {
+        "configured": bool(NAMI_API_USER and NAMI_API_SECRET),
+        "ok": check.get("ok", False), "available": check.get("available", False),
+        "degraded": check.get("degraded", True), "required": False,
+        "fallback": "continue_without_nami_odds" if not check.get("ok") else None,
+        "status_code": check.get("status_code"), "api_version": "v5",
+        "product": "football_odds", "probe_endpoint": endpoint,
+        "entitlement": "available" if check.get("ok") else ("not_entitled" if not_entitled else "unknown"),
+        "error_category": "product_not_entitled" if not_entitled else ("upstream_error" if error else None),
+        "response_fields": sorted(data.keys()), "results_shape": result_shape,
+        "sample_count": sample_count,
+        "integration_status": "capability_probe_only",
+        "decision_use": False,
+        "required_before_import": ["timestamp_semantics_verified", "company_array_verified", "history_coverage_verified"],
     }
 
 
@@ -3204,7 +3244,7 @@ def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6, ri
 
 @app.get("/")
 def root():
-    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/import-status", "/shadow/data-source-health", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}"]}
+    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/import-status", "/shadow/data-source-health", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}"]}
 
 
 @app.get("/health")
@@ -3216,6 +3256,12 @@ def health():
 def shadow_nami_capabilities(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     return JSONResponse(nami_capability_check())
+
+
+@app.get("/shadow/nami-odds-capabilities")
+def shadow_nami_odds_capabilities(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse(nami_odds_capability_check())
 
 
 @app.get("/api-football/live")

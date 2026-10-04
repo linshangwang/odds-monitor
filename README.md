@@ -355,6 +355,11 @@ SNAPSHOT_STORE_PATH=/data/shadow_snapshots.json
 Nami 只用于补充数据，不是主流程依赖。未配置、IP 未授权、限流、超时、非 JSON
 响应或其他上游异常都会返回 `degraded=true` 和
 `fallback=continue_without_nami`；服务健康状态、既有数据源和影子分析流程继续运行。
+
+V1.43 新增受保护的 `GET /shadow/nami-odds-capabilities`。它按官方足球 v5 文档探测
+`odds/live` 的独立产品授权和返回结构，但只做能力审计：在公司数组、时间戳语义和历史覆盖
+完成验证前，Nami 指数不会写入盘口时间轴、不会改变基本面，也不会参与最终推荐。指数产品
+未开通或调用失败时返回 `continue_without_nami_odds`，主系统继续稳定运行。
 可通过 `NAMI_REQUEST_TIMEOUT` 单独限制等待时间，默认最多 10 秒。
 所有外部数据源的 JSON 与文本诊断响应都会递归移除已配置的密钥值；即使上游回显请求参数，
 接口响应和日志数据也不会返回真实凭据。
