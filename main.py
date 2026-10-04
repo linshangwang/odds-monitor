@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.27.0"
+VERSION = "1.28.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -3273,6 +3273,100 @@ def fixture_readiness_report(fixture: Any, now_ts: Optional[int] = None) -> Dict
     }
 
 
+def lock_calibration_prediction(fixture: Any, probabilities: Dict[str, Any], recommendation: Optional[Dict[str, Any]] = None, captured_at: Optional[int] = None) -> Dict[str, Any]:
+    fixture_key = str(fixture or "").strip()
+    if not fixture_key:
+        raise HTTPException(status_code=400, detail="fixture_required")
+    captured_at = int(captured_at or time.time())
+    parsed = {key: as_float((probabilities or {}).get(key)) for key in ("home", "draw", "away")}
+    if any(value is None or not 0 < value < 1 for value in parsed.values()) or abs(sum(parsed.values()) - 1.0) > 0.01:
+        raise HTTPException(status_code=400, detail="invalid_1x2_probabilities")
+    recommendation = recommendation if isinstance(recommendation, dict) else {"decision": "PASS"}
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        metadata = (store.get("external_prematch") or {}).get(fixture_key) or {}
+        kickoff = _parse_timestamp(get_nested(metadata, ["match", "kickoff_utc"]))
+        if kickoff is not None and captured_at >= kickoff:
+            raise HTTPException(status_code=409, detail="prediction_must_be_locked_before_kickoff")
+        predictions = store.setdefault("calibration_predictions", {})
+        if fixture_key in predictions:
+            existing = predictions[fixture_key]
+            if _content_hash({"probabilities": existing.get("probabilities"), "recommendation": existing.get("recommendation")}) == _content_hash({"probabilities": parsed, "recommendation": recommendation}):
+                return {**existing, "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="prediction_already_locked")
+        record = {
+            "fixture": fixture_key, "captured_at": captured_at, "kickoff_at": kickoff,
+            "probabilities": parsed, "recommendation": recommendation,
+            "prediction_hash": _content_hash({"fixture": fixture_key, "captured_at": captured_at, "probabilities": parsed, "recommendation": recommendation}),
+            "status": "locked", "settlement": None,
+        }
+        predictions[fixture_key] = record
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return {**record, "action": "locked"}
+
+
+def settle_calibration_prediction(fixture: Any, home_goals: Any, away_goals: Any, settled_at: Optional[int] = None) -> Dict[str, Any]:
+    fixture_key = str(fixture or "").strip()
+    if not fixture_key:
+        raise HTTPException(status_code=400, detail="fixture_required")
+    try:
+        home_goals, away_goals = int(home_goals), int(away_goals)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="goals_must_be_non_negative_integers")
+    if home_goals < 0 or away_goals < 0:
+        raise HTTPException(status_code=400, detail="goals_must_be_non_negative_integers")
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        record = (store.get("calibration_predictions") or {}).get(fixture_key)
+        if not record:
+            raise HTTPException(status_code=404, detail="locked_prediction_not_found")
+        existing = record.get("settlement")
+        if existing:
+            if existing.get("home_goals") == home_goals and existing.get("away_goals") == away_goals:
+                return {**existing, "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="settlement_already_recorded")
+        outcome = "home" if home_goals > away_goals else ("away" if away_goals > home_goals else "draw")
+        probabilities = record["probabilities"]
+        brier = sum((probabilities[key] - (1.0 if key == outcome else 0.0)) ** 2 for key in ("home", "draw", "away"))
+        log_loss = -math.log(max(probabilities[outcome], 1e-15))
+        recommendation = record.get("recommendation") or {}
+        decision = recommendation.get("decision") or recommendation.get("selection") or "PASS"
+        price = as_float(recommendation.get("price"))
+        bet_placed = decision in ("home", "draw", "away") and price is not None and price > 1
+        unit_return = (price - 1.0 if decision == outcome else -1.0) if bet_placed else None
+        settlement = {
+            "fixture": fixture_key, "settled_at": int(settled_at or time.time()),
+            "home_goals": home_goals, "away_goals": away_goals, "outcome_1x2": outcome,
+            "brier_score": round(brier, 8), "log_loss": round(log_loss, 8),
+            "bet_placed": bet_placed, "selection": decision if bet_placed else None,
+            "price": price if bet_placed else None, "unit_return": round(unit_return, 8) if unit_return is not None else None,
+            "prediction_hash": record.get("prediction_hash"), "action": "settled",
+        }
+        record["status"] = "settled"
+        record["settlement"] = settlement
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return settlement
+
+
+def calibration_report() -> Dict[str, Any]:
+    records = list((load_snapshot_store().get("calibration_predictions") or {}).values())
+    settled = [record.get("settlement") for record in records if isinstance(record.get("settlement"), dict)]
+    bets = [row for row in settled if row.get("bet_placed") and as_float(row.get("unit_return")) is not None]
+    total_return = sum(as_float(row.get("unit_return")) or 0 for row in bets)
+    return {
+        "version": VERSION, "locked_count": len(records), "settled_count": len(settled),
+        "pending_count": len(records) - len(settled),
+        "average_brier_score": round(sum(row["brier_score"] for row in settled) / len(settled), 8) if settled else None,
+        "average_log_loss": round(sum(row["log_loss"] for row in settled) / len(settled), 8) if settled else None,
+        "bet_count": len(bets), "total_unit_return": round(total_return, 8),
+        "roi": round(total_return / len(bets), 8) if bets else None,
+        "records": settled,
+        "policy": "predictions are immutable after locking; PASS is excluded from betting ROI but included in probability calibration",
+    }
+
+
 def audit_lineup_confidence(lineup_history: Any, submitted_confidence: Any, now_ts: Optional[int] = None) -> Dict[str, Any]:
     now_ts = int(time.time()) if now_ts is None else int(now_ts)
     submitted = as_float(submitted_confidence)
@@ -3540,6 +3634,28 @@ def shadow_imported_prematch(fixture: str, include_companies: bool = False, incl
 def shadow_fixture_readiness(fixture: str, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     return JSONResponse({"ok": True, "readiness": fixture_readiness_report(fixture)})
+
+
+@app.post("/shadow/calibration/lock")
+async def shadow_calibration_lock(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    payload = await request.json()
+    record = lock_calibration_prediction(payload.get("fixture"), payload.get("probabilities") or {}, payload.get("recommendation"), payload.get("captured_at"))
+    return JSONResponse({"ok": True, "record": record})
+
+
+@app.post("/shadow/calibration/settle")
+async def shadow_calibration_settle(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    payload = await request.json()
+    settlement = settle_calibration_prediction(payload.get("fixture"), payload.get("home_goals"), payload.get("away_goals"), payload.get("settled_at"))
+    return JSONResponse({"ok": True, "settlement": settlement})
+
+
+@app.get("/shadow/calibration/report")
+def shadow_calibration_report(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "calibration": calibration_report()})
 
 
 

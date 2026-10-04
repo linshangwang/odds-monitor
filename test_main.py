@@ -1647,6 +1647,39 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(blocked["status"], "not_ready")
         self.assertIn("1x2:insufficient_bookmakers", blocked["market_blockers"])
 
+    def test_calibration_lock_settle_and_report_are_immutable(self):
+        main.write_snapshot_store({"version": main.VERSION, "fixtures": {}, "external_prematch": {"cal-1": {"match": {"kickoff_utc": "1970-01-01T00:16:40+00:00"}}}})
+        locked = main.lock_calibration_prediction("cal-1", {"home": .6, "draw": .25, "away": .15}, {"decision": "home", "price": 2.0}, captured_at=900)
+        self.assertEqual(locked["action"], "locked")
+        self.assertEqual(main.lock_calibration_prediction("cal-1", {"home": .6, "draw": .25, "away": .15}, {"decision": "home", "price": 2.0}, captured_at=950)["action"], "unchanged")
+        with self.assertRaises(main.HTTPException) as changed:
+            main.lock_calibration_prediction("cal-1", {"home": .5, "draw": .3, "away": .2}, captured_at=950)
+        self.assertEqual(changed.exception.status_code, 409)
+
+        settlement = main.settle_calibration_prediction("cal-1", 2, 1, settled_at=1100)
+        self.assertEqual(settlement["outcome_1x2"], "home")
+        self.assertAlmostEqual(settlement["brier_score"], .245, places=8)
+        self.assertAlmostEqual(settlement["log_loss"], -main.math.log(.6), places=8)
+        self.assertEqual(settlement["unit_return"], 1.0)
+        self.assertEqual(main.settle_calibration_prediction("cal-1", 2, 1)["action"], "unchanged")
+        with self.assertRaises(main.HTTPException):
+            main.settle_calibration_prediction("cal-1", 1, 2)
+        report = main.calibration_report()
+        self.assertEqual(report["settled_count"], 1)
+        self.assertEqual(report["bet_count"], 1)
+        self.assertEqual(report["roi"], 1.0)
+
+    def test_calibration_pass_counts_probability_not_betting_roi(self):
+        main.write_snapshot_store({"version": main.VERSION, "fixtures": {}})
+        main.lock_calibration_prediction("cal-pass", {"home": .4, "draw": .3, "away": .3}, {"decision": "PASS"}, captured_at=100)
+        settled = main.settle_calibration_prediction("cal-pass", 0, 0, settled_at=200)
+        self.assertFalse(settled["bet_placed"])
+        self.assertIsNone(settled["unit_return"])
+        report = main.calibration_report()
+        self.assertEqual(report["settled_count"], 1)
+        self.assertEqual(report["bet_count"], 0)
+        self.assertIsNone(report["roi"])
+
     def test_imported_ai_packet_excludes_invalid_latest_node(self):
         packet = self.prematch_packet()
         invalid_late = dict(packet["timeline"][0])
