@@ -2429,6 +2429,23 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(report["pang"]["fresh_fixture_count"], 1)
         self.assertIsNone(report["missing_action"])
 
+    def test_public_health_exposes_only_compact_market_route_summary(self):
+        route = {
+            "status": "awaiting_verified_snapshot", "decision_eligible": False,
+            "decision_route": None, "collector_candidates": ["api_football_configured_unverified_for_current_fixture"],
+            "pang": {"fresh_fixture_count": 0, "fixtures": [{"secret": "must-not-leak"}]},
+            "missing_action": "PASS", "rule": "internal-rule-detail",
+        }
+        with patch("main.market_data_route_report", return_value=route):
+            result = main.health()
+        public = result["market_data_route"]
+        self.assertEqual(public["status"], "awaiting_verified_snapshot")
+        self.assertEqual(public["missing_action"], "PASS")
+        self.assertEqual(public["fresh_fixture_count"], 0)
+        self.assertNotIn("pang", public)
+        self.assertNotIn("rule", public)
+        self.assertNotIn("must-not-leak", str(public))
+
     def test_freshness_uses_latest_stage_and_rejects_future_timestamp(self):
         metadata = {"match": {"kickoff_utc": "2030-01-01T00:00:00+00:00"}}
         history = [
