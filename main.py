@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.26.0"
+VERSION = "1.27.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -3221,6 +3221,58 @@ def imported_fixture_freshness(metadata: Dict[str, Any], history: List[Dict[str,
     }
 
 
+def fixture_readiness_report(fixture: Any, now_ts: Optional[int] = None) -> Dict[str, Any]:
+    fixture_key = str(fixture)
+    store = load_snapshot_store()
+    history = get_fixture_snapshots(fixture_key)
+    metadata = (store.get("external_prematch") or {}).get(fixture_key) or {}
+    freshness = imported_fixture_freshness(metadata, history, now_ts=now_ts)
+    timeline_audit = audit_line_movement_timeline(history)
+    latest = latest_prematch_snapshot([row for row in history if snapshot_stage_usable(row)])
+    consensus = get_nested(latest or {}, ["market_snapshot", "consensus_main_line"], {}) or {}
+    required_market_audit = {}
+    for market in ("1x2", "asian_handicap", "over_under"):
+        row = consensus.get(market) if isinstance(consensus.get(market), dict) else {}
+        reasons = []
+        if not row:
+            reasons.append("data_missing")
+        if row and row.get("source") != "complete_company_array":
+            reasons.append("complete_company_array_required")
+        if row and int(row.get("bookmaker_count") or 0) < MIN_CONSENSUS_BOOKMAKERS:
+            reasons.append("insufficient_bookmakers")
+        required_market_audit[market] = {"eligible": not reasons, "reasons": reasons, "bookmaker_count": row.get("bookmaker_count"), "source": row.get("source")}
+    market_blockers = [f"{market}:{reason}" for market, audit in required_market_audit.items() for reason in audit["reasons"]]
+    if not freshness.get("decision_eligible"):
+        market_blockers.append("freshness:" + str(freshness.get("reason") or freshness.get("state")))
+    if not timeline_audit.get("decision_eligible"):
+        market_blockers.append("line_movement:" + str(timeline_audit.get("reason")))
+    market_ready = not market_blockers
+    versions = get_fundamental_versions(fixture_key)
+    latest_version = versions[-1] if versions else None
+    chain_audit = audit_fundamental_chain(get_nested(latest_version or {}, ["script"], {}), now_ts=now_ts)
+    lineup_audit = audit_lineup_confidence(metadata.get("lineup_history"), 1.0, now_ts=now_ts)
+    lineup_ready = (lineup_audit.get("effective_confidence") or 0) >= MIN_LINEUP_CONFIDENCE
+    decision_blockers = list(market_blockers)
+    if not chain_audit.get("decision_eligible"):
+        decision_blockers.append("fundamental_chain_incomplete")
+    if not lineup_ready:
+        decision_blockers.append("lineup_confidence_insufficient")
+    decision_ready = market_ready and chain_audit.get("decision_eligible") is True and lineup_ready
+    status = "decision_ready" if decision_ready else ("shadow_ready" if market_ready else "not_ready")
+    opening = next((row for row in history if row.get("stage") == "Opening"), None)
+    return {
+        "version": VERSION, "fixture": fixture_key, "status": status,
+        "shadow_ready": market_ready, "decision_ready": decision_ready,
+        "market_blockers": market_blockers, "decision_blockers": decision_blockers,
+        "freshness": freshness, "line_movement_audit": timeline_audit,
+        "required_market_audit": required_market_audit,
+        "opening_source_audit": (opening or {}).get("opening_source_audit") or {"status": "data_missing", "verified": False},
+        "fundamental_chain_audit": chain_audit, "lineup_confidence_audit": lineup_audit,
+        "latest_stage": (latest or {}).get("stage"),
+        "policy": "shadow_ready requires fresh two-stage complete-company-array markets; decision_ready also requires verified fundamentals and lineup confidence",
+    }
+
+
 def audit_lineup_confidence(lineup_history: Any, submitted_confidence: Any, now_ts: Optional[int] = None) -> Dict[str, Any]:
     now_ts = int(time.time()) if now_ts is None else int(now_ts)
     submitted = as_float(submitted_confidence)
@@ -3482,6 +3534,12 @@ def build_imported_ai_packet(fixture: str, include_companies: bool = False, incl
 def shadow_imported_prematch(fixture: str, include_companies: bool = False, include_lineups: bool = False, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     return JSONResponse(build_imported_ai_packet(fixture, include_companies=include_companies, include_lineups=include_lineups))
+
+
+@app.get("/shadow/readiness/{fixture}")
+def shadow_fixture_readiness(fixture: str, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "readiness": fixture_readiness_report(fixture)})
 
 
 

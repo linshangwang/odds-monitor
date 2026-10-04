@@ -1619,6 +1619,34 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(opening["import_status"], "data_missing")
         self.assertEqual(opening["opening_source_audit"]["verified_markets"], [])
 
+    def test_fixture_readiness_distinguishes_shadow_from_decision_ready(self):
+        consensus = {
+            "1x2": {"home": 2.0, "draw": 3.4, "away": 3.8, "bookmaker_count": 2, "source": "complete_company_array"},
+            "asian_handicap": {"line": -0.25, "home": 1.9, "away": 1.95, "bookmaker_count": 2, "source": "complete_company_array"},
+            "over_under": {"line": 2.5, "over": 1.91, "under": 1.94, "bookmaker_count": 2, "source": "complete_company_array"},
+        }
+        rows = [
+            {"fixture": "ready-1", "stage": "T-24h", "snapshot_at": 100, "import_status": "available", "market_snapshot": {"available": True, "consensus_main_line": consensus}, "stage_timing_audit": {"status": "valid"}, "market_dynamics": {"comparison_status": "data_missing"}},
+            {"fixture": "ready-1", "stage": "T-12h", "snapshot_at": 200, "import_status": "available", "market_snapshot": {"available": True, "consensus_main_line": consensus}, "stage_timing_audit": {"status": "valid"}, "market_dynamics": {"comparison_status": "compared"}},
+        ]
+        main.write_snapshot_store({"version": main.VERSION, "fixtures": {"ready-1": rows}, "external_prematch": {"ready-1": {"match": {"kickoff_utc": "1970-01-01T00:16:40+00:00"}, "lineup_history": [{"observed_at": 190, "status": "official"}]}}})
+        report = main.fixture_readiness_report("ready-1", now_ts=250)
+        self.assertEqual(report["status"], "shadow_ready")
+        self.assertTrue(report["shadow_ready"])
+        self.assertFalse(report["decision_ready"])
+        self.assertEqual(report["market_blockers"], [])
+        self.assertIn("fundamental_chain_incomplete", report["decision_blockers"])
+        self.assertEqual(report["latest_stage"], "T-12h")
+
+        weak = dict(consensus)
+        weak["1x2"] = {**consensus["1x2"], "bookmaker_count": 1}
+        store = main.load_snapshot_store()
+        store["fixtures"]["ready-1"][1]["market_snapshot"]["consensus_main_line"] = weak
+        main.write_snapshot_store(store)
+        blocked = main.fixture_readiness_report("ready-1", now_ts=250)
+        self.assertEqual(blocked["status"], "not_ready")
+        self.assertIn("1x2:insufficient_bookmakers", blocked["market_blockers"])
+
     def test_imported_ai_packet_excludes_invalid_latest_node(self):
         packet = self.prematch_packet()
         invalid_late = dict(packet["timeline"][0])
