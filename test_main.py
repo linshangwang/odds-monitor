@@ -78,6 +78,29 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(metadata["provider_fixture_ids"], {"pang": "uuid-1"})
         self.assertEqual(metadata["fixture_identity"]["status"], "complete")
 
+    def test_nami_schedule_is_parsed_as_non_decision_supplement(self):
+        payload = {"code": 0, "results": {
+            "competition": [{"id": 5, "name_en": "UEFA Nations League"}],
+            "team": [{"id": 10, "name_en": "France"}, {"id": 11, "name_en": "Italy"}],
+            "match": [{"id": 99, "competition_id": 5, "home_team_id": 10, "away_team_id": 11, "match_time": 1791115200, "status_id": 1}],
+        }}
+        parsed = main.parse_nami_schedule({"ok": True, "status_code": 200, "data": payload})
+        self.assertEqual(parsed["fixture_count"], 1)
+        self.assertEqual(parsed["target_candidate_count"], 1)
+        fixture = parsed["fixtures"][0]
+        self.assertEqual(fixture["provider_fixture_id"], "99")
+        self.assertFalse(fixture["decision_eligible"])
+        self.assertEqual(fixture["fixture_identity"]["source"], "nami")
+
+    def test_target_fixture_probe_keeps_nami_out_of_primary_queue(self):
+        nami = {"ok": True, "data_status": "available", "fixture_count": 1, "target_candidate_count": 1, "fixtures": [{"provider": "nami", "provider_fixture_id": "99", "decision_eligible": False}], "error": None, "status_code": 200}
+        with patch.object(main, "call_api_football", return_value={"ok": False, "error": "Missing API_FOOTBALL_KEY"}), patch.object(main, "nami_fixtures_for_date", return_value=nami), patch.object(main, "API_FOOTBALL_KEY", ""):
+            result = main.target_fixtures_for_date("2026-10-04", include_supplemental=True)
+        self.assertEqual(result["target_count"], 0)
+        self.assertEqual(result["supplemental_target_candidate_count"], 1)
+        self.assertFalse(result["supplemental_fixtures"][0]["decision_eligible"])
+        self.assertFalse(result["source_audit"]["nami"]["fallback_used"])
+
     def test_complete_timeline_contains_opening(self):
         self.assertEqual(main.PREMATCH_STAGE_ORDER, ["Opening", "T-24h", "T-12h", "T-6h", "T-3h", "T-1h", "T-15m", "Closing"])
 

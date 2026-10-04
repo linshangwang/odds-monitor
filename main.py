@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.32.0"
+VERSION = "1.33.0"
 RELEASE_CHANNEL = "shadow-usable"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
@@ -88,6 +88,8 @@ DEFAULT_TARGET_LEAGUES: Dict[int, str] = {
 }
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
+raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
+NAMI_TARGET_COMPETITION_IDS = {str(x).strip() for x in raw_nami_target.split(",") if str(x).strip()}
 
 TRACKING_STAGES = [
     {"key": "Opening", "label": "Opening 开盘", "offset": timedelta(hours=-48), "purpose": "仅保存有来源证明的真实开盘；自动当前赔率不得冒充开盘"},
@@ -327,6 +329,56 @@ def nami_capability_check() -> Dict[str, Any]:
     }
 
 
+def _nami_name(row: Dict[str, Any]) -> Optional[str]:
+    for key in ("name_zh", "name_zht", "name_en", "name", "short_name"):
+        if row.get(key):
+            return str(row[key])
+    return None
+
+
+def parse_nami_schedule(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Parse Nami relation arrays while preserving its provider id namespace."""
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    results = data.get("results") if isinstance(data.get("results"), dict) else {}
+    matches = results.get("match") if isinstance(results.get("match"), list) else []
+    competitions = {str(row.get("id")): row for row in (results.get("competition") or []) if isinstance(row, dict) and row.get("id") is not None}
+    teams = {str(row.get("id")): row for row in (results.get("team") or []) if isinstance(row, dict) and row.get("id") is not None}
+    target_names = {normalize_fixture_identity_name(name) for name in DEFAULT_TARGET_LEAGUES.values()}
+    fixtures = []
+    for row in matches:
+        if not isinstance(row, dict):
+            continue
+        competition_id = str(row.get("competition_id") or "")
+        competition_name = _nami_name(competitions.get(competition_id, {}))
+        home = teams.get(str(row.get("home_team_id") or ""), {})
+        away = teams.get(str(row.get("away_team_id") or ""), {})
+        match = {"id": row.get("id"), "match_time": row.get("match_time"), "home": _nami_name(home), "away": _nami_name(away), "league_name": competition_name}
+        identity = fixture_identity_from_match(match, competition_name, "nami")
+        target_candidate = competition_id in NAMI_TARGET_COMPETITION_IDS or normalize_fixture_identity_name(competition_name) in target_names
+        fixtures.append({
+            "provider": "nami", "provider_fixture_id": identity.get("source_fixture_id"),
+            "competition_id": competition_id or None, "competition": competition_name,
+            "home_team_id": str(row.get("home_team_id")) if row.get("home_team_id") is not None else None,
+            "home": _nami_name(home), "away_team_id": str(row.get("away_team_id")) if row.get("away_team_id") is not None else None,
+            "away": _nami_name(away), "kickoff_at": identity.get("kickoff_at"), "status_id": row.get("status_id"),
+            "target_candidate": target_candidate, "fixture_identity": identity,
+            "decision_eligible": False, "reason": "provider_identity_requires_unique_reconciliation_and_market_data",
+        })
+    return {
+        "ok": bool(result.get("ok")), "status_code": result.get("status_code"),
+        "data_status": "available" if result.get("ok") else "data_missing",
+        "fixture_count": len(fixtures), "target_candidate_count": sum(bool(row["target_candidate"]) for row in fixtures),
+        "fixtures": fixtures, "error": result.get("error"),
+    }
+
+
+def nami_fixtures_for_date(date: str) -> Dict[str, Any]:
+    digits = str(date or "").replace("-", "")
+    if len(digits) != 8 or not digits.isdigit():
+        return {"ok": False, "data_status": "data_missing", "fixture_count": 0, "target_candidate_count": 0, "fixtures": [], "error": "invalid_date"}
+    return parse_nami_schedule(call_nami("/api/v5/football/match/schedule/diary", {"date": digits}))
+
+
 def response_list(result: Dict[str, Any]) -> List[Any]:
     data = result.get("data") or {}
     return data.get("response") if isinstance(data, dict) and isinstance(data.get("response"), list) else []
@@ -366,7 +418,7 @@ def fixture_summary(row: Dict[str, Any]) -> Dict[str, Any]:
     return {"fixture_id": fixture.get("id"), "date": fixture.get("date"), "timestamp": fixture.get("timestamp"), "venue": fixture.get("venue"), "referee": fixture.get("referee"), "league_id": league_id, "league": league.get("name"), "league_round": league.get("round"), "league_target_name": DEFAULT_TARGET_LEAGUES.get(league_id), "country": league.get("country"), "season": league.get("season"), "home_id": home.get("id"), "home": home.get("name"), "away_id": away.get("id"), "away": away.get("name"), "status": status.get("short"), "elapsed": status.get("elapsed"), "goals": goals}
 
 
-def target_fixtures_for_date(date: str, timezone_name: str = "Asia/Shanghai") -> Dict[str, Any]:
+def target_fixtures_for_date(date: str, timezone_name: str = "Asia/Shanghai", include_supplemental: bool = False) -> Dict[str, Any]:
     result = call_api_football("/fixtures", {"date": date, "timezone": timezone_name})
     rows = response_list(result)
     targets = [r for r in rows if isinstance(r, dict) and get_nested(r, ["league", "id"]) in TARGET_LEAGUE_IDS]
@@ -382,6 +434,7 @@ def target_fixtures_for_date(date: str, timezone_name: str = "Asia/Shanghai") ->
         discovery_status, blocker = "available_no_targets", "no_target_league_fixtures_for_date"
     else:
         discovery_status, blocker = "available", None
+    nami_schedule = nami_fixtures_for_date(date) if include_supplemental else None
     source_audit = {
         "selected_source": "api_football",
         "selected_source_configured": configured,
@@ -393,6 +446,7 @@ def target_fixtures_for_date(date: str, timezone_name: str = "Asia/Shanghai") ->
             "role": "optional_supplemental_source",
             "fixture_id_namespace_compatible": False,
             "fallback_used": False,
+            "schedule_probe": ({key: nami_schedule.get(key) for key in ("ok", "status_code", "data_status", "fixture_count", "target_candidate_count", "error")} if nami_schedule else None),
             "reason": "nami_fixture_ids_must_not_be_sent_to_api_football_endpoints",
         },
         "policy": "never_cross_join_fixture_ids_between_providers; missing_discovery_data_remains_data_missing",
@@ -403,6 +457,8 @@ def target_fixtures_for_date(date: str, timezone_name: str = "Asia/Shanghai") ->
         "all_count": len(rows), "target_count": len(summaries), "fixtures": summaries,
         "source_status_code": result.get("status_code"), "source_audit": source_audit,
         "data_status": discovery_status, "data_missing": not configured,
+        "supplemental_fixtures": (nami_schedule or {}).get("fixtures", []),
+        "supplemental_target_candidate_count": (nami_schedule or {}).get("target_candidate_count", 0),
     }
 
 
@@ -3133,13 +3189,13 @@ def historical_odds_selfcheck() -> Dict[str, Any]:
 
 @app.get("/prematch/target-fixtures")
 def prematch_target_fixtures(date: str, timezone_name: str = Query("Asia/Shanghai", alias="timezone")):
-    return JSONResponse(target_fixtures_for_date(date, timezone_name))
+    return JSONResponse(target_fixtures_for_date(date, timezone_name, include_supplemental=True))
 
 
 @app.get("/shadow/target-fixtures")
 def shadow_target_fixtures(date: str, timezone_name: str = Query("Asia/Shanghai", alias="timezone"), token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
-    return JSONResponse(target_fixtures_for_date(date, timezone_name))
+    return JSONResponse(target_fixtures_for_date(date, timezone_name, include_supplemental=True))
 
 
 @app.get("/shadow/analyze-fixture")
