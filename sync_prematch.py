@@ -24,6 +24,8 @@ DEFAULT_ENDPOINT = "https://web-production-f1134.up.railway.app"
 EXCLUDED_REPORT_LIMIT = 50
 MAX_DECODED_BUNDLE_BYTES = 150 * 1024 * 1024
 DEFAULT_UPLOAD_BATCH_SIZE = 50
+REPORT_SAMPLE_LIMIT = 50
+SERVER_RESULT_SAMPLE_LIMIT = 10
 
 
 def bounded_gzip_decompress(raw: bytes, max_bytes: int) -> bytes:
@@ -139,16 +141,37 @@ def upload_packet_batches(endpoint: str, token: str, packets: List[Dict[str, Any
     for offset in range(0, len(packets), int(batch_size)):
         batch = packets[offset:offset + int(batch_size)]
         result = upload_packets(endpoint, token, batch, expected_date=expected_date, require_prematch=require_prematch)
-        results.append({"batch_number": len(results) + 1, "packet_count": len(batch), "server": result})
+        server_rows = result.get("results") if isinstance(result.get("results"), list) else []
+        compact_server = {key: result.get(key) for key in ("ok", "version", "imported_count", "stage_counts") if key in result}
+        compact_server.update({"results_count": len(server_rows), "results_sample": server_rows[:SERVER_RESULT_SAMPLE_LIMIT], "results_truncated": len(server_rows) > SERVER_RESULT_SAMPLE_LIMIT})
+        results.append({"batch_number": len(results) + 1, "packet_count": len(batch), "server": compact_server})
     return {"ok": True, "batch_count": len(results), "packet_count": len(packets), "batches": results}
 
 
 def summary(packets: List[Dict[str, Any]]) -> Dict[str, Any]:
+    fixtures = [str((packet.get("match") or {}).get("match_id") or "") for packet in packets]
     return {
         "packet_count": len(packets),
-        "fixtures": [str((packet.get("match") or {}).get("match_id") or "") for packet in packets],
+        "fixtures_sample": fixtures[:REPORT_SAMPLE_LIMIT],
+        "fixtures_sample_limit": REPORT_SAMPLE_LIMIT,
+        "fixtures_truncated": len(fixtures) > REPORT_SAMPLE_LIMIT,
         "leagues": sorted({str(packet.get("league") or "") for packet in packets}),
         "pang_policy": "read_only_existing_file; no remote writes or tasks",
+    }
+
+
+def compact_preflight_report(preflight: Dict[str, Any]) -> Dict[str, Any]:
+    rows = preflight.get("rows") if isinstance(preflight.get("rows"), list) else []
+    reason_counts: Dict[str, int] = {}
+    for row in rows:
+        for reason in row.get("reasons") or []:
+            reason_counts[str(reason)] = reason_counts.get(str(reason), 0) + 1
+    return {
+        **{key: value for key, value in preflight.items() if key != "rows"},
+        "reason_counts": reason_counts,
+        "rows_sample": rows[:REPORT_SAMPLE_LIMIT],
+        "rows_sample_limit": REPORT_SAMPLE_LIMIT,
+        "rows_truncated": len(rows) > REPORT_SAMPLE_LIMIT,
     }
 
 
@@ -219,7 +242,7 @@ def main() -> int:
     preflight = packet_preflight(packets, args.expected_date, args.require_prematch)
     report = {
         **summary(packets),
-        "preflight": preflight,
+        "preflight": compact_preflight_report(preflight),
         "selection": {
             "prematch_window_hours": args.prematch_window_hours,
             "source_selected_count": source_selected_count,

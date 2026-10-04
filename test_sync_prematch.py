@@ -115,6 +115,15 @@ class ReadOnlyPrematchSyncTests(unittest.TestCase):
         self.assertEqual(result["batch_count"], 3)
         self.assertEqual(result["packet_count"], 5)
 
+    def test_upload_batch_report_bounds_server_fixture_results(self):
+        server_rows = [{"fixture": index} for index in range(sync_prematch.SERVER_RESULT_SAMPLE_LIMIT + 2)]
+        with patch("sync_prematch.upload_packets", return_value={"ok": True, "imported_count": len(server_rows), "results": server_rows}):
+            result = sync_prematch.upload_packet_batches("https://example.test", "secret", [self.packet()])
+        server = result["batches"][0]["server"]
+        self.assertEqual(len(server["results_sample"]), sync_prematch.SERVER_RESULT_SAMPLE_LIMIT)
+        self.assertTrue(server["results_truncated"])
+        self.assertEqual(server["results_count"], len(server_rows))
+
     def test_upload_batch_size_cannot_exceed_server_limit(self):
         with self.assertRaisesRegex(ValueError, "upload_batch_size_must_be_1_to_100"):
             sync_prematch.upload_packet_batches("https://example.test", "secret", [], batch_size=101)
@@ -135,6 +144,14 @@ class ReadOnlyPrematchSyncTests(unittest.TestCase):
         report = sync_prematch.packet_preflight([self.packet()], expected_date="2026-10-05", require_prematch=True, now_ts=1791220000)
         self.assertEqual(report["status"], "ready")
         self.assertEqual(report["ready_count"], 1)
+
+    def test_compact_preflight_report_keeps_counts_and_bounds_rows(self):
+        rows = [{"fixture": str(index), "status": "rejected", "reasons": ["example"]} for index in range(sync_prematch.REPORT_SAMPLE_LIMIT + 2)]
+        compact = sync_prematch.compact_preflight_report({"status": "rejected", "packet_count": len(rows), "rows": rows})
+        self.assertEqual(compact["packet_count"], len(rows))
+        self.assertEqual(compact["reason_counts"], {"example": len(rows)})
+        self.assertEqual(len(compact["rows_sample"]), sync_prematch.REPORT_SAMPLE_LIMIT)
+        self.assertTrue(compact["rows_truncated"])
 
     def test_upload_forwards_strict_preflight_headers(self):
         response = Mock()
