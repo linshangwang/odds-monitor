@@ -132,6 +132,29 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(report["counts"]["no_match"], 1)
         self.assertFalse(report["rows"][0]["decision_eligible"])
 
+    def test_apply_provider_reconciliation_is_idempotent_and_local_only(self):
+        pang_match = {"match_id": "pang-1", "kickoff_utc": 1000, "home": "A", "away": "B"}
+        pang_identity = main.fixture_identity_from_match(pang_match, "UEFA Nations League", "pang")
+        store = {"external_prematch": {"pang-1": {"league": "UEFA Nations League", "match": pang_match, "fixture_identity": pang_identity}}}
+        nami_identity = main.fixture_identity_from_match({"id": 88, "match_time": 1000, "home": "A", "away": "B"}, "UEFA Nations League", "nami")
+        schedule = {"ok": True, "fixtures": [{"provider_fixture_id": "88", "target_candidate": True, "home": "A", "away": "B", "kickoff_at": 1000, "fixture_identity": nami_identity}]}
+        first = main.apply_provider_reconciliation("2026-10-05", store_override=store, nami_schedule_override=schedule, persist=False)
+        second = main.apply_provider_reconciliation("2026-10-05", store_override=store, nami_schedule_override=schedule, persist=False)
+        self.assertEqual(first["audit"]["applied_count"], 1)
+        self.assertEqual(second["audit"]["unchanged_count"], 1)
+        self.assertEqual(store["external_prematch"]["pang-1"]["provider_fixture_ids"]["nami"], "88")
+        self.assertEqual(store["external_prematch"]["pang-1"]["provider_reconciliation"]["method"], "strict_team_league_kickoff_unique_match")
+
+    def test_apply_provider_reconciliation_never_overwrites_conflicting_nami_id(self):
+        pang_match = {"match_id": "pang-1", "kickoff_utc": 1000, "home": "A", "away": "B"}
+        pang_identity = main.fixture_identity_from_match(pang_match, "UEFA Nations League", "pang")
+        store = {"external_prematch": {"pang-1": {"league": "UEFA Nations League", "match": pang_match, "fixture_identity": pang_identity, "provider_fixture_ids": {"pang": "pang-1", "nami": "old"}}}}
+        nami_identity = main.fixture_identity_from_match({"id": 88, "match_time": 1000, "home": "A", "away": "B"}, "UEFA Nations League", "nami")
+        schedule = {"ok": True, "fixtures": [{"provider_fixture_id": "88", "target_candidate": True, "fixture_identity": nami_identity}]}
+        result = main.apply_provider_reconciliation("2026-10-05", store_override=store, nami_schedule_override=schedule, persist=False)
+        self.assertEqual(result["rejected"][0]["reason"], "existing_nami_id_conflict")
+        self.assertEqual(store["external_prematch"]["pang-1"]["provider_fixture_ids"]["nami"], "old")
+
     def test_complete_timeline_contains_opening(self):
         self.assertEqual(main.PREMATCH_STAGE_ORDER, ["Opening", "T-24h", "T-12h", "T-6h", "T-3h", "T-1h", "T-15m", "Closing"])
 

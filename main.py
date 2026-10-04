@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.35.0"
+VERSION = "1.36.0"
 RELEASE_CHANNEL = "shadow-usable"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
@@ -1687,6 +1687,53 @@ def provider_reconciliation_report(date: str, store_override: Optional[Dict[str,
     }
 
 
+def apply_provider_reconciliation(date: str, store_override: Optional[Dict[str, Any]] = None, nami_schedule_override: Optional[Dict[str, Any]] = None, persist: bool = True) -> Dict[str, Any]:
+    """Persist only unique, conflict-free provider ids in the local Railway store."""
+    with SNAPSHOT_STORE_LOCK:
+        store = store_override if store_override is not None else load_snapshot_store()
+        report = provider_reconciliation_report(date, store_override=store, nami_schedule_override=nami_schedule_override)
+        applied, unchanged, rejected = [], [], []
+        metadata_by_fixture = store.setdefault("external_prematch", {})
+        now_ts = int(time.time())
+        for row in report["rows"]:
+            if row.get("status") != "matched" or not row.get("decision_eligible"):
+                rejected.append({"nami_fixture_id": row.get("nami_fixture_id"), "reason": row.get("reason") or row.get("status")})
+                continue
+            pang_fixture = str(row.get("matched_pang_fixture_id") or "")
+            nami_fixture = str(row.get("nami_fixture_id") or "")
+            metadata = metadata_by_fixture.get(pang_fixture)
+            if not metadata or not nami_fixture:
+                rejected.append({"nami_fixture_id": nami_fixture or None, "reason": "matched_metadata_missing"})
+                continue
+            provider_ids = metadata.setdefault("provider_fixture_ids", {"pang": pang_fixture})
+            existing = str(provider_ids.get("nami") or "")
+            if existing and existing != nami_fixture:
+                rejected.append({"nami_fixture_id": nami_fixture, "pang_fixture_id": pang_fixture, "reason": "existing_nami_id_conflict"})
+                continue
+            record = {"pang_fixture_id": pang_fixture, "nami_fixture_id": nami_fixture}
+            if existing == nami_fixture:
+                unchanged.append(record)
+                continue
+            provider_ids["nami"] = nami_fixture
+            metadata["provider_reconciliation"] = {
+                "status": "matched", "matched_at": now_ts, "match_date": date,
+                "method": "strict_team_league_kickoff_unique_match", "kickoff_tolerance_seconds": 900,
+            }
+            applied.append(record)
+        audit = {
+            "run_at": now_ts, "date": date, "applied_count": len(applied), "unchanged_count": len(unchanged),
+            "rejected_count": len(rejected), "source_counts": report.get("counts"),
+            "policy": "local_mapping_only; no_pang_writes; conflicts_never_overwritten",
+        }
+        history = store.setdefault("provider_reconciliation_audit", [])
+        history.append(audit)
+        store["provider_reconciliation_audit"] = history[-500:]
+        store["version"] = VERSION
+        if persist and store_override is None:
+            write_snapshot_store(store)
+        return {"ok": report.get("ok"), "version": VERSION, "date": date, "applied": applied, "unchanged": unchanged, "rejected": rejected, "audit": audit}
+
+
 def normalize_information_search(value: Any, snapshot_at: Optional[int] = None) -> Optional[Dict[str, Any]]:
     if not isinstance(value, dict):
         return None
@@ -3239,6 +3286,12 @@ def shadow_target_fixtures(date: str, timezone_name: str = Query("Asia/Shanghai"
 def shadow_provider_reconciliation(date: str, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     return JSONResponse(provider_reconciliation_report(date))
+
+
+@app.post("/shadow/provider-reconciliation/apply")
+def shadow_apply_provider_reconciliation(date: str, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse(apply_provider_reconciliation(date))
 
 
 @app.get("/shadow/analyze-fixture")
