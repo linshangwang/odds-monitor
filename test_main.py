@@ -20,6 +20,32 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         main.SNAPSHOT_STORE_PATH = self.old_store
         self.tmp.cleanup()
 
+    def test_target_fixture_discovery_reports_missing_source_without_nami_id_fallback(self):
+        original_api, original_user, original_secret = main.API_FOOTBALL_KEY, main.NAMI_API_USER, main.NAMI_API_SECRET
+        main.API_FOOTBALL_KEY, main.NAMI_API_USER, main.NAMI_API_SECRET = "", "configured-user", "configured-secret"
+        try:
+            result = main.target_fixtures_for_date("2026-10-04")
+        finally:
+            main.API_FOOTBALL_KEY, main.NAMI_API_USER, main.NAMI_API_SECRET = original_api, original_user, original_secret
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["data_status"], "data_missing")
+        self.assertEqual(result["source_audit"]["blocker"], "api_football_not_configured")
+        self.assertFalse(result["source_audit"]["nami"]["fallback_used"])
+        self.assertFalse(result["source_audit"]["nami"]["fixture_id_namespace_compatible"])
+
+    def test_target_fixture_discovery_distinguishes_empty_date_from_missing_config(self):
+        original_api = main.API_FOOTBALL_KEY
+        main.API_FOOTBALL_KEY = "configured"
+        try:
+            with patch.object(main, "call_api_football", return_value={"ok": True, "status_code": 200, "data": {"response": []}}):
+                result = main.target_fixtures_for_date("2026-10-04")
+        finally:
+            main.API_FOOTBALL_KEY = original_api
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data_status"], "available_empty")
+        self.assertFalse(result["data_missing"])
+        self.assertEqual(result["source_audit"]["blocker"], "no_fixtures_returned_for_date")
+
     def test_complete_timeline_contains_opening(self):
         self.assertEqual(main.PREMATCH_STAGE_ORDER, ["Opening", "T-24h", "T-12h", "T-6h", "T-3h", "T-1h", "T-15m", "Closing"])
 
@@ -1717,7 +1743,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         }
         with patch.object(main, "operations_status_report", return_value=operations), patch.object(main, "SHADOW_ACCESS_TOKEN", "configured"):
             release = main.release_acceptance_report(now_ts=1000)
-        self.assertEqual(release["version"], "1.30.0")
+        self.assertEqual(release["version"], main.VERSION)
         self.assertEqual(release["status"], "shadow_usable")
         self.assertTrue(release["shadow_use_authorized"])
         self.assertFalse(release["real_money_use_authorized"])

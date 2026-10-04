@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.30.0"
+VERSION = "1.31.0"
 RELEASE_CHANNEL = "shadow-usable"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
@@ -370,7 +370,39 @@ def target_fixtures_for_date(date: str, timezone_name: str = "Asia/Shanghai") ->
     rows = response_list(result)
     targets = [r for r in rows if isinstance(r, dict) and get_nested(r, ["league", "id"]) in TARGET_LEAGUE_IDS]
     summaries = [fixture_summary(r) for r in targets]
-    return {"ok": result.get("ok"), "date": date, "timezone": timezone_name, "mode": "target_major_leagues_only", "target_league_ids": sorted(TARGET_LEAGUE_IDS), "all_count": len(rows), "target_count": len(summaries), "fixtures": summaries, "source_status_code": result.get("status_code")}
+    configured = bool(API_FOOTBALL_KEY)
+    if not configured:
+        discovery_status, blocker = "data_missing", "api_football_not_configured"
+    elif not result.get("ok"):
+        discovery_status, blocker = "upstream_unavailable", result.get("error") or "api_football_request_failed"
+    elif not rows:
+        discovery_status, blocker = "available_empty", "no_fixtures_returned_for_date"
+    elif not summaries:
+        discovery_status, blocker = "available_no_targets", "no_target_league_fixtures_for_date"
+    else:
+        discovery_status, blocker = "available", None
+    source_audit = {
+        "selected_source": "api_football",
+        "selected_source_configured": configured,
+        "discovery_status": discovery_status,
+        "blocker": blocker,
+        "decision_eligible": bool(result.get("ok") and summaries),
+        "nami": {
+            "configured": bool(NAMI_API_USER and NAMI_API_SECRET),
+            "role": "optional_supplemental_source",
+            "fixture_id_namespace_compatible": False,
+            "fallback_used": False,
+            "reason": "nami_fixture_ids_must_not_be_sent_to_api_football_endpoints",
+        },
+        "policy": "never_cross_join_fixture_ids_between_providers; missing_discovery_data_remains_data_missing",
+    }
+    return {
+        "ok": result.get("ok"), "date": date, "timezone": timezone_name,
+        "mode": "target_major_leagues_only", "target_league_ids": sorted(TARGET_LEAGUE_IDS),
+        "all_count": len(rows), "target_count": len(summaries), "fixtures": summaries,
+        "source_status_code": result.get("status_code"), "source_audit": source_audit,
+        "data_status": discovery_status, "data_missing": not configured,
+    }
 
 
 def parse_fixture_context(fixture_id: int) -> Dict[str, Any]:
