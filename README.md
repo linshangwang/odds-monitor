@@ -101,6 +101,7 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 - TheStats 与 The Odds API 同样检查顶层业务错误；HTTP 200 中明确的 `error/errors`、`success:false` 或失败状态不会被当作有效数据。
 - Nami 同时识别 `err/error/errors`、非零 `code`、`success:false` 与失败状态；任何 Nami 业务错误仍只触发可审计降级，不中断主系统。
 - Opening 不再机械等同于 T-48h：自动任务不会用首次看到的当前赔率冒充开盘价；只有带真实开盘来源的导入数据可填充 Opening，否则保持 `data_missing`。
+- Opening 导入必须同时包含可解析的观测时间和非空公司盘口数组；缺一项即标记 `opening_source_unverified`，上游汇总值不能单独充当开盘证据。
 - 每个节点保存 1X2、亚洲让球、大小球，并在上游提供时保存 BTTS、主队进球数、客队进球数。
 - `primary` 字段继续保留以兼容旧调用方，但内容改为基于完整公司数组计算的 `consensus_main_line`，不再机械取第一家公司。
 - 显著跨档、异常价格或跨市场背离会触发基本面重新采集，并保存基本面版本、触发原因、变量变化、概率变化和最优盘口变化。

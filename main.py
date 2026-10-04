@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.25.0"
+VERSION = "1.26.0"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -1580,17 +1580,33 @@ def import_prematch_packet(packet: Dict[str, Any], store_override: Optional[Dict
             raise HTTPException(status_code=400, detail={"error": "invalid_or_duplicate_stage", "stage": stage})
         seen.add(stage)
         status = "available" if stage_data.get("status") == "available" else "data_missing"
-        market_snapshot = imported_market_snapshot(stage_data)
-        snapshot_at = _parse_timestamp(stage_data.get("latest_observed_at") or stage_data.get("target_at")) or int(time.time())
+        observed_value = stage_data.get("latest_observed_at") or stage_data.get("target_at")
+        observed_at = _parse_timestamp(observed_value)
+        company_array = stage_data.get("company_market_array")
+        opening_source_audit = None
+        effective_stage_data = stage_data
+        if stage == "Opening":
+            opening_source_audit = {
+                "verified": bool(observed_at is not None and isinstance(company_array, list) and company_array),
+                "observed_at_present": observed_at is not None,
+                "company_market_array_present": bool(isinstance(company_array, list) and company_array),
+                "policy": "opening_requires_observation_time_and_company_market_array",
+            }
+            if status == "available" and not opening_source_audit["verified"]:
+                status = "data_missing"
+                effective_stage_data = {**stage_data, "status": "data_missing"}
+        market_snapshot = imported_market_snapshot(effective_stage_data)
+        snapshot_at = observed_at or int(time.time())
         information_search = normalize_information_search(stage_data.get("information_search"), snapshot_at)
-        source_hash = _content_hash({"stage": stage, "status": status, "market_snapshot": market_snapshot, "missing_reason": stage_data.get("reason"), "latest_observed_at": stage_data.get("latest_observed_at"), "target_at": stage_data.get("target_at"), "kickoff_utc": match.get("kickoff_utc"), "information_search": information_search})
+        missing_reason = "opening_source_unverified" if stage == "Opening" and status == "data_missing" and opening_source_audit and not opening_source_audit["verified"] else stage_data.get("reason")
+        source_hash = _content_hash({"stage": stage, "status": status, "market_snapshot": market_snapshot, "missing_reason": missing_reason, "latest_observed_at": stage_data.get("latest_observed_at"), "target_at": stage_data.get("target_at"), "kickoff_utc": match.get("kickoff_utc"), "information_search": information_search, "opening_source_audit": opening_source_audit})
         record = {
             "version": VERSION, "fixture": fixture, "external_fixture_id": fixture, "source": "pang_import",
             "stage": stage, "snapshot_at": snapshot_at,
             "fixture_info": match, "data_quality": packet.get("data_quality"), "coverage": {"source": "pang", "quote_count": stage_data.get("quote_count"), "bookmaker_count": stage_data.get("bookmaker_count")},
-            "import_status": status, "missing_reason": stage_data.get("reason") if status == "data_missing" else None,
+            "import_status": status, "missing_reason": missing_reason if status == "data_missing" else None,
             "market_snapshot": market_snapshot, "source_content_hash": source_hash, "market_dynamics": None,
-            "information_search": information_search,
+            "information_search": information_search, "opening_source_audit": opening_source_audit,
         }
         record["stage_timing_audit"] = audit_stage_timing(stage, record["snapshot_at"], match.get("kickoff_utc"))
         records.append(record)
