@@ -364,6 +364,10 @@ V1.43 新增受保护的 `GET /shadow/nami-odds-capabilities`。它按官方足�
 V1.44 为该探针增加结构指纹：仅输出 `results` 内的字段路径、数据类型、数组长度与截断状态，
 不输出公司名、赔率值、比赛内容或任何凭据。结构指纹用于确认实际授权返回的 schema；在结构
 尚未验证前，集成状态继续保持 `capability_probe_only` 且 `decision_use=false`。
+
+V1.45 在 Railway 启动后以后台线程自动执行一次指数能力探测，并将脱敏摘要缓存到 `/health`
+的 `nami_odds_startup_probe`。外部请求不能触发重复探测，因此不会形成公开额度消耗入口；探测异常
+只记录异常类型，系统继续运行，且 `decision_use` 始终为 `false`。
 可通过 `NAMI_REQUEST_TIMEOUT` 单独限制等待时间，默认最多 10 秒。
 所有外部数据源的 JSON 与文本诊断响应都会递归移除已配置的密钥值；即使上游回显请求参数，
 接口响应和日志数据也不会返回真实凭据。

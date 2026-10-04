@@ -1807,6 +1807,24 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("results.companies[].name", rendered)
         self.assertIn("results.companies[].price", rendered)
 
+    def test_nami_odds_startup_probe_caches_only_redacted_summary(self):
+        original = main.NAMI_ODDS_STARTUP_PROBE
+        try:
+            with patch("main.nami_odds_capability_check", return_value={
+                "configured": True, "available": True, "entitlement": "available",
+                "error_category": None, "results_shape": "object", "sample_count": 2,
+                "structure_fingerprint": {"paths": [{"path": "results.asia", "type": "array", "length": 2}]},
+                "integration_status": "capability_probe_only", "raw_secret": "must-not-be-cached",
+            }):
+                main.run_nami_odds_startup_probe()
+            rendered = str(main.NAMI_ODDS_STARTUP_PROBE)
+            self.assertEqual(main.NAMI_ODDS_STARTUP_PROBE["status"], "completed")
+            self.assertFalse(main.NAMI_ODDS_STARTUP_PROBE["decision_use"])
+            self.assertNotIn("raw_secret", rendered)
+            self.assertNotIn("must-not-be-cached", rendered)
+        finally:
+            main.NAMI_ODDS_STARTUP_PROBE = original
+
     def prematch_packet(self):
         consensus = {
             "1x2": {"status": "available", "median_prices": {"home": 2.0, "draw": 3.4, "away": 3.8}},
