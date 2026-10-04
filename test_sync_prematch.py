@@ -107,6 +107,20 @@ class ReadOnlyPrematchSyncTests(unittest.TestCase):
         self.assertNotIn("secret", post.call_args.args[0])
         self.assertEqual(json.loads(gzip.decompress(kwargs["data"]))["packets"][0]["match"]["match_id"], "m-1")
 
+    def test_upload_batches_respect_server_packet_limit(self):
+        packets = [self.packet() for _ in range(5)]
+        with patch("sync_prematch.upload_packets", side_effect=[{"ok": True}, {"ok": True}, {"ok": True}]) as upload:
+            result = sync_prematch.upload_packet_batches("https://example.test", "secret", packets, batch_size=2)
+        self.assertEqual([len(call.args[2]) for call in upload.call_args_list], [2, 2, 1])
+        self.assertEqual(result["batch_count"], 3)
+        self.assertEqual(result["packet_count"], 5)
+
+    def test_upload_batch_size_cannot_exceed_server_limit(self):
+        with self.assertRaisesRegex(ValueError, "upload_batch_size_must_be_1_to_100"):
+            sync_prematch.upload_packet_batches("https://example.test", "secret", [], batch_size=101)
+        with self.assertRaisesRegex(ValueError, "upload_batch_size_must_be_1_to_100"):
+            sync_prematch.upload_packet_batches("https://example.test", "secret", [], batch_size=0)
+
     def test_preflight_rejects_historical_bundle_for_current_date(self):
         report = sync_prematch.packet_preflight([self.packet()], expected_date="2026-10-06")
         self.assertEqual(report["status"], "rejected")

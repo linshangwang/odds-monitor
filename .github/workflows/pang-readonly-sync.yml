@@ -81,6 +81,7 @@ jobs:
             --remote-path "$PANG_REMOTE_PATH" \
             --league "UEFA Nations League" \
             --prematch-window-hours 72 \
+            --batch-size 50 \
             --require-prematch
 
       - name: Remove ephemeral SSH material

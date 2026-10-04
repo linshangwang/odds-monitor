@@ -23,6 +23,7 @@ SAFE_REMOTE_PATH = re.compile(r"^/[A-Za-z0-9._/-]+$")
 DEFAULT_ENDPOINT = "https://web-production-f1134.up.railway.app"
 EXCLUDED_REPORT_LIMIT = 50
 MAX_DECODED_BUNDLE_BYTES = 150 * 1024 * 1024
+DEFAULT_UPLOAD_BATCH_SIZE = 50
 
 
 def bounded_gzip_decompress(raw: bytes, max_bytes: int) -> bytes:
@@ -131,6 +132,17 @@ def upload_packets(endpoint: str, token: str, packets: List[Dict[str, Any]], tim
     return response.json()
 
 
+def upload_packet_batches(endpoint: str, token: str, packets: List[Dict[str, Any]], batch_size: int = DEFAULT_UPLOAD_BATCH_SIZE, expected_date: Optional[str] = None, require_prematch: bool = False) -> Dict[str, Any]:
+    if not 1 <= int(batch_size) <= 100:
+        raise ValueError("upload_batch_size_must_be_1_to_100")
+    results = []
+    for offset in range(0, len(packets), int(batch_size)):
+        batch = packets[offset:offset + int(batch_size)]
+        result = upload_packets(endpoint, token, batch, expected_date=expected_date, require_prematch=require_prematch)
+        results.append({"batch_number": len(results) + 1, "packet_count": len(batch), "server": result})
+    return {"ok": True, "batch_count": len(results), "packet_count": len(packets), "batches": results}
+
+
 def summary(packets: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "packet_count": len(packets),
@@ -189,6 +201,7 @@ def main() -> int:
     parser.add_argument("--endpoint", default=os.getenv("SHADOW_ENDPOINT", DEFAULT_ENDPOINT))
     parser.add_argument("--expected-date", help="Require every kickoff to use this YYYY-MM-DD date")
     parser.add_argument("--require-prematch", action="store_true", help="Reject fixtures whose kickoff has already passed")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_UPLOAD_BATCH_SIZE, help="Upload 1-100 packets per request")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.ssh_host and not args.remote_path:
@@ -226,7 +239,7 @@ def main() -> int:
     if preflight["status"] != "ready":
         print(json.dumps({**report, "status": "rejected_before_upload"}, ensure_ascii=False))
         return 2
-    result = upload_packets(args.endpoint, os.getenv("SHADOW_ACCESS_TOKEN", ""), packets, expected_date=args.expected_date, require_prematch=args.require_prematch)
+    result = upload_packet_batches(args.endpoint, os.getenv("SHADOW_ACCESS_TOKEN", ""), packets, batch_size=args.batch_size, expected_date=args.expected_date, require_prematch=args.require_prematch)
     print(json.dumps({**report, "status": "uploaded", "server": result}, ensure_ascii=False))
     return 0
 
