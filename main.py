@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.45.0"
+VERSION = "1.46.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -56,6 +56,7 @@ AUTO_SNAPSHOT_LAST_ERROR: Optional[str] = None
 AUTO_RECONCILIATION_LAST_RESULT: Optional[Dict[str, Any]] = None
 NAMI_ODDS_STARTUP_PROBE: Dict[str, Any] = {"status": "pending", "decision_use": False}
 NAMI_ODDS_STARTUP_PROBE_STARTED = False
+NAMI_ODDS_PROBE_TTL_SECONDS = max(3600, int(os.getenv("NAMI_ODDS_PROBE_TTL_SECONDS", str(7 * 24 * 3600))))
 CALIBRATION_MIN_SAMPLE = max(1, int(os.getenv("CALIBRATION_MIN_SAMPLE", "30")))
 API_FOOTBALL_RATE_LIMIT_UNTIL = 0
 SNAPSHOT_STORE_LOCK = threading.RLock()
@@ -469,15 +470,34 @@ def run_nami_odds_startup_probe() -> None:
     """Run one non-blocking, redacted capability probe per service process."""
     global NAMI_ODDS_STARTUP_PROBE
     try:
+        now_ts = int(time.time())
+        store = load_snapshot_store()
+        cached = get_nested(store, ["provider_capability_cache", "nami_football_odds"], {}) or {}
+        checked_at = int(cached.get("checked_at") or 0)
+        if checked_at > 0 and 0 <= now_ts - checked_at < NAMI_ODDS_PROBE_TTL_SECONDS:
+            NAMI_ODDS_STARTUP_PROBE = {
+                **cached, "status": "completed", "source": "persistent_cache",
+                "age_seconds": now_ts - checked_at, "decision_use": False,
+            }
+            return
         result = nami_odds_capability_check()
-        NAMI_ODDS_STARTUP_PROBE = {
-            "status": "completed", "checked_at": int(time.time()),
+        summary = {
+            "status": "completed", "checked_at": now_ts,
             "configured": result.get("configured"), "available": result.get("available"),
             "entitlement": result.get("entitlement"), "error_category": result.get("error_category"),
             "results_shape": result.get("results_shape"), "sample_count": result.get("sample_count"),
             "structure_fingerprint": result.get("structure_fingerprint"),
-            "integration_status": result.get("integration_status"), "decision_use": False,
+            "integration_status": result.get("integration_status"),
+            "source": "live_probe", "age_seconds": 0, "decision_use": False,
         }
+        with SNAPSHOT_STORE_LOCK:
+            latest_store = load_snapshot_store()
+            latest_store.setdefault("provider_capability_cache", {})["nami_football_odds"] = {
+                key: value for key, value in summary.items() if key not in ("source", "age_seconds")
+            }
+            latest_store["version"] = VERSION
+            write_snapshot_store(latest_store)
+        NAMI_ODDS_STARTUP_PROBE = summary
     except Exception as exc:
         NAMI_ODDS_STARTUP_PROBE = {
             "status": "error", "checked_at": int(time.time()),
@@ -3312,7 +3332,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "has_thestats_key": bool(THESTATS_API_KEY), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "nami_odds_startup_probe": NAMI_ODDS_STARTUP_PROBE, "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "snapshot_store_warn_bytes": SNAPSHOT_STORE_WARN_BYTES, "fundamental_version_retention": FUNDAMENTAL_VERSION_RETENTION, "portfolio_run_retention": PORTFOLIO_RUN_RETENTION, "external_data_stale_seconds": EXTERNAL_DATA_STALE_SECONDS, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}, "auto_provider_reconciliation": AUTO_RECONCILIATION_LAST_RESULT}
+    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "has_thestats_key": bool(THESTATS_API_KEY), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "nami_odds_startup_probe": NAMI_ODDS_STARTUP_PROBE, "nami_odds_probe_ttl_seconds": NAMI_ODDS_PROBE_TTL_SECONDS, "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "snapshot_store_warn_bytes": SNAPSHOT_STORE_WARN_BYTES, "fundamental_version_retention": FUNDAMENTAL_VERSION_RETENTION, "portfolio_run_retention": PORTFOLIO_RUN_RETENTION, "external_data_stale_seconds": EXTERNAL_DATA_STALE_SECONDS, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}, "auto_provider_reconciliation": AUTO_RECONCILIATION_LAST_RESULT}
 
 
 @app.get("/shadow/nami-capabilities")

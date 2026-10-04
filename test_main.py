@@ -1810,7 +1810,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
     def test_nami_odds_startup_probe_caches_only_redacted_summary(self):
         original = main.NAMI_ODDS_STARTUP_PROBE
         try:
-            with patch("main.nami_odds_capability_check", return_value={
+            with patch("main.load_snapshot_store", return_value={"fixtures": {}}), patch("main.write_snapshot_store", return_value=True), patch("main.nami_odds_capability_check", return_value={
                 "configured": True, "available": True, "entitlement": "available",
                 "error_category": None, "results_shape": "object", "sample_count": 2,
                 "structure_fingerprint": {"paths": [{"path": "results.asia", "type": "array", "length": 2}]},
@@ -1822,6 +1822,25 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             self.assertFalse(main.NAMI_ODDS_STARTUP_PROBE["decision_use"])
             self.assertNotIn("raw_secret", rendered)
             self.assertNotIn("must-not-be-cached", rendered)
+        finally:
+            main.NAMI_ODDS_STARTUP_PROBE = original
+
+    def test_nami_odds_startup_probe_reuses_unexpired_persistent_cache(self):
+        original = main.NAMI_ODDS_STARTUP_PROBE
+        now_ts = 1_800_000_000
+        cached = {
+            "status": "completed", "checked_at": now_ts - 60, "configured": True,
+            "available": False, "entitlement": "not_entitled", "decision_use": False,
+        }
+        try:
+            with patch("main.time.time", return_value=now_ts), patch("main.load_snapshot_store", return_value={
+                "provider_capability_cache": {"nami_football_odds": cached}
+            }), patch("main.nami_odds_capability_check") as live_probe:
+                main.run_nami_odds_startup_probe()
+            live_probe.assert_not_called()
+            self.assertEqual(main.NAMI_ODDS_STARTUP_PROBE["source"], "persistent_cache")
+            self.assertEqual(main.NAMI_ODDS_STARTUP_PROBE["age_seconds"], 60)
+            self.assertFalse(main.NAMI_ODDS_STARTUP_PROBE["decision_use"])
         finally:
             main.NAMI_ODDS_STARTUP_PROBE = original
 
