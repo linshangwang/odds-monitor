@@ -16,6 +16,15 @@ class ReadOnlyPrematchSyncTests(unittest.TestCase):
         self.assertEqual(len(selected), 1)
         self.assertEqual(selected[0]["match"]["match_id"], "m-1")
 
+    def test_decode_bundle_rejects_gzip_expansion_over_limit(self):
+        raw = gzip.compress(json.dumps({"packets": [self.packet()]}).encode())
+        with self.assertRaisesRegex(ValueError, "bundle_decompressed_size_limit_exceeded"):
+            sync_prematch.decode_bundle(raw, max_decoded_bytes=10)
+
+    def test_decode_bundle_rejects_large_plain_payload(self):
+        with self.assertRaisesRegex(ValueError, "bundle_decompressed_size_limit_exceeded"):
+            sync_prematch.decode_bundle(b"{}" + b" " * 20, max_decoded_bytes=10)
+
     def test_selects_only_fixtures_inside_prematch_window(self):
         now_ts = 1_800_000_000
 

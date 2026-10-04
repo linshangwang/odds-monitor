@@ -6,6 +6,7 @@ but it never uploads, creates, edits, or schedules anything on pang.
 
 import argparse
 import gzip
+import io
 import json
 import os
 import re
@@ -21,11 +22,22 @@ import requests
 SAFE_REMOTE_PATH = re.compile(r"^/[A-Za-z0-9._/-]+$")
 DEFAULT_ENDPOINT = "https://web-production-f1134.up.railway.app"
 EXCLUDED_REPORT_LIMIT = 50
+MAX_DECODED_BUNDLE_BYTES = 150 * 1024 * 1024
 
 
-def decode_bundle(raw: bytes) -> Dict[str, Any]:
+def bounded_gzip_decompress(raw: bytes, max_bytes: int) -> bytes:
+    with gzip.GzipFile(fileobj=io.BytesIO(raw), mode="rb") as stream:
+        decoded = stream.read(max_bytes + 1)
+    if len(decoded) > max_bytes:
+        raise ValueError("bundle_decompressed_size_limit_exceeded")
+    return decoded
+
+
+def decode_bundle(raw: bytes, max_decoded_bytes: int = MAX_DECODED_BUNDLE_BYTES) -> Dict[str, Any]:
     if raw[:2] == b"\x1f\x8b":
-        raw = gzip.decompress(raw)
+        raw = bounded_gzip_decompress(raw, max_decoded_bytes)
+    elif len(raw) > max_decoded_bytes:
+        raise ValueError("bundle_decompressed_size_limit_exceeded")
     value = json.loads(raw.decode("utf-8"))
     if isinstance(value, list):
         return {"packets": value}

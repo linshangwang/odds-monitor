@@ -1,4 +1,5 @@
 import os
+import gzip
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -19,6 +20,12 @@ class ShadowV4UpgradeTests(unittest.TestCase):
     def tearDown(self):
         main.SNAPSHOT_STORE_PATH = self.old_store
         self.tmp.cleanup()
+
+    def test_bounded_gzip_decompression_rejects_expansion_over_limit(self):
+        encoded = gzip.compress(b"x" * 100)
+        with self.assertRaisesRegex(ValueError, "decompressed_size_limit_exceeded"):
+            main.bounded_gzip_decompress(encoded, 20)
+        self.assertEqual(main.bounded_gzip_decompress(encoded, 100), b"x" * 100)
 
     def test_target_fixture_discovery_reports_missing_source_without_nami_id_fallback(self):
         original_api, original_user, original_secret = main.API_FOOTBALL_KEY, main.NAMI_API_USER, main.NAMI_API_SECRET

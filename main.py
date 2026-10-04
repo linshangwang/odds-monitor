@@ -1,5 +1,6 @@
 import json
 import gzip
+import io
 import math
 import os
 import time
@@ -20,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.52.0"
+VERSION = "1.53.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -33,6 +34,16 @@ SNAPSHOT_STORE_GZIP = os.getenv("SNAPSHOT_STORE_GZIP", "true").lower() in ("1", 
 EXTERNAL_DATA_STALE_SECONDS = max(60, int(os.getenv("EXTERNAL_DATA_STALE_SECONDS", "1800")))
 FUNDAMENTAL_VERSION_RETENTION = max(10, min(int(os.getenv("FUNDAMENTAL_VERSION_RETENTION", "100")), 1000))
 PORTFOLIO_RUN_RETENTION = max(10, min(int(os.getenv("PORTFOLIO_RUN_RETENTION", "100")), 1000))
+MAX_IMPORT_DECOMPRESSED_BYTES = 150 * 1024 * 1024
+
+
+def bounded_gzip_decompress(raw: bytes, max_bytes: int) -> bytes:
+    """Decompress at most max_bytes, avoiding unbounded gzip expansion."""
+    with gzip.GzipFile(fileobj=io.BytesIO(raw), mode="rb") as stream:
+        decoded = stream.read(max_bytes + 1)
+    if len(decoded) > max_bytes:
+        raise ValueError("decompressed_size_limit_exceeded")
+    return decoded
 SNAPSHOT_STORE_WARN_BYTES = max(1024 * 1024, int(os.getenv("SNAPSHOT_STORE_WARN_BYTES", str(256 * 1024 * 1024))))
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.03"))
 MIN_EV = float(os.getenv("MIN_EV", "0.03"))
@@ -3578,8 +3589,9 @@ async def shadow_import_prematch_packets(request: Request, token: Optional[str] 
         raise HTTPException(status_code=413, detail="request_body_too_large")
     try:
         if request.headers.get("content-encoding", "").lower() == "gzip":
-            body = gzip.decompress(body)
-            if len(body) > 150 * 1024 * 1024:
+            try:
+                body = bounded_gzip_decompress(body, MAX_IMPORT_DECOMPRESSED_BYTES)
+            except ValueError:
                 raise HTTPException(status_code=413, detail="decompressed_body_too_large")
         payload = json.loads(body.decode("utf-8"))
     except HTTPException:
