@@ -16,6 +16,34 @@ class ReadOnlyPrematchSyncTests(unittest.TestCase):
         self.assertEqual(len(selected), 1)
         self.assertEqual(selected[0]["match"]["match_id"], "m-1")
 
+    def test_selects_only_fixtures_inside_prematch_window(self):
+        now_ts = 1_800_000_000
+
+        def packet(fixture, kickoff):
+            item = self.packet()
+            item["match"] = {"match_id": fixture, "kickoff_utc": kickoff}
+            return item
+
+        iso = lambda ts: sync_prematch.datetime.fromtimestamp(ts, sync_prematch.timezone.utc).isoformat()
+        packets = [
+            packet("past", iso(now_ts - 60)),
+            packet("inside", iso(now_ts + 24 * 3600)),
+            packet("far", iso(now_ts + 80 * 3600)),
+            packet("invalid", "not-a-date"),
+        ]
+        selected, excluded = sync_prematch.select_prematch_window(packets, 72, now_ts=now_ts)
+        self.assertEqual([item["match"]["match_id"] for item in selected], ["inside"])
+        self.assertEqual(
+            {item["fixture"]: item["reason"] for item in excluded},
+            {"past": "fixture_not_prematch", "far": "outside_prematch_window", "invalid": "missing_or_invalid_kickoff"},
+        )
+
+    def test_prematch_window_rejects_unbounded_values(self):
+        with self.assertRaisesRegex(ValueError, "prematch_window_hours_must_be_1_to_168"):
+            sync_prematch.select_prematch_window([], 0)
+        with self.assertRaisesRegex(ValueError, "prematch_window_hours_must_be_1_to_168"):
+            sync_prematch.select_prematch_window([], 169)
+
     def test_remote_reader_is_restricted_to_existing_absolute_file(self):
         with self.assertRaises(ValueError):
             sync_prematch.read_pang_file("pang", "/tmp/data.gz;touch /tmp/x")

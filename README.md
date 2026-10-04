@@ -514,15 +514,17 @@ Team Total，分别计算去水概率、Edge、EV 与 Script Coverage，再选�
 先做不联网的检查：
 
 ```text
-python sync_prematch.py --input bundle.json.gz --league "UEFA Nations League" --dry-run
+python sync_prematch.py --input bundle.json.gz --league "UEFA Nations League" --prematch-window-hours 72 --dry-run
 ```
 
 使用已经配置好的 SSH 主机别名读取现有文件：
 
 ```text
-python sync_prematch.py --ssh-host pang --remote-path /absolute/path/bundle.json.gz --league "UEFA Nations League" --dry-run
+python sync_prematch.py --ssh-host pang --remote-path /absolute/path/bundle.json.gz --league "UEFA Nations League" --prematch-window-hours 72 --dry-run
 ```
 
 取消 `--dry-run` 才会上传 Railway。访问令牌只能通过本机环境变量
 `SHADOW_ACCESS_TOKEN` 提供；程序不会把令牌放进 URL 或输出中。SSH 模式使用密钥或 agent，
 不会把 pang 密码写入脚本。
+
+V1.51 的只读同步仅选择未来 72 小时内开赛的欧国联数据。已结束、开赛时间无效或窗口外的包会明确记录排除原因且不会上传；筛选不会修改开赛时间、伪造历史节点或把旧数据重新标记为当前数据。

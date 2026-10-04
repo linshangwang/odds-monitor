@@ -80,6 +80,7 @@ jobs:
             --ssh-host pang-readonly \
             --remote-path "$PANG_REMOTE_PATH" \
             --league "UEFA Nations League" \
+            --prematch-window-hours 72 \
             --require-prematch
 
       - name: Remove ephemeral SSH material
@@ -87,4 +88,3 @@ jobs:
         shell: bash
         run: |
           rm -f "$HOME/.ssh/pang_sync_key" "$HOME/.ssh/config" "$HOME/.ssh/known_hosts"
-

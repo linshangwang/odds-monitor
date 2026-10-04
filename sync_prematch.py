@@ -66,6 +66,33 @@ def select_packets(bundle: Dict[str, Any], league: Optional[str] = None) -> List
     return selected
 
 
+def select_prematch_window(packets: List[Dict[str, Any]], window_hours: int, now_ts: Optional[int] = None) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Keep only genuinely upcoming fixtures inside a bounded time window."""
+    if not 1 <= int(window_hours) <= 168:
+        raise ValueError("prematch_window_hours_must_be_1_to_168")
+    current_ts = int(datetime.now(timezone.utc).timestamp()) if now_ts is None else int(now_ts)
+    upper_ts = current_ts + int(window_hours) * 3600
+    selected, excluded = [], []
+    for packet in packets:
+        match = packet.get("match") or {}
+        fixture = str(match.get("match_id") or "").strip() or None
+        try:
+            kickoff = datetime.fromisoformat(str(match.get("kickoff_utc")).replace("Z", "+00:00"))
+            if kickoff.tzinfo is None:
+                kickoff = kickoff.replace(tzinfo=timezone.utc)
+            kickoff_ts = int(kickoff.timestamp())
+        except (TypeError, ValueError):
+            excluded.append({"fixture": fixture, "reason": "missing_or_invalid_kickoff"})
+            continue
+        if kickoff_ts <= current_ts:
+            excluded.append({"fixture": fixture, "reason": "fixture_not_prematch"})
+        elif kickoff_ts > upper_ts:
+            excluded.append({"fixture": fixture, "reason": "outside_prematch_window"})
+        else:
+            selected.append(packet)
+    return selected, excluded
+
+
 def compressed_payload(packets: List[Dict[str, Any]]) -> bytes:
     raw = json.dumps({"packets": packets}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return gzip.compress(raw, compresslevel=6)
@@ -145,6 +172,7 @@ def main() -> int:
     source.add_argument("--ssh-host", help="SSH host configured in ~/.ssh/config")
     parser.add_argument("--remote-path", help="Absolute existing JSON/JSON.GZ path on pang")
     parser.add_argument("--league", help="Exact league name filter")
+    parser.add_argument("--prematch-window-hours", type=int, help="Keep fixtures starting in the next 1-168 hours")
     parser.add_argument("--endpoint", default=os.getenv("SHADOW_ENDPOINT", DEFAULT_ENDPOINT))
     parser.add_argument("--expected-date", help="Require every kickoff to use this YYYY-MM-DD date")
     parser.add_argument("--require-prematch", action="store_true", help="Reject fixtures whose kickoff has already passed")
@@ -154,8 +182,19 @@ def main() -> int:
         parser.error("--remote-path is required with --ssh-host")
     raw = read_local(args.input) if args.input else read_pang_file(args.ssh_host, args.remote_path)
     packets = select_packets(decode_bundle(raw), args.league)
+    excluded: List[Dict[str, Any]] = []
+    if args.prematch_window_hours is not None:
+        packets, excluded = select_prematch_window(packets, args.prematch_window_hours)
     preflight = packet_preflight(packets, args.expected_date, args.require_prematch)
-    report = {**summary(packets), "preflight": preflight}
+    report = {
+        **summary(packets),
+        "preflight": preflight,
+        "selection": {
+            "prematch_window_hours": args.prematch_window_hours,
+            "excluded_count": len(excluded),
+            "excluded": excluded,
+        },
+    }
     if args.dry_run:
         print(json.dumps({**report, "status": "dry_run"}, ensure_ascii=False))
         return 0 if preflight["status"] == "ready" else 2
