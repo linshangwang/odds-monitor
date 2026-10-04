@@ -1582,20 +1582,22 @@ def import_prematch_packet(packet: Dict[str, Any], store_override: Optional[Dict
         status = "available" if stage_data.get("status") == "available" else "data_missing"
         observed_value = stage_data.get("latest_observed_at") or stage_data.get("target_at")
         observed_at = _parse_timestamp(observed_value)
-        company_array = stage_data.get("company_market_array")
         opening_source_audit = None
-        effective_stage_data = stage_data
+        market_snapshot = imported_market_snapshot(stage_data)
         if stage == "Opening":
+            verified_markets = [
+                market for market, row in (market_snapshot.get("consensus_main_line") or {}).items()
+                if isinstance(row, dict) and row.get("source") == "complete_company_array" and int(row.get("bookmaker_count") or 0) >= 1
+            ]
             opening_source_audit = {
-                "verified": bool(observed_at is not None and isinstance(company_array, list) and company_array),
+                "verified": bool(observed_at is not None and verified_markets),
                 "observed_at_present": observed_at is not None,
-                "company_market_array_present": bool(isinstance(company_array, list) and company_array),
-                "policy": "opening_requires_observation_time_and_company_market_array",
+                "verified_markets": verified_markets,
+                "policy": "opening_requires_observation_time_and_recalculated_complete_company_array",
             }
             if status == "available" and not opening_source_audit["verified"]:
                 status = "data_missing"
-                effective_stage_data = {**stage_data, "status": "data_missing"}
-        market_snapshot = imported_market_snapshot(effective_stage_data)
+                market_snapshot = empty_market_snapshot()
         snapshot_at = observed_at or int(time.time())
         information_search = normalize_information_search(stage_data.get("information_search"), snapshot_at)
         missing_reason = "opening_source_unverified" if stage == "Opening" and status == "data_missing" and opening_source_audit and not opening_source_audit["verified"] else stage_data.get("reason")

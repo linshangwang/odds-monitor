@@ -1578,6 +1578,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         opening = rows[0]
         self.assertTrue(opening["opening_source_audit"]["verified"])
+        self.assertIn("1x2", opening["opening_source_audit"]["verified_markets"])
         self.assertEqual(opening["market_snapshot"]["primary"]["asian_handicap"]["line"], -0.25)
         self.assertEqual(opening["market_snapshot"]["primary"]["asian_handicap"]["source"], "upstream_consensus_fallback")
         self.assertEqual(opening["market_snapshot"]["primary"]["home_team_total"]["line"], 2.5)
@@ -1607,6 +1608,16 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(opening["missing_reason"], "opening_source_unverified")
         self.assertFalse(opening["opening_source_audit"]["verified"])
         self.assertFalse(opening["market_snapshot"]["available"])
+
+    def test_incomplete_company_rows_do_not_verify_opening(self):
+        packet = self.prematch_packet()
+        packet["timeline"][0]["company_market_array"] = [
+            {"bookmaker_name": "A", "market": "1x2", "selection": "Home", "price": "2.0"}
+        ]
+        main.import_prematch_packet(packet)
+        opening = next(row for row in main.get_fixture_snapshots("uuid-1") if row["stage"] == "Opening")
+        self.assertEqual(opening["import_status"], "data_missing")
+        self.assertEqual(opening["opening_source_audit"]["verified_markets"], [])
 
     def test_imported_ai_packet_excludes_invalid_latest_node(self):
         packet = self.prematch_packet()
