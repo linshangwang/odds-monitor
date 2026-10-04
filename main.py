@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.33.0"
+VERSION = "1.34.0"
 RELEASE_CHANNEL = "shadow-usable"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
@@ -90,6 +90,10 @@ raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
 NAMI_TARGET_COMPETITION_IDS = {str(x).strip() for x in raw_nami_target.split(",") if str(x).strip()}
+DEFAULT_NAMI_TARGET_COMPETITIONS: Dict[str, str] = {
+    "2906": "UEFA Nations League",
+}
+NAMI_TARGET_COMPETITION_IDS.update(DEFAULT_NAMI_TARGET_COMPETITIONS)
 
 TRACKING_STAGES = [
     {"key": "Opening", "label": "Opening 开盘", "offset": timedelta(hours=-48), "purpose": "仅保存有来源证明的真实开盘；自动当前赔率不得冒充开盘"},
@@ -350,14 +354,15 @@ def parse_nami_schedule(result: Dict[str, Any]) -> Dict[str, Any]:
             continue
         competition_id = str(row.get("competition_id") or "")
         competition_name = _nami_name(competitions.get(competition_id, {}))
+        canonical_competition = DEFAULT_NAMI_TARGET_COMPETITIONS.get(competition_id) or competition_name
         home = teams.get(str(row.get("home_team_id") or ""), {})
         away = teams.get(str(row.get("away_team_id") or ""), {})
-        match = {"id": row.get("id"), "match_time": row.get("match_time"), "home": _nami_name(home), "away": _nami_name(away), "league_name": competition_name}
-        identity = fixture_identity_from_match(match, competition_name, "nami")
+        match = {"id": row.get("id"), "match_time": row.get("match_time"), "home": _nami_name(home), "away": _nami_name(away), "league_name": canonical_competition}
+        identity = fixture_identity_from_match(match, canonical_competition, "nami")
         target_candidate = competition_id in NAMI_TARGET_COMPETITION_IDS or normalize_fixture_identity_name(competition_name) in target_names
         fixtures.append({
             "provider": "nami", "provider_fixture_id": identity.get("source_fixture_id"),
-            "competition_id": competition_id or None, "competition": competition_name,
+            "competition_id": competition_id or None, "competition": competition_name, "canonical_competition": canonical_competition,
             "home_team_id": str(row.get("home_team_id")) if row.get("home_team_id") is not None else None,
             "home": _nami_name(home), "away_team_id": str(row.get("away_team_id")) if row.get("away_team_id") is not None else None,
             "away": _nami_name(away), "kickoff_at": identity.get("kickoff_at"), "status_id": row.get("status_id"),

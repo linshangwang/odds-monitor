@@ -101,6 +101,17 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(result["supplemental_fixtures"][0]["decision_eligible"])
         self.assertFalse(result["source_audit"]["nami"]["fallback_used"])
 
+    def test_nami_provider_competition_id_maps_chinese_nations_league_name(self):
+        payload = {"code": 0, "results": {
+            "competition": [{"id": 2906, "name_zh": "欧洲国家联赛"}],
+            "team": [{"id": 1, "name_zh": "法国"}, {"id": 2, "name_zh": "意大利"}],
+            "match": [{"id": 7, "competition_id": 2906, "home_team_id": 1, "away_team_id": 2, "match_time": 1791115200, "status_id": 1}],
+        }}
+        fixture = main.parse_nami_schedule({"ok": True, "data": payload})["fixtures"][0]
+        self.assertTrue(fixture["target_candidate"])
+        self.assertEqual(fixture["canonical_competition"], "UEFA Nations League")
+        self.assertEqual(fixture["fixture_identity"]["normalized"]["league"], "uefanationsleague")
+
     def test_complete_timeline_contains_opening(self):
         self.assertEqual(main.PREMATCH_STAGE_ORDER, ["Opening", "T-24h", "T-12h", "T-6h", "T-3h", "T-1h", "T-15m", "Closing"])
 
