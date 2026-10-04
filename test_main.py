@@ -1709,6 +1709,30 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("auto_snapshot_cycle_stale", codes)
         self.assertIn("auto_snapshot_last_cycle_failed", codes)
 
+    def test_v130_release_acceptance_authorizes_shadow_not_real_money_use(self):
+        operations = {
+            "status": "healthy",
+            "store": {"operational": True, "recovery_ready": True},
+            "calibration": {"settled_count": 12, "minimum_sample": 30, "sample_ready": False},
+        }
+        with patch.object(main, "operations_status_report", return_value=operations), patch.object(main, "SHADOW_ACCESS_TOKEN", "configured"):
+            release = main.release_acceptance_report(now_ts=1000)
+        self.assertEqual(release["version"], "1.30.0")
+        self.assertEqual(release["status"], "shadow_usable")
+        self.assertTrue(release["shadow_use_authorized"])
+        self.assertFalse(release["real_money_use_authorized"])
+        self.assertFalse(release["controlled_decision_candidate"])
+        self.assertIn("calibration_minimum_sample_not_reached", release["warnings"])
+        self.assertEqual(release["blockers"], [])
+
+        blocked_operations = {**operations, "status": "blocked", "store": {"operational": False, "recovery_ready": False}}
+        with patch.object(main, "operations_status_report", return_value=blocked_operations), patch.object(main, "SHADOW_ACCESS_TOKEN", ""):
+            blocked = main.release_acceptance_report(now_ts=1000)
+        self.assertEqual(blocked["status"], "not_ready")
+        self.assertFalse(blocked["shadow_use_authorized"])
+        self.assertIn("persistent_store_operational", blocked["blockers"])
+        self.assertIn("protected_api_configured", blocked["blockers"])
+
     def test_imported_ai_packet_excludes_invalid_latest_node(self):
         packet = self.prematch_packet()
         invalid_late = dict(packet["timeline"][0])

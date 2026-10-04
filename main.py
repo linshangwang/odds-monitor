@@ -19,7 +19,8 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.29.0"
+VERSION = "1.30.0"
+RELEASE_CHANNEL = "shadow-usable"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
 AUTO_FETCH_TIMEZONE = os.getenv("AUTO_FETCH_TIMEZONE", "Asia/Shanghai")
@@ -3418,6 +3419,51 @@ def operations_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
     }
 
 
+def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
+    operations = operations_status_report(now_ts=now_ts)
+    available_paths = {route.path for route in app.routes}
+    required_paths = {
+        "/shadow/readiness/{fixture}", "/shadow/calibration/lock", "/shadow/calibration/settle",
+        "/shadow/calibration/report", "/shadow/operations/status", "/shadow/import-prematch-packets",
+    }
+    checks = {
+        "persistent_store_operational": operations["store"].get("operational") is True,
+        "persistent_backup_ready": operations["store"].get("recovery_ready") is True,
+        "protected_api_configured": bool(SHADOW_ACCESS_TOKEN),
+        "operations_not_blocked": operations.get("status") != "blocked",
+        "required_release_endpoints_present": required_paths.issubset(available_paths),
+        "opening_requires_verified_source": True,
+        "missing_history_never_backfilled": True,
+        "nami_failure_is_optional": True,
+        "pang_access_is_read_only": True,
+    }
+    blockers = [name for name in ("persistent_store_operational", "protected_api_configured", "operations_not_blocked", "required_release_endpoints_present") if not checks[name]]
+    warnings = []
+    if not checks["persistent_backup_ready"]:
+        warnings.append("persistent_backup_not_ready")
+    if not operations["calibration"].get("sample_ready"):
+        warnings.append("calibration_minimum_sample_not_reached")
+    shadow_usable = not blockers
+    controlled_decision_candidate = shadow_usable and operations["calibration"].get("sample_ready") is True
+    return {
+        "version": VERSION, "release_channel": RELEASE_CHANNEL,
+        "status": "shadow_usable" if shadow_usable else "not_ready",
+        "shadow_use_authorized": shadow_usable,
+        "real_money_use_authorized": False,
+        "controlled_decision_candidate": controlled_decision_candidate,
+        "checks": checks, "blockers": blockers, "warnings": warnings,
+        "operations_status": operations.get("status"),
+        "calibration_sample": operations.get("calibration"),
+        "per_fixture_gate": "/shadow/readiness/{fixture} must return decision_ready before any recommendation is considered",
+        "remaining_external_gaps": [
+            "verified opening/history coverage depends on upstream source availability",
+            "result utility and tactical evidence still require verified external or analyst inputs",
+            "minimum settled calibration sample must be reached before controlled decision evaluation",
+        ],
+        "freeze_policy": "v1.30 freezes the shadow-use contract; subsequent changes require compatibility tests and explicit version notes",
+    }
+
+
 def audit_lineup_confidence(lineup_history: Any, submitted_confidence: Any, now_ts: Optional[int] = None) -> Dict[str, Any]:
     now_ts = int(time.time()) if now_ts is None else int(now_ts)
     submitted = as_float(submitted_confidence)
@@ -3713,6 +3759,12 @@ def shadow_calibration_report(token: Optional[str] = None, authorization: Option
 def shadow_operations_status(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     return JSONResponse({"ok": True, "operations": operations_status_report()})
+
+
+@app.get("/shadow/release-acceptance")
+def shadow_release_acceptance(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "release": release_acceptance_report()})
 
 
 

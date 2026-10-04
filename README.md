@@ -105,6 +105,7 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 - `GET /shadow/readiness/{fixture}` 输出 `not_ready`、`shadow_ready` 或 `decision_ready`，并逐项列出时效、时间轴、三大核心盘口、基本面链和阵容置信度阻塞原因。
 - v1.28 校准闭环通过 `/shadow/calibration/lock` 在赛前锁定 1X2 概率，通过 `/settle` 录入赛果，并由 `/report` 汇总 Brier Score、Log Loss、单位收益与 ROI；PASS 计入概率校准但不计入投注收益。
 - v1.29 的 `/shadow/operations/status` 汇总持久化完整性、自动采集线程、外部数据时效、逾期复核任务和校准样本门槛，并以 `healthy/degraded/blocked` 及 info/warning/critical 告警输出。
+- v1.30 冻结影子可用版契约。`/shadow/release-acceptance` 汇总发布检查、外部缺口和使用边界；当前只授权影子运行，任何正式建议仍必须通过单场 `decision_ready` 且达到校准样本门槛。
 - Opening 导入必须同时包含可解析的观测时间和非空公司盘口数组；缺一项即标记 `opening_source_unverified`，上游汇总值不能单独充当开盘证据。
 - 每个节点保存 1X2、亚洲让球、大小球，并在上游提供时保存 BTTS、主队进球数、客队进球数。
 - `primary` 字段继续保留以兼容旧调用方，但内容改为基于完整公司数组计算的 `consensus_main_line`，不再机械取第一家公司。
