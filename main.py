@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.40.0"
+VERSION = "1.41.0"
 RELEASE_CHANNEL = "shadow-usable"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
@@ -341,6 +341,15 @@ def _nami_name(row: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _nami_names(row: Dict[str, Any]) -> List[str]:
+    values = []
+    for key in ("name_zh", "name_zht", "name_en", "name", "short_name"):
+        value = str(row.get(key) or "").strip()
+        if value and value not in values:
+            values.append(value)
+    return values
+
+
 def parse_nami_schedule(result: Dict[str, Any]) -> Dict[str, Any]:
     """Parse Nami relation arrays while preserving its provider id namespace."""
     data = result.get("data") if isinstance(result.get("data"), dict) else {}
@@ -358,7 +367,12 @@ def parse_nami_schedule(result: Dict[str, Any]) -> Dict[str, Any]:
         canonical_competition = DEFAULT_NAMI_TARGET_COMPETITIONS.get(competition_id) or competition_name
         home = teams.get(str(row.get("home_team_id") or ""), {})
         away = teams.get(str(row.get("away_team_id") or ""), {})
-        match = {"id": row.get("id"), "match_time": row.get("match_time"), "home": _nami_name(home), "away": _nami_name(away), "league_name": canonical_competition}
+        match = {
+            "id": row.get("id"), "match_time": row.get("match_time"),
+            "home": _nami_name(home), "away": _nami_name(away),
+            "home_aliases": _nami_names(home), "away_aliases": _nami_names(away),
+            "league_name": canonical_competition,
+        }
         identity = fixture_identity_from_match(match, canonical_competition, "nami")
         target_candidate = competition_id in NAMI_TARGET_COMPETITION_IDS or normalize_fixture_identity_name(competition_name) in target_names
         fixtures.append({
@@ -1623,9 +1637,11 @@ def fixture_identity_from_match(match: Dict[str, Any], league: Any = None, sourc
         "home": normalize_fixture_identity_name(home),
         "away": normalize_fixture_identity_name(away),
         "league": normalize_fixture_identity_name(league_name),
+        "home_aliases": sorted({normalize_fixture_identity_name(value) for value in ([home] + list(match.get("home_aliases") or [])) if normalize_fixture_identity_name(value)}),
+        "away_aliases": sorted({normalize_fixture_identity_name(value) for value in ([away] + list(match.get("away_aliases") or [])) if normalize_fixture_identity_name(value)}),
     }
     complete = bool(kickoff is not None and normalized["home"] and normalized["away"])
-    canonical_key = _content_hash({"kickoff_minute": kickoff // 60 if kickoff is not None else None, **normalized})[:32] if complete else None
+    canonical_key = _content_hash({"kickoff_minute": kickoff // 60 if kickoff is not None else None, "home": normalized["home"], "away": normalized["away"], "league": normalized["league"]})[:32] if complete else None
     return {
         "source": source, "source_fixture_id": str(match.get("match_id") or match.get("fixture_id") or match.get("id") or "") or None,
         "kickoff_at": kickoff, "normalized": normalized, "canonical_key": canonical_key,
@@ -1644,7 +1660,11 @@ def reconcile_fixture_identity(incoming: Dict[str, Any], candidates: List[Dict[s
         if candidate.get("status") != "complete":
             continue
         left, right = incoming.get("normalized") or {}, candidate.get("normalized") or {}
-        same_teams = left.get("home") == right.get("home") and left.get("away") == right.get("away")
+        left_home = set(left.get("home_aliases") or [left.get("home")]) - {None, ""}
+        right_home = set(right.get("home_aliases") or [right.get("home")]) - {None, ""}
+        left_away = set(left.get("away_aliases") or [left.get("away")]) - {None, ""}
+        right_away = set(right.get("away_aliases") or [right.get("away")]) - {None, ""}
+        same_teams = bool(left_home & right_home) and bool(left_away & right_away)
         league_compatible = not left.get("league") or not right.get("league") or left.get("league") == right.get("league")
         kickoff_delta = abs(int(incoming.get("kickoff_at")) - int(candidate.get("kickoff_at")))
         if same_teams and league_compatible and kickoff_delta <= kickoff_tolerance_seconds:

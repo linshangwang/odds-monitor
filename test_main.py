@@ -203,6 +203,28 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(report["status"], "rejected")
         self.assertIn("duplicate_match_id", report["rows"][1]["reasons"])
 
+    def test_multilingual_nami_team_aliases_match_english_pang_names(self):
+        pang = main.fixture_identity_from_match({"match_id": "p1", "kickoff_utc": 1000, "home": "France", "away": "Italy"}, "UEFA Nations League", "pang")
+        nami = main.fixture_identity_from_match({
+            "id": 9, "match_time": 1000, "home": "法国", "away": "意大利",
+            "home_aliases": ["法国", "France"], "away_aliases": ["意大利", "Italy"],
+        }, "UEFA Nations League", "nami")
+        result = main.reconcile_fixture_identity(nami, [pang])
+        self.assertEqual(result["status"], "matched")
+        self.assertEqual(result["match"]["source_fixture_id"], "p1")
+
+    def test_nami_parser_preserves_multilingual_team_aliases(self):
+        payload = {"results": {
+            "competition": [{"id": 2906, "name_zh": "欧洲国家联赛", "name_en": "UEFA Nations League"}],
+            "team": [{"id": 1, "name_zh": "法国", "name_en": "France"}, {"id": 2, "name_zh": "意大利", "name_en": "Italy"}],
+            "match": [{"id": 3, "competition_id": 2906, "home_team_id": 1, "away_team_id": 2, "match_time": 1000}],
+        }}
+        fixture = main.parse_nami_schedule({"ok": True, "data": payload})["fixtures"][0]
+        aliases = fixture["fixture_identity"]["normalized"]
+        self.assertIn("france", aliases["home_aliases"])
+        self.assertIn("法国", aliases["home_aliases"])
+        self.assertIn("italy", aliases["away_aliases"])
+
     def test_complete_timeline_contains_opening(self):
         self.assertEqual(main.PREMATCH_STAGE_ORDER, ["Opening", "T-24h", "T-12h", "T-6h", "T-3h", "T-1h", "T-15m", "Closing"])
 
