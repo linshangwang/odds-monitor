@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.43.0"
+VERSION = "1.44.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -393,6 +393,35 @@ def parse_nami_schedule(result: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def payload_structure_fingerprint(value: Any, max_depth: int = 5, max_fields: int = 100) -> Dict[str, Any]:
+    """Return schema-like paths and collection sizes without returning provider values."""
+    paths: List[Dict[str, Any]] = []
+
+    def walk(node: Any, path: str, depth: int) -> None:
+        if len(paths) >= max_fields:
+            return
+        if isinstance(node, dict):
+            paths.append({"path": path or "$", "type": "object", "field_count": len(node)})
+            if depth < max_depth:
+                for key in sorted(node.keys(), key=str):
+                    walk(node[key], f"{path}.{key}" if path else str(key), depth + 1)
+        elif isinstance(node, list):
+            paths.append({"path": path or "$", "type": "array", "length": len(node)})
+            if node and depth < max_depth:
+                walk(node[0], f"{path}[]" if path else "[]", depth + 1)
+        elif node is None:
+            paths.append({"path": path or "$", "type": "null"})
+        elif isinstance(node, bool):
+            paths.append({"path": path or "$", "type": "boolean"})
+        elif isinstance(node, (int, float)):
+            paths.append({"path": path or "$", "type": "number"})
+        else:
+            paths.append({"path": path or "$", "type": "string"})
+
+    walk(value, "results", 0)
+    return {"paths": paths, "path_count": len(paths), "truncated": len(paths) >= max_fields}
+
+
 def nami_odds_capability_check() -> Dict[str, Any]:
     """Probe Nami football odds entitlement without making it a system dependency.
 
@@ -416,6 +445,7 @@ def nami_odds_capability_check() -> Dict[str, Any]:
     error = str(check.get("error") or "")
     error_lower = error.lower()
     not_entitled = any(token in error_lower for token in ("entitle", "permission", "product", "套餐", "权限", "未开通"))
+    structure = payload_structure_fingerprint(results)
     return {
         "configured": bool(NAMI_API_USER and NAMI_API_SECRET),
         "ok": check.get("ok", False), "available": check.get("available", False),
@@ -426,7 +456,7 @@ def nami_odds_capability_check() -> Dict[str, Any]:
         "entitlement": "available" if check.get("ok") else ("not_entitled" if not_entitled else "unknown"),
         "error_category": "product_not_entitled" if not_entitled else ("upstream_error" if error else None),
         "response_fields": sorted(data.keys()), "results_shape": result_shape,
-        "sample_count": sample_count,
+        "sample_count": sample_count, "structure_fingerprint": structure,
         "integration_status": "capability_probe_only",
         "decision_use": False,
         "required_before_import": ["timestamp_semantics_verified", "company_array_verified", "history_coverage_verified"],

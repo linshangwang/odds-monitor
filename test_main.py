@@ -1781,6 +1781,11 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["entitlement"], "available")
         self.assertEqual(result["results_shape"], "object")
         self.assertEqual(result["sample_count"], 3)
+        paths = {row["path"]: row for row in result["structure_fingerprint"]["paths"]}
+        self.assertEqual(paths["results"]["type"], "object")
+        self.assertEqual(paths["results.asia"]["length"], 1)
+        self.assertEqual(paths["results.asia[].id"]["type"], "number")
+        self.assertNotIn("value", str(result["structure_fingerprint"]))
 
     def test_nami_odds_missing_entitlement_does_not_break_system(self):
         with patch("main.call_nami", return_value={
@@ -1792,6 +1797,15 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["error_category"], "product_not_entitled")
         self.assertEqual(result["fallback"], "continue_without_nami_odds")
         self.assertTrue(main.health()["ok"])
+
+    def test_payload_structure_fingerprint_never_returns_values(self):
+        secret_value = "sensitive-provider-value"
+        result = main.payload_structure_fingerprint({"companies": [{"name": secret_value, "price": 1.91}]})
+        rendered = str(result)
+        self.assertNotIn(secret_value, rendered)
+        self.assertNotIn("1.91", rendered)
+        self.assertIn("results.companies[].name", rendered)
+        self.assertIn("results.companies[].price", rendered)
 
     def prematch_packet(self):
         consensus = {
