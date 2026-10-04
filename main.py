@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.46.0"
+VERSION = "1.47.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -3651,6 +3651,44 @@ def imported_fixture_freshness(metadata: Dict[str, Any], history: List[Dict[str,
     }
 
 
+def market_data_route_report(store_override: Optional[Dict[str, Any]] = None, now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Describe verified decision data separately from merely configured collectors."""
+    store = store_override if store_override is not None else load_snapshot_store()
+    state_counts = {state: 0 for state in ("fresh", "stale", "historical", "invalid_timestamp", "data_missing")}
+    for fixture, metadata in (store.get("external_prematch") or {}).items():
+        history = (store.get("fixtures") or {}).get(str(fixture), []) or []
+        freshness = imported_fixture_freshness(metadata, history, now_ts=now_ts)
+        state = freshness.get("state")
+        if state in state_counts:
+            state_counts[state] += 1
+    fresh_count = state_counts["fresh"]
+    nami_cache = get_nested(store, ["provider_capability_cache", "nami_football_odds"], {}) or {}
+    nami_available = nami_cache.get("available") is True and nami_cache.get("entitlement") == "available"
+    collector_candidates = []
+    if API_FOOTBALL_KEY:
+        collector_candidates.append("api_football_configured_unverified_for_current_fixture")
+    if nami_available:
+        collector_candidates.append("nami_odds_entitled_unverified_for_current_fixture")
+    decision_route = "pang_persisted_snapshot" if fresh_count else None
+    if decision_route:
+        status = "decision_data_available"
+    elif collector_candidates:
+        status = "awaiting_verified_snapshot"
+    else:
+        status = "market_source_blocked"
+    return {
+        "status": status, "decision_eligible": bool(decision_route),
+        "decision_route": decision_route, "collector_candidates": collector_candidates,
+        "pang": {"policy": "read_only", "fresh_fixture_count": fresh_count, "state_counts": state_counts},
+        "nami_odds": {
+            "entitlement": nami_cache.get("entitlement") or NAMI_ODDS_STARTUP_PROBE.get("entitlement") or "unknown",
+            "available": nami_available, "decision_use": False,
+        },
+        "rule": "configured credentials are not decision data; only a fresh persisted market snapshot is decision eligible",
+        "missing_action": "PASS" if not decision_route else None,
+    }
+
+
 def fixture_readiness_report(fixture: Any, now_ts: Optional[int] = None) -> Dict[str, Any]:
     fixture_key = str(fixture)
     store = load_snapshot_store()
@@ -3941,6 +3979,7 @@ def shadow_data_source_health(probe_nami: bool = False, token: Optional[str] = N
         "ok": True, "version": VERSION, "generated_at": int(time.time()),
         "pang": {"write_policy": "read_only_source_no_remote_tasks", "sync": store.get("import_sync_status") or {"status": "never_imported"}, "fixture_state_counts": state_counts, "fixtures": fixtures},
         "nami": nami, "decision_gate": {"requires_fresh_prematch_data": True, "stale_action": "PASS"},
+        "market_data_route": market_data_route_report(store_override=store),
     })
 
 

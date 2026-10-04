@@ -2404,6 +2404,31 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         missing = main.imported_fixture_freshness(metadata, [], now_ts=1100)
         self.assertEqual(missing["state"], "data_missing")
 
+    def test_market_data_route_does_not_treat_configured_key_as_decision_data(self):
+        store = {
+            "fixtures": {}, "external_prematch": {},
+            "provider_capability_cache": {"nami_football_odds": {"entitlement": "not_entitled", "available": False}},
+        }
+        with patch.object(main, "API_FOOTBALL_KEY", "configured-key"):
+            report = main.market_data_route_report(store_override=store, now_ts=1000)
+        self.assertEqual(report["status"], "awaiting_verified_snapshot")
+        self.assertFalse(report["decision_eligible"])
+        self.assertIsNone(report["decision_route"])
+        self.assertEqual(report["missing_action"], "PASS")
+        self.assertIn("api_football_configured_unverified_for_current_fixture", report["collector_candidates"])
+
+    def test_market_data_route_accepts_only_fresh_persisted_snapshot(self):
+        store = {
+            "fixtures": {"fixture-1": [{"stage": "T-3h", "snapshot_at": 990, "import_status": "available", "market_snapshot": {"available": True}}]},
+            "external_prematch": {"fixture-1": {"match": {"kickoff_utc": "1970-01-01T00:33:20+00:00"}}},
+        }
+        report = main.market_data_route_report(store_override=store, now_ts=1000)
+        self.assertEqual(report["status"], "decision_data_available")
+        self.assertTrue(report["decision_eligible"])
+        self.assertEqual(report["decision_route"], "pang_persisted_snapshot")
+        self.assertEqual(report["pang"]["fresh_fixture_count"], 1)
+        self.assertIsNone(report["missing_action"])
+
     def test_freshness_uses_latest_stage_and_rejects_future_timestamp(self):
         metadata = {"match": {"kickoff_utc": "2030-01-01T00:00:00+00:00"}}
         history = [
