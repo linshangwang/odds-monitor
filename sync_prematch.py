@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -97,6 +98,44 @@ def summary(packets: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def packet_preflight(packets: List[Dict[str, Any]], expected_date: Optional[str] = None, require_prematch: bool = False, now_ts: Optional[int] = None) -> Dict[str, Any]:
+    now_ts = int(datetime.now(timezone.utc).timestamp()) if now_ts is None else int(now_ts)
+    seen, rows = set(), []
+    for packet in packets:
+        match = packet.get("match") or {}
+        fixture = str(match.get("match_id") or "").strip()
+        kickoff_raw = match.get("kickoff_utc")
+        try:
+            kickoff_dt = datetime.fromisoformat(str(kickoff_raw).replace("Z", "+00:00"))
+            if kickoff_dt.tzinfo is None:
+                kickoff_dt = kickoff_dt.replace(tzinfo=timezone.utc)
+            kickoff_ts, kickoff_date = int(kickoff_dt.timestamp()), kickoff_dt.date().isoformat()
+        except (TypeError, ValueError):
+            kickoff_ts, kickoff_date = None, None
+        reasons = []
+        if not fixture:
+            reasons.append("missing_match_id")
+        elif fixture in seen:
+            reasons.append("duplicate_match_id")
+        seen.add(fixture)
+        if kickoff_ts is None:
+            reasons.append("missing_or_invalid_kickoff")
+        if expected_date and kickoff_date != expected_date:
+            reasons.append("kickoff_date_mismatch")
+        if require_prematch and kickoff_ts is not None and kickoff_ts <= now_ts:
+            reasons.append("fixture_not_prematch")
+        if not isinstance(packet.get("timeline"), list):
+            reasons.append("timeline_not_array")
+        rows.append({"fixture": fixture or None, "kickoff_date": kickoff_date, "status": "rejected" if reasons else "ready", "reasons": reasons})
+    rejected = [row for row in rows if row["status"] == "rejected"]
+    return {
+        "status": "ready" if packets and not rejected else "rejected",
+        "packet_count": len(packets), "ready_count": len(rows) - len(rejected), "rejected_count": len(rejected),
+        "expected_date": expected_date, "require_prematch": require_prematch, "rows": rows,
+        "policy": "historical_or_wrong-date_packets_are_never_relabelled_as_current",
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Read-only pang prematch packet sync")
     source = parser.add_mutually_exclusive_group(required=True)
@@ -105,16 +144,22 @@ def main() -> int:
     parser.add_argument("--remote-path", help="Absolute existing JSON/JSON.GZ path on pang")
     parser.add_argument("--league", help="Exact league name filter")
     parser.add_argument("--endpoint", default=os.getenv("SHADOW_ENDPOINT", DEFAULT_ENDPOINT))
+    parser.add_argument("--expected-date", help="Require every kickoff to use this YYYY-MM-DD date")
+    parser.add_argument("--require-prematch", action="store_true", help="Reject fixtures whose kickoff has already passed")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.ssh_host and not args.remote_path:
         parser.error("--remote-path is required with --ssh-host")
     raw = read_local(args.input) if args.input else read_pang_file(args.ssh_host, args.remote_path)
     packets = select_packets(decode_bundle(raw), args.league)
-    report = summary(packets)
+    preflight = packet_preflight(packets, args.expected_date, args.require_prematch)
+    report = {**summary(packets), "preflight": preflight}
     if args.dry_run:
         print(json.dumps({**report, "status": "dry_run"}, ensure_ascii=False))
-        return 0
+        return 0 if preflight["status"] == "ready" else 2
+    if preflight["status"] != "ready":
+        print(json.dumps({**report, "status": "rejected_before_upload"}, ensure_ascii=False))
+        return 2
     result = upload_packets(args.endpoint, os.getenv("SHADOW_ACCESS_TOKEN", ""), packets)
     print(json.dumps({**report, "status": "uploaded", "server": result}, ensure_ascii=False))
     return 0

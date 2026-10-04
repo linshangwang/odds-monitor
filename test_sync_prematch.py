@@ -8,7 +8,7 @@ import sync_prematch
 
 class ReadOnlyPrematchSyncTests(unittest.TestCase):
     def packet(self, league="UEFA Nations League"):
-        return {"schema_version": "shadow_prematch_packet_v1", "league": league, "match": {"match_id": "m-1"}, "timeline": []}
+        return {"schema_version": "shadow_prematch_packet_v1", "league": league, "match": {"match_id": "m-1", "kickoff_utc": "2026-10-05T20:00:00+00:00"}, "timeline": []}
 
     def test_decodes_gzip_and_filters_league(self):
         raw = gzip.compress(json.dumps({"packets": [self.packet(), self.packet("Other")]}, ensure_ascii=False).encode())
@@ -41,6 +41,21 @@ class ReadOnlyPrematchSyncTests(unittest.TestCase):
         self.assertEqual(kwargs["headers"]["X-Sync-Mode"], "incremental")
         self.assertNotIn("secret", post.call_args.args[0])
         self.assertEqual(json.loads(gzip.decompress(kwargs["data"]))["packets"][0]["match"]["match_id"], "m-1")
+
+    def test_preflight_rejects_historical_bundle_for_current_date(self):
+        report = sync_prematch.packet_preflight([self.packet()], expected_date="2026-10-06")
+        self.assertEqual(report["status"], "rejected")
+        self.assertIn("kickoff_date_mismatch", report["rows"][0]["reasons"])
+
+    def test_preflight_rejects_finished_fixture_when_prematch_required(self):
+        report = sync_prematch.packet_preflight([self.packet()], require_prematch=True, now_ts=1791230401)
+        self.assertEqual(report["status"], "rejected")
+        self.assertIn("fixture_not_prematch", report["rows"][0]["reasons"])
+
+    def test_preflight_accepts_matching_future_packet(self):
+        report = sync_prematch.packet_preflight([self.packet()], expected_date="2026-10-05", require_prematch=True, now_ts=1791220000)
+        self.assertEqual(report["status"], "ready")
+        self.assertEqual(report["ready_count"], 1)
 
 
 if __name__ == "__main__":
