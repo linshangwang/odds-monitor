@@ -379,6 +379,11 @@ V1.47 在 `/shadow/data-source-health` 增加 `market_data_route`。它将“已
 
 V1.48 将盘口路由的脱敏摘要加入公开 `/health`：仅显示路由状态、决策资格、候选采集器、
 新鲜比赛数量和缺失动作，不返回比赛标识、盘口、公司数组或持久化内容，便于部署后直接验收。
+
+V1.49 在现有 V4 基本面链内部加入五个扩展维度：`Current Athletic Level`、
+`Structural Replacement`、`Absolute Attack Quality`、双向 `Open-Game Beneficiary` 与
+`Late-Game Resistance`。审计结果单独输出 `extended_dimension_audit`；旧数据包仍可读取，缺少
+新字段会明确标记 `data_missing`，但不会仅因版本升级而破坏既有接口兼容。
 可通过 `NAMI_REQUEST_TIMEOUT` 单独限制等待时间，默认最多 10 秒。
 所有外部数据源的 JSON 与文本诊断响应都会递归移除已配置的密钥值；即使上游回显请求参数，
 接口响应和日志数据也不会返回真实凭据。

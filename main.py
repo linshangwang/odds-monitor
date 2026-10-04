@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.48.0"
+VERSION = "1.49.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -2258,13 +2258,13 @@ def pure_fundamental_script(data: Dict[str, Any]) -> Dict[str, Any]:
     chain = {
         "result_utility": {"status": "data_missing", "home_win_draw_loss_utility": None, "away_win_draw_loss_utility": None, "reason": "competition objective/qualification rules are not supplied by current feeds"},
         "tactical_risk_appetite": {"status": "data_missing", "value": None, "depends_on": "result_utility and verified coach intent"},
-        "rotation_quality": {"status": "partial" if lineup_confirmed else "data_missing", "starting_xi_strength": None, "creativity": None, "finishing": None, "chemistry": None, "bench_strength": None, "bench_upgrade": None, "lineup_intent": None, "reason": "confirmed_xi_present_but_quality_dimensions_not_scored" if lineup_confirmed else ("partial_or_unconfirmed_lineup_not_sufficient" if lineup_available else "lineup_data_missing")},
-        "execution_ability": {"status": "partial" if execution_evidence_available else "data_missing", "source": "season_stats and recent_form; no event-level xG/xThreat feed", "usable_stats_sides": usable_stats_sides, "usable_form_sides": usable_form_sides},
+        "rotation_quality": {"status": "partial" if lineup_confirmed else "data_missing", "starting_xi_strength": None, "creativity": None, "finishing": None, "chemistry": None, "bench_strength": None, "bench_upgrade": None, "lineup_intent": None, "current_athletic_level": {"home": None, "away": None}, "structural_replacement": {"home": None, "away": None}, "reason": "confirmed_xi_present_but_quality_dimensions_not_scored" if lineup_confirmed else ("partial_or_unconfirmed_lineup_not_sufficient" if lineup_available else "lineup_data_missing")},
+        "execution_ability": {"status": "partial" if execution_evidence_available else "data_missing", "source": "season_stats and recent_form; no event-level xG/xThreat feed", "usable_stats_sides": usable_stats_sides, "usable_form_sides": usable_form_sides, "absolute_attack_quality": {"home": None, "away": None}},
         "tactical_matchup": {"status": "data_missing", "value": None, "reason": "formation/style/event-level data unavailable"},
         "game_state_elasticity": {"status": "data_missing", "states": {"0_0_persists": None, "home_scores_first": None, "away_scores_first": None, "draw_at_60": None, "trailing_last_30": None}},
         "first_goal_state_transition": {"status": "data_missing", "home_first": None, "away_first": None},
-        "open_game_beneficiary": {"status": "data_missing", "team": None, "reason": "requires tactical risk and transition/conversion evidence"},
-        "time_segment_strength": {"status": "data_missing", "segments": {"0_15": None, "16_30": None, "31_45": None, "46_60": None, "61_75": None, "76_90": None}},
+        "open_game_beneficiary": {"status": "data_missing", "team": None, "two_way": {"home_attack_gain": None, "home_defensive_exposure": None, "away_attack_gain": None, "away_defensive_exposure": None}, "reason": "requires tactical risk and transition/conversion evidence"},
+        "time_segment_strength": {"status": "data_missing", "segments": {"0_15": None, "16_30": None, "31_45": None, "46_60": None, "61_75": None, "76_90": None}, "late_game_resistance": {"home": None, "away": None}},
         "goal_conversion": {"status": "partial" if conversion_evidence_available else "data_missing", "strength_edge": None, "goal_edge": None, "margin_edge": None, "usable_stats_sides": usable_stats_sides if conversion_evidence_available else [], "warning": "Strength Edge != Goal Edge != Margin Edge"},
     }
     content = json.dumps({"fixture": data.get("fixture"), "evidence": evidence, "chain": chain}, ensure_ascii=False, sort_keys=True, default=str)
@@ -2854,6 +2854,21 @@ def audit_fundamental_chain(script: Dict[str, Any], now_ts: Optional[int] = None
         absent = [field for field in ("strength_edge", "goal_edge", "margin_edge") if conversion.get(field) in (None, "", [], {})]
         if absent:
             structural_issues["goal_conversion_edges"] = {"missing_fields": absent, "rule": "strength_edge_goal_edge_and_margin_edge_are_distinct"}
+    extended_paths = {
+        "current_athletic_level": (("rotation_quality", "current_athletic_level", "home"), ("rotation_quality", "current_athletic_level", "away")),
+        "structural_replacement": (("rotation_quality", "structural_replacement", "home"), ("rotation_quality", "structural_replacement", "away")),
+        "absolute_attack_quality": (("execution_ability", "absolute_attack_quality", "home"), ("execution_ability", "absolute_attack_quality", "away")),
+        "two_way_open_game": tuple(("open_game_beneficiary", "two_way", field) for field in ("home_attack_gain", "home_defensive_exposure", "away_attack_gain", "away_defensive_exposure")),
+        "late_game_resistance": (("time_segment_strength", "late_game_resistance", "home"), ("time_segment_strength", "late_game_resistance", "away")),
+    }
+    extended_dimension_audit = {}
+    for dimension, paths in extended_paths.items():
+        missing_paths = [".".join(path) for path in paths if get_nested(chain, list(path)) in (None, "", [], {})]
+        extended_dimension_audit[dimension] = {
+            "status": "available" if not missing_paths else ("partial" if len(missing_paths) < len(paths) else "data_missing"),
+            "missing_paths": missing_paths,
+        }
+    extended_ready = all(row["status"] == "available" for row in extended_dimension_audit.values())
     completeness = sum(scores.values()) / len(FUNDAMENTAL_CHAIN)
     eligible = completeness >= 0.6 and not critical_missing and not critical_provenance_missing and not critical_timestamp_issues and not semantic_issues and not structural_issues and not market_contaminated_sections
     return {
@@ -2870,6 +2885,9 @@ def audit_fundamental_chain(script: Dict[str, Any], now_ts: Optional[int] = None
         "critical_semantic_issues": semantic_issues,
         "structural_issues": structural_issues,
         "market_contaminated_sections": market_contaminated_sections,
+        "extended_dimension_audit": extended_dimension_audit,
+        "extended_dimensions_ready": extended_ready,
+        "extended_dimensions_policy": "compatibility audit in V1.49; missing legacy fields do not alone invalidate an otherwise eligible V4 packet",
         "critical_schema": {
             "result_utility": "home/away each require numeric win, draw, loss",
             "rotation_quality": "home/away each require at least 4 named quality fields; numeric scores must be 0..1",

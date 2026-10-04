@@ -284,6 +284,16 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(real_stats["chain"]["goal_conversion"]["status"], "partial")
         self.assertEqual(real_stats["chain"]["goal_conversion"]["usable_stats_sides"], ["home"])
 
+    def test_pure_fundamental_script_exposes_extended_structural_dimensions(self):
+        script = main.pure_fundamental_script({"structured_inputs": {}})
+        chain = script["chain"]
+        self.assertIn("current_athletic_level", chain["rotation_quality"])
+        self.assertIn("structural_replacement", chain["rotation_quality"])
+        self.assertIn("absolute_attack_quality", chain["execution_ability"])
+        self.assertIn("two_way", chain["open_game_beneficiary"])
+        self.assertIn("late_game_resistance", chain["time_segment_strength"])
+        self.assertIsNone(chain["open_game_beneficiary"]["two_way"]["home_defensive_exposure"])
+
     def test_failed_upstream_response_body_does_not_count_as_coverage(self):
         failed = main.coverage_summary({"ok": False, "status_code": 403, "data": {"results": 1, "response": [{"error": "forbidden"}]}})
         self.assertFalse(failed["has_data"])
@@ -1506,6 +1516,18 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         insufficient = main.audit_fundamental_chain({"chain": chain}, now_ts=1790989200)
         self.assertFalse(insufficient["decision_eligible"])
         self.assertIn("goal_conversion", insufficient["critical_missing"])
+
+    def test_extended_dimension_audit_is_backward_compatible_and_explicit(self):
+        chain = {key: {"status": "data_missing"} for key in main.FUNDAMENTAL_CHAIN}
+        audit = main.audit_fundamental_chain({"chain": chain}, now_ts=1790989200)
+        self.assertFalse(audit["extended_dimensions_ready"])
+        self.assertEqual(audit["extended_dimension_audit"]["two_way_open_game"]["status"], "data_missing")
+        chain["open_game_beneficiary"]["two_way"] = {
+            "home_attack_gain": .7, "home_defensive_exposure": .4,
+            "away_attack_gain": .6, "away_defensive_exposure": .5,
+        }
+        updated = main.audit_fundamental_chain({"chain": chain}, now_ts=1790989200)
+        self.assertEqual(updated["extended_dimension_audit"]["two_way_open_game"]["status"], "available")
 
     def test_chain_structural_states_and_conversion_edges_are_required(self):
         now_ts = 1790989200
