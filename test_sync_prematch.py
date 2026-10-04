@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+import requests
 import sync_prematch
 
 
@@ -145,6 +146,26 @@ class ReadOnlyPrematchSyncTests(unittest.TestCase):
             sync_prematch.upload_packet_batches("https://example.test", "secret", [], batch_size=101)
         with self.assertRaisesRegex(ValueError, "upload_batch_size_must_be_1_to_100"):
             sync_prematch.upload_packet_batches("https://example.test", "secret", [], batch_size=0)
+
+    def test_upload_batches_retry_transient_connection_failure(self):
+        with patch("sync_prematch.upload_packets", side_effect=[requests.ConnectionError("temporary"), {"ok": True}]) as upload, patch("sync_prematch.time.sleep") as sleep:
+            result = sync_prematch.upload_packet_batches("https://example.test", "secret", [self.packet()], max_attempts=3)
+        self.assertEqual(upload.call_count, 2)
+        sleep.assert_called_once_with(2.0)
+        self.assertEqual(result["batches"][0]["attempt_count"], 2)
+
+    def test_upload_batches_do_not_retry_client_http_error(self):
+        response = Mock(status_code=422)
+        error = requests.HTTPError("invalid packet", response=response)
+        with patch("sync_prematch.upload_packets", side_effect=error) as upload, patch("sync_prematch.time.sleep") as sleep:
+            with self.assertRaises(requests.HTTPError):
+                sync_prematch.upload_packet_batches("https://example.test", "secret", [self.packet()])
+        self.assertEqual(upload.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_upload_attempt_limit_is_bounded(self):
+        with self.assertRaisesRegex(ValueError, "upload_max_attempts_must_be_1_to_5"):
+            sync_prematch.upload_packet_batches("https://example.test", "secret", [], max_attempts=6)
 
     def test_preflight_rejects_historical_bundle_for_current_date(self):
         report = sync_prematch.packet_preflight([self.packet()], expected_date="2026-10-06")

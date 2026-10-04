@@ -82,6 +82,7 @@ jobs:
             --league "UEFA Nations League" \
             --prematch-window-hours 72 \
             --batch-size 50 \
+            --upload-attempts 3 \
             --require-prematch
 
       - name: Remove ephemeral SSH material

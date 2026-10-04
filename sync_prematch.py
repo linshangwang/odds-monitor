@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -143,17 +144,34 @@ def upload_packets(endpoint: str, token: str, packets: List[Dict[str, Any]], tim
     return response.json()
 
 
-def upload_packet_batches(endpoint: str, token: str, packets: List[Dict[str, Any]], batch_size: int = DEFAULT_UPLOAD_BATCH_SIZE, expected_date: Optional[str] = None, require_prematch: bool = False) -> Dict[str, Any]:
+def retryable_upload_error(exc: Exception) -> bool:
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    return isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code >= 500
+
+
+def upload_packet_batches(endpoint: str, token: str, packets: List[Dict[str, Any]], batch_size: int = DEFAULT_UPLOAD_BATCH_SIZE, expected_date: Optional[str] = None, require_prematch: bool = False, max_attempts: int = 3, retry_delay_seconds: float = 2.0) -> Dict[str, Any]:
     if not 1 <= int(batch_size) <= 100:
         raise ValueError("upload_batch_size_must_be_1_to_100")
+    if not 1 <= int(max_attempts) <= 5:
+        raise ValueError("upload_max_attempts_must_be_1_to_5")
     results = []
     for offset in range(0, len(packets), int(batch_size)):
         batch = packets[offset:offset + int(batch_size)]
-        result = upload_packets(endpoint, token, batch, expected_date=expected_date, require_prematch=require_prematch)
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                result = upload_packets(endpoint, token, batch, expected_date=expected_date, require_prematch=require_prematch)
+                break
+            except requests.RequestException as exc:
+                if attempt >= int(max_attempts) or not retryable_upload_error(exc):
+                    raise
+                time.sleep(float(retry_delay_seconds) * (2 ** (attempt - 1)))
         server_rows = result.get("results") if isinstance(result.get("results"), list) else []
         compact_server = {key: result.get(key) for key in ("ok", "version", "imported_count", "stage_counts") if key in result}
         compact_server.update({"results_count": len(server_rows), "results_sample": server_rows[:SERVER_RESULT_SAMPLE_LIMIT], "results_truncated": len(server_rows) > SERVER_RESULT_SAMPLE_LIMIT})
-        results.append({"batch_number": len(results) + 1, "packet_count": len(batch), "server": compact_server})
+        results.append({"batch_number": len(results) + 1, "packet_count": len(batch), "attempt_count": attempt, "server": compact_server})
     return {"ok": True, "batch_count": len(results), "packet_count": len(packets), "batches": results}
 
 
@@ -234,6 +252,7 @@ def main() -> int:
     parser.add_argument("--expected-date", help="Require every kickoff to use this YYYY-MM-DD date")
     parser.add_argument("--require-prematch", action="store_true", help="Reject fixtures whose kickoff has already passed")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_UPLOAD_BATCH_SIZE, help="Upload 1-100 packets per request")
+    parser.add_argument("--upload-attempts", type=int, default=3, help="Retry transient upload failures 1-5 times")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.ssh_host and not args.remote_path:
@@ -271,7 +290,7 @@ def main() -> int:
     if preflight["status"] != "ready":
         print(json.dumps({**report, "status": "rejected_before_upload"}, ensure_ascii=False))
         return 2
-    result = upload_packet_batches(args.endpoint, os.getenv("SHADOW_ACCESS_TOKEN", ""), packets, batch_size=args.batch_size, expected_date=args.expected_date, require_prematch=args.require_prematch)
+    result = upload_packet_batches(args.endpoint, os.getenv("SHADOW_ACCESS_TOKEN", ""), packets, batch_size=args.batch_size, expected_date=args.expected_date, require_prematch=args.require_prematch, max_attempts=args.upload_attempts)
     print(json.dumps({**report, "status": "uploaded", "server": result}, ensure_ascii=False))
     return 0
 
