@@ -1,5 +1,7 @@
 import gzip
 import json
+import os
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -90,8 +92,22 @@ class ReadOnlyPrematchSyncTests(unittest.TestCase):
         with patch("sync_prematch.subprocess.run", return_value=completed) as run:
             self.assertEqual(sync_prematch.read_pang_file("pang", "/data/export.json"), b"{}")
         command = run.call_args.args[0]
-        self.assertEqual(command[-2:], ["cat --", "/data/export.json"])
+        self.assertEqual(command[-2:], [f"head -c {sync_prematch.MAX_ENCODED_SOURCE_BYTES + 1} --", "/data/export.json"])
         self.assertNotIn("scp", command)
+
+    def test_remote_reader_rejects_source_over_limit(self):
+        completed = Mock(returncode=0, stdout=b"12345", stderr=b"")
+        with patch("sync_prematch.subprocess.run", return_value=completed):
+            with self.assertRaisesRegex(ValueError, "source_file_size_limit_exceeded"):
+                sync_prematch.read_pang_file("pang", "/data/export.json.gz", max_bytes=4)
+
+    def test_local_reader_rejects_source_over_limit_before_read(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "bundle.json")
+            with open(path, "wb") as handle:
+                handle.write(b"12345")
+            with self.assertRaisesRegex(ValueError, "source_file_size_limit_exceeded"):
+                sync_prematch.read_local(path, max_bytes=4)
 
     def test_upload_uses_header_token_gzip_and_incremental_mode(self):
         response = Mock()

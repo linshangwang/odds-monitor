@@ -23,6 +23,7 @@ SAFE_REMOTE_PATH = re.compile(r"^/[A-Za-z0-9._/-]+$")
 DEFAULT_ENDPOINT = "https://web-production-f1134.up.railway.app"
 EXCLUDED_REPORT_LIMIT = 50
 MAX_DECODED_BUNDLE_BYTES = 150 * 1024 * 1024
+MAX_ENCODED_SOURCE_BYTES = 64 * 1024 * 1024
 DEFAULT_UPLOAD_BATCH_SIZE = 50
 REPORT_SAMPLE_LIMIT = 50
 SERVER_RESULT_SAMPLE_LIMIT = 10
@@ -51,21 +52,29 @@ def decode_bundle(raw: bytes, max_decoded_bytes: int = MAX_DECODED_BUNDLE_BYTES)
     raise ValueError("bundle_must_contain_shadow_prematch_packets")
 
 
-def read_local(path: str) -> bytes:
-    return Path(path).read_bytes()
+def read_local(path: str, max_bytes: int = MAX_ENCODED_SOURCE_BYTES) -> bytes:
+    source = Path(path)
+    if source.stat().st_size > max_bytes:
+        raise ValueError("source_file_size_limit_exceeded")
+    raw = source.read_bytes()
+    if len(raw) > max_bytes:
+        raise ValueError("source_file_size_limit_exceeded")
+    return raw
 
 
-def read_pang_file(host: str, remote_path: str, timeout: int = 60) -> bytes:
+def read_pang_file(host: str, remote_path: str, timeout: int = 60, max_bytes: int = MAX_ENCODED_SOURCE_BYTES) -> bytes:
     if not host or any(char.isspace() for char in host):
         raise ValueError("invalid_ssh_host")
     if not SAFE_REMOTE_PATH.fullmatch(remote_path or "") or ".." in remote_path.split("/"):
         raise ValueError("unsafe_remote_path")
-    reader = "gzip -cd --" if remote_path.endswith(".gz") else "cat --"
+    reader = f"head -c {int(max_bytes) + 1} --"
     command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host, reader, remote_path]
     completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
     if completed.returncode:
         error = completed.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"pang_read_failed: {error[:300]}")
+    if len(completed.stdout) > max_bytes:
+        raise ValueError("source_file_size_limit_exceeded")
     return completed.stdout
 
 
