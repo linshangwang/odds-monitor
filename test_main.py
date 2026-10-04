@@ -155,6 +155,31 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["rejected"][0]["reason"], "existing_nami_id_conflict")
         self.assertEqual(store["external_prematch"]["pang-1"]["provider_fixture_ids"]["nami"], "old")
 
+    def test_auto_provider_reconciliation_skips_without_pang_data(self):
+        with patch.object(main, "load_snapshot_store", return_value={"external_prematch": {}}), patch.object(main, "apply_provider_reconciliation") as apply:
+            result = main.auto_provider_reconciliation_cycle(main.datetime(2026, 10, 5, tzinfo=main.timezone.utc))
+        self.assertEqual(result["reason"], "no_pang_fixtures_imported")
+        apply.assert_not_called()
+
+    def test_auto_provider_reconciliation_runs_once_per_local_date(self):
+        now = main.datetime(2026, 10, 5, tzinfo=main.timezone.utc)
+        already = {"date": "2026-10-05", "applied_count": 1}
+        store = {"external_prematch": {"pang-1": {}}, "provider_reconciliation_audit": [already]}
+        with patch.object(main, "load_snapshot_store", return_value=store), patch.object(main, "apply_provider_reconciliation") as apply:
+            result = main.auto_provider_reconciliation_cycle(now)
+        self.assertEqual(result["reason"], "already_completed_for_date")
+        apply.assert_not_called()
+
+    def test_auto_provider_reconciliation_applies_when_due(self):
+        now = main.datetime(2026, 10, 5, tzinfo=main.timezone.utc)
+        store = {"external_prematch": {"pang-1": {}}, "provider_reconciliation_audit": []}
+        applied = {"ok": True, "audit": {"applied_count": 2, "unchanged_count": 1, "rejected_count": 3}}
+        with patch.object(main, "load_snapshot_store", return_value=store), patch.object(main, "apply_provider_reconciliation", return_value=applied) as apply:
+            result = main.auto_provider_reconciliation_cycle(now)
+        apply.assert_called_once_with("2026-10-05")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["applied_count"], 2)
+
     def test_complete_timeline_contains_opening(self):
         self.assertEqual(main.PREMATCH_STAGE_ORDER, ["Opening", "T-24h", "T-12h", "T-6h", "T-3h", "T-1h", "T-15m", "Closing"])
 

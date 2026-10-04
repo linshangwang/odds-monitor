@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.36.0"
+VERSION = "1.37.0"
 RELEASE_CHANNEL = "shadow-usable"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
@@ -52,6 +52,7 @@ AUTO_SNAPSHOT_THREAD_STARTED = False
 AUTO_SNAPSHOT_THREAD: Optional[threading.Thread] = None
 AUTO_SNAPSHOT_LAST_CYCLE_AT: Optional[int] = None
 AUTO_SNAPSHOT_LAST_ERROR: Optional[str] = None
+AUTO_RECONCILIATION_LAST_RESULT: Optional[Dict[str, Any]] = None
 CALIBRATION_MIN_SAMPLE = max(1, int(os.getenv("CALIBRATION_MIN_SAMPLE", "30")))
 API_FOOTBALL_RATE_LIMIT_UNTIL = 0
 SNAPSHOT_STORE_LOCK = threading.RLock()
@@ -4212,9 +4213,14 @@ def auto_snapshot_cycle() -> None:
 
 
 def auto_snapshot_worker() -> None:
-    global AUTO_SNAPSHOT_LAST_CYCLE_AT, AUTO_SNAPSHOT_LAST_ERROR
+    global AUTO_SNAPSHOT_LAST_CYCLE_AT, AUTO_SNAPSHOT_LAST_ERROR, AUTO_RECONCILIATION_LAST_RESULT
     while True:
         try:
+            try:
+                AUTO_RECONCILIATION_LAST_RESULT = auto_provider_reconciliation_cycle()
+            except Exception as exc:
+                AUTO_RECONCILIATION_LAST_RESULT = {"status": "error", "error_type": type(exc).__name__, "at": int(time.time())}
+                print("[AUTO_RECONCILIATION] failed: " + str(exc))
             auto_snapshot_cycle()
             AUTO_SNAPSHOT_LAST_CYCLE_AT = int(time.time())
             AUTO_SNAPSHOT_LAST_ERROR = None
@@ -4223,6 +4229,24 @@ def auto_snapshot_worker() -> None:
             AUTO_SNAPSHOT_LAST_ERROR = type(exc).__name__
             print("[AUTO_SNAPSHOT] cycle failed: " + str(exc))
         time.sleep(AUTO_SNAPSHOT_POLL_SECONDS)
+
+
+def auto_provider_reconciliation_cycle(now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Run provider reconciliation at most once per local calendar date."""
+    now = now or datetime.now(timezone.utc)
+    date_str = now.astimezone(ZoneInfo(AUTO_FETCH_TIMEZONE)).date().isoformat()
+    store = load_snapshot_store()
+    if not (store.get("external_prematch") or {}):
+        return {"status": "skipped", "reason": "no_pang_fixtures_imported", "date": date_str, "at": int(now.timestamp())}
+    previous = next((row for row in reversed(store.get("provider_reconciliation_audit") or []) if row.get("date") == date_str), None)
+    if previous:
+        return {"status": "skipped", "reason": "already_completed_for_date", "date": date_str, "previous": previous, "at": int(now.timestamp())}
+    result = apply_provider_reconciliation(date_str)
+    return {
+        "status": "completed" if result.get("ok") else "degraded", "date": date_str,
+        "applied_count": result["audit"]["applied_count"], "unchanged_count": result["audit"]["unchanged_count"],
+        "rejected_count": result["audit"]["rejected_count"], "at": int(now.timestamp()),
+    }
 
 
 def start_auto_snapshot_worker() -> None:
