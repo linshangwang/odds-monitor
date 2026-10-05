@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.79.0"
+VERSION = "1.80.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -2150,6 +2150,8 @@ def import_prematch_packet(packet: Dict[str, Any], store_override: Optional[Dict
     if packet.get("schema_version") != "shadow_prematch_packet_v1":
         raise HTTPException(status_code=400, detail="unsupported_schema_version")
     match = packet.get("match") or {}
+    if not isinstance(match, dict):
+        raise HTTPException(status_code=400, detail="match_must_be_an_object")
     fixture = str(match.get("match_id") or "").strip()
     if not fixture:
         raise HTTPException(status_code=400, detail="missing_match_id")
@@ -2157,6 +2159,14 @@ def import_prematch_packet(packet: Dict[str, Any], store_override: Optional[Dict
     timeline = packet.get("timeline")
     if not isinstance(timeline, list):
         raise HTTPException(status_code=400, detail="timeline_must_be_an_array")
+    invalid_stage_indexes = [index for index, row in enumerate(timeline) if not isinstance(row, dict)]
+    if invalid_stage_indexes:
+        raise HTTPException(status_code=400, detail={
+            "error": "timeline_rows_must_be_objects",
+            "invalid_row_indexes": invalid_stage_indexes[:50],
+            "invalid_row_count": len(invalid_stage_indexes),
+            "indexes_truncated": len(invalid_stage_indexes) > 50,
+        })
     seen = set()
     records: List[Dict[str, Any]] = []
     imported = []
