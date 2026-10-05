@@ -1549,6 +1549,24 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(second["changed_information"], [])
         self.assertEqual(second["evidence_metadata_changes"], ["result_utility"])
         self.assertIn("fundamental_estimator", second["variable_changes"])
+        self.assertEqual(second["change_types"], ["evidence_metadata", "estimator"])
+        self.assertEqual(second["primary_change_type"], "evidence_metadata")
+
+    def test_version_change_types_distinguish_baseline_and_no_change(self):
+        script = {"content_hash": "same", "chain": {key: {"status": "data_missing"} for key in main.FUNDAMENTAL_CHAIN}}
+        first = main.save_fundamental_version(24, script, {"triggered": False})
+        second = main.save_fundamental_version(24, script, {"triggered": False}, first)
+        self.assertEqual(first["change_types"], ["baseline"])
+        self.assertEqual(first["primary_change_type"], "baseline")
+        self.assertEqual(second["change_types"], ["no_change"])
+        self.assertEqual(second["primary_change_type"], "no_change")
+
+    def test_reason_and_warning_refresh_are_evidence_metadata(self):
+        old = {"goal_conversion": {"status": "partial", "home": {"rate": .1}, "reason": "limited sample", "warning": "old"}}
+        new = {"goal_conversion": {"status": "partial", "home": {"rate": .1}, "reason": "sample rechecked", "warning": "new"}}
+        substantive, metadata = main.fundamental_chain_change_sets(old, new)
+        self.assertEqual(substantive, [])
+        self.assertEqual(metadata, ["goal_conversion"])
 
     def test_fundamental_version_retention_keeps_monotonic_numbers(self):
         script = {"content_hash": "x", "chain": {key: {"status": "data_missing"} for key in main.FUNDAMENTAL_CHAIN}}

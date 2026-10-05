@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.64.0"
+VERSION = "1.65.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -2320,7 +2320,7 @@ def normalize_revalidation_trigger(trigger: Optional[Dict[str, Any]]) -> Dict[st
     return normalized
 
 
-FUNDAMENTAL_EVIDENCE_METADATA_FIELDS = {"observed_at", "as_of", "source", "provenance", "evidence", "evidence_refs", "notes"}
+FUNDAMENTAL_EVIDENCE_METADATA_FIELDS = {"observed_at", "as_of", "source", "provenance", "evidence", "evidence_refs", "notes", "reason", "warning"}
 
 
 def substantive_fundamental_section(section: Any) -> Any:
@@ -2376,6 +2376,23 @@ def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict
         prior_version_number = (previous or {}).get("version_number")
         script_changed = has_previous and bool(changed_sections)
         chain_audit = audit_fundamental_chain(script)
+        probability_changed = probability_change.get("before") != probability_change.get("after") if has_previous and "after" in probability_change else None
+        best_market_changed = best_market_change.get("changed") if has_previous and "changed" in best_market_change else None
+        change_types = []
+        if not has_previous:
+            change_types.append("baseline")
+        if changed_sections:
+            change_types.append("fundamental_variables")
+        if evidence_metadata_changes:
+            change_types.append("evidence_metadata")
+        if estimator_changed:
+            change_types.append("estimator")
+        if probability_changed:
+            change_types.append("model_probability")
+        if best_market_changed:
+            change_types.append("best_market_expression")
+        if has_previous and not change_types:
+            change_types.append("no_change")
         record = {
             "version_number": next_version, "previous_version_number": prior_version_number,
             "created_at": int(time.time()), "trigger": normalized_trigger,
@@ -2383,6 +2400,8 @@ def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict
             "evidence_metadata_changes": evidence_metadata_changes,
             "probability_change": probability_change,
             "best_market_change": best_market_change,
+            "change_types": change_types,
+            "primary_change_type": next((kind for kind in ("fundamental_variables", "evidence_metadata", "estimator", "model_probability", "best_market_expression", "baseline", "no_change") if kind in change_types), "no_change"),
             "fundamental_chain_audit": {
                 "status": chain_audit.get("status"),
                 "decision_eligible": chain_audit.get("decision_eligible") is True,
@@ -2403,8 +2422,8 @@ def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict
                 "fundamental_evidence_eligible": chain_audit.get("decision_eligible") is True,
                 "estimator_changed": estimator_changed,
                 "evidence_metadata_refreshed": bool(evidence_metadata_changes),
-                "probability_changed": probability_change.get("before") != probability_change.get("after") if has_previous and "after" in probability_change else None,
-                "best_market_changed": best_market_change.get("changed") if has_previous and "changed" in best_market_change else None,
+                "probability_changed": probability_changed,
+                "best_market_changed": best_market_changed,
                 "triggered_by_market_revalidation": normalized_trigger["triggered"],
                 "trigger_reasons": normalized_trigger["reasons"],
                 "stage": normalized_trigger.get("stage"),
