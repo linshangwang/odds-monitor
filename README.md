@@ -578,3 +578,5 @@ V1.74 关闭歧义数据的回退旁路。若某市场的公司数组发现重�
 V1.75 将回退门禁扩展到残缺公司数组。某市场已经存在公司明细但无法组成至少一条完整合法报价时，返回 `data_missing_company_array_no_complete_quote`，不采用上游聚合值；只有该市场完全没有公司明细时，才为接口兼容保留上游 Consensus 回退。
 
 V1.76 扩充 pang 公司数组质量审计，按市场公开报价组总数、完整有效组数、残缺或非法组数及重复选项歧义组数。审计仍只保存聚合统计和最多 50 条歧义样本，便于解释 `data_missing` 而不放大导入包或持久化体积。
+
+V1.77 为每个被拒绝的 pang 报价组增加互斥原因统计：`ambiguous_duplicate_selection`、`missing_or_invalid_line` 或 `missing_or_invalid_selection_price`。统计按市场聚合，不改变既有盘口数组和 Consensus 字段，可直接定位上游字段质量问题。

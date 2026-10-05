@@ -2374,7 +2374,29 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(quality["quote_group_count_by_market"]["1x2"], 1)
         self.assertEqual(quality["eligible_complete_quote_group_count_by_market"]["1x2"], 0)
         self.assertEqual(quality["incomplete_or_invalid_quote_group_count_by_market"]["1x2"], 1)
+        self.assertEqual(
+            quality["rejection_reason_count_by_market"]["1x2"],
+            {"missing_or_invalid_selection_price": 1},
+        )
         self.assertEqual(quality["quote_group_count_by_market"]["asian_handicap"], 0)
+
+    def test_imported_quality_audit_distinguishes_missing_line_from_duplicate_selection(self):
+        markets = main._import_company_markets([
+            {"bookmaker_name": "A", "market": "over_under", "selection": "Over", "price": "1.9"},
+            {"bookmaker_name": "A", "market": "over_under", "selection": "Under", "price": "1.9"},
+            {"bookmaker_name": "B", "market": "btts", "selection": "Yes", "price": "1.8"},
+            {"bookmaker_name": "B", "market": "btts", "selection": "Yes", "price": "1.9"},
+            {"bookmaker_name": "B", "market": "btts", "selection": "No", "price": "2.0"},
+        ])
+        audit = main._import_company_array_quality_audit(markets)
+        self.assertEqual(
+            audit["rejection_reason_count_by_market"]["over_under"],
+            {"missing_or_invalid_line": 1},
+        )
+        self.assertEqual(
+            audit["rejection_reason_count_by_market"]["btts"],
+            {"ambiguous_duplicate_selection": 1},
+        )
 
     def test_imported_duplicate_line_selection_only_rejects_affected_line(self):
         stage = self.prematch_packet()["timeline"][0]

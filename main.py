@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.76.0"
+VERSION = "1.77.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -1802,6 +1802,7 @@ def _import_company_array_quality_audit(markets: Dict[str, List[Dict[str, Any]]]
     group_count_by_market = {market: 0 for market in markets}
     eligible_group_count_by_market = {market: 0 for market in markets}
     invalid_group_count_by_market = {market: 0 for market in markets}
+    rejection_reason_count_by_market = {market: {} for market in markets}
     required_prices = {
         "1x2": ("home", "draw", "away"), "btts": ("yes", "no"),
         "asian_handicap": ("home", "away"), "over_under": ("over", "under"),
@@ -1821,6 +1822,14 @@ def _import_company_array_quality_audit(markets: Dict[str, List[Dict[str, Any]]]
                     eligible_group_count_by_market[market] += 1
                 else:
                     invalid_group_count_by_market[market] += 1
+                    if candidate.get("ambiguous_duplicate_selection"):
+                        rejection_reason = "ambiguous_duplicate_selection"
+                    elif market not in ("1x2", "btts") and as_float(candidate.get("line")) is None:
+                        rejection_reason = "missing_or_invalid_line"
+                    else:
+                        rejection_reason = "missing_or_invalid_selection_price"
+                    reason_counts = rejection_reason_count_by_market[market]
+                    reason_counts[rejection_reason] = reason_counts.get(rejection_reason, 0) + 1
                 if not candidate.get("ambiguous_duplicate_selection"):
                     continue
                 duplicate_groups.append({
@@ -1841,6 +1850,7 @@ def _import_company_array_quality_audit(markets: Dict[str, List[Dict[str, Any]]]
         "quote_group_count_by_market": group_count_by_market,
         "eligible_complete_quote_group_count_by_market": eligible_group_count_by_market,
         "incomplete_or_invalid_quote_group_count_by_market": invalid_group_count_by_market,
+        "rejection_reason_count_by_market": rejection_reason_count_by_market,
         "ambiguous_duplicate_selection_groups": duplicate_groups[:50],
         "ambiguous_duplicate_selection_groups_truncated": len(duplicate_groups) > 50,
         "policy": "ambiguous duplicate selections are excluded from company-array consensus",
