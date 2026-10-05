@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.83.0"
+VERSION = "1.84.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -4306,9 +4306,41 @@ def fixture_acceptance_summary(fixture_ids: Optional[List[Any]] = None, now_ts: 
     }
 
 
+def release_candidate_self_test() -> Dict[str, Any]:
+    safe_pass = decision_layer(empty_market_snapshot())
+    safe_pass_audit = audit_decision_output(safe_pass)
+    actionable_market = empty_market_snapshot()
+    actionable_market["consensus_main_line"]["1x2"] = {
+        "home": 2.0, "draw": 3.5, "away": 4.0,
+        "bookmaker_count": max(2, MIN_CONSENSUS_BOOKMAKERS),
+        "source": "complete_company_array", "dispersion_eligible": True,
+    }
+    actionable = decision_layer(
+        actionable_market,
+        {"1x2": {"home": .60, "draw": .23, "away": .17}},
+        {"1x2": {"home": .90, "draw": .30, "away": .20}},
+        crowding=.30, lineup_confidence=.90, death_path=[],
+    )
+    actionable_audit = audit_decision_output(actionable)
+    checks = {
+        "missing_data_returns_pass": safe_pass.get("decision") == "PASS",
+        "pass_output_contract_complete": safe_pass_audit.get("decision_eligible") is True,
+        "eligible_data_returns_actionable": actionable.get("decision") != "PASS",
+        "actionable_output_contract_complete": actionable_audit.get("decision_eligible") is True,
+    }
+    return {
+        "status": "passed" if all(checks.values()) else "failed",
+        "passed": all(checks.values()), "checks": checks,
+        "pass_reasons": safe_pass.get("pass_reasons"),
+        "actionable_selection": actionable.get("decision"),
+        "policy": "release requires both safe PASS and complete actionable decision paths",
+    }
+
+
 def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
     operations = operations_status_report(now_ts=now_ts)
     fixture_acceptance = fixture_acceptance_summary(now_ts=now_ts)
+    self_test = release_candidate_self_test()
     available_paths = {route.path for route in app.routes}
     required_paths = {
         "/shadow/readiness/{fixture}", "/shadow/calibration/lock", "/shadow/calibration/settle",
@@ -4326,8 +4358,9 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         "pang_access_is_read_only": True,
         "real_fixture_shadow_path_validated": fixture_acceptance["shadow_path_validated"],
         "real_fixture_decision_path_validated": fixture_acceptance["decision_path_validated"],
+        "internal_decision_contract_self_test": self_test["passed"],
     }
-    blockers = [name for name in ("persistent_store_operational", "protected_api_configured", "operations_not_blocked", "required_release_endpoints_present") if not checks[name]]
+    blockers = [name for name in ("persistent_store_operational", "protected_api_configured", "operations_not_blocked", "required_release_endpoints_present", "internal_decision_contract_self_test") if not checks[name]]
     warnings = []
     if not checks["persistent_backup_ready"]:
         warnings.append("persistent_backup_not_ready")
@@ -4347,6 +4380,7 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         "operations_status": operations.get("status"),
         "calibration_sample": operations.get("calibration"),
         "fixture_acceptance": fixture_acceptance,
+        "release_candidate_self_test": self_test,
         "per_fixture_gate": "/shadow/readiness/{fixture} must return decision_ready before any recommendation is considered",
         "remaining_external_gaps": [
             "verified opening/history coverage depends on upstream source availability",

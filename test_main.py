@@ -2325,6 +2325,13 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(action_audit["decision_eligible"])
         self.assertIn("actionable_decision_requires_best_market", action_audit["consistency_issues"])
 
+    def test_release_candidate_self_test_covers_pass_and_actionable_paths(self):
+        result = main.release_candidate_self_test()
+        self.assertEqual(result["status"], "passed")
+        self.assertTrue(result["passed"])
+        self.assertTrue(all(result["checks"].values()))
+        self.assertNotEqual(result["actionable_selection"], "PASS")
+
     def test_imported_ai_packet_excludes_invalid_latest_node(self):
         packet = self.prematch_packet()
         invalid_late = dict(packet["timeline"][0])

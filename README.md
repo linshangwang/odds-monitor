@@ -592,3 +592,5 @@ V1.81 对 `lineup_history` 增加相同的写入前门禁：字段存在时必�
 V1.82 在发布验收中分离“平台可运行”和“真实比赛端到端已验证”。`fixture_acceptance` 汇总真实导入比赛的 not-ready、shadow-ready 与 decision-ready 数量，并分别给出盘口影子链路和完整决策链路是否已跑通；没有真实合格比赛时会明确警告，不再用接口存在或配置完成代替实战验收。
 
 V1.83 为最终赛前评估增加输出契约审计，强制检查 Model Probability、Market no-vig Probability、Edge、EV、Script Coverage、Crowding、Line Movement、Lineup Confidence、Death Path、Best Market 与 Bet/PASS。可操作建议必须拥有完整最优盘口且无 PASS 原因；PASS 必须没有最优盘口并给出原因。内部输出若不一致会自动降级为 PASS。
+
+V1.84 在发布验收中内置决策链双场景自检：缺失输入必须安全 PASS，满足公司覆盖、模型、脚本和风险门槛的输入必须产生契约完整的可操作结果。任一场景失败都会成为发布阻断项，使可用版验收不再只依赖测试日志。
