@@ -645,6 +645,27 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["fundamental_change_audit"]["changed_sections"], ["result_utility"])
         self.assertFalse(result["fundamental_change_audit"]["evidence_eligible"])
 
+    def test_evidence_metadata_refresh_is_not_fundamental_confirmation(self):
+        old_section = {"status": "available", "home": {"win": 1, "draw": 0, "loss": -1}, "source": "feed-a", "observed_at": 100}
+        new_section = {**old_section, "source": "feed-b", "observed_at": 200, "evidence_refs": ["new-report"]}
+        previous = {"script": {"content_hash": "old", "chain": {"result_utility": old_section}}}
+        script = {"content_hash": "new", "chain": {"result_utility": new_section}}
+        result = main.classify_market_move_details({"revalidation_trigger": {"triggered": True}}, previous, script)
+        self.assertEqual(result["classification"], "Market-Only Move")
+        self.assertEqual(result["fundamental_change_audit"]["changed_sections"], [])
+        self.assertEqual(result["fundamental_change_audit"]["evidence_metadata_only_sections"], ["result_utility"])
+
+    def test_status_or_value_change_remains_substantive(self):
+        old_section = {"status": "partial", "home": {"score": .5}, "source": "feed", "observed_at": 100}
+        new_section = {"status": "available", "home": {"score": .7}, "source": "feed", "observed_at": 200}
+        previous = {"script": {"chain": {"execution_ability": old_section}}}
+        script = {"chain": {"execution_ability": new_section}}
+        with patch("main.audit_fundamental_chain", return_value={"decision_eligible": True, "status": "eligible"}):
+            result = main.classify_market_move_details({}, previous, script)
+        self.assertEqual(result["classification"], "Fundamental Confirmed")
+        self.assertEqual(result["fundamental_change_audit"]["changed_sections"], ["execution_ability"])
+        self.assertEqual(result["fundamental_change_audit"]["evidence_metadata_only_sections"], [])
+
     def test_optional_markets_participate_in_movement_and_divergence(self):
         previous = {"stage": "T-3h", "market_snapshot": {"primary": {
             "over_under": {"line": 2.5, "over": 1.9, "under": 1.9},

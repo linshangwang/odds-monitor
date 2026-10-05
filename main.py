@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.59.0"
+VERSION = "1.60.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -2371,7 +2371,16 @@ def classify_market_move_details(dynamics: Dict[str, Any], previous_version: Opt
     suspected = information.get("status") == "suspected_unconfirmed" and evidence_eligible and bool(get_nested(dynamics, ["revalidation_trigger", "triggered"]))
     previous_chain = get_nested(previous_version or {}, ["script", "chain"]) or {}
     new_chain = (new_script or {}).get("chain") if isinstance((new_script or {}).get("chain"), dict) else {}
-    changed_fundamental_sections = [key for key in FUNDAMENTAL_CHAIN if previous_chain.get(key) != new_chain.get(key)] if previous_version and new_script else []
+    metadata_fields = {"observed_at", "as_of", "source", "provenance", "evidence", "evidence_refs", "notes"}
+
+    def substantive_section(section: Any) -> Any:
+        if not isinstance(section, dict):
+            return section
+        return {key: value for key, value in section.items() if key not in metadata_fields}
+
+    raw_changed_sections = [key for key in FUNDAMENTAL_CHAIN if previous_chain.get(key) != new_chain.get(key)] if previous_version and new_script else []
+    changed_fundamental_sections = [key for key in raw_changed_sections if substantive_section(previous_chain.get(key)) != substantive_section(new_chain.get(key))]
+    evidence_metadata_only_sections = [key for key in raw_changed_sections if key not in changed_fundamental_sections]
     new_chain_audit = audit_fundamental_chain(new_script or {}) if changed_fundamental_sections else {"decision_eligible": False, "status": "not_changed"}
     fundamental_changed = bool(changed_fundamental_sections and new_chain_audit.get("decision_eligible"))
     conditions = [
@@ -2391,8 +2400,9 @@ def classify_market_move_details(dynamics: Dict[str, Any], previous_version: Opt
         "primary_precedence": ["Fundamental Confirmed", "Model-Market Divergence", "Cross-Market Divergence", "Likely Information-Driven", "Market-Only Move"],
         "fundamental_change_audit": {
             "changed_sections": changed_fundamental_sections,
+            "evidence_metadata_only_sections": evidence_metadata_only_sections,
             "evidence_eligible": bool(new_chain_audit.get("decision_eligible")),
-            "rule": "verified_chain_section_change_required; model_or_estimator_hash_change_alone_is_not_fundamental_confirmation",
+            "rule": "verified_substantive_chain_change_required; evidence timestamp/source refresh or model/estimator hash change alone is not fundamental confirmation",
         },
         "inferred_without_evidence": False,
     }
