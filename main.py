@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.80.0"
+VERSION = "1.81.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -2167,6 +2167,17 @@ def import_prematch_packet(packet: Dict[str, Any], store_override: Optional[Dict
             "invalid_row_count": len(invalid_stage_indexes),
             "indexes_truncated": len(invalid_stage_indexes) > 50,
         })
+    lineup_history = packet.get("lineup_history")
+    if lineup_history is not None and not isinstance(lineup_history, list):
+        raise HTTPException(status_code=400, detail="lineup_history_must_be_an_array")
+    invalid_lineup_indexes = [index for index, row in enumerate(lineup_history or []) if not isinstance(row, dict)]
+    if invalid_lineup_indexes:
+        raise HTTPException(status_code=400, detail={
+            "error": "lineup_history_rows_must_be_objects",
+            "invalid_row_indexes": invalid_lineup_indexes[:50],
+            "invalid_row_count": len(invalid_lineup_indexes),
+            "indexes_truncated": len(invalid_lineup_indexes) > 50,
+        })
     seen = set()
     records: List[Dict[str, Any]] = []
     imported = []
@@ -2216,7 +2227,7 @@ def import_prematch_packet(packet: Dict[str, Any], store_override: Optional[Dict
             "schema_version": packet.get("schema_version"), "league": packet.get("league") or previous_meta.get("league"),
             "exported_at": packet.get("exported_at") or previous_meta.get("exported_at"), "match": match or previous_meta.get("match"),
             "required_timeline": packet.get("required_timeline") or previous_meta.get("required_timeline") or PREMATCH_STAGE_ORDER,
-            "lineup_history": packet.get("lineup_history") if "lineup_history" in packet else previous_meta.get("lineup_history", []),
+            "lineup_history": lineup_history if "lineup_history" in packet else previous_meta.get("lineup_history", []),
             "data_quality": packet.get("data_quality") or previous_meta.get("data_quality"),
             "fixture_identity": fixture_identity,
             "provider_fixture_ids": {**(previous_meta.get("provider_fixture_ids") or {}), "pang": fixture},

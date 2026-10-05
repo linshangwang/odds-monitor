@@ -2454,6 +2454,24 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(raised.exception.detail["invalid_row_indexes"], [1, 2])
         self.assertEqual(main.get_fixture_snapshots("uuid-1"), [])
 
+    def test_imported_packet_rejects_non_array_lineup_history(self):
+        packet = self.prematch_packet()
+        packet["lineup_history"] = {"status": "official"}
+        with self.assertRaises(main.HTTPException) as raised:
+            main.import_prematch_packet(packet)
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.detail, "lineup_history_must_be_an_array")
+
+    def test_imported_packet_rejects_non_object_lineup_rows_before_persistence(self):
+        packet = self.prematch_packet()
+        packet["lineup_history"] = [packet["lineup_history"][0], None]
+        with self.assertRaises(main.HTTPException) as raised:
+            main.import_prematch_packet(packet)
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.detail["error"], "lineup_history_rows_must_be_objects")
+        self.assertEqual(raised.exception.detail["invalid_row_indexes"], [1])
+        self.assertEqual(main.get_fixture_snapshots("uuid-1"), [])
+
     def test_imported_duplicate_line_selection_only_rejects_affected_line(self):
         stage = self.prematch_packet()["timeline"][0]
         stage["consensus_main_line"]["home_team_total"] = {"status": "data_missing"}
