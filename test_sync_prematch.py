@@ -121,8 +121,19 @@ class ReadOnlyPrematchSyncTests(unittest.TestCase):
         self.assertEqual(kwargs["headers"]["Authorization"], "Bearer secret")
         self.assertEqual(kwargs["headers"]["Content-Encoding"], "gzip")
         self.assertEqual(kwargs["headers"]["X-Sync-Mode"], "incremental")
+        decoded = gzip.decompress(kwargs["data"])
+        self.assertEqual(kwargs["headers"]["X-Payload-SHA256"], sync_prematch.hashlib.sha256(decoded).hexdigest())
         self.assertNotIn("secret", post.call_args.args[0])
-        self.assertEqual(json.loads(gzip.decompress(kwargs["data"]))["packets"][0]["match"]["match_id"], "m-1")
+        self.assertEqual(json.loads(decoded)["packets"][0]["match"]["match_id"], "m-1")
+
+    def test_upload_forwards_source_fingerprint_without_token_leakage(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"ok": True}
+        digest = "a" * 64
+        with patch("sync_prematch.requests.post", return_value=response) as post:
+            sync_prematch.upload_packets("https://example.test", "secret", [self.packet()], source_sha256=digest)
+        self.assertEqual(post.call_args.kwargs["headers"]["X-Source-SHA256"], digest)
 
     def test_upload_batches_respect_server_packet_limit(self):
         packets = [self.packet() for _ in range(5)]

@@ -6,6 +6,7 @@ but it never uploads, creates, edits, or schedules anything on pang.
 
 import argparse
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -119,22 +120,28 @@ def select_prematch_window(packets: List[Dict[str, Any]], window_hours: int, now
     return selected, excluded
 
 
+def canonical_payload(packets: List[Dict[str, Any]]) -> bytes:
+    return json.dumps({"packets": packets}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
 def compressed_payload(packets: List[Dict[str, Any]]) -> bytes:
-    raw = json.dumps({"packets": packets}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    return gzip.compress(raw, compresslevel=6)
+    return gzip.compress(canonical_payload(packets), compresslevel=6)
 
 
-def upload_packets(endpoint: str, token: str, packets: List[Dict[str, Any]], timeout: int = 45, expected_date: Optional[str] = None, require_prematch: bool = False) -> Dict[str, Any]:
+def upload_packets(endpoint: str, token: str, packets: List[Dict[str, Any]], timeout: int = 45, expected_date: Optional[str] = None, require_prematch: bool = False, source_sha256: Optional[str] = None) -> Dict[str, Any]:
     if not endpoint.startswith("https://"):
         raise ValueError("https_endpoint_required")
     if not token:
         raise ValueError("SHADOW_ACCESS_TOKEN_required")
+    payload = canonical_payload(packets)
     response = requests.post(
         endpoint.rstrip("/") + "/shadow/import-prematch-packets",
-        data=compressed_payload(packets),
+        data=gzip.compress(payload, compresslevel=6),
         headers={
             "Authorization": f"Bearer {token}", "Content-Type": "application/json",
             "Content-Encoding": "gzip", "X-Sync-Mode": "incremental", "X-Sync-Source": "pang-readonly-local",
+            "X-Payload-SHA256": hashlib.sha256(payload).hexdigest(),
+            **({"X-Source-SHA256": source_sha256} if source_sha256 else {}),
             **({"X-Expected-Match-Date": expected_date} if expected_date else {}),
             **({"X-Require-Prematch": "true"} if require_prematch else {}),
         },
@@ -150,7 +157,7 @@ def retryable_upload_error(exc: Exception) -> bool:
     return isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code >= 500
 
 
-def upload_packet_batches(endpoint: str, token: str, packets: List[Dict[str, Any]], batch_size: int = DEFAULT_UPLOAD_BATCH_SIZE, expected_date: Optional[str] = None, require_prematch: bool = False, max_attempts: int = 3, retry_delay_seconds: float = 2.0) -> Dict[str, Any]:
+def upload_packet_batches(endpoint: str, token: str, packets: List[Dict[str, Any]], batch_size: int = DEFAULT_UPLOAD_BATCH_SIZE, expected_date: Optional[str] = None, require_prematch: bool = False, max_attempts: int = 3, retry_delay_seconds: float = 2.0, source_sha256: Optional[str] = None) -> Dict[str, Any]:
     if not 1 <= int(batch_size) <= 100:
         raise ValueError("upload_batch_size_must_be_1_to_100")
     if not 1 <= int(max_attempts) <= 5:
@@ -162,7 +169,7 @@ def upload_packet_batches(endpoint: str, token: str, packets: List[Dict[str, Any
         while True:
             attempt += 1
             try:
-                result = upload_packets(endpoint, token, batch, expected_date=expected_date, require_prematch=require_prematch)
+                result = upload_packets(endpoint, token, batch, expected_date=expected_date, require_prematch=require_prematch, source_sha256=source_sha256)
                 break
             except requests.RequestException as exc:
                 if attempt >= int(max_attempts) or not retryable_upload_error(exc):
@@ -258,6 +265,7 @@ def main() -> int:
     if args.ssh_host and not args.remote_path:
         parser.error("--remote-path is required with --ssh-host")
     raw = read_local(args.input) if args.input else read_pang_file(args.ssh_host, args.remote_path)
+    source_sha256 = hashlib.sha256(raw).hexdigest()
     packets = select_packets(decode_bundle(raw), args.league)
     source_selected_count = len(packets)
     excluded: List[Dict[str, Any]] = []
@@ -274,6 +282,7 @@ def main() -> int:
         "selection": {
             "prematch_window_hours": args.prematch_window_hours,
             "source_selected_count": source_selected_count,
+            "source_sha256": source_sha256,
             "excluded_count": len(excluded),
             "excluded_reason_counts": exclusion_reasons,
             "excluded_sample": excluded[:EXCLUDED_REPORT_LIMIT],
@@ -290,7 +299,7 @@ def main() -> int:
     if preflight["status"] != "ready":
         print(json.dumps({**report, "status": "rejected_before_upload"}, ensure_ascii=False))
         return 2
-    result = upload_packet_batches(args.endpoint, os.getenv("SHADOW_ACCESS_TOKEN", ""), packets, batch_size=args.batch_size, expected_date=args.expected_date, require_prematch=args.require_prematch, max_attempts=args.upload_attempts)
+    result = upload_packet_batches(args.endpoint, os.getenv("SHADOW_ACCESS_TOKEN", ""), packets, batch_size=args.batch_size, expected_date=args.expected_date, require_prematch=args.require_prematch, max_attempts=args.upload_attempts, source_sha256=source_sha256)
     print(json.dumps({**report, "status": "uploaded", "server": result}, ensure_ascii=False))
     return 0
 

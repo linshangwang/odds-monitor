@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.57.0"
+VERSION = "1.58.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -3585,6 +3585,7 @@ async def shadow_import_prematch_packets(request: Request, token: Optional[str] 
     """Import canonical prematch packets without calling or changing upstream providers."""
     require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     body = await request.body()
+    request_bytes = len(body)
     if len(body) > 30 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="request_body_too_large")
     try:
@@ -3593,6 +3594,13 @@ async def shadow_import_prematch_packets(request: Request, token: Optional[str] 
                 body = bounded_gzip_decompress(body, MAX_IMPORT_DECOMPRESSED_BYTES)
             except ValueError:
                 raise HTTPException(status_code=413, detail="decompressed_body_too_large")
+        payload_sha256 = hashlib.sha256(body).hexdigest()
+        supplied_payload_sha256 = str(request.headers.get("x-payload-sha256") or "").lower()
+        if supplied_payload_sha256 and supplied_payload_sha256 != payload_sha256:
+            raise HTTPException(status_code=422, detail="payload_sha256_mismatch")
+        source_sha256 = str(request.headers.get("x-source-sha256") or "").lower()
+        if source_sha256 and (len(source_sha256) != 64 or any(char not in "0123456789abcdef" for char in source_sha256)):
+            raise HTTPException(status_code=400, detail="invalid_source_sha256")
         payload = json.loads(body.decode("utf-8"))
     except HTTPException:
         raise
@@ -3617,7 +3625,8 @@ async def shadow_import_prematch_packets(request: Request, token: Optional[str] 
         store["import_sync_status"] = {
             "status": "ok", "last_success_at": int(time.time()), "previous_success_at": previous.get("last_success_at"),
             "packet_count": len(results), "fixtures": [row.get("fixture") for row in results],
-            "request_bytes": len(await request.body()), "content_encoding": request.headers.get("content-encoding") or "identity",
+            "request_bytes": request_bytes, "content_encoding": request.headers.get("content-encoding") or "identity",
+            "payload_sha256": payload_sha256, "source_sha256": source_sha256 or None,
             "mode": request.headers.get("x-sync-mode") or "batch", "source": request.headers.get("x-sync-source") or "external",
             "stage_counts": totals, "changed_fixture_count": sum(1 for row in results if row.get("changed")),
         }
