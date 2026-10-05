@@ -2276,6 +2276,10 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("calibration_minimum_sample_not_reached", release["warnings"])
         self.assertIn("real_fixture_shadow_path_not_yet_validated", release["warnings"])
         self.assertFalse(release["fixture_acceptance"]["shadow_path_validated"])
+        self.assertTrue(release["usable_scope"]["system_usable"])
+        self.assertEqual(release["usable_scope"]["operating_mode"], "manual_or_api_import_shadow")
+        self.assertTrue(release["usable_scope"]["safe_pass_without_fresh_data"])
+        self.assertIn("real_money_betting", release["usable_scope"]["not_authorized"])
         self.assertEqual(release["blockers"], [])
 
         blocked_operations = {**operations, "status": "blocked", "store": {"operational": False, "recovery_ready": False}}

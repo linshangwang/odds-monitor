@@ -594,3 +594,5 @@ V1.82 在发布验收中分离“平台可运行”和“真实比赛端到端�
 V1.83 为最终赛前评估增加输出契约审计，强制检查 Model Probability、Market no-vig Probability、Edge、EV、Script Coverage、Crowding、Line Movement、Lineup Confidence、Death Path、Best Market 与 Bet/PASS。可操作建议必须拥有完整最优盘口且无 PASS 原因；PASS 必须没有最优盘口并给出原因。内部输出若不一致会自动降级为 PASS。
 
 V1.84 在发布验收中内置决策链双场景自检：缺失输入必须安全 PASS，满足公司覆盖、模型、脚本和风险门槛的输入必须产生契约完整的可操作结果。任一场景失败都会成为发布阻断项，使可用版验收不再只依赖测试日志。
+
+V1.85 定义当前正式影子可用范围。系统在持久化、鉴权、接口和内部决策自检通过后可用于赛前影子分析、手动/API 数据包验证及校准采集；没有新鲜自动数据流时保持 `manual_or_api_import_shadow` 模式并强制安全 PASS。pang 自动实时流是否完成真实比赛验证单独公开，不再混同为系统代码不可用；真钱投注和缺少新鲜验证数据的自动推荐仍明确禁止。

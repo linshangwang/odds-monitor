@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.84.0"
+VERSION = "1.85.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -4370,12 +4370,22 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         warnings.append("real_fixture_shadow_path_not_yet_validated")
     shadow_usable = not blockers
     controlled_decision_candidate = shadow_usable and operations["calibration"].get("sample_ready") is True
+    operating_mode = "live_feed_shadow" if fixture_acceptance["shadow_path_validated"] else "manual_or_api_import_shadow"
     return {
         "version": VERSION, "release_channel": RELEASE_CHANNEL,
         "status": "shadow_usable" if shadow_usable else "not_ready",
         "shadow_use_authorized": shadow_usable,
         "real_money_use_authorized": False,
         "controlled_decision_candidate": controlled_decision_candidate,
+        "usable_scope": {
+            "system_usable": shadow_usable,
+            "operating_mode": operating_mode,
+            "manual_or_api_import_available": checks["required_release_endpoints_present"],
+            "automatic_live_feed_validated": fixture_acceptance["shadow_path_validated"],
+            "safe_pass_without_fresh_data": True,
+            "approved_uses": ["prematch_shadow_analysis", "manual_or_api_packet_validation", "calibration_collection"],
+            "not_authorized": ["real_money_betting", "automatic_recommendations_without_fresh_verified_data"],
+        },
         "checks": checks, "blockers": blockers, "warnings": warnings,
         "operations_status": operations.get("status"),
         "calibration_sample": operations.get("calibration"),
