@@ -242,7 +242,15 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("italy", aliases["away_aliases"])
 
     def test_complete_timeline_contains_opening(self):
-        self.assertEqual(main.PREMATCH_STAGE_ORDER, ["Opening", "T-24h", "T-12h", "T-6h", "T-3h", "T-1h", "T-15m", "Closing"])
+        self.assertEqual(main.PREMATCH_STAGE_ORDER, ["Opening", "T-24h", "T-12h", "T-6h", "T-3h", "T-1h", "T-30m", "Closing"])
+
+    def test_legacy_t15_record_does_not_backfill_required_t30_stage(self):
+        legacy = {"stage": "T-15m", "snapshot_at": 100, "import_status": "available", "market_snapshot": {"available": True}, "stage_timing_audit": {"status": "valid"}, "sequence_timing_audit": {"status": "valid"}}
+        timeline = main.complete_prematch_timeline([legacy])
+        t30 = next(row for row in timeline if row["stage"] == "T-30m")
+        self.assertEqual(t30["timeline_status"], "data_missing")
+        self.assertTrue(t30["synthetic_placeholder"])
+        self.assertNotIn("T-15m", [row["stage"] for row in timeline])
 
     def test_opening_is_never_synthesized_from_scheduled_current_odds(self):
         kickoff = main.datetime.now(main.timezone.utc) + main.timedelta(hours=48)
@@ -453,8 +461,8 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         market["available"] = True
         old_news = {"captured_at": 100, "lineups": {"available": True, "confirmed": True, "teams": [{"version": "old"}]}, "injuries": {"available": True, "home_count": 1}}
         new_news = {"captured_at": 200, "lineups": {"available": True, "confirmed": True, "teams": [{"version": "new"}]}, "injuries": {"available": False, "status": "fetch_failed"}}
-        first = {"fixture": 92, "stage": "T-15m", "snapshot_at": 100, "market_snapshot": market, "team_news_snapshot": old_news, "stage_timing_audit": {"status": "valid"}}
-        second = {"fixture": 92, "stage": "T-15m", "snapshot_at": 200, "market_snapshot": market, "team_news_snapshot": new_news, "stage_timing_audit": {"status": "valid"}}
+        first = {"fixture": 92, "stage": "T-30m", "snapshot_at": 100, "market_snapshot": market, "team_news_snapshot": old_news, "stage_timing_audit": {"status": "valid"}}
+        second = {"fixture": 92, "stage": "T-30m", "snapshot_at": 200, "market_snapshot": market, "team_news_snapshot": new_news, "stage_timing_audit": {"status": "valid"}}
         main.save_snapshot(first)
         main.save_snapshot(second)
         news = main.get_fixture_snapshots(92)[0]["team_news_snapshot"]
@@ -520,9 +528,9 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         rows = [
             {"stage": "Opening", "snapshot_at": 9999},
             {"stage": "T-3h", "snapshot_at": 100},
-            {"stage": "T-15m", "snapshot_at": 200},
+            {"stage": "T-30m", "snapshot_at": 200},
         ]
-        self.assertEqual(main.latest_prematch_snapshot(rows)["stage"], "T-15m")
+        self.assertEqual(main.latest_prematch_snapshot(rows)["stage"], "T-30m")
         self.assertIsNone(main.latest_prematch_snapshot([{"stage": "FT", "snapshot_at": 10000}]))
 
     def test_stage_timing_rejects_mislabeled_tx_snapshot(self):
@@ -539,7 +547,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(selected["stage"], "T-3h")
 
     def test_stage_timing_is_unverifiable_not_invented_without_kickoff(self):
-        audit = main.audit_stage_timing("T-15m", 1000, None)
+        audit = main.audit_stage_timing("T-30m", 1000, None)
         self.assertEqual(audit["status"], "data_missing")
         self.assertTrue(audit["decision_eligible"])
 
@@ -1487,7 +1495,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         first = main.save_portfolio_run("test-set", ["a", "b"], first_portfolio, 3, ["T-3h"])
         second = main.save_portfolio_run("test-set", ["a", "b"], first_portfolio, 3, ["T-1h"])
         changed_portfolio = {**first_portfolio, "risk_adjusted_recommendation": {"decision": "PASS", "reason": "no_combination_passed_half_edge_stress_test"}}
-        third = main.save_portfolio_run("test-set", ["a", "b"], changed_portfolio, 3, ["T-15m"])
+        third = main.save_portfolio_run("test-set", ["a", "b"], changed_portfolio, 3, ["T-30m"])
         self.assertTrue(first["recommendation_change"]["changed"])
         self.assertFalse(second["recommendation_change"]["changed"])
         self.assertTrue(third["recommendation_change"]["changed"])
@@ -2114,7 +2122,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             {"bookmaker_name": "A", "market": "home_team_total", "market_name": "Home Team Total Goals(1st Half)", "selection": "Over 0.5", "line": "0.5", "price": "1.8"},
             {"bookmaker_name": "A", "market": "home_team_total", "market_name": "Home Team Total Goals(1st Half)", "selection": "Under 0.5", "line": "0.5", "price": "2.0"},
         ]}
-        return {"schema_version": "shadow_prematch_packet_v1", "league": "UEFA Nations League", "match": {"match_id": "uuid-1", "home_team_name": "Home", "away_team_name": "Away"}, "required_timeline": main.PREMATCH_STAGE_ORDER, "timeline": [row, {"stage": "T-15m", "status": "data_missing", "reason": "not captured"}], "lineup_history": [{"observed_at": "2026-09-29T00:00:00+00:00", "status": "official"}], "data_quality": {"level": "partial"}}
+        return {"schema_version": "shadow_prematch_packet_v1", "league": "UEFA Nations League", "match": {"match_id": "uuid-1", "home_team_name": "Home", "away_team_name": "Away"}, "required_timeline": main.PREMATCH_STAGE_ORDER, "timeline": [row, {"stage": "T-30m", "status": "data_missing", "reason": "not captured"}], "lineup_history": [{"observed_at": "2026-09-29T00:00:00+00:00", "status": "official"}], "data_quality": {"level": "partial"}}
 
     def test_imported_packet_preserves_uuid_arrays_and_missing_stage(self):
         result = main.import_prematch_packet(self.prematch_packet())
@@ -2131,10 +2139,10 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(opening["market_snapshot"]["consensus_audit"]["1x2"], "recalculated_from_company_array")
         self.assertEqual(len(opening["market_snapshot"]["markets"]["home_team_total"][0]["lines"]), 1)
         self.assertEqual(opening["market_snapshot"]["markets"]["1x2"][0]["home"], 2.0)
-        missing = [x for x in rows if x["stage"] == "T-15m"][0]
+        missing = [x for x in rows if x["stage"] == "T-30m"][0]
         self.assertEqual(missing["import_status"], "data_missing")
         packet = main.build_imported_ai_packet("uuid-1")
-        self.assertIn("T-15m", packet["market"]["missing_stages"])
+        self.assertIn("T-30m", packet["market"]["missing_stages"])
         self.assertNotIn("company_market_array", packet["market"]["timeline"][0])
         self.assertIsNone(packet["fundamentals"]["lineup_history"])
         self.assertNotIn("markets", packet["market"]["current"])
@@ -2339,17 +2347,17 @@ class ShadowV4UpgradeTests(unittest.TestCase):
     def test_imported_ai_packet_excludes_invalid_latest_node(self):
         packet = self.prematch_packet()
         invalid_late = dict(packet["timeline"][0])
-        invalid_late["stage"] = "T-15m"
+        invalid_late["stage"] = "T-30m"
         invalid_late["latest_observed_at"] = "2030-01-01T00:00:00+00:00"
         packet["timeline"] = [packet["timeline"][0], invalid_late]
         main.import_prematch_packet(packet)
         store = main.load_snapshot_store()
-        late = next(row for row in store["fixtures"]["uuid-1"] if row["stage"] == "T-15m")
+        late = next(row for row in store["fixtures"]["uuid-1"] if row["stage"] == "T-30m")
         late["stage_timing_audit"] = {"status": "invalid", "decision_eligible": False}
         main.write_snapshot_store(store)
         result = main.build_imported_ai_packet("uuid-1")
         self.assertEqual(result["market"]["available_prematch_stage_count"], 1)
-        self.assertIn("T-15m", result["market"]["missing_stages"])
+        self.assertIn("T-30m", result["market"]["missing_stages"])
         self.assertEqual(result["market"]["current"]["consensus_main_line"]["1x2"]["home"], 2.0)
         self.assertIn("line_movement_requires_two_real_comparable_stages", result["decision_layer"]["pass_reasons"])
 
@@ -2768,7 +2776,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
     def test_revalidation_queue_prioritizes_late_and_overdue_moves(self):
         tasks = [
             {"task_id": "early", "status": "pending", "stage": "T-24h", "created_at": 9000, "reasons": ["abnormal_price_move"]},
-            {"task_id": "late", "status": "pending", "stage": "T-15m", "created_at": 7000, "reasons": ["cross_market_divergence"]},
+            {"task_id": "late", "status": "pending", "stage": "T-30m", "created_at": 7000, "reasons": ["cross_market_divergence"]},
         ]
         viewed = main.revalidation_queue_view(tasks, now_ts=10000)
         self.assertEqual(viewed[0]["task_id"], "late")
@@ -2816,7 +2824,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         main.write_snapshot_store({"version": main.VERSION, "fixtures": {}, "fundamental_revalidation_queue": {
             "early": {"task_id": "early", "fixture": "fixture-1", "stage": "T-6h", "status": "pending"},
             "current": {"task_id": "current", "fixture": "fixture-1", "stage": "T-3h", "status": "pending"},
-            "later": {"task_id": "later", "fixture": "fixture-1", "stage": "T-15m", "status": "pending"},
+            "later": {"task_id": "later", "fixture": "fixture-1", "stage": "T-30m", "status": "pending"},
         }})
         resolved = main.resolve_revalidation_tasks("fixture-1", {"version_number": 2, "changed_information": [], "fundamental_chain_audit": {"decision_eligible": True}}, resolved_through_stage="T-3h")
         self.assertEqual(resolved, 2)
@@ -2828,7 +2836,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
     def test_incomplete_revalidation_attempt_stays_pending_with_missing_evidence(self):
         main.write_snapshot_store({"version": main.VERSION, "fixtures": {}, "fundamental_revalidation_queue": {
             "task": {"task_id": "task", "fixture": "fixture-1", "stage": "T-3h", "status": "pending", "created_at": 1},
-            "later": {"task_id": "later", "fixture": "fixture-1", "stage": "T-15m", "status": "pending", "created_at": 1},
+            "later": {"task_id": "later", "fixture": "fixture-1", "stage": "T-30m", "status": "pending", "created_at": 1},
         }})
         audit = {"critical_missing": ["result_utility"], "critical_provenance_missing": ["rotation_quality"], "critical_semantic_issues": {}, "critical_structural_issues": {}}
         recorded = main.record_incomplete_revalidation_attempt("fixture-1", audit, "T-3h")
@@ -2967,7 +2975,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         stale = main.imported_fixture_freshness(metadata, history, now_ts=10000)
         self.assertEqual(stale["latest_stage"], "T-1h")
         self.assertEqual(stale["state"], "stale")
-        future = main.imported_fixture_freshness(metadata, [{"stage": "T-15m", "import_status": "available", "snapshot_at": 10401}], now_ts=10000)
+        future = main.imported_fixture_freshness(metadata, [{"stage": "T-30m", "import_status": "available", "snapshot_at": 10401}], now_ts=10000)
         self.assertEqual(future["state"], "invalid_timestamp")
         self.assertFalse(future["decision_eligible"])
 

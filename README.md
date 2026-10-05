@@ -84,8 +84,8 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 
 ## V4 兼容升级
 
-- 固定时间轴：`Opening → T-24h → T-12h → T-6h → T-3h → T-1h → T-15m → Closing`。未真实采集的节点返回 `data_missing`，不使用当前赔率回填。
-- T-1h、T-15m 和 Closing 快照持久化 `team_news_snapshot`，包含伤停、阵型、教练及确认首发名单；接口请求结束后不会丢失阵容详情。
+- 固定时间轴：`Opening → T-24h → T-12h → T-6h → T-3h → T-1h → T-30m → Closing`。未真实采集的节点返回 `data_missing`，不使用当前赔率回填。
+- T-1h、T-30m 和 Closing 快照持久化 `team_news_snapshot`，包含伤停、阵型、教练及确认首发名单；接口请求结束后不会丢失阵容详情。
 - 伤停数据区分 `confirmed_empty`（接口成功且确认无伤停）与 `fetch_failed`（数据缺失），失败时人数为 `null`，禁止按零伤停参与模型。
 - 一次性当前基线只有在赔率接口成功且确有市场数据时才允许落盘，同时保存阶段时效审计和临场阵容快照；不会用空响应制造历史节点。
 - 同一 T-X 阶段采用质量不可降级写入：已存在的有效快照不会被空赔率、错误时段或无效序列的新采集覆盖。
@@ -157,7 +157,7 @@ Edge、EV、脚本覆盖率、拥挤度和阵容可信度门槛，且不存在 D
 组合请求可传安全格式的 `portfolio_id`；未传时按排序后的比赛集合自动生成稳定ID。每次评估会
 在Railway现有持久化文件中保存最近100个版本，包括触发原因、风险偏好、推荐签名及相对上一版
 是否发生变化。历史通过受令牌保护的 `GET /shadow/portfolio/history/{portfolio_id}` 查询。
-组合评估还可传 `stage`，支持 Opening、T-24h、T-12h、T-6h、T-3h、T-1h、T-15m、Closing。
+组合评估还可传 `stage`，支持 Opening、T-24h、T-12h、T-6h、T-3h、T-1h、T-30m、Closing。
 历史接口固定返回完整八节点 `timeline`；没有执行组合评估的节点明确为 `data_missing`，后续建议
 不会反向填充早期节点。未传阶段的评估独立列入 `manual_runs`。
 每个保存版本还带有 `transition`：自动区分 Initial Recommendation、No Change、
@@ -237,7 +237,7 @@ T-X 变盘比较现覆盖全部可用市场：1X2、AH、O/U、BTTS、主队进�
 计算模型概率、Edge和EV供审计，但会以 `line_movement_requires_two_real_comparable_stages`
 强制 PASS。
 “最新盘口”按固定 T-X 阶段顺序选择最接近开赛的真实节点，而非按数据库写入时间。较早阶段
-即使稍后补传或修订，也不会覆盖 T-3h、T-1h、T-15m 或 Closing 的决策位置。
+即使稍后补传或修订，也不会覆盖 T-3h、T-1h、T-30m 或 Closing 的决策位置。
 数据新鲜度也绑定该最新阶段，而不是所有记录中最大的写入时间；超过当前时间5分钟的快照标记
 `invalid_timestamp` 并强制 PASS，防止时间漂移或错误时间戳污染临场判断。
 导入时还会核对节点标签与开赛时间：各 T-X 节点采用明确允许误差，严重错位标记
@@ -252,7 +252,7 @@ T-X 变盘比较现覆盖全部可用市场：1X2、AH、O/U、BTTS、主队进�
 队列达到保留上限时只裁剪最旧的 revalidated/superseded 历史，pending 永不静默淘汰；若 pending
 本身超过500条，`/shadow/import-status` 返回 `over_capacity=true`，便于及时扩容或处理积压。
 复核结案受当前评估阶段约束：例如使用 T-3h 数据重算时，只能关闭 T-3h 及更早任务；后来产生的
-T-1h、T-15m 或 Closing 信号继续保持 pending，等待对应阶段的新事实复核。
+T-1h、T-30m 或 Closing 信号继续保持 pending，等待对应阶段的新事实复核。
 `Likely Information-Driven` 只在变盘已触发、信息状态为 `suspected_unconfirmed` 且至少存在一个
 证据引用时使用；“暂时找不到原因”不再被包装成信息盘。每次分类附 `classification_audit.basis`。
 外部导入的 `information_search.evidence_refs` 会限制数量和长度，并校验结构化证据的来源、定位符与观察时间；未来时间或不可识别来源只进入审计，不参与信息盘分类。
@@ -596,3 +596,5 @@ V1.83 为最终赛前评估增加输出契约审计，强制检查 Model Probabi
 V1.84 在发布验收中内置决策链双场景自检：缺失输入必须安全 PASS，满足公司覆盖、模型、脚本和风险门槛的输入必须产生契约完整的可操作结果。任一场景失败都会成为发布阻断项，使可用版验收不再只依赖测试日志。
 
 V1.85 定义当前正式影子可用范围。系统在持久化、鉴权、接口和内部决策自检通过后可用于赛前影子分析、手动/API 数据包验证及校准采集；没有新鲜自动数据流时保持 `manual_or_api_import_shadow` 模式并强制安全 PASS。pang 自动实时流是否完成真实比赛验证单独公开，不再混同为系统代码不可用；真钱投注和缺少新鲜验证数据的自动推荐仍明确禁止。
+
+V1.86 将最终临场节点由 T-15m 调整为 T-30m，统一更新采集计划、时序审计、阵容快照、基本面版本、组合阶段和输出文档。历史 T-15m 记录仍保留在持久化文件中，但不会被重命名、回填或冒充新的 T-30m 必需节点。

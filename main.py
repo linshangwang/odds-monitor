@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.85.0"
+VERSION = "1.86.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -118,7 +118,7 @@ TRACKING_STAGES = [
     {"key": "T-6h", "label": "T-6h 盘口/赔率确认", "offset": timedelta(hours=-6), "purpose": "盘口持续性与赔率结构确认"},
     {"key": "T-3h", "label": "T-3h 临场前修正", "offset": timedelta(hours=-3), "purpose": "盘口跨档、反转、饱和度观察"},
     {"key": "T-1h", "label": "T-1h 阵容伤停确认", "offset": timedelta(hours=-1), "purpose": "首发/伤停/临场水位修正"},
-    {"key": "T-15m", "label": "T-15m 最终影子判断", "offset": timedelta(minutes=-15), "purpose": "最终临场确认"},
+    {"key": "T-30m", "label": "T-30m 最终影子判断", "offset": timedelta(minutes=-30), "purpose": "最终临场确认"},
     {"key": "Closing", "label": "Closing 封盘", "offset": timedelta(minutes=-1), "purpose": "封盘盘口与最终水位"},
     {"key": "FT", "label": "FT 赛后复盘", "offset": timedelta(hours=2), "purpose": "赛后复盘命中/偏差"},
 ]
@@ -1041,7 +1041,7 @@ def lineup_summary(result: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def team_news_snapshot(data: Dict[str, Any], stage: str) -> Optional[Dict[str, Any]]:
-    if stage not in ("T-1h", "T-15m", "Closing"):
+    if stage not in ("T-1h", "T-30m", "Closing"):
         return None
     structured = data.get("structured_inputs") if isinstance(data.get("structured_inputs"), dict) else {}
     return {
@@ -1090,7 +1090,7 @@ def collect_stage_snapshot_data(fixture_id: int, stage: str) -> Dict[str, Any]:
     calls: Dict[str, Dict[str, Any]] = {
         "odds_prematch": call_api_football("/odds", {"fixture": fixture_id})
     }
-    if stage in ("T-1h", "T-15m", "Closing"):
+    if stage in ("T-1h", "T-30m", "Closing"):
         calls["injuries"] = call_api_football("/injuries", {"fixture": fixture_id})
         calls["lineups"] = call_api_football("/fixtures/lineups", {"fixture": fixture_id})
     coverage = {name: coverage_summary(result) for name, result in calls.items()}
@@ -1110,7 +1110,7 @@ def collect_stage_snapshot_data(fixture_id: int, stage: str) -> Dict[str, Any]:
             "lineups": normalized_lineups,
             "lineups_available": normalized_lineups.get("available", False),
             "lineups_confirmed": normalized_lineups.get("confirmed", False),
-            "collection_profile": "late_market_plus_team_news" if stage in ("T-1h", "T-15m", "Closing") else "market_only"
+            "collection_profile": "late_market_plus_team_news" if stage in ("T-1h", "T-30m", "Closing") else "market_only"
         },
         "shadow_summary": {
             "directional_notes": ["自动阶段快照：仅采集该阶段必要数据"],
@@ -1324,8 +1324,8 @@ def audit_stage_timing(stage: str, observed_at: Any, kickoff_at: Any) -> Dict[st
         valid = seconds_before > 0
         expected, tolerance = None, None
     else:
-        expected_map = {"T-24h": 86400, "T-12h": 43200, "T-6h": 21600, "T-3h": 10800, "T-1h": 3600, "T-15m": 900, "Closing": 0}
-        tolerance_map = {"T-24h": 21600, "T-12h": 10800, "T-6h": 5400, "T-3h": 2700, "T-1h": 1800, "T-15m": 900, "Closing": 900}
+        expected_map = {"T-24h": 86400, "T-12h": 43200, "T-6h": 21600, "T-3h": 10800, "T-1h": 3600, "T-30m": 1800, "Closing": 0}
+        tolerance_map = {"T-24h": 21600, "T-12h": 10800, "T-6h": 5400, "T-3h": 2700, "T-1h": 1800, "T-30m": 900, "Closing": 900}
         expected, tolerance = expected_map.get(stage), tolerance_map.get(stage)
         valid = expected is not None and -300 <= seconds_before and abs(seconds_before - expected) <= tolerance
     return {
@@ -3899,7 +3899,7 @@ def shadow_snapshot(fixture: int, stage: str = "manual", raw: bool = False, toke
     previous_version = versions[-1] if versions else None
     script = pure_fundamental_script(data)
     trigger = get_nested(dynamics, ["revalidation_trigger"], {}) or {}
-    should_version = not versions or bool(trigger.get("triggered")) or normalized in ("T-1h", "T-15m", "Closing")
+    should_version = not versions or bool(trigger.get("triggered")) or normalized in ("T-1h", "T-30m", "Closing")
     fundamental_version = save_fundamental_version(fixture, script, {"stage": normalized, **trigger}, previous_version) if should_version else previous_version
     classification = classify_market_move_details(dynamics, previous_version, script)
     dynamics["classification"] = classification["classification"]
@@ -4814,7 +4814,7 @@ def shadow_report(fixture: int, token: Optional[str] = None, authorization: Opti
     require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     data = collect_prematch_data(fixture, include_raw=False)
     fx, si = data.get("fixture", {}), data.get("structured_inputs", {})
-    lines = [f"【比赛】{fx.get('home')} vs {fx.get('away')} / {fx.get('league')} / {fx.get('league_round')}", f"【状态】{fx.get('status')}  开赛时间UTC：{fx.get('date')}", f"【数据完整度】{data.get('data_quality')}", f"【近期状态】主队：{get_nested(si, ['recent_form_last_10', 'home'])}", f"【近期状态】客队：{get_nested(si, ['recent_form_last_10', 'away'])}", f"【积分】主队：{get_nested(si, ['standings', 'home'])}", f"【积分】客队：{get_nested(si, ['standings', 'away'])}", f"【赛季统计】主队：{get_nested(si, ['season_stats', 'home'])}", f"【赛季统计】客队：{get_nested(si, ['season_stats', 'away'])}", f"【伤停】{si.get('injuries')}", f"【预测】{si.get('prediction')}", f"【赔率摘要】{si.get('odds')}", f"【盘口快照】{si.get('odds_market_snapshot')}", f"【影子摘要】{data.get('shadow_summary')}", "【注意】这是数据摘要，不是最终投注建议；临场前必须按 T-24h → T-12h → T-6h → T-3h → T-1h → T-15m → Closing → FT 追踪刷新。"]
+    lines = [f"【比赛】{fx.get('home')} vs {fx.get('away')} / {fx.get('league')} / {fx.get('league_round')}", f"【状态】{fx.get('status')}  开赛时间UTC：{fx.get('date')}", f"【数据完整度】{data.get('data_quality')}", f"【近期状态】主队：{get_nested(si, ['recent_form_last_10', 'home'])}", f"【近期状态】客队：{get_nested(si, ['recent_form_last_10', 'away'])}", f"【积分】主队：{get_nested(si, ['standings', 'home'])}", f"【积分】客队：{get_nested(si, ['standings', 'away'])}", f"【赛季统计】主队：{get_nested(si, ['season_stats', 'home'])}", f"【赛季统计】客队：{get_nested(si, ['season_stats', 'away'])}", f"【伤停】{si.get('injuries')}", f"【预测】{si.get('prediction')}", f"【赔率摘要】{si.get('odds')}", f"【盘口快照】{si.get('odds_market_snapshot')}", f"【影子摘要】{data.get('shadow_summary')}", "【注意】这是数据摘要，不是最终投注建议；临场前必须按 T-24h → T-12h → T-6h → T-3h → T-1h → T-30m → Closing → FT 追踪刷新。"]
     return "\n".join(lines)
 
 
@@ -4890,7 +4890,7 @@ def auto_snapshot_cycle() -> None:
                             versions = get_fundamental_versions(int(fx["fixture_id"]))
                             previous_version = versions[-1] if versions else None
                             trigger = get_nested(dynamics, ["revalidation_trigger"], {}) or {}
-                            full_data = collect_prematch_data(int(fx["fixture_id"]), include_raw=False) if (not versions or trigger.get("triggered") or key in ("T-1h", "T-15m", "Closing")) else None
+                            full_data = collect_prematch_data(int(fx["fixture_id"]), include_raw=False) if (not versions or trigger.get("triggered") or key in ("T-1h", "T-30m", "Closing")) else None
                             script = pure_fundamental_script(full_data) if full_data else get_nested(previous_version or {}, ["script"], {})
                             fundamental_version = save_fundamental_version(int(fx["fixture_id"]), script, {"stage": key, **trigger}, previous_version) if full_data else previous_version
                             classification = classify_market_move_details(dynamics, previous_version, script)
