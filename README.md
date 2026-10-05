@@ -582,3 +582,5 @@ V1.76 扩充 pang 公司数组质量审计，按市场公开报价组总数、�
 V1.77 为每个被拒绝的 pang 报价组增加互斥原因统计：`ambiguous_duplicate_selection`、`missing_or_invalid_line` 或 `missing_or_invalid_selection_price`。统计按市场聚合，不改变既有盘口数组和 Consensus 字段，可直接定位上游字段质量问题。
 
 V1.78 精简 Railway 快照内 pang `raw_values` 的存储，只保留公司、市场、选项、盘口线、价格和观测时间等计算及追溯必需字段。`company_array_compaction_audit` 记录输入、保留和裁剪字段总数；Consensus、市场结构及导入接口保持兼容，未知大字段不再重复持久化。
+
+V1.79 为 pang 盘口导入增加写入前结构校验。`consensus_main_line` 必须是对象，`company_market_array` 必须是数组且每行必须是对象；非法输入返回明确 400 和有界行号审计，不再产生未处理的线上 500，也不会覆盖既有有效快照。

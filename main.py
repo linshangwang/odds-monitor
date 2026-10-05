@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.78.0"
+VERSION = "1.79.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -1884,8 +1884,21 @@ def imported_market_snapshot(stage: Dict[str, Any]) -> Dict[str, Any]:
     snapshot = empty_market_snapshot()
     if stage.get("status") != "available":
         return snapshot
-    consensus = _import_consensus(stage.get("consensus_main_line") or {})
+    upstream_consensus = stage.get("consensus_main_line") or {}
+    if not isinstance(upstream_consensus, dict):
+        raise HTTPException(status_code=400, detail="consensus_main_line_must_be_an_object")
     company_market_array = stage.get("company_market_array") or []
+    if not isinstance(company_market_array, list):
+        raise HTTPException(status_code=400, detail="company_market_array_must_be_an_array")
+    invalid_row_indexes = [index for index, row in enumerate(company_market_array) if not isinstance(row, dict)]
+    if invalid_row_indexes:
+        raise HTTPException(status_code=400, detail={
+            "error": "company_market_array_rows_must_be_objects",
+            "invalid_row_indexes": invalid_row_indexes[:50],
+            "invalid_row_count": len(invalid_row_indexes),
+            "indexes_truncated": len(invalid_row_indexes) > 50,
+        })
+    consensus = _import_consensus(upstream_consensus)
     markets = _import_company_markets(company_market_array)
     company_array_quality_audit = _import_company_array_quality_audit(markets)
     complete_imported_btts, deduped_imported_btts, fragmented_imported_btts = _complete_deduped_bookmaker_rows(markets["btts"], ("yes", "no"))

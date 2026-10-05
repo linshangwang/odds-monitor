@@ -2409,6 +2409,33 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(audit["quote_count"], len(stage["company_market_array"]))
         self.assertEqual(audit["dropped_unneeded_field_count"], 1)
 
+    def test_imported_company_array_rejects_non_array_before_persistence(self):
+        packet = self.prematch_packet()
+        packet["timeline"][0]["company_market_array"] = {"selection": "Home"}
+        with self.assertRaises(main.HTTPException) as raised:
+            main.import_prematch_packet(packet)
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.detail, "company_market_array_must_be_an_array")
+        self.assertEqual(main.get_fixture_snapshots("uuid-1"), [])
+
+    def test_imported_company_array_rejects_non_object_rows_with_bounded_audit(self):
+        packet = self.prematch_packet()
+        packet["timeline"][0]["company_market_array"] = [None, "bad-row"]
+        with self.assertRaises(main.HTTPException) as raised:
+            main.import_prematch_packet(packet)
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.detail["error"], "company_market_array_rows_must_be_objects")
+        self.assertEqual(raised.exception.detail["invalid_row_indexes"], [0, 1])
+        self.assertEqual(main.get_fixture_snapshots("uuid-1"), [])
+
+    def test_imported_consensus_rejects_non_object_before_persistence(self):
+        packet = self.prematch_packet()
+        packet["timeline"][0]["consensus_main_line"] = ["invalid"]
+        with self.assertRaises(main.HTTPException) as raised:
+            main.import_prematch_packet(packet)
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.detail, "consensus_main_line_must_be_an_object")
+
     def test_imported_duplicate_line_selection_only_rejects_affected_line(self):
         stage = self.prematch_packet()["timeline"][0]
         stage["consensus_main_line"]["home_team_total"] = {"status": "data_missing"}
