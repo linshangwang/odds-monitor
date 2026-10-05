@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.72.0"
+VERSION = "1.73.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -1761,33 +1761,64 @@ def _import_company_markets(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[s
         if market not in markets:
             continue
         bookmaker = str(raw.get("bookmaker_name") or raw.get("bookmaker_id") or "unknown")
+        bookmaker_identity = _bookmaker_identity(bookmaker)
         selection = str(raw.get("selection") or "").strip().lower()
         price = as_float(raw.get("price"))
         if market in ("1x2", "btts"):
-            key = (market, bookmaker, "")
-            item = grouped.setdefault(key, {"bookmaker": bookmaker, "raw_values": []})
+            key = (market, bookmaker_identity, "")
+            item = grouped.setdefault(key, {"bookmaker": bookmaker, "raw_values": [], "selection_counts": {}})
             normalized = {"home": "home", "draw": "draw", "away": "away", "yes": "yes", "no": "no"}.get(selection)
             if normalized:
+                item["selection_counts"][normalized] = item["selection_counts"].get(normalized, 0) + 1
+                if item["selection_counts"][normalized] > 1:
+                    item["ambiguous_duplicate_selection"] = True
                 item[normalized] = price
             item["raw_values"].append(raw)
         else:
             line = str(raw.get("line") if raw.get("line") is not None else "")
-            key = (market, bookmaker, line)
-            item = grouped.setdefault(key, {"bookmaker": bookmaker, "line": as_float(line), "raw_values": []})
+            key = (market, bookmaker_identity, line)
+            item = grouped.setdefault(key, {"bookmaker": bookmaker, "line": as_float(line), "raw_values": [], "selection_counts": {}})
             side = "home" if selection.startswith("home") else "away" if selection.startswith("away") else "over" if selection.startswith("over") else "under" if selection.startswith("under") else None
             if side:
+                item["selection_counts"][side] = item["selection_counts"].get(side, 0) + 1
+                if item["selection_counts"][side] > 1:
+                    item["ambiguous_duplicate_selection"] = True
                 item[side] = price
             item["raw_values"].append(raw)
     by_book: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    for (market, bookmaker, line), item in grouped.items():
+    for (market, bookmaker_identity, line), item in grouped.items():
         if market in ("1x2", "btts"):
             markets[market].append(item)
         else:
-            book = by_book.setdefault((market, bookmaker), {"bookmaker": bookmaker, "lines": []})
+            book = by_book.setdefault((market, bookmaker_identity), {"bookmaker": item["bookmaker"], "lines": []})
             book["lines"].append({key: value for key, value in item.items() if key != "bookmaker"})
     for (market, _), item in by_book.items():
         markets[market].append(item)
     return markets
+
+
+def _import_company_array_quality_audit(markets: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    duplicate_groups = []
+    for market, bookmaker_rows in markets.items():
+        for bookmaker_row in bookmaker_rows:
+            candidates = [bookmaker_row] if market in ("1x2", "btts") else list(bookmaker_row.get("lines") or [])
+            for candidate in candidates:
+                if not candidate.get("ambiguous_duplicate_selection"):
+                    continue
+                duplicate_groups.append({
+                    "market": market,
+                    "bookmaker": bookmaker_row.get("bookmaker"),
+                    "line": candidate.get("line"),
+                    "duplicate_selections": sorted(
+                        key for key, count in (candidate.get("selection_counts") or {}).items() if count > 1
+                    ),
+                })
+    return {
+        "ambiguous_duplicate_selection_group_count": len(duplicate_groups),
+        "ambiguous_duplicate_selection_groups": duplicate_groups[:50],
+        "ambiguous_duplicate_selection_groups_truncated": len(duplicate_groups) > 50,
+        "policy": "ambiguous duplicate selections are excluded from company-array consensus",
+    }
 
 
 def imported_market_snapshot(stage: Dict[str, Any]) -> Dict[str, Any]:
@@ -1796,7 +1827,7 @@ def imported_market_snapshot(stage: Dict[str, Any]) -> Dict[str, Any]:
         return snapshot
     consensus = _import_consensus(stage.get("consensus_main_line") or {})
     markets = _import_company_markets(stage.get("company_market_array") or [])
-    complete_imported_btts = [row for row in _dedupe_bookmaker_rows(markets["btts"], ("yes", "no")) if (as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1]
+    complete_imported_btts, deduped_imported_btts, fragmented_imported_btts = _complete_deduped_bookmaker_rows(markets["btts"], ("yes", "no"))
     recalculated_markets = {
         "1x2": _consensus_1x2(markets["1x2"]),
         "asian_handicap": _consensus_line(markets["asian_handicap"], ("home", "away")),
@@ -1806,6 +1837,12 @@ def imported_market_snapshot(stage: Dict[str, Any]) -> Dict[str, Any]:
             "bookmaker_count": len(complete_imported_btts),
             "yes": _median([row.get("yes") for row in complete_imported_btts]),
             "no": _median([row.get("no") for row in complete_imported_btts]),
+            "bookmaker_coverage_audit": {
+                **_bookmaker_coverage_audit(markets["btts"], deduped_imported_btts),
+                "eligible_unique_bookmaker_count": len(complete_imported_btts),
+                "incomplete_unique_bookmaker_count": len(deduped_imported_btts) - len(complete_imported_btts),
+                "fragmented_synthetic_complete_identities_rejected": fragmented_imported_btts,
+            },
             **_price_dispersion(complete_imported_btts, ("yes", "no")),
         } if complete_imported_btts else None),
         "home_team_total": _consensus_line(markets["home_team_total"], ("over", "under")),
@@ -1829,6 +1866,7 @@ def imported_market_snapshot(stage: Dict[str, Any]) -> Dict[str, Any]:
         "primary": dict(consensus),
         "consensus_main_line": consensus,
         "consensus_audit": consensus_audit,
+        "company_array_quality_audit": _import_company_array_quality_audit(markets),
         "data_status": {key: ("available" if value else "data_missing") for key, value in consensus.items()},
     })
     return snapshot

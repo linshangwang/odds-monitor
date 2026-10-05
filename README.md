@@ -570,3 +570,5 @@ V1.70 禁止把同一公司的多条不完整记录拼成一条虚假的完整�
 V1.71 进一步隔离不完整重复行：Consensus 中位价格只聚合同一公司的完整原始记录。缺少任一选项的重复行仍计入覆盖审计，但不会改变该公司的 home/draw/away 或 yes/no 价格。
 
 V1.72 拒绝单家公司同一市场内部的重复选项。若一条记录在同一盘口含多个 Home、Over、Under、Yes 或 No，解析器标记 `ambiguous_duplicate_selection`，该记录不参与 Consensus，并在公司覆盖审计中统计。
+
+V1.73 将相同保护扩展到 pang 导入的 `company_market_array`。同一标准化公司、同一市场及同一盘口线出现重复选项时，不再以最后一条静默覆盖前值；该组报价被排除于 Consensus，并通过有界 `company_array_quality_audit` 记录。不同公司或同一公司的不同盘口线仍独立计算。

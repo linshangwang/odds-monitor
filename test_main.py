@@ -2329,6 +2329,47 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(snapshot["consensus_main_line"]["1x2"]["home"], 2.0)
         self.assertEqual(snapshot["consensus_main_line"]["1x2"]["method"], "median_all_complete_bookmakers")
 
+    def test_imported_duplicate_selection_is_rejected_instead_of_last_value_winning(self):
+        stage = self.prematch_packet()["timeline"][0]
+        stage["consensus_main_line"]["1x2"] = {"status": "data_missing"}
+        stage["company_market_array"].insert(1, {
+            "bookmaker_name": " a ", "market": "1x2", "selection": "Home", "price": "1.6",
+        })
+        snapshot = main.imported_market_snapshot(stage)
+        self.assertIsNone(snapshot["consensus_main_line"]["1x2"])
+        self.assertTrue(snapshot["markets"]["1x2"][0]["ambiguous_duplicate_selection"])
+        audit = snapshot["company_array_quality_audit"]
+        self.assertEqual(audit["ambiguous_duplicate_selection_group_count"], 1)
+        self.assertEqual(audit["ambiguous_duplicate_selection_groups"][0]["duplicate_selections"], ["home"])
+
+    def test_imported_duplicate_line_selection_only_rejects_affected_line(self):
+        stage = self.prematch_packet()["timeline"][0]
+        stage["consensus_main_line"]["home_team_total"] = {"status": "data_missing"}
+        stage["company_market_array"].append({
+            "bookmaker_name": "A", "market": "home_team_total", "market_name": "Total - Home",
+            "selection": "Over 2.5", "line": "2.5", "price": "1.7",
+        })
+        stage["company_market_array"].extend([
+            {"bookmaker_name": "A", "market": "home_team_total", "market_name": "Total - Home", "selection": "Over 1.5", "line": "1.5", "price": "1.8"},
+            {"bookmaker_name": "A", "market": "home_team_total", "market_name": "Total - Home", "selection": "Under 1.5", "line": "1.5", "price": "2.0"},
+        ])
+        snapshot = main.imported_market_snapshot(stage)
+        consensus = snapshot["consensus_main_line"]["home_team_total"]
+        self.assertEqual(consensus["line"], 1.5)
+        self.assertEqual(consensus["bookmaker_count"], 1)
+        self.assertEqual(snapshot["company_array_quality_audit"]["ambiguous_duplicate_selection_group_count"], 1)
+
+    def test_imported_same_selection_across_bookmakers_is_not_ambiguous(self):
+        stage = self.prematch_packet()["timeline"][0]
+        stage["company_market_array"].extend([
+            {"bookmaker_name": "B", "market": "1x2", "selection": "Home", "price": "2.2"},
+            {"bookmaker_name": "B", "market": "1x2", "selection": "Draw", "price": "3.2"},
+            {"bookmaker_name": "B", "market": "1x2", "selection": "Away", "price": "3.6"},
+        ])
+        snapshot = main.imported_market_snapshot(stage)
+        self.assertEqual(snapshot["consensus_main_line"]["1x2"]["bookmaker_count"], 2)
+        self.assertEqual(snapshot["company_array_quality_audit"]["ambiguous_duplicate_selection_group_count"], 0)
+
     def test_snapshot_store_is_gzip_and_reads_plain_legacy_json(self):
         main.write_snapshot_store({"version": "test", "fixtures": {}})
         with open(main.SNAPSHOT_STORE_PATH, "rb") as handle:
