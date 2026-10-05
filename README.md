@@ -564,3 +564,5 @@ V1.67 要求所有可用盘口节点的观测时间按 Opening→Closing 严格�
 V1.68 从比较源头修正 `comparison_status`：只有当前与前序节点至少共享一个可比较市场时才返回 compared。仅存在前序节点但盘口完全不重叠时返回 data_missing，并通过 `comparison_audit` 标记 `no_shared_comparable_market`，不会触发重核信号。
 
 V1.69 为自行计算的 1X2、AH、O/U、BTTS 与 Team Total Consensus 增加公司覆盖审计，公开原始报价数、标准化后唯一公司数、重复报价数和缺失公司名数量。重复行及公司名大小写/空格变体不会增加 bookmaker_count，所有缺名报价共享一个 unknown 身份。
+
+V1.70 禁止把同一公司的多条不完整记录拼成一条虚假的完整报价。1X2 与 BTTS 只有在该公司至少存在一条自身包含全部选项且价格有效的记录时才进入 Consensus；被拒绝的碎片合成身份会进入覆盖审计。

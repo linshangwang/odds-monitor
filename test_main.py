@@ -1034,6 +1034,27 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(audit["missing_bookmaker_name_quote_count"], 2)
         self.assertEqual(audit["unique_bookmaker_count"], 1)
 
+    def test_consensus_rejects_synthetic_completion_from_fragments(self):
+        rows = [
+            {"bookmaker": "Book A", "home": 2.0, "draw": 3.4, "away": None},
+            {"bookmaker": "book a", "home": None, "draw": None, "away": 3.8},
+        ]
+        complete, deduped, fragmented = main._complete_deduped_bookmaker_rows(rows, ("home", "draw", "away"))
+        self.assertEqual(complete, [])
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(fragmented, ["book a"])
+        self.assertIsNone(main._consensus_1x2(rows))
+
+    def test_consensus_accepts_duplicate_rows_when_one_is_complete(self):
+        rows = [
+            {"bookmaker": "Book A", "home": 2.0, "draw": 3.4, "away": 3.8},
+            {"bookmaker": "book a", "home": 2.2, "draw": None, "away": None},
+        ]
+        consensus = main._consensus_1x2(rows)
+        self.assertEqual(consensus["bookmaker_count"], 1)
+        self.assertEqual(consensus["bookmaker_coverage_audit"]["eligible_unique_bookmaker_count"], 1)
+        self.assertEqual(consensus["bookmaker_coverage_audit"]["fragmented_synthetic_complete_identities_rejected"], [])
+
     def test_line_consensus_exposes_selected_line_bookmaker_coverage(self):
         consensus = main._consensus_line([
             {"bookmaker": "Book A", "lines": [{"line": 2.5, "over": 1.9, "under": 1.9}, {"line": 2.5, "over": 1.92, "under": 1.88}]},

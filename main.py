@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.69.0"
+VERSION = "1.70.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -764,6 +764,21 @@ def _bookmaker_coverage_audit(raw_rows: List[Dict[str, Any]], deduped_rows: List
     }
 
 
+def _complete_deduped_bookmaker_rows(rows: List[Dict[str, Any]], keys: Tuple[str, ...]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
+    deduped = _dedupe_bookmaker_rows(rows, keys)
+    raw_complete_identities = {
+        _bookmaker_identity(row.get("bookmaker"))
+        for row in rows if all((as_float(row.get(key)) or 0) > 1.0 for key in keys)
+    }
+    complete = [row for row in deduped if row.get("bookmaker_identity") in raw_complete_identities]
+    fragmented = [
+        str(row.get("bookmaker_identity")) for row in deduped
+        if row.get("bookmaker_identity") not in raw_complete_identities
+        and all((as_float(row.get(key)) or 0) > 1.0 for key in keys)
+    ]
+    return complete, deduped, fragmented
+
+
 def _price_dispersion(rows: List[Dict[str, Any]], keys: Tuple[str, ...]) -> Dict[str, Any]:
     spreads = {}
     for key in keys:
@@ -803,8 +818,7 @@ def _price_dispersion(rows: List[Dict[str, Any]], keys: Tuple[str, ...]) -> Dict
 
 
 def _consensus_1x2(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    deduped = _dedupe_bookmaker_rows(rows, ("home", "draw", "away"))
-    complete = [x for x in deduped if all((as_float(x.get(k)) or 0) > 1.0 for k in ("home", "draw", "away"))]
+    complete, deduped, fragmented = _complete_deduped_bookmaker_rows(rows, ("home", "draw", "away"))
     if not complete:
         return None
     return {
@@ -812,7 +826,7 @@ def _consensus_1x2(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         "home": _median([x.get("home") for x in complete]),
         "draw": _median([x.get("draw") for x in complete]),
         "away": _median([x.get("away") for x in complete]),
-        "bookmaker_coverage_audit": _bookmaker_coverage_audit(rows, deduped),
+        "bookmaker_coverage_audit": {**_bookmaker_coverage_audit(rows, deduped), "eligible_unique_bookmaker_count": len(complete), "incomplete_unique_bookmaker_count": len(deduped) - len(complete), "fragmented_synthetic_complete_identities_rejected": fragmented},
         **_price_dispersion(complete, ("home", "draw", "away")),
     }
 
@@ -909,8 +923,8 @@ def extract_market_snapshot(odds_result: Dict[str, Any]) -> Dict[str, Any]:
         "away_team_total": _consensus_line(snapshot["markets"]["away_team_total"], ("over", "under")),
     }
     btts = snapshot["markets"]["btts"]
-    complete_btts = [row for row in _dedupe_bookmaker_rows(btts, ("yes", "no")) if (as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1]
-    consensus["btts"] = ({"method": "median_all_complete_bookmakers", "source": "complete_company_array", "bookmaker_count": len(complete_btts), "yes": _median([x.get("yes") for x in complete_btts]), "no": _median([x.get("no") for x in complete_btts]), "bookmaker_coverage_audit": _bookmaker_coverage_audit(btts, _dedupe_bookmaker_rows(btts, ("yes", "no"))), **_price_dispersion(complete_btts, ("yes", "no"))} if complete_btts else None)
+    complete_btts, deduped_btts, fragmented_btts = _complete_deduped_bookmaker_rows(btts, ("yes", "no"))
+    consensus["btts"] = ({"method": "median_all_complete_bookmakers", "source": "complete_company_array", "bookmaker_count": len(complete_btts), "yes": _median([x.get("yes") for x in complete_btts]), "no": _median([x.get("no") for x in complete_btts]), "bookmaker_coverage_audit": {**_bookmaker_coverage_audit(btts, deduped_btts), "eligible_unique_bookmaker_count": len(complete_btts), "incomplete_unique_bookmaker_count": len(deduped_btts) - len(complete_btts), "fragmented_synthetic_complete_identities_rejected": fragmented_btts}, **_price_dispersion(complete_btts, ("yes", "no"))} if complete_btts else None)
     snapshot["consensus_main_line"] = consensus
     snapshot["primary"] = dict(consensus)
     snapshot["data_status"] = {key: ("available" if value else "data_missing") for key, value in consensus.items()}
