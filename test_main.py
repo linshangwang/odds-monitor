@@ -2302,6 +2302,29 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(empty["status"], "awaiting_real_fixture")
         self.assertFalse(empty["shadow_path_validated"])
 
+    def test_final_decision_output_contract_accepts_explained_pass(self):
+        decision = main.decision_layer(main.empty_market_snapshot())
+        audit = main.audit_decision_output(decision)
+        self.assertEqual(audit["status"], "complete")
+        self.assertTrue(audit["decision_eligible"])
+        self.assertEqual(audit["mode"], "pass")
+
+    def test_final_decision_output_contract_rejects_inconsistent_outputs(self):
+        incomplete_pass = {"decision": "PASS", "best_market": {"market": "1x2"}, "pass_reasons": []}
+        pass_audit = main.audit_decision_output(incomplete_pass)
+        self.assertFalse(pass_audit["decision_eligible"])
+        self.assertIn("pass_must_not_have_best_market", pass_audit["consistency_issues"])
+        self.assertTrue(pass_audit["missing_fields"])
+
+        actionable = {field: None for field in (
+            "model_probability", "market_no_vig_probability", "edge", "ev", "script_coverage",
+            "crowding", "line_movement", "lineup_confidence", "death_path",
+        )}
+        actionable.update({"decision": "home", "best_market": {}, "pass_reasons": []})
+        action_audit = main.audit_decision_output(actionable)
+        self.assertFalse(action_audit["decision_eligible"])
+        self.assertIn("actionable_decision_requires_best_market", action_audit["consistency_issues"])
+
     def test_imported_ai_packet_excludes_invalid_latest_node(self):
         packet = self.prematch_packet()
         invalid_late = dict(packet["timeline"][0])

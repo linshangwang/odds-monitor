@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.82.0"
+VERSION = "1.83.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -3238,6 +3238,42 @@ def build_decision_summary(decision: Dict[str, Any], chain_audit: Dict[str, Any]
     }
 
 
+def audit_decision_output(decision: Dict[str, Any]) -> Dict[str, Any]:
+    required_fields = (
+        "decision", "model_probability", "market_no_vig_probability", "edge", "ev",
+        "script_coverage", "crowding", "line_movement", "lineup_confidence", "death_path",
+        "pass_reasons", "best_market",
+    )
+    missing_fields = [field for field in required_fields if field not in decision]
+    decision_name = decision.get("decision")
+    pass_mode = decision_name == "PASS"
+    consistency_issues = []
+    if pass_mode:
+        if decision.get("best_market") is not None:
+            consistency_issues.append("pass_must_not_have_best_market")
+        if not isinstance(decision.get("pass_reasons"), list) or not decision.get("pass_reasons"):
+            consistency_issues.append("pass_requires_at_least_one_reason")
+    else:
+        best = decision.get("best_market") if isinstance(decision.get("best_market"), dict) else {}
+        if not best:
+            consistency_issues.append("actionable_decision_requires_best_market")
+        for field in ("market", "selection", "price", "model_probability", "market_no_vig_probability", "edge", "ev", "script_coverage"):
+            if best.get(field) is None:
+                consistency_issues.append(f"actionable_best_market_missing_{field}")
+        if decision.get("pass_reasons"):
+            consistency_issues.append("actionable_decision_must_not_have_pass_reasons")
+    eligible = not missing_fields and not consistency_issues
+    return {
+        "status": "complete" if eligible else "incomplete",
+        "decision_eligible": eligible,
+        "mode": "pass" if pass_mode else "actionable",
+        "required_fields": list(required_fields),
+        "missing_fields": missing_fields,
+        "consistency_issues": consistency_issues,
+        "policy": "incomplete or inconsistent final output must be downgraded to PASS",
+    }
+
+
 def detect_model_market_divergence(decision: Dict[str, Any], threshold: float = 0.08, model_ready: bool = True, fundamental_eligible: bool = True, market_data_eligible: bool = True) -> Dict[str, Any]:
     raw_comparable = [row for row in decision.get("candidates") or [] if as_float(row.get("edge")) is not None]
     comparable = [row for row in raw_comparable if row.get("market_coverage_eligible", True) and row.get("consensus_source_eligible", True) and row.get("dispersion_eligible", True)]
@@ -3315,6 +3351,10 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
     )
     decision["model_market_divergence"] = model_market_divergence
     decision["market_move_classification"] = "Model-Market Divergence" if model_market_divergence["triggered"] else get_nested(decision, ["line_movement", "classification"])
+    output_audit = audit_decision_output(decision)
+    if not output_audit["decision_eligible"]:
+        force_pass_decision(decision, "final_output_contract_incomplete")
+    decision["output_contract_audit"] = output_audit
     versions = get_fundamental_versions(fixture)
     previous = versions[-1] if versions else None
     previous_probability = get_nested(previous or {}, ["script", "model", "probabilities", "1x2"])
