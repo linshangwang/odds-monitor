@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.81.0"
+VERSION = "1.82.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -4233,8 +4233,42 @@ def operations_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
     }
 
 
+def fixture_acceptance_summary(fixture_ids: Optional[List[Any]] = None, now_ts: Optional[int] = None) -> Dict[str, Any]:
+    if fixture_ids is None:
+        fixture_ids = list((load_snapshot_store().get("external_prematch") or {}).keys())
+    reports = [fixture_readiness_report(fixture, now_ts=now_ts) for fixture in fixture_ids]
+    counts = {
+        status: sum(report.get("status") == status for report in reports)
+        for status in ("not_ready", "shadow_ready", "decision_ready")
+    }
+    shadow_validated = counts["shadow_ready"] + counts["decision_ready"] > 0
+    decision_validated = counts["decision_ready"] > 0
+    status = (
+        "decision_path_validated" if decision_validated else
+        "shadow_path_validated" if shadow_validated else
+        "awaiting_real_fixture" if not reports else
+        "real_fixtures_not_ready"
+    )
+    return {
+        "status": status,
+        "fixture_count": len(reports),
+        "status_counts": counts,
+        "shadow_path_validated": shadow_validated,
+        "decision_path_validated": decision_validated,
+        "fixtures": [{
+            "fixture": report.get("fixture"), "status": report.get("status"),
+            "latest_stage": report.get("latest_stage"),
+            "market_blockers": list(report.get("market_blockers") or [])[:20],
+            "decision_blockers": list(report.get("decision_blockers") or [])[:20],
+        } for report in reports[:50]],
+        "fixtures_truncated": len(reports) > 50,
+        "policy": "platform readiness and real-fixture end-to-end validation are reported separately",
+    }
+
+
 def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
     operations = operations_status_report(now_ts=now_ts)
+    fixture_acceptance = fixture_acceptance_summary(now_ts=now_ts)
     available_paths = {route.path for route in app.routes}
     required_paths = {
         "/shadow/readiness/{fixture}", "/shadow/calibration/lock", "/shadow/calibration/settle",
@@ -4250,6 +4284,8 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         "missing_history_never_backfilled": True,
         "nami_failure_is_optional": True,
         "pang_access_is_read_only": True,
+        "real_fixture_shadow_path_validated": fixture_acceptance["shadow_path_validated"],
+        "real_fixture_decision_path_validated": fixture_acceptance["decision_path_validated"],
     }
     blockers = [name for name in ("persistent_store_operational", "protected_api_configured", "operations_not_blocked", "required_release_endpoints_present") if not checks[name]]
     warnings = []
@@ -4257,6 +4293,8 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         warnings.append("persistent_backup_not_ready")
     if not operations["calibration"].get("sample_ready"):
         warnings.append("calibration_minimum_sample_not_reached")
+    if not checks["real_fixture_shadow_path_validated"]:
+        warnings.append("real_fixture_shadow_path_not_yet_validated")
     shadow_usable = not blockers
     controlled_decision_candidate = shadow_usable and operations["calibration"].get("sample_ready") is True
     return {
@@ -4268,6 +4306,7 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         "checks": checks, "blockers": blockers, "warnings": warnings,
         "operations_status": operations.get("status"),
         "calibration_sample": operations.get("calibration"),
+        "fixture_acceptance": fixture_acceptance,
         "per_fixture_gate": "/shadow/readiness/{fixture} must return decision_ready before any recommendation is considered",
         "remaining_external_gaps": [
             "verified opening/history coverage depends on upstream source availability",

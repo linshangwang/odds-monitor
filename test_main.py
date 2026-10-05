@@ -2260,7 +2260,13 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "store": {"operational": True, "recovery_ready": True},
             "calibration": {"settled_count": 12, "minimum_sample": 30, "sample_ready": False},
         }
-        with patch.object(main, "operations_status_report", return_value=operations), patch.object(main, "SHADOW_ACCESS_TOKEN", "configured"):
+        fixture_acceptance = {
+            "status": "awaiting_real_fixture", "fixture_count": 0,
+            "status_counts": {"not_ready": 0, "shadow_ready": 0, "decision_ready": 0},
+            "shadow_path_validated": False, "decision_path_validated": False,
+            "fixtures": [], "fixtures_truncated": False,
+        }
+        with patch.object(main, "operations_status_report", return_value=operations), patch.object(main, "fixture_acceptance_summary", return_value=fixture_acceptance), patch.object(main, "SHADOW_ACCESS_TOKEN", "configured"):
             release = main.release_acceptance_report(now_ts=1000)
         self.assertEqual(release["version"], main.VERSION)
         self.assertEqual(release["status"], "shadow_usable")
@@ -2268,15 +2274,33 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(release["real_money_use_authorized"])
         self.assertFalse(release["controlled_decision_candidate"])
         self.assertIn("calibration_minimum_sample_not_reached", release["warnings"])
+        self.assertIn("real_fixture_shadow_path_not_yet_validated", release["warnings"])
+        self.assertFalse(release["fixture_acceptance"]["shadow_path_validated"])
         self.assertEqual(release["blockers"], [])
 
         blocked_operations = {**operations, "status": "blocked", "store": {"operational": False, "recovery_ready": False}}
-        with patch.object(main, "operations_status_report", return_value=blocked_operations), patch.object(main, "SHADOW_ACCESS_TOKEN", ""):
+        with patch.object(main, "operations_status_report", return_value=blocked_operations), patch.object(main, "fixture_acceptance_summary", return_value=fixture_acceptance), patch.object(main, "SHADOW_ACCESS_TOKEN", ""):
             blocked = main.release_acceptance_report(now_ts=1000)
         self.assertEqual(blocked["status"], "not_ready")
         self.assertFalse(blocked["shadow_use_authorized"])
         self.assertIn("persistent_store_operational", blocked["blockers"])
         self.assertIn("protected_api_configured", blocked["blockers"])
+
+    def test_fixture_acceptance_requires_a_real_ready_fixture(self):
+        reports = {
+            "a": {"fixture": "a", "status": "not_ready", "latest_stage": "Opening", "market_blockers": ["line_movement:data_missing"], "decision_blockers": []},
+            "b": {"fixture": "b", "status": "shadow_ready", "latest_stage": "T-12h", "market_blockers": [], "decision_blockers": ["fundamental_chain_incomplete"]},
+        }
+        with patch.object(main, "fixture_readiness_report", side_effect=lambda fixture, now_ts=None: reports[fixture]):
+            summary = main.fixture_acceptance_summary(["a", "b"], now_ts=1000)
+        self.assertEqual(summary["status"], "shadow_path_validated")
+        self.assertTrue(summary["shadow_path_validated"])
+        self.assertFalse(summary["decision_path_validated"])
+        self.assertEqual(summary["status_counts"]["shadow_ready"], 1)
+
+        empty = main.fixture_acceptance_summary([], now_ts=1000)
+        self.assertEqual(empty["status"], "awaiting_real_fixture")
+        self.assertFalse(empty["shadow_path_validated"])
 
     def test_imported_ai_packet_excludes_invalid_latest_node(self):
         packet = self.prematch_packet()
