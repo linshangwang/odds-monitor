@@ -2340,7 +2340,21 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertTrue(snapshot["markets"]["1x2"][0]["ambiguous_duplicate_selection"])
         audit = snapshot["company_array_quality_audit"]
         self.assertEqual(audit["ambiguous_duplicate_selection_group_count"], 1)
+        self.assertEqual(audit["ambiguous_duplicate_selection_group_count_by_market"]["1x2"], 1)
         self.assertEqual(audit["ambiguous_duplicate_selection_groups"][0]["duplicate_selections"], ["home"])
+
+    def test_imported_ambiguous_company_array_cannot_fall_back_to_upstream_consensus(self):
+        stage = self.prematch_packet()["timeline"][0]
+        stage["company_market_array"].insert(1, {
+            "bookmaker_name": "A", "market": "1x2", "selection": "Home", "price": "1.6",
+        })
+        snapshot = main.imported_market_snapshot(stage)
+        self.assertIsNone(snapshot["consensus_main_line"]["1x2"])
+        self.assertEqual(snapshot["data_status"]["1x2"], "data_missing")
+        self.assertEqual(
+            snapshot["consensus_audit"]["1x2"],
+            "data_missing_company_array_ambiguous_duplicate_selection",
+        )
 
     def test_imported_duplicate_line_selection_only_rejects_affected_line(self):
         stage = self.prematch_packet()["timeline"][0]

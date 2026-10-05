@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.73.0"
+VERSION = "1.74.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -1813,8 +1813,13 @@ def _import_company_array_quality_audit(markets: Dict[str, List[Dict[str, Any]]]
                         key for key, count in (candidate.get("selection_counts") or {}).items() if count > 1
                     ),
                 })
+    duplicate_group_count_by_market = {
+        market: sum(group["market"] == market for group in duplicate_groups)
+        for market in markets
+    }
     return {
         "ambiguous_duplicate_selection_group_count": len(duplicate_groups),
+        "ambiguous_duplicate_selection_group_count_by_market": duplicate_group_count_by_market,
         "ambiguous_duplicate_selection_groups": duplicate_groups[:50],
         "ambiguous_duplicate_selection_groups_truncated": len(duplicate_groups) > 50,
         "policy": "ambiguous duplicate selections are excluded from company-array consensus",
@@ -1827,6 +1832,7 @@ def imported_market_snapshot(stage: Dict[str, Any]) -> Dict[str, Any]:
         return snapshot
     consensus = _import_consensus(stage.get("consensus_main_line") or {})
     markets = _import_company_markets(stage.get("company_market_array") or [])
+    company_array_quality_audit = _import_company_array_quality_audit(markets)
     complete_imported_btts, deduped_imported_btts, fragmented_imported_btts = _complete_deduped_bookmaker_rows(markets["btts"], ("yes", "no"))
     recalculated_markets = {
         "1x2": _consensus_1x2(markets["1x2"]),
@@ -1850,10 +1856,14 @@ def imported_market_snapshot(stage: Dict[str, Any]) -> Dict[str, Any]:
     }
     consensus_audit = {}
     for key, recalculated in recalculated_markets.items():
+        ambiguous_company_rows = (company_array_quality_audit.get("ambiguous_duplicate_selection_group_count_by_market") or {}).get(key, 0)
         if recalculated:
             recalculated["source"] = "complete_company_array"
             consensus[key] = recalculated
             consensus_audit[key] = "recalculated_from_company_array"
+        elif ambiguous_company_rows:
+            consensus[key] = None
+            consensus_audit[key] = "data_missing_company_array_ambiguous_duplicate_selection"
         elif consensus.get(key):
             consensus_audit[key] = "upstream_fallback_company_array_unavailable"
         else:
@@ -1866,7 +1876,7 @@ def imported_market_snapshot(stage: Dict[str, Any]) -> Dict[str, Any]:
         "primary": dict(consensus),
         "consensus_main_line": consensus,
         "consensus_audit": consensus_audit,
-        "company_array_quality_audit": _import_company_array_quality_audit(markets),
+        "company_array_quality_audit": company_array_quality_audit,
         "data_status": {key: ("available" if value else "data_missing") for key, value in consensus.items()},
     })
     return snapshot
