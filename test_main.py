@@ -617,13 +617,33 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["classification"], "Likely Information-Driven")
 
     def test_market_move_classification_preserves_overlapping_signals(self):
-        previous = {"script": {"content_hash": "old"}}
-        script = {"content_hash": "new"}
+        previous = {"script": {"content_hash": "old", "chain": {"result_utility": {"status": "data_missing"}}}}
+        script = {"content_hash": "new", "chain": {"result_utility": {"status": "available", "evidence": "verified"}}}
         dynamics = {"cross_market_divergence": True, "revalidation_trigger": {"triggered": True}}
-        result = main.classify_market_move_details(dynamics, previous, script, model_market_divergence=True)
+        with patch("main.audit_fundamental_chain", return_value={"decision_eligible": True, "status": "eligible"}):
+            result = main.classify_market_move_details(dynamics, previous, script, model_market_divergence=True)
         self.assertEqual(result["classification"], "Fundamental Confirmed")
         self.assertEqual(result["matched_classifications"], ["Fundamental Confirmed", "Model-Market Divergence", "Cross-Market Divergence"])
         self.assertIn("Cross-Market Divergence", result["classification_bases"])
+        self.assertEqual(result["fundamental_change_audit"]["changed_sections"], ["result_utility"])
+
+    def test_model_hash_change_alone_is_not_fundamental_confirmation(self):
+        chain = {key: {"status": "data_missing"} for key in main.FUNDAMENTAL_CHAIN}
+        previous = {"script": {"content_hash": "old", "chain": chain, "model": {"model_hash": "a"}}}
+        script = {"content_hash": "new", "chain": chain, "model": {"model_hash": "b"}}
+        result = main.classify_market_move_details({"revalidation_trigger": {"triggered": True}}, previous, script)
+        self.assertEqual(result["classification"], "Market-Only Move")
+        self.assertEqual(result["fundamental_change_audit"]["changed_sections"], [])
+        self.assertFalse(result["fundamental_change_audit"]["evidence_eligible"])
+
+    def test_unverified_chain_change_is_not_fundamental_confirmation(self):
+        previous = {"script": {"content_hash": "old", "chain": {"result_utility": {"status": "data_missing"}}}}
+        script = {"content_hash": "new", "chain": {"result_utility": {"status": "available", "evidence": "claim only"}}}
+        with patch("main.audit_fundamental_chain", return_value={"decision_eligible": False, "status": "insufficient"}):
+            result = main.classify_market_move_details({"revalidation_trigger": {"triggered": True}}, previous, script)
+        self.assertEqual(result["classification"], "Market-Only Move")
+        self.assertEqual(result["fundamental_change_audit"]["changed_sections"], ["result_utility"])
+        self.assertFalse(result["fundamental_change_audit"]["evidence_eligible"])
 
     def test_optional_markets_participate_in_movement_and_divergence(self):
         previous = {"stage": "T-3h", "market_snapshot": {"primary": {

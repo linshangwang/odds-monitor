@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.58.0"
+VERSION = "1.59.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -2369,7 +2369,11 @@ def classify_market_move_details(dynamics: Dict[str, Any], previous_version: Opt
     evidence_audit = information.get("evidence_audit") if isinstance(information.get("evidence_audit"), dict) else None
     evidence_eligible = bool(evidence_audit.get("decision_eligible")) if evidence_audit is not None else any(str(ref).strip() for ref in evidence_refs)
     suspected = information.get("status") == "suspected_unconfirmed" and evidence_eligible and bool(get_nested(dynamics, ["revalidation_trigger", "triggered"]))
-    fundamental_changed = bool(previous_version and new_script and get_nested(previous_version, ["script", "content_hash"]) != new_script.get("content_hash"))
+    previous_chain = get_nested(previous_version or {}, ["script", "chain"]) or {}
+    new_chain = (new_script or {}).get("chain") if isinstance((new_script or {}).get("chain"), dict) else {}
+    changed_fundamental_sections = [key for key in FUNDAMENTAL_CHAIN if previous_chain.get(key) != new_chain.get(key)] if previous_version and new_script else []
+    new_chain_audit = audit_fundamental_chain(new_script or {}) if changed_fundamental_sections else {"decision_eligible": False, "status": "not_changed"}
+    fundamental_changed = bool(changed_fundamental_sections and new_chain_audit.get("decision_eligible"))
     conditions = [
         ("Fundamental Confirmed", fundamental_changed, "verified_fundamental_version_changed"),
         ("Model-Market Divergence", bool(model_market_divergence), "eligible_model_probability_differs_from_market"),
@@ -2385,6 +2389,11 @@ def classify_market_move_details(dynamics: Dict[str, Any], previous_version: Opt
         "matched_classifications": [row["classification"] for row in matched],
         "classification_bases": {row["classification"]: row["basis"] for row in matched},
         "primary_precedence": ["Fundamental Confirmed", "Model-Market Divergence", "Cross-Market Divergence", "Likely Information-Driven", "Market-Only Move"],
+        "fundamental_change_audit": {
+            "changed_sections": changed_fundamental_sections,
+            "evidence_eligible": bool(new_chain_audit.get("decision_eligible")),
+            "rule": "verified_chain_section_change_required; model_or_estimator_hash_change_alone_is_not_fundamental_confirmation",
+        },
         "inferred_without_evidence": False,
     }
 
