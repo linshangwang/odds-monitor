@@ -556,3 +556,5 @@ V1.63 对被证据门禁拒绝的重核关闭请求自动记录一次失败核�
 V1.64 将实质变化判定扩展到基本面链的嵌套对象和数组。主客队子结构中的来源、时间戳、证据引用或备注刷新同样只算元数据变化；嵌套评分、能力或状态值变化仍被识别为实质变化。
 
 V1.65 为每个基本面版本增加 `change_types` 与 `primary_change_type`，明确区分 baseline、fundamental_variables、evidence_metadata、estimator、model_probability、best_market_expression 和 no_change。原因与警告文字刷新也归入证据元数据，不再冒充变量变化。
+
+V1.66 收紧 Line Movement 硬门槛：至少两个可用节点必须具有不同的有效观测时间，且最新节点必须包含至少一个实际可比较的价格、去水概率或盘口线。单独伪造 `comparison_status=compared` 或使用相同时间戳不能形成最终建议。

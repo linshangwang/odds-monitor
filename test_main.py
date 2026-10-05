@@ -510,7 +510,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         opening = {"stage": "Opening", "snapshot_at": 1, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "data_missing"}}
         single = main.audit_line_movement_timeline([opening])
         self.assertFalse(single["decision_eligible"])
-        later = {"stage": "T-12h", "snapshot_at": 2, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "compared"}}
+        later = {"stage": "T-12h", "snapshot_at": 2, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "compared", "market_movements": {"1x2": {"home": -.05}}}}
         complete = main.audit_line_movement_timeline([opening, later])
         self.assertTrue(complete["decision_eligible"])
         self.assertEqual(complete["available_stage_count"], 2)
@@ -747,11 +747,29 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         decision = {"decision": "home", "best_market": {"market": "1x2"}, "edge": .05, "ev": .08, "pass_reasons": []}
         history = [
             {"stage": "T-24h", "snapshot_at": 100, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "data_missing"}},
-            {"stage": "T-3h", "snapshot_at": 200, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "compared"}},
+            {"stage": "T-3h", "snapshot_at": 200, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "compared", "market_movements": {"1x2": {"home": -.1}}}},
         ]
         gated = main.apply_line_movement_gate(decision, history)
         self.assertEqual(gated["decision"], "home")
         self.assertTrue(gated["line_movement_audit"]["decision_eligible"])
+
+    def test_line_movement_gate_rejects_duplicate_observation_times(self):
+        history = [
+            {"stage": "T-24h", "snapshot_at": 100, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "data_missing"}},
+            {"stage": "T-3h", "snapshot_at": 100, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "compared", "market_movements": {"1x2": {"home": -.1}}}},
+        ]
+        audit = main.audit_line_movement_timeline(history)
+        self.assertFalse(audit["decision_eligible"])
+        self.assertIn("fewer_than_two_distinct_observation_times", audit["blockers"])
+
+    def test_line_movement_gate_rejects_empty_compared_marker(self):
+        history = [
+            {"stage": "T-24h", "snapshot_at": 100, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "data_missing"}},
+            {"stage": "T-3h", "snapshot_at": 200, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "compared", "market_movements": {}, "no_vig_probability_movements": {}}},
+        ]
+        audit = main.audit_line_movement_timeline(history)
+        self.assertFalse(audit["decision_eligible"])
+        self.assertIn("latest_stage_has_no_shared_comparable_market", audit["blockers"])
 
     def test_shadow_ai_packet_ignores_ft_and_invalid_prematch_nodes(self):
         snapshots = [
@@ -2033,7 +2051,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         }
         rows = [
             {"fixture": "ready-1", "stage": "T-24h", "snapshot_at": 100, "import_status": "available", "market_snapshot": {"available": True, "consensus_main_line": consensus}, "stage_timing_audit": {"status": "valid"}, "market_dynamics": {"comparison_status": "data_missing"}},
-            {"fixture": "ready-1", "stage": "T-12h", "snapshot_at": 200, "import_status": "available", "market_snapshot": {"available": True, "consensus_main_line": consensus}, "stage_timing_audit": {"status": "valid"}, "market_dynamics": {"comparison_status": "compared"}},
+            {"fixture": "ready-1", "stage": "T-12h", "snapshot_at": 200, "import_status": "available", "market_snapshot": {"available": True, "consensus_main_line": consensus}, "stage_timing_audit": {"status": "valid"}, "market_dynamics": {"comparison_status": "compared", "market_movements": {"1x2": {"home": 0.0, "draw": 0.0, "away": 0.0}}}},
         ]
         main.write_snapshot_store({"version": main.VERSION, "fixtures": {"ready-1": rows}, "external_prematch": {"ready-1": {"match": {"kickoff_utc": "1970-01-01T00:16:40+00:00"}, "lineup_history": [{"observed_at": 190, "status": "official"}]}}})
         report = main.fixture_readiness_report("ready-1", now_ts=250)

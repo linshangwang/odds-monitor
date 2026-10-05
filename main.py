@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.65.0"
+VERSION = "1.66.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -1340,11 +1340,31 @@ def audit_line_movement_timeline(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     comparable = [row for row in available if get_nested(row, ["market_dynamics", "comparison_status"]) == "compared"]
     latest = latest_prematch_snapshot(available)
     latest_comparable = get_nested(latest or {}, ["market_dynamics", "comparison_status"]) == "compared"
-    eligible = len(available) >= 2 and latest_comparable
+    timestamps = [int(row.get("snapshot_at")) for row in available if isinstance(row.get("snapshot_at"), (int, float)) and int(row.get("snapshot_at")) > 0]
+    distinct_timestamps = sorted(set(timestamps))
+    latest_dynamics = (latest or {}).get("market_dynamics") if isinstance((latest or {}).get("market_dynamics"), dict) else {}
+    probability_comparisons = [market for market, detail in (latest_dynamics.get("no_vig_probability_movements") or {}).items() if isinstance(detail, dict) and detail.get("status") == "compared"]
+    movement_values = [value for detail in (latest_dynamics.get("market_movements") or {}).values() if isinstance(detail, dict) for value in detail.values() if as_float(value) is not None]
+    actual_comparison = bool(probability_comparisons or movement_values)
+    blockers = []
+    if len(available) < 2:
+        blockers.append("fewer_than_two_available_stages")
+    if len(distinct_timestamps) < 2:
+        blockers.append("fewer_than_two_distinct_observation_times")
+    if not latest_comparable:
+        blockers.append("latest_stage_not_marked_compared")
+    if latest_comparable and not actual_comparison:
+        blockers.append("latest_stage_has_no_shared_comparable_market")
+    eligible = not blockers
     return {
         "decision_eligible": eligible,
         "available_stage_count": len(available), "required_minimum_available_stages": 2,
         "comparable_stage_count": len(comparable), "latest_stage": (latest or {}).get("stage"),
+        "distinct_observation_time_count": len(distinct_timestamps),
+        "latest_actual_comparison": actual_comparison,
+        "latest_probability_compared_markets": probability_comparisons,
+        "latest_comparable_value_count": len(movement_values),
+        "blockers": blockers,
         "latest_comparison_status": get_nested(latest or {}, ["market_dynamics", "comparison_status"]) or "data_missing",
         "reason": None if eligible else "line_movement_requires_two_real_comparable_stages",
         "missing_stages": [row["stage"] for row in timeline if row.get("timeline_status") == "data_missing"],
