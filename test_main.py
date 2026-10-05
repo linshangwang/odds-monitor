@@ -2439,6 +2439,15 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(queue["task"]["required_evidence"], ["result_utility", "rotation_quality"])
         self.assertNotIn("last_attempt_at", queue["later"])
 
+    def test_revalidation_required_evidence_includes_all_hard_blocker_types(self):
+        audit = {
+            "critical_missing": ["result_utility"],
+            "critical_timestamp_issues": {"rotation_quality": {"issue": "stale"}},
+            "structural_issues": {"goal_conversion_edges": {"missing_fields": ["margin_edge"]}},
+            "market_contaminated_sections": {"execution_ability": ["market_odds"]},
+        }
+        self.assertEqual(main.revalidation_required_evidence(audit), ["execution_ability", "goal_conversion_edges", "result_utility", "rotation_quality"])
+
     def test_first_revalidation_version_does_not_claim_fundamental_change(self):
         main.write_snapshot_store({"version": main.VERSION, "fixtures": {}, "fundamental_revalidation_queue": {
             "task": {"task_id": "task", "fixture": "fixture-1", "status": "pending"}
@@ -2456,6 +2465,9 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(main.resolve_revalidation_tasks("fixture-1", version), 0)
         task = main.load_snapshot_store()["fundamental_revalidation_queue"]["task"]
         self.assertEqual(task["status"], "pending")
+        self.assertEqual(task["attempt_count"], 1)
+        self.assertEqual(task["last_attempt_outcome"], "insufficient_verified_fundamental_evidence")
+        self.assertEqual(task["required_evidence"], ["fundamental_chain_completeness"])
 
     def test_saved_version_contains_bounded_chain_evidence_audit(self):
         script = {"content_hash": "x", "chain": {key: {"status": "data_missing"} for key in main.FUNDAMENTAL_CHAIN}}

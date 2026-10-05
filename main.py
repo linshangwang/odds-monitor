@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.62.0"
+VERSION = "1.63.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -1548,6 +1548,7 @@ def resolve_revalidation_tasks(fixture: str, version_record: Optional[Dict[str, 
         return 0
     evidence_eligible = get_nested(version_record, ["fundamental_chain_audit", "decision_eligible"]) is True
     if not evidence_eligible:
+        record_incomplete_revalidation_attempt(fixture, version_record.get("fundamental_chain_audit") or {}, resolved_through_stage)
         return 0
     changed_information = list(version_record.get("changed_information") or [])
     prior_version_exists = int(version_record.get("version_number") or 0) > 1
@@ -1579,6 +1580,19 @@ def resolve_revalidation_tasks(fixture: str, version_record: Optional[Dict[str, 
         return changed
 
 
+def revalidation_required_evidence(chain_audit: Dict[str, Any]) -> List[str]:
+    required = (
+        list(chain_audit.get("critical_missing") or [])
+        + list(chain_audit.get("critical_provenance_missing") or [])
+        + list((chain_audit.get("critical_timestamp_issues") or {}).keys())
+        + list((chain_audit.get("critical_semantic_issues") or {}).keys())
+        + list((chain_audit.get("structural_issues") or {}).keys())
+        + list((chain_audit.get("critical_structural_issues") or {}).keys())
+        + list((chain_audit.get("market_contaminated_sections") or {}).keys())
+    )
+    return sorted(set(required)) or ["fundamental_chain_completeness"]
+
+
 def record_incomplete_revalidation_attempt(fixture: str, chain_audit: Dict[str, Any], attempted_through_stage: Optional[str] = None) -> int:
     """Keep a triggered task pending while proving that a factual recheck was attempted."""
     with SNAPSHOT_STORE_LOCK:
@@ -1594,12 +1608,11 @@ def record_incomplete_revalidation_attempt(fixture: str, chain_audit: Dict[str, 
                     "last_attempt_at": int(time.time()),
                     "last_attempt_outcome": "insufficient_verified_fundamental_evidence",
                     "attempted_through_stage": attempted_through_stage,
-                    "required_evidence": sorted(set(
-                        list(chain_audit.get("critical_missing") or [])
-                        + list(chain_audit.get("critical_provenance_missing") or [])
-                        + list((chain_audit.get("critical_semantic_issues") or {}).keys())
-                        + list((chain_audit.get("critical_structural_issues") or {}).keys())
-                    )),
+                    "required_evidence": revalidation_required_evidence(chain_audit),
+                    "last_attempt_blocker_categories": [key for key in (
+                        "critical_missing", "critical_provenance_missing", "critical_timestamp_issues",
+                        "critical_semantic_issues", "structural_issues", "market_contaminated_sections",
+                    ) if chain_audit.get(key)],
                 })
                 changed += 1
         if changed:
