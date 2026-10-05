@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.75.0"
+VERSION = "1.76.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -1799,10 +1799,28 @@ def _import_company_markets(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[s
 
 def _import_company_array_quality_audit(markets: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
     duplicate_groups = []
+    group_count_by_market = {market: 0 for market in markets}
+    eligible_group_count_by_market = {market: 0 for market in markets}
+    invalid_group_count_by_market = {market: 0 for market in markets}
+    required_prices = {
+        "1x2": ("home", "draw", "away"), "btts": ("yes", "no"),
+        "asian_handicap": ("home", "away"), "over_under": ("over", "under"),
+        "home_team_total": ("over", "under"), "away_team_total": ("over", "under"),
+    }
     for market, bookmaker_rows in markets.items():
         for bookmaker_row in bookmaker_rows:
             candidates = [bookmaker_row] if market in ("1x2", "btts") else list(bookmaker_row.get("lines") or [])
             for candidate in candidates:
+                group_count_by_market[market] += 1
+                complete = (
+                    not candidate.get("ambiguous_duplicate_selection")
+                    and all((as_float(candidate.get(key)) or 0) > 1.0 for key in required_prices[market])
+                    and (market in ("1x2", "btts") or as_float(candidate.get("line")) is not None)
+                )
+                if complete:
+                    eligible_group_count_by_market[market] += 1
+                else:
+                    invalid_group_count_by_market[market] += 1
                 if not candidate.get("ambiguous_duplicate_selection"):
                     continue
                 duplicate_groups.append({
@@ -1820,6 +1838,9 @@ def _import_company_array_quality_audit(markets: Dict[str, List[Dict[str, Any]]]
     return {
         "ambiguous_duplicate_selection_group_count": len(duplicate_groups),
         "ambiguous_duplicate_selection_group_count_by_market": duplicate_group_count_by_market,
+        "quote_group_count_by_market": group_count_by_market,
+        "eligible_complete_quote_group_count_by_market": eligible_group_count_by_market,
+        "incomplete_or_invalid_quote_group_count_by_market": invalid_group_count_by_market,
         "ambiguous_duplicate_selection_groups": duplicate_groups[:50],
         "ambiguous_duplicate_selection_groups_truncated": len(duplicate_groups) > 50,
         "policy": "ambiguous duplicate selections are excluded from company-array consensus",

@@ -2370,6 +2370,11 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "data_missing_company_array_no_complete_quote",
         )
         self.assertEqual(snapshot["consensus_audit"]["asian_handicap"], "upstream_fallback_company_array_unavailable")
+        quality = snapshot["company_array_quality_audit"]
+        self.assertEqual(quality["quote_group_count_by_market"]["1x2"], 1)
+        self.assertEqual(quality["eligible_complete_quote_group_count_by_market"]["1x2"], 0)
+        self.assertEqual(quality["incomplete_or_invalid_quote_group_count_by_market"]["1x2"], 1)
+        self.assertEqual(quality["quote_group_count_by_market"]["asian_handicap"], 0)
 
     def test_imported_duplicate_line_selection_only_rejects_affected_line(self):
         stage = self.prematch_packet()["timeline"][0]
