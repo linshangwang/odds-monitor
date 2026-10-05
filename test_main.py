@@ -655,6 +655,20 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["fundamental_change_audit"]["changed_sections"], [])
         self.assertEqual(result["fundamental_change_audit"]["evidence_metadata_only_sections"], ["result_utility"])
 
+    def test_nested_evidence_metadata_refresh_is_not_substantive(self):
+        old_section = {"status": "available", "home": {"score": .7, "source": "feed-a", "observed_at": 100}, "away": {"score": .6}}
+        new_section = {"status": "available", "home": {"score": .7, "source": "feed-b", "observed_at": 200, "evidence_refs": ["report-2"]}, "away": {"score": .6}}
+        substantive, metadata = main.fundamental_chain_change_sets({"execution_ability": old_section}, {"execution_ability": new_section})
+        self.assertEqual(substantive, [])
+        self.assertEqual(metadata, ["execution_ability"])
+
+    def test_nested_numeric_change_remains_substantive(self):
+        old_section = {"status": "available", "home": {"score": .7, "source": "feed-a"}}
+        new_section = {"status": "available", "home": {"score": .8, "source": "feed-b"}}
+        substantive, metadata = main.fundamental_chain_change_sets({"execution_ability": old_section}, {"execution_ability": new_section})
+        self.assertEqual(substantive, ["execution_ability"])
+        self.assertEqual(metadata, [])
+
     def test_status_or_value_change_remains_substantive(self):
         old_section = {"status": "partial", "home": {"score": .5}, "source": "feed", "observed_at": 100}
         new_section = {"status": "available", "home": {"score": .7}, "source": "feed", "observed_at": 200}

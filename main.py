@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.63.0"
+VERSION = "1.64.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -2324,9 +2324,15 @@ FUNDAMENTAL_EVIDENCE_METADATA_FIELDS = {"observed_at", "as_of", "source", "prove
 
 
 def substantive_fundamental_section(section: Any) -> Any:
-    if not isinstance(section, dict):
-        return section
-    return {key: value for key, value in section.items() if key not in FUNDAMENTAL_EVIDENCE_METADATA_FIELDS}
+    if isinstance(section, dict):
+        return {
+            key: substantive_fundamental_section(value)
+            for key, value in section.items()
+            if key not in FUNDAMENTAL_EVIDENCE_METADATA_FIELDS
+        }
+    if isinstance(section, list):
+        return [substantive_fundamental_section(value) for value in section]
+    return section
 
 
 def fundamental_chain_change_sets(old_chain: Dict[str, Any], new_chain: Dict[str, Any]) -> Tuple[List[str], List[str]]:
