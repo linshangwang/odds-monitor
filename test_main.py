@@ -2393,6 +2393,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         }})
         version = {
             "version_number": 2, "changed_information": ["rotation_quality"],
+            "fundamental_chain_audit": {"decision_eligible": True},
             "probability_change": {"delta": {"home": -.03, "draw": .01, "away": .02}},
             "best_market_change": {"changed": True, "before": "home", "after": "away"},
         }
@@ -2407,7 +2408,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         main.write_snapshot_store({"version": main.VERSION, "fixtures": {}, "fundamental_revalidation_queue": {
             "task": {"task_id": "task", "fixture": "fixture-1", "status": "pending"}
         }})
-        main.resolve_revalidation_tasks("fixture-1", {"version_number": 2, "changed_information": []}, model_market_divergence=True)
+        main.resolve_revalidation_tasks("fixture-1", {"version_number": 2, "changed_information": [], "fundamental_chain_audit": {"decision_eligible": True}}, model_market_divergence=True)
         task = main.load_snapshot_store()["fundamental_revalidation_queue"]["task"]
         self.assertEqual(task["resolution_classification"], "Model-Market Divergence")
 
@@ -2417,7 +2418,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "current": {"task_id": "current", "fixture": "fixture-1", "stage": "T-3h", "status": "pending"},
             "later": {"task_id": "later", "fixture": "fixture-1", "stage": "T-15m", "status": "pending"},
         }})
-        resolved = main.resolve_revalidation_tasks("fixture-1", {"version_number": 2, "changed_information": []}, resolved_through_stage="T-3h")
+        resolved = main.resolve_revalidation_tasks("fixture-1", {"version_number": 2, "changed_information": [], "fundamental_chain_audit": {"decision_eligible": True}}, resolved_through_stage="T-3h")
         self.assertEqual(resolved, 2)
         queue = main.load_snapshot_store()["fundamental_revalidation_queue"]
         self.assertEqual(queue["early"]["status"], "revalidated")
@@ -2442,10 +2443,26 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         main.write_snapshot_store({"version": main.VERSION, "fixtures": {}, "fundamental_revalidation_queue": {
             "task": {"task_id": "task", "fixture": "fixture-1", "status": "pending"}
         }})
-        main.resolve_revalidation_tasks("fixture-1", {"version_number": 1, "changed_information": main.FUNDAMENTAL_CHAIN})
+        main.resolve_revalidation_tasks("fixture-1", {"version_number": 1, "changed_information": main.FUNDAMENTAL_CHAIN, "fundamental_chain_audit": {"decision_eligible": True}})
         task = main.load_snapshot_store()["fundamental_revalidation_queue"]["task"]
         self.assertEqual(task["resolution_classification"], "Market-Only Move")
         self.assertFalse(task["fundamental_changed"])
+
+    def test_unverified_version_cannot_close_revalidation_task(self):
+        main.write_snapshot_store({"version": main.VERSION, "fixtures": {}, "fundamental_revalidation_queue": {
+            "task": {"task_id": "task", "fixture": "fixture-1", "status": "pending"}
+        }})
+        version = {"version_number": 2, "changed_information": ["rotation_quality"], "fundamental_chain_audit": {"decision_eligible": False}}
+        self.assertEqual(main.resolve_revalidation_tasks("fixture-1", version), 0)
+        task = main.load_snapshot_store()["fundamental_revalidation_queue"]["task"]
+        self.assertEqual(task["status"], "pending")
+
+    def test_saved_version_contains_bounded_chain_evidence_audit(self):
+        script = {"content_hash": "x", "chain": {key: {"status": "data_missing"} for key in main.FUNDAMENTAL_CHAIN}}
+        row = main.save_fundamental_version(23, script, {"triggered": False})
+        self.assertFalse(row["fundamental_chain_audit"]["decision_eligible"])
+        self.assertFalse(row["recalculation_audit"]["fundamental_evidence_eligible"])
+        self.assertIn("result_utility", row["fundamental_chain_audit"]["critical_missing"])
 
     def test_incremental_import_skips_stale_stage(self):
         packet = self.prematch_packet()

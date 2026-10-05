@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.61.0"
+VERSION = "1.62.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -1546,6 +1546,9 @@ def _trim_revalidation_queue(queue: Dict[str, Dict[str, Any]], limit: int = 500)
 def resolve_revalidation_tasks(fixture: str, version_record: Optional[Dict[str, Any]], model_market_divergence: bool = False, resolved_through_stage: Optional[str] = None) -> int:
     if not version_record or version_record.get("version_number") is None:
         return 0
+    evidence_eligible = get_nested(version_record, ["fundamental_chain_audit", "decision_eligible"]) is True
+    if not evidence_eligible:
+        return 0
     changed_information = list(version_record.get("changed_information") or [])
     prior_version_exists = int(version_record.get("version_number") or 0) > 1
     substantive_change = prior_version_exists and bool(changed_information)
@@ -2353,6 +2356,7 @@ def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict
             best_market_change = {**best_market_change, "before": latest_best, "changed": latest_best != best_market_change.get("after")}
         prior_version_number = (previous or {}).get("version_number")
         script_changed = has_previous and bool(changed_sections)
+        chain_audit = audit_fundamental_chain(script)
         record = {
             "version_number": next_version, "previous_version_number": prior_version_number,
             "created_at": int(time.time()), "trigger": normalized_trigger,
@@ -2360,6 +2364,16 @@ def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict
             "evidence_metadata_changes": evidence_metadata_changes,
             "probability_change": probability_change,
             "best_market_change": best_market_change,
+            "fundamental_chain_audit": {
+                "status": chain_audit.get("status"),
+                "decision_eligible": chain_audit.get("decision_eligible") is True,
+                "critical_missing": chain_audit.get("critical_missing") or [],
+                "critical_provenance_missing": chain_audit.get("critical_provenance_missing") or [],
+                "critical_timestamp_issues": chain_audit.get("critical_timestamp_issues") or {},
+                "critical_semantic_issues": chain_audit.get("critical_semantic_issues") or {},
+                "structural_issues": chain_audit.get("structural_issues") or {},
+                "market_contaminated_sections": chain_audit.get("market_contaminated_sections") or {},
+            },
             "recalculation_audit": {
                 "performed": True,
                 "baseline_created": not has_previous,
@@ -2367,6 +2381,7 @@ def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict
                 "requested_previous_version_number": requested_previous_version,
                 "comparison_rebased_to_latest": comparison_rebased,
                 "fundamental_changed": script_changed,
+                "fundamental_evidence_eligible": chain_audit.get("decision_eligible") is True,
                 "estimator_changed": estimator_changed,
                 "evidence_metadata_refreshed": bool(evidence_metadata_changes),
                 "probability_changed": probability_change.get("before") != probability_change.get("after") if has_previous and "after" in probability_change else None,
