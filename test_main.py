@@ -1014,11 +1014,34 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         ])
         self.assertEqual(consensus["bookmaker_count"], 1)
         self.assertEqual(consensus["home"], 2.1)
+        self.assertEqual(consensus["bookmaker_coverage_audit"]["raw_quote_count"], 2)
+        self.assertEqual(consensus["bookmaker_coverage_audit"]["unique_bookmaker_count"], 1)
+        self.assertEqual(consensus["bookmaker_coverage_audit"]["duplicate_quote_count"], 1)
+        self.assertFalse(consensus["bookmaker_coverage_audit"]["duplicate_quotes_count_as_additional_bookmakers"])
         snapshot = main.empty_market_snapshot()
         snapshot["consensus_main_line"]["1x2"] = consensus
         result = main.decision_layer(snapshot, {"home": .55, "draw": .25, "away": .20}, {"home": .8, "draw": .3, "away": .2}, .4, .9, [])
         self.assertEqual(result["decision"], "PASS")
         self.assertIn("consensus_bookmaker_coverage_below_minimum", result["pass_reasons"])
+
+    def test_consensus_missing_bookmaker_names_share_one_identity(self):
+        consensus = main._consensus_1x2([
+            {"bookmaker": None, "home": 2.0, "draw": 3.4, "away": 3.8},
+            {"bookmaker": "", "home": 2.1, "draw": 3.3, "away": 3.7},
+        ])
+        self.assertEqual(consensus["bookmaker_count"], 1)
+        audit = consensus["bookmaker_coverage_audit"]
+        self.assertEqual(audit["missing_bookmaker_name_quote_count"], 2)
+        self.assertEqual(audit["unique_bookmaker_count"], 1)
+
+    def test_line_consensus_exposes_selected_line_bookmaker_coverage(self):
+        consensus = main._consensus_line([
+            {"bookmaker": "Book A", "lines": [{"line": 2.5, "over": 1.9, "under": 1.9}, {"line": 2.5, "over": 1.92, "under": 1.88}]},
+            {"bookmaker": "Book B", "lines": [{"line": 2.5, "over": 1.91, "under": 1.89}]},
+        ], ("over", "under"))
+        self.assertEqual(consensus["bookmaker_count"], 2)
+        self.assertEqual(consensus["bookmaker_coverage_audit"]["raw_quote_count"], 3)
+        self.assertEqual(consensus["bookmaker_coverage_audit"]["duplicate_quote_count"], 1)
 
     def test_consensus_line_tie_uses_market_center_not_shallowest_line(self):
         consensus = main._consensus_line([{

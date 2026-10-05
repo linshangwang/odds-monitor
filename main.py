@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.68.0"
+VERSION = "1.69.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -753,6 +753,17 @@ def _dedupe_bookmaker_rows(rows: List[Dict[str, Any]], keys: Tuple[str, ...]) ->
     return deduped
 
 
+def _bookmaker_coverage_audit(raw_rows: List[Dict[str, Any]], deduped_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "raw_quote_count": len(raw_rows),
+        "unique_bookmaker_count": len(deduped_rows),
+        "duplicate_quote_count": max(0, len(raw_rows) - len(deduped_rows)),
+        "missing_bookmaker_name_quote_count": sum(not str(row.get("bookmaker") or "").strip() for row in raw_rows),
+        "identity_method": "trimmed_casefolded_bookmaker_name; missing names share one unknown identity",
+        "duplicate_quotes_count_as_additional_bookmakers": False,
+    }
+
+
 def _price_dispersion(rows: List[Dict[str, Any]], keys: Tuple[str, ...]) -> Dict[str, Any]:
     spreads = {}
     for key in keys:
@@ -792,7 +803,8 @@ def _price_dispersion(rows: List[Dict[str, Any]], keys: Tuple[str, ...]) -> Dict
 
 
 def _consensus_1x2(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    complete = [x for x in _dedupe_bookmaker_rows(rows, ("home", "draw", "away")) if all((as_float(x.get(k)) or 0) > 1.0 for k in ("home", "draw", "away"))]
+    deduped = _dedupe_bookmaker_rows(rows, ("home", "draw", "away"))
+    complete = [x for x in deduped if all((as_float(x.get(k)) or 0) > 1.0 for k in ("home", "draw", "away"))]
     if not complete:
         return None
     return {
@@ -800,6 +812,7 @@ def _consensus_1x2(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         "home": _median([x.get("home") for x in complete]),
         "draw": _median([x.get("draw") for x in complete]),
         "away": _median([x.get("away") for x in complete]),
+        "bookmaker_coverage_audit": _bookmaker_coverage_audit(rows, deduped),
         **_price_dispersion(complete, ("home", "draw", "away")),
     }
 
@@ -830,6 +843,7 @@ def _consensus_line(markets: List[Dict[str, Any]], price_keys: Tuple[str, str]) 
         "tie_break_reference_line": round(reference_line, 4),
         price_keys[0]: left, price_keys[1]: right,
         "bookmaker_count": len(rows), "bookmakers": sorted({str(r.get('bookmaker')) for r in rows if r.get('bookmaker')}),
+        "bookmaker_coverage_audit": _bookmaker_coverage_audit(raw_by_line[value], rows),
         **_price_dispersion(rows, price_keys),
     }
 
@@ -896,7 +910,7 @@ def extract_market_snapshot(odds_result: Dict[str, Any]) -> Dict[str, Any]:
     }
     btts = snapshot["markets"]["btts"]
     complete_btts = [row for row in _dedupe_bookmaker_rows(btts, ("yes", "no")) if (as_float(row.get("yes")) or 0) > 1 and (as_float(row.get("no")) or 0) > 1]
-    consensus["btts"] = ({"method": "median_all_complete_bookmakers", "source": "complete_company_array", "bookmaker_count": len(complete_btts), "yes": _median([x.get("yes") for x in complete_btts]), "no": _median([x.get("no") for x in complete_btts]), **_price_dispersion(complete_btts, ("yes", "no"))} if complete_btts else None)
+    consensus["btts"] = ({"method": "median_all_complete_bookmakers", "source": "complete_company_array", "bookmaker_count": len(complete_btts), "yes": _median([x.get("yes") for x in complete_btts]), "no": _median([x.get("no") for x in complete_btts]), "bookmaker_coverage_audit": _bookmaker_coverage_audit(btts, _dedupe_bookmaker_rows(btts, ("yes", "no"))), **_price_dispersion(complete_btts, ("yes", "no"))} if complete_btts else None)
     snapshot["consensus_main_line"] = consensus
     snapshot["primary"] = dict(consensus)
     snapshot["data_status"] = {key: ("available" if value else "data_missing") for key, value in consensus.items()}
