@@ -1070,6 +1070,27 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(len(deduped), 1)
         self.assertEqual(fragmented, [])
 
+    def test_duplicate_selection_inside_quote_is_rejected(self):
+        rows = [{"bookmaker": "Book A", "home": 2.0, "draw": 3.4, "away": 3.8, "ambiguous_duplicate_selection": True}]
+        self.assertIsNone(main._consensus_1x2(rows))
+
+    def test_line_parser_marks_repeated_side_at_same_line_ambiguous(self):
+        lines = main._line_market([
+            {"value": "Over 2.5", "odd": "1.90"},
+            {"value": "Over 2.5", "odd": "1.95"},
+            {"value": "Under 2.5", "odd": "1.90"},
+        ], ("Over", "Under"), ("over", "under"))
+        self.assertTrue(lines[0]["ambiguous_duplicate_selection"])
+        self.assertEqual(lines[0]["selection_counts"]["over"], 2)
+        self.assertIsNone(main._consensus_line([{"bookmaker": "A", "lines": lines}], ("over", "under")))
+
+    def test_two_way_parser_marks_repeated_selection_ambiguous(self):
+        entry = main._two_way_market([
+            {"value": "Yes", "odd": "1.8"}, {"value": "Yes", "odd": "1.9"}, {"value": "No", "odd": "2.0"},
+        ], ("yes", "no"))
+        self.assertTrue(entry["ambiguous_duplicate_selection"])
+        self.assertEqual(entry["selection_counts"], {"yes": 2, "no": 1})
+
     def test_line_consensus_exposes_selected_line_bookmaker_coverage(self):
         consensus = main._consensus_line([
             {"bookmaker": "Book A", "lines": [{"line": 2.5, "over": 1.9, "under": 1.9}, {"line": 2.5, "over": 1.92, "under": 1.88}]},

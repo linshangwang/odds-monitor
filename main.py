@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.71.0"
+VERSION = "1.72.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -759,6 +759,7 @@ def _bookmaker_coverage_audit(raw_rows: List[Dict[str, Any]], deduped_rows: List
         "unique_bookmaker_count": len(deduped_rows),
         "duplicate_quote_count": max(0, len(raw_rows) - len(deduped_rows)),
         "missing_bookmaker_name_quote_count": sum(not str(row.get("bookmaker") or "").strip() for row in raw_rows),
+        "ambiguous_duplicate_selection_quote_count": sum(bool(row.get("ambiguous_duplicate_selection")) for row in raw_rows),
         "identity_method": "trimmed_casefolded_bookmaker_name; missing names share one unknown identity",
         "duplicate_quotes_count_as_additional_bookmakers": False,
     }
@@ -766,7 +767,7 @@ def _bookmaker_coverage_audit(raw_rows: List[Dict[str, Any]], deduped_rows: List
 
 def _complete_deduped_bookmaker_rows(rows: List[Dict[str, Any]], keys: Tuple[str, ...]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
     deduped = _dedupe_bookmaker_rows(rows, keys)
-    complete_raw_rows = [row for row in rows if all((as_float(row.get(key)) or 0) > 1.0 for key in keys)]
+    complete_raw_rows = [row for row in rows if not row.get("ambiguous_duplicate_selection") and all((as_float(row.get(key)) or 0) > 1.0 for key in keys)]
     raw_complete_identities = {_bookmaker_identity(row.get("bookmaker")) for row in complete_raw_rows}
     complete = _dedupe_bookmaker_rows(complete_raw_rows, keys)
     fragmented = [
@@ -834,7 +835,7 @@ def _consensus_line(markets: List[Dict[str, Any]], price_keys: Tuple[str, str]) 
     for market in markets:
         for line in market.get("lines", []) or []:
             value = as_float(line.get("line"))
-            if value is None or any((as_float(line.get(key)) or 0) <= 1.0 for key in price_keys):
+            if value is None or line.get("ambiguous_duplicate_selection") or any((as_float(line.get(key)) or 0) <= 1.0 for key in price_keys):
                 continue
             raw_by_line.setdefault(value, []).append({"bookmaker": market.get("bookmaker"), **line})
     by_line = {value: _dedupe_bookmaker_rows(rows, price_keys) for value, rows in raw_by_line.items()}
@@ -862,10 +863,17 @@ def _consensus_line(markets: List[Dict[str, Any]], price_keys: Tuple[str, str]) 
 
 def _two_way_market(values: List[Dict[str, Any]], labels: Tuple[str, str]) -> Dict[str, Any]:
     entry = {labels[0]: None, labels[1]: None, "raw_values": values}
+    counts = {labels[0]: 0, labels[1]: 0}
     for value in values:
         raw = str(value.get("value", "")).strip().lower()
-        if raw == labels[0].lower(): entry[labels[0]] = value.get("odd")
-        if raw == labels[1].lower(): entry[labels[1]] = value.get("odd")
+        if raw == labels[0].lower():
+            counts[labels[0]] += 1
+            entry[labels[0]] = value.get("odd")
+        if raw == labels[1].lower():
+            counts[labels[1]] += 1
+            entry[labels[1]] = value.get("odd")
+    entry["ambiguous_duplicate_selection"] = any(count > 1 for count in counts.values())
+    entry["selection_counts"] = counts
     return entry
 
 
@@ -876,9 +884,12 @@ def _line_market(values: List[Dict[str, Any]], prefixes: Tuple[str, str], keys: 
         for prefix, key in zip(prefixes, keys):
             if raw.lower().startswith(prefix.lower() + " "):
                 line = raw[len(prefix):].strip()
-                lines.setdefault(line, {"line": line, keys[0]: None, keys[1]: None, "raw_values": []})
+                lines.setdefault(line, {"line": line, keys[0]: None, keys[1]: None, "raw_values": [], "selection_counts": {keys[0]: 0, keys[1]: 0}})
                 lines[line][key] = value.get("odd")
+                lines[line]["selection_counts"][key] += 1
                 lines[line]["raw_values"].append(value)
+    for row in lines.values():
+        row["ambiguous_duplicate_selection"] = any(count > 1 for count in row["selection_counts"].values())
     return list(lines.values())
 
 
@@ -897,10 +908,13 @@ def extract_market_snapshot(odds_result: Dict[str, Any]) -> Dict[str, Any]:
             values = bet.get("values", []) or []
             if name == "Match Winner":
                 entry = {"bookmaker": bm_name, "raw_values": values, "home": None, "draw": None, "away": None}
+                selection_counts = {"home": 0, "draw": 0, "away": 0}
                 for v in values:
-                    if str(v.get("value")) == "Home": entry["home"] = v.get("odd")
-                    if str(v.get("value")) == "Draw": entry["draw"] = v.get("odd")
-                    if str(v.get("value")) == "Away": entry["away"] = v.get("odd")
+                    if str(v.get("value")) == "Home": entry["home"] = v.get("odd"); selection_counts["home"] += 1
+                    if str(v.get("value")) == "Draw": entry["draw"] = v.get("odd"); selection_counts["draw"] += 1
+                    if str(v.get("value")) == "Away": entry["away"] = v.get("odd"); selection_counts["away"] += 1
+                entry["selection_counts"] = selection_counts
+                entry["ambiguous_duplicate_selection"] = any(count > 1 for count in selection_counts.values())
                 snapshot["markets"]["1x2"].append(entry)
             elif name == "Asian Handicap":
                 snapshot["markets"]["asian_handicap"].append({"bookmaker": bm_name, "lines": _line_market(values, ("Home", "Away"), ("home", "away"))})
