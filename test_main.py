@@ -1052,8 +1052,23 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         ]
         consensus = main._consensus_1x2(rows)
         self.assertEqual(consensus["bookmaker_count"], 1)
+        self.assertEqual(consensus["home"], 2.0)
+        self.assertEqual(consensus["draw"], 3.4)
+        self.assertEqual(consensus["away"], 3.8)
         self.assertEqual(consensus["bookmaker_coverage_audit"]["eligible_unique_bookmaker_count"], 1)
         self.assertEqual(consensus["bookmaker_coverage_audit"]["fragmented_synthetic_complete_identities_rejected"], [])
+
+    def test_incomplete_duplicate_cannot_distort_complete_quote(self):
+        rows = [
+            {"bookmaker": "Book A", "yes": 1.8, "no": 2.0},
+            {"bookmaker": "book a", "yes": 9.0, "no": None},
+        ]
+        complete, deduped, fragmented = main._complete_deduped_bookmaker_rows(rows, ("yes", "no"))
+        self.assertEqual(len(complete), 1)
+        self.assertEqual(complete[0]["yes"], 1.8)
+        self.assertEqual(complete[0]["no"], 2.0)
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(fragmented, [])
 
     def test_line_consensus_exposes_selected_line_bookmaker_coverage(self):
         consensus = main._consensus_line([

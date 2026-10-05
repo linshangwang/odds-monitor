@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.70.0"
+VERSION = "1.71.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -766,11 +766,9 @@ def _bookmaker_coverage_audit(raw_rows: List[Dict[str, Any]], deduped_rows: List
 
 def _complete_deduped_bookmaker_rows(rows: List[Dict[str, Any]], keys: Tuple[str, ...]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
     deduped = _dedupe_bookmaker_rows(rows, keys)
-    raw_complete_identities = {
-        _bookmaker_identity(row.get("bookmaker"))
-        for row in rows if all((as_float(row.get(key)) or 0) > 1.0 for key in keys)
-    }
-    complete = [row for row in deduped if row.get("bookmaker_identity") in raw_complete_identities]
+    complete_raw_rows = [row for row in rows if all((as_float(row.get(key)) or 0) > 1.0 for key in keys)]
+    raw_complete_identities = {_bookmaker_identity(row.get("bookmaker")) for row in complete_raw_rows}
+    complete = _dedupe_bookmaker_rows(complete_raw_rows, keys)
     fragmented = [
         str(row.get("bookmaker_identity")) for row in deduped
         if row.get("bookmaker_identity") not in raw_complete_identities
