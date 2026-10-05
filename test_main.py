@@ -761,6 +761,27 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         audit = main.audit_line_movement_timeline(history)
         self.assertFalse(audit["decision_eligible"])
         self.assertIn("fewer_than_two_distinct_observation_times", audit["blockers"])
+        self.assertIn("observation_times_not_strictly_in_stage_order", audit["blockers"])
+
+    def test_line_movement_gate_rejects_reverse_chronology(self):
+        history = [
+            {"stage": "T-24h", "snapshot_at": 200, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "data_missing"}},
+            {"stage": "T-3h", "snapshot_at": 100, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "compared", "market_movements": {"1x2": {"home": -.1}}}},
+        ]
+        audit = main.audit_line_movement_timeline(history)
+        self.assertFalse(audit["decision_eligible"])
+        self.assertFalse(audit["observation_times_strictly_chronological"])
+        self.assertIn("observation_times_not_strictly_in_stage_order", audit["blockers"])
+
+    def test_line_movement_gate_rejects_missing_observation_time(self):
+        history = [
+            {"stage": "T-24h", "snapshot_at": None, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "data_missing"}},
+            {"stage": "T-3h", "snapshot_at": 200, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "compared", "market_movements": {"1x2": {"home": -.1}}}},
+        ]
+        audit = main.audit_line_movement_timeline(history)
+        self.assertFalse(audit["decision_eligible"])
+        self.assertFalse(audit["all_observation_times_valid"])
+        self.assertIn("observation_times_not_strictly_in_stage_order", audit["blockers"])
 
     def test_line_movement_gate_rejects_empty_compared_marker(self):
         history = [

@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.66.0"
+VERSION = "1.67.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -1342,6 +1342,8 @@ def audit_line_movement_timeline(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     latest_comparable = get_nested(latest or {}, ["market_dynamics", "comparison_status"]) == "compared"
     timestamps = [int(row.get("snapshot_at")) for row in available if isinstance(row.get("snapshot_at"), (int, float)) and int(row.get("snapshot_at")) > 0]
     distinct_timestamps = sorted(set(timestamps))
+    all_times_valid = len(timestamps) == len(available)
+    strictly_chronological = all_times_valid and all(timestamps[index] < timestamps[index + 1] for index in range(len(timestamps) - 1))
     latest_dynamics = (latest or {}).get("market_dynamics") if isinstance((latest or {}).get("market_dynamics"), dict) else {}
     probability_comparisons = [market for market, detail in (latest_dynamics.get("no_vig_probability_movements") or {}).items() if isinstance(detail, dict) and detail.get("status") == "compared"]
     movement_values = [value for detail in (latest_dynamics.get("market_movements") or {}).values() if isinstance(detail, dict) for value in detail.values() if as_float(value) is not None]
@@ -1351,6 +1353,8 @@ def audit_line_movement_timeline(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         blockers.append("fewer_than_two_available_stages")
     if len(distinct_timestamps) < 2:
         blockers.append("fewer_than_two_distinct_observation_times")
+    if len(available) >= 2 and not strictly_chronological:
+        blockers.append("observation_times_not_strictly_in_stage_order")
     if not latest_comparable:
         blockers.append("latest_stage_not_marked_compared")
     if latest_comparable and not actual_comparison:
@@ -1361,6 +1365,8 @@ def audit_line_movement_timeline(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "available_stage_count": len(available), "required_minimum_available_stages": 2,
         "comparable_stage_count": len(comparable), "latest_stage": (latest or {}).get("stage"),
         "distinct_observation_time_count": len(distinct_timestamps),
+        "all_observation_times_valid": all_times_valid,
+        "observation_times_strictly_chronological": strictly_chronological,
         "latest_actual_comparison": actual_comparison,
         "latest_probability_compared_markets": probability_comparisons,
         "latest_comparable_value_count": len(movement_values),

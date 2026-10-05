@@ -558,3 +558,5 @@ V1.64 将实质变化判定扩展到基本面链的嵌套对象和数组。主�
 V1.65 为每个基本面版本增加 `change_types` 与 `primary_change_type`，明确区分 baseline、fundamental_variables、evidence_metadata、estimator、model_probability、best_market_expression 和 no_change。原因与警告文字刷新也归入证据元数据，不再冒充变量变化。
 
 V1.66 收紧 Line Movement 硬门槛：至少两个可用节点必须具有不同的有效观测时间，且最新节点必须包含至少一个实际可比较的价格、去水概率或盘口线。单独伪造 `comparison_status=compared` 或使用相同时间戳不能形成最终建议。
+
+V1.67 要求所有可用盘口节点的观测时间按 Opening→Closing 严格递增。缺失时间、重复时间或后续 T-X 节点早于前序节点都会加入 `observation_times_not_strictly_in_stage_order` 并强制 PASS。
