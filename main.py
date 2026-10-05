@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.60.0"
+VERSION = "1.61.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -2304,6 +2304,22 @@ def normalize_revalidation_trigger(trigger: Optional[Dict[str, Any]]) -> Dict[st
     return normalized
 
 
+FUNDAMENTAL_EVIDENCE_METADATA_FIELDS = {"observed_at", "as_of", "source", "provenance", "evidence", "evidence_refs", "notes"}
+
+
+def substantive_fundamental_section(section: Any) -> Any:
+    if not isinstance(section, dict):
+        return section
+    return {key: value for key, value in section.items() if key not in FUNDAMENTAL_EVIDENCE_METADATA_FIELDS}
+
+
+def fundamental_chain_change_sets(old_chain: Dict[str, Any], new_chain: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    raw_changed = [key for key in FUNDAMENTAL_CHAIN if old_chain.get(key) != new_chain.get(key)]
+    substantive = [key for key in raw_changed if substantive_fundamental_section(old_chain.get(key)) != substantive_fundamental_section(new_chain.get(key))]
+    metadata_only = [key for key in raw_changed if key not in substantive]
+    return substantive, metadata_only
+
+
 def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict[str, Any], previous: Optional[Dict[str, Any]] = None, probability_change: Optional[Dict[str, Any]] = None, best_market_change: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     with SNAPSHOT_STORE_LOCK:
         store = load_snapshot_store()
@@ -2314,10 +2330,12 @@ def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict
         comparison_rebased = bool(persisted_previous) and requested_previous_version != persisted_previous.get("version_number")
         old_script = (previous or {}).get("script") or {}
         has_previous = bool(previous)
-        changed_sections = [key for key in FUNDAMENTAL_CHAIN if has_previous and get_nested(old_script, ["chain", key]) != get_nested(script, ["chain", key])]
-        variable_changes = {key: {"before": get_nested(old_script, ["chain", key]), "after": get_nested(script, ["chain", key])} for key in changed_sections}
-        if has_previous and old_script.get("estimator") != script.get("estimator"):
-            changed_sections.append("fundamental_estimator")
+        old_chain = old_script.get("chain") if isinstance(old_script.get("chain"), dict) else {}
+        new_chain = script.get("chain") if isinstance(script.get("chain"), dict) else {}
+        changed_sections, evidence_metadata_changes = fundamental_chain_change_sets(old_chain, new_chain) if has_previous else ([], [])
+        variable_changes = {key: {"before": old_chain.get(key), "after": new_chain.get(key)} for key in changed_sections}
+        estimator_changed = bool(has_previous and old_script.get("estimator") != script.get("estimator"))
+        if estimator_changed:
             variable_changes["fundamental_estimator"] = {"before": old_script.get("estimator"), "after": script.get("estimator")}
         next_version = max((int(row.get("version_number") or 0) for row in rows), default=0) + 1
         normalized_trigger = normalize_revalidation_trigger(trigger)
@@ -2334,11 +2352,12 @@ def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict
             latest_best = get_nested(previous or {}, ["best_market_change", "after"])
             best_market_change = {**best_market_change, "before": latest_best, "changed": latest_best != best_market_change.get("after")}
         prior_version_number = (previous or {}).get("version_number")
-        script_changed = has_previous and (old_script.get("content_hash") != script.get("content_hash") or bool(changed_sections))
+        script_changed = has_previous and bool(changed_sections)
         record = {
             "version_number": next_version, "previous_version_number": prior_version_number,
             "created_at": int(time.time()), "trigger": normalized_trigger,
             "changed_information": changed_sections, "variable_changes": variable_changes,
+            "evidence_metadata_changes": evidence_metadata_changes,
             "probability_change": probability_change,
             "best_market_change": best_market_change,
             "recalculation_audit": {
@@ -2348,6 +2367,8 @@ def save_fundamental_version(fixture: int, script: Dict[str, Any], trigger: Dict
                 "requested_previous_version_number": requested_previous_version,
                 "comparison_rebased_to_latest": comparison_rebased,
                 "fundamental_changed": script_changed,
+                "estimator_changed": estimator_changed,
+                "evidence_metadata_refreshed": bool(evidence_metadata_changes),
                 "probability_changed": probability_change.get("before") != probability_change.get("after") if has_previous and "after" in probability_change else None,
                 "best_market_changed": best_market_change.get("changed") if has_previous and "changed" in best_market_change else None,
                 "triggered_by_market_revalidation": normalized_trigger["triggered"],
@@ -2371,16 +2392,7 @@ def classify_market_move_details(dynamics: Dict[str, Any], previous_version: Opt
     suspected = information.get("status") == "suspected_unconfirmed" and evidence_eligible and bool(get_nested(dynamics, ["revalidation_trigger", "triggered"]))
     previous_chain = get_nested(previous_version or {}, ["script", "chain"]) or {}
     new_chain = (new_script or {}).get("chain") if isinstance((new_script or {}).get("chain"), dict) else {}
-    metadata_fields = {"observed_at", "as_of", "source", "provenance", "evidence", "evidence_refs", "notes"}
-
-    def substantive_section(section: Any) -> Any:
-        if not isinstance(section, dict):
-            return section
-        return {key: value for key, value in section.items() if key not in metadata_fields}
-
-    raw_changed_sections = [key for key in FUNDAMENTAL_CHAIN if previous_chain.get(key) != new_chain.get(key)] if previous_version and new_script else []
-    changed_fundamental_sections = [key for key in raw_changed_sections if substantive_section(previous_chain.get(key)) != substantive_section(new_chain.get(key))]
-    evidence_metadata_only_sections = [key for key in raw_changed_sections if key not in changed_fundamental_sections]
+    changed_fundamental_sections, evidence_metadata_only_sections = fundamental_chain_change_sets(previous_chain, new_chain) if previous_version and new_script else ([], [])
     new_chain_audit = audit_fundamental_chain(new_script or {}) if changed_fundamental_sections else {"decision_eligible": False, "status": "not_changed"}
     fundamental_changed = bool(changed_fundamental_sections and new_chain_audit.get("decision_eligible"))
     conditions = [

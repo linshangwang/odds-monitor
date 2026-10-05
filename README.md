@@ -546,3 +546,5 @@ V1.58 为 pang 原始包和每个上传批次生成 SHA-256 内容指纹。Railw
 V1.59 收紧 `Fundamental Confirmed` 分类：必须有具体基本面链环节发生变化，且新链通过完整证据审计。仅模型概率、估算器或脚本哈希变化不再被误判为基本面已确认；未验证的链变化继续归入 Market-Only Move 或其他有证据支持的市场分类。
 
 V1.60 进一步区分实质变量变化与证据元数据刷新。仅更新 `observed_at`、`source`、`provenance`、证据引用或备注不会触发 Fundamental Confirmed；状态或实际变量变化且证据审计合格时才可确认，并在 `fundamental_change_audit` 分别列出两类变化。
+
+V1.61 将同一判定应用到持久化的基本面版本审计。`changed_information` 只保存实质链变量变化；证据刷新进入 `evidence_metadata_changes`，估算器变化单独标记 `estimator_changed`，两者都不会把 `fundamental_changed` 置为真，防止后续重核任务绕过分类门槛。

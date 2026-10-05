@@ -1523,6 +1523,19 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertTrue(second["recalculation_audit"]["best_market_changed"])
         self.assertEqual(second["recalculation_audit"]["stage"], "T-1h")
 
+    def test_version_audit_does_not_treat_evidence_refresh_as_fundamental_change(self):
+        base_chain = {key: {"status": "data_missing"} for key in main.FUNDAMENTAL_CHAIN}
+        base_chain["result_utility"] = {"status": "available", "home": {"win": 1, "draw": 0, "loss": -1}, "source": "feed-a", "observed_at": 100}
+        first = main.save_fundamental_version(22, {"content_hash": "a", "chain": base_chain, "estimator": {"value": 1}}, {"triggered": False})
+        refreshed_chain = {**base_chain, "result_utility": {**base_chain["result_utility"], "source": "feed-b", "observed_at": 200}}
+        second = main.save_fundamental_version(22, {"content_hash": "b", "chain": refreshed_chain, "estimator": {"value": 2}}, {"triggered": True}, first)
+        self.assertFalse(second["recalculation_audit"]["fundamental_changed"])
+        self.assertTrue(second["recalculation_audit"]["estimator_changed"])
+        self.assertTrue(second["recalculation_audit"]["evidence_metadata_refreshed"])
+        self.assertEqual(second["changed_information"], [])
+        self.assertEqual(second["evidence_metadata_changes"], ["result_utility"])
+        self.assertIn("fundamental_estimator", second["variable_changes"])
+
     def test_fundamental_version_retention_keeps_monotonic_numbers(self):
         script = {"content_hash": "x", "chain": {key: {"status": "data_missing"} for key in main.FUNDAMENTAL_CHAIN}}
         with patch.object(main, "FUNDAMENTAL_VERSION_RETENTION", 3):
