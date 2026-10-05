@@ -560,3 +560,5 @@ V1.65 为每个基本面版本增加 `change_types` 与 `primary_change_type`，
 V1.66 收紧 Line Movement 硬门槛：至少两个可用节点必须具有不同的有效观测时间，且最新节点必须包含至少一个实际可比较的价格、去水概率或盘口线。单独伪造 `comparison_status=compared` 或使用相同时间戳不能形成最终建议。
 
 V1.67 要求所有可用盘口节点的观测时间按 Opening→Closing 严格递增。缺失时间、重复时间或后续 T-X 节点早于前序节点都会加入 `observation_times_not_strictly_in_stage_order` 并强制 PASS。
+
+V1.68 从比较源头修正 `comparison_status`：只有当前与前序节点至少共享一个可比较市场时才返回 compared。仅存在前序节点但盘口完全不重叠时返回 data_missing，并通过 `comparison_audit` 标记 `no_shared_comparable_market`，不会触发重核信号。

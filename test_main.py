@@ -716,6 +716,26 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIsNone(probability["over_under"]["deltas"])
         self.assertIn("abnormal_price_move", dynamics["revalidation_trigger"]["reasons"])
 
+    def test_snapshot_comparison_requires_a_shared_market(self):
+        previous = {"stage": "T-6h", "market_snapshot": {"primary": {"1x2": {"home": 2.0, "draw": 3.4, "away": 3.8}}}}
+        current = main.empty_market_snapshot()
+        current["primary"]["over_under"] = {"line": 2.5, "over": 1.9, "under": 1.9}
+        dynamics = main.compare_market_snapshots([previous], current, "T-3h")
+        self.assertEqual(dynamics["comparison_status"], "data_missing")
+        self.assertEqual(dynamics["comparison_audit"]["reason"], "no_shared_comparable_market")
+        self.assertEqual(dynamics["comparison_audit"]["shared_comparable_market_count"], 0)
+        self.assertFalse(dynamics["revalidation_trigger"]["triggered"])
+
+    def test_snapshot_comparison_audits_shared_unchanged_market(self):
+        market = {"1x2": {"home": 2.0, "draw": 3.4, "away": 3.8}}
+        previous = {"stage": "T-6h", "market_snapshot": {"primary": market}}
+        current = main.empty_market_snapshot()
+        current["primary"] = market
+        dynamics = main.compare_market_snapshots([previous], current, "T-3h")
+        self.assertEqual(dynamics["comparison_status"], "compared")
+        self.assertEqual(dynamics["comparison_audit"]["shared_comparable_markets"], ["1x2"])
+        self.assertFalse(dynamics["revalidation_trigger"]["triggered"])
+
     def test_decision_layer_passes_when_inputs_missing(self):
         result = main.decision_layer(main.empty_market_snapshot())
         self.assertEqual(result["decision"], "PASS")

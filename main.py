@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.67.0"
+VERSION = "1.68.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -2254,9 +2254,23 @@ def compare_market_snapshots(history: List[Dict[str, Any]], current: Dict[str, A
     if significant_line: reasons.append("significant_line_move")
     if significant_price: reasons.append("abnormal_price_move")
     if cross_market: reasons.append("cross_market_divergence")
+    shared_markets = sorted({
+        market for market, movement in movements.items()
+        if any(as_float(value) is not None for value in movement.values())
+    } | {
+        market for market, detail in probability_movements.items()
+        if detail.get("status") in ("compared", "line_changed")
+    })
+    actual_comparison = bool(previous and shared_markets)
     return {
         "stage": stage, "previous_stage": previous.get("stage") if previous else None,
-        "comparison_status": "data_missing" if not previous else "compared",
+        "comparison_status": "compared" if actual_comparison else "data_missing",
+        "comparison_audit": {
+            "previous_stage_available": bool(previous),
+            "shared_comparable_markets": shared_markets,
+            "shared_comparable_market_count": len(shared_markets),
+            "reason": None if actual_comparison else ("previous_stage_missing" if not previous else "no_shared_comparable_market"),
+        },
         "market_movements": movements, "no_vig_probability_movements": probability_movements,
         "line_crossing": {"asian_handicap_delta": ah_delta, "asian_handicap_crossed_025_or_more": abs(ah_delta) >= 0.25 if ah_delta is not None else None, "over_under_delta": ou_delta, "over_under_crossed_025_or_more": abs(ou_delta) >= 0.25 if ou_delta is not None else None},
         "water_movement": {"home_1x2_odd_delta": home_delta, "away_1x2_odd_delta": away_delta},
