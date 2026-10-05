@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.74.0"
+VERSION = "1.75.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -1864,6 +1864,9 @@ def imported_market_snapshot(stage: Dict[str, Any]) -> Dict[str, Any]:
         elif ambiguous_company_rows:
             consensus[key] = None
             consensus_audit[key] = "data_missing_company_array_ambiguous_duplicate_selection"
+        elif markets.get(key):
+            consensus[key] = None
+            consensus_audit[key] = "data_missing_company_array_no_complete_quote"
         elif consensus.get(key):
             consensus_audit[key] = "upstream_fallback_company_array_unavailable"
         else:

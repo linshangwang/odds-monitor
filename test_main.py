@@ -2356,6 +2356,21 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "data_missing_company_array_ambiguous_duplicate_selection",
         )
 
+    def test_imported_incomplete_company_array_cannot_fall_back_to_upstream_consensus(self):
+        stage = self.prematch_packet()["timeline"][0]
+        stage["company_market_array"] = [
+            {"bookmaker_name": "A", "market": "1x2", "selection": "Home", "price": "2.0"},
+            {"bookmaker_name": "A", "market": "1x2", "selection": "Draw", "price": "3.4"},
+        ]
+        snapshot = main.imported_market_snapshot(stage)
+        self.assertIsNone(snapshot["consensus_main_line"]["1x2"])
+        self.assertEqual(snapshot["data_status"]["1x2"], "data_missing")
+        self.assertEqual(
+            snapshot["consensus_audit"]["1x2"],
+            "data_missing_company_array_no_complete_quote",
+        )
+        self.assertEqual(snapshot["consensus_audit"]["asian_handicap"], "upstream_fallback_company_array_unavailable")
+
     def test_imported_duplicate_line_selection_only_rejects_affected_line(self):
         stage = self.prematch_packet()["timeline"][0]
         stage["consensus_main_line"]["home_team_total"] = {"status": "data_missing"}
