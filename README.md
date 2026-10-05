@@ -580,3 +580,5 @@ V1.75 将回退门禁扩展到残缺公司数组。某市场已经存在公司�
 V1.76 扩充 pang 公司数组质量审计，按市场公开报价组总数、完整有效组数、残缺或非法组数及重复选项歧义组数。审计仍只保存聚合统计和最多 50 条歧义样本，便于解释 `data_missing` 而不放大导入包或持久化体积。
 
 V1.77 为每个被拒绝的 pang 报价组增加互斥原因统计：`ambiguous_duplicate_selection`、`missing_or_invalid_line` 或 `missing_or_invalid_selection_price`。统计按市场聚合，不改变既有盘口数组和 Consensus 字段，可直接定位上游字段质量问题。
+
+V1.78 精简 Railway 快照内 pang `raw_values` 的存储，只保留公司、市场、选项、盘口线、价格和观测时间等计算及追溯必需字段。`company_array_compaction_audit` 记录输入、保留和裁剪字段总数；Consensus、市场结构及导入接口保持兼容，未知大字段不再重复持久化。

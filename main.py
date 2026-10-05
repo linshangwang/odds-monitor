@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 load_dotenv()
 
-VERSION = "1.77.0"
+VERSION = "1.78.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -1750,6 +1750,29 @@ def _import_consensus(source: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+IMPORTED_QUOTE_FIELDS = (
+    "bookmaker_name", "bookmaker_id", "market", "market_name", "selection", "line", "price",
+    "observed_at", "updated_at",
+)
+
+
+def _compact_imported_quote(raw: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: raw.get(key) for key in IMPORTED_QUOTE_FIELDS if raw.get(key) is not None}
+
+
+def _import_company_array_compaction_audit(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    input_fields = sum(len(row) for row in rows if isinstance(row, dict))
+    retained_fields = sum(len(_compact_imported_quote(row)) for row in rows if isinstance(row, dict))
+    return {
+        "quote_count": sum(isinstance(row, dict) for row in rows),
+        "input_field_count": input_fields,
+        "retained_field_count": retained_fields,
+        "dropped_unneeded_field_count": max(0, input_fields - retained_fields),
+        "retained_fields": list(IMPORTED_QUOTE_FIELDS),
+        "policy": "raw_values retain only fields needed for calculation, provenance and audit",
+    }
+
+
 def _import_company_markets(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     markets = empty_market_snapshot()["markets"]
     grouped: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
@@ -1773,7 +1796,7 @@ def _import_company_markets(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[s
                 if item["selection_counts"][normalized] > 1:
                     item["ambiguous_duplicate_selection"] = True
                 item[normalized] = price
-            item["raw_values"].append(raw)
+            item["raw_values"].append(_compact_imported_quote(raw))
         else:
             line = str(raw.get("line") if raw.get("line") is not None else "")
             key = (market, bookmaker_identity, line)
@@ -1784,7 +1807,7 @@ def _import_company_markets(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[s
                 if item["selection_counts"][side] > 1:
                     item["ambiguous_duplicate_selection"] = True
                 item[side] = price
-            item["raw_values"].append(raw)
+            item["raw_values"].append(_compact_imported_quote(raw))
     by_book: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for (market, bookmaker_identity, line), item in grouped.items():
         if market in ("1x2", "btts"):
@@ -1862,7 +1885,8 @@ def imported_market_snapshot(stage: Dict[str, Any]) -> Dict[str, Any]:
     if stage.get("status") != "available":
         return snapshot
     consensus = _import_consensus(stage.get("consensus_main_line") or {})
-    markets = _import_company_markets(stage.get("company_market_array") or [])
+    company_market_array = stage.get("company_market_array") or []
+    markets = _import_company_markets(company_market_array)
     company_array_quality_audit = _import_company_array_quality_audit(markets)
     complete_imported_btts, deduped_imported_btts, fragmented_imported_btts = _complete_deduped_bookmaker_rows(markets["btts"], ("yes", "no"))
     recalculated_markets = {
@@ -1911,6 +1935,7 @@ def imported_market_snapshot(stage: Dict[str, Any]) -> Dict[str, Any]:
         "consensus_main_line": consensus,
         "consensus_audit": consensus_audit,
         "company_array_quality_audit": company_array_quality_audit,
+        "company_array_compaction_audit": _import_company_array_compaction_audit(company_market_array),
         "data_status": {key: ("available" if value else "data_missing") for key, value in consensus.items()},
     })
     return snapshot

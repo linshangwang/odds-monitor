@@ -2398,6 +2398,17 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             {"ambiguous_duplicate_selection": 1},
         )
 
+    def test_imported_raw_quotes_drop_unneeded_large_fields_with_audit(self):
+        stage = self.prematch_packet()["timeline"][0]
+        stage["company_market_array"][0]["unused_payload"] = "x" * 10000
+        snapshot = main.imported_market_snapshot(stage)
+        raw_quote = snapshot["markets"]["1x2"][0]["raw_values"][0]
+        self.assertNotIn("unused_payload", raw_quote)
+        self.assertEqual(raw_quote["selection"], "Home")
+        audit = snapshot["company_array_compaction_audit"]
+        self.assertEqual(audit["quote_count"], len(stage["company_market_array"]))
+        self.assertEqual(audit["dropped_unneeded_field_count"], 1)
+
     def test_imported_duplicate_line_selection_only_rejects_affected_line(self):
         stage = self.prematch_packet()["timeline"][0]
         stage["consensus_main_line"]["home_team_total"] = {"status": "data_missing"}
