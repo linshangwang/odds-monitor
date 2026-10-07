@@ -158,6 +158,7 @@ TheStatsAPI可作为第二事件权威，但其`match_id`必须在开赛前通�
 - 新模块必须通过消融测试，证明对 Calibration、CLV、Process Accuracy 或风险指标有独立增益。
 - 新理论登记时必须预先指定结构化联赛/市场范围及模块级消融计划。允许隔离的模块标识为 `MSCB`、`STATE_TREE`、`IEH`、`TAC`、`TDD`、`LET`、`LPS`、`OCR`；必须逐项使用规则定义的固定移除/中和干预，不能在赛后改名或换口径。
 - 每个验证样本必须在开赛前同时锁定 Champion、Challenger 及预登记全部模块的消融输出、计算时间和证据定位。模块缺失、多余、开赛后计算或超出预登记联赛/市场范围时，样本无效。
+- 已锁定验证样本的赛后证据只能由系统绑定已核实Postmatch与赛前Closing快照自动派生。Closing必须与冻结表达保持同一市场、选择和盘口档位，并达到公司覆盖门槛；缺失或跨档时不得猜测CLV。全部派生门槛通过后可以自动创建等待确认的Promotion Candidate，但不得自动激活Champion。
 - `support/counterexample` 只能由锁定后的前向 Brier 增益、模块消融增益和风险阈值派生；调用方提交的结论一律不参与验证标签。
 - 前向 Brier 必须绑定赛前已冻结的实际`market + selection + line`：1X2使用`home/draw/away`，BTTS使用`yes/no`，AH、O/U、主队总进球和客队总进球使用`full_win/half_win/push/half_loss/full_loss`结算分布；四分之一盘必须保留半赢/半输，不得把非1X2市场借用胜平负概率或胜平负赛果评分。
 - Champion市场分布必须由冻结的独立Poisson重放投影得出；Challenger和每个预登记模块消融必须在完全相同的市场、选择、盘口档位与类别空间内比较。旧版`legacy_1x2_brier`只可审计，不具备Champion晋级资格。

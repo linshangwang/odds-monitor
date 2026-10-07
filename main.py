@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.08.0"
+VERSION = "2.09.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -198,7 +198,7 @@ LEARNING_TOP_FLIGHT_LEAGUES: Dict[int, Dict[str, str]] = {
 }
 LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
 LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
-LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.08").strip() or "MODEL_RULES.md@2026-10-08-v2.08"
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.09").strip() or "MODEL_RULES.md@2026-10-08-v2.09"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -6902,6 +6902,12 @@ def run_learning_cycle(
     auto_lock_forward_validation = payload.get("auto_lock_forward_validation", True)
     if not isinstance(auto_lock_forward_validation, bool):
         raise HTTPException(status_code=400, detail="auto_lock_forward_validation_must_be_boolean")
+    auto_record_forward_validation = payload.get("auto_record_forward_validation", True)
+    if not isinstance(auto_record_forward_validation, bool):
+        raise HTTPException(status_code=400, detail="auto_record_forward_validation_must_be_boolean")
+    auto_create_promotion_candidates = payload.get("auto_create_promotion_candidates", True)
+    if not isinstance(auto_create_promotion_candidates, bool):
+        raise HTTPException(status_code=400, detail="auto_create_promotion_candidates_must_be_boolean")
     supplied_run_id = str(payload.get("run_id") or "").strip()
     safe_run_id = supplied_run_id and len(supplied_run_id) <= 100 and all(char in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in supplied_run_id)
     if apply_changes and not safe_run_id:
@@ -7078,6 +7084,18 @@ def run_learning_cycle(
                 }
                 for row in quality_preview.get("candidates") or []
             ]
+    forward_validation_evidence_results = []
+    if auto_record_forward_validation:
+        evidence_refresh = refresh_learning_forward_validation_evidence(
+            now_ts=now_ts, apply_changes=apply_changes,
+        )
+        forward_validation_evidence_results = evidence_refresh.get("results") or []
+    promotion_candidate_results = []
+    if auto_create_promotion_candidates:
+        promotion_refresh = refresh_learning_promotion_candidates(
+            now_ts=now_ts, apply_changes=apply_changes,
+        )
+        promotion_candidate_results = promotion_refresh.get("results") or []
     research_proposal_results = []
     if auto_refresh_research_proposals:
         if apply_changes:
@@ -7190,6 +7208,8 @@ def run_learning_cycle(
         "postmatch_review_draft_results": draft_results,
         "review_completion_results": review_completion_results,
         "quality_card_results": quality_card_results,
+        "forward_validation_evidence_results": forward_validation_evidence_results,
+        "promotion_candidate_results": promotion_candidate_results,
         "research_proposal_results": research_proposal_results,
         "hypothesis_registration_results": hypothesis_registration_results,
         "freeze_results": freeze_results,
@@ -7200,6 +7220,8 @@ def run_learning_cycle(
         ),
         "automatic_hypothesis_registration_policy": "preregistered_templates_only",
         "automatic_champion_change": False,
+        "automatic_promotion_candidate_creation": True,
+        "explicit_user_confirmation_required_for_champion": True,
         "result_backfit_allowed": False,
     }
     result = {
@@ -7210,10 +7232,12 @@ def run_learning_cycle(
         "probability_replay_missing_count": sum(row.get("probability_replay_status") == "data_missing" for row in freeze_results),
         "review_draft_count": sum(row.get("action") == "drafted" for row in draft_results),
         "quality_card_created_count": sum(row.get("action") == "created" for row in quality_card_results),
+        "forward_validation_evidence_recorded_count": sum(row.get("action") == "recorded" for row in forward_validation_evidence_results),
+        "promotion_candidate_created_count": sum(row.get("action") == "candidate_created" for row in promotion_candidate_results),
         "shadow_lock_created_count": sum(row.get("action") == "locked" for row in shadow_lock_results),
         "research_proposal_version_count": sum(row.get("action") == "proposed" for row in research_proposal_results),
         "hypothesis_registered_count": sum(row.get("action") == "registered" for row in hypothesis_registration_results),
-        "rejected_count": sum(row.get("action") in {"rejected", "would_reject"} for row in settlement_results + fact_results + draft_results + review_completion_results + freeze_results + shadow_lock_results),
+        "rejected_count": sum(row.get("action") in {"rejected", "would_reject"} for row in settlement_results + fact_results + draft_results + review_completion_results + freeze_results + shadow_lock_results + forward_validation_evidence_results + promotion_candidate_results),
         "action": "completed" if apply_changes else "previewed",
     }
     if apply_changes:
@@ -8536,7 +8560,57 @@ def generate_internal_shadow_lock(
     )
 
 
-def record_hypothesis_validation(hypothesis_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+def _learning_closing_price_evidence(
+    freeze: Dict[str, Any], shadow_lock: Dict[str, Any], store: Dict[str, Any],
+) -> Dict[str, Any]:
+    fixture = str(freeze.get("fixture") or "")
+    kickoff_at = int(freeze.get("kickoff_at") or 0)
+    rows = [
+        row for row in ((store.get("fixtures") or {}).get(fixture) or [])
+        if isinstance(row, dict) and row.get("stage") == "Closing"
+        and 0 < int(row.get("snapshot_at") or 0) < kickoff_at
+        and get_nested(row, ["stage_timing_audit", "status"]) != "invalid"
+        and get_nested(row, ["sequence_timing_audit", "status"]) != "invalid"
+    ]
+    closing = max(rows, key=lambda row: int(row.get("snapshot_at") or 0), default=None)
+    if not closing:
+        return {"ok": False, "reason": "verified_prematch_closing_snapshot_required"}
+    market_snapshot = closing.get("market_snapshot") if isinstance(closing.get("market_snapshot"), dict) else {}
+    if market_snapshot.get("available") is not True:
+        return {"ok": False, "reason": "closing_market_snapshot_unavailable"}
+    expression = shadow_lock.get("selected_expression") if isinstance(shadow_lock.get("selected_expression"), dict) else {}
+    market = str(expression.get("market") or "").strip()
+    selection = str(expression.get("selection") or "").strip().casefold()
+    line = as_float(expression.get("line"))
+    aliases = {
+        "match_winner": "1x2", "moneyline": "1x2", "total": "over_under", "goals": "over_under",
+        "both_teams_to_score": "btts",
+    }
+    market = aliases.get(market, market)
+    selection_aliases = {"主胜": "home", "客胜": "away", "平": "draw", "大": "over", "小": "under", "是": "yes", "否": "no"}
+    selection = selection_aliases.get(selection, selection)
+    main_line = get_nested(market_snapshot, ["consensus_main_line", market], {}) or get_nested(market_snapshot, ["primary", market], {}) or {}
+    if market in {"asian_handicap", "over_under", "home_team_total", "away_team_total"}:
+        closing_line = as_float(main_line.get("line"))
+        if line is None or closing_line is None or abs(line - closing_line) > 1e-9:
+            return {"ok": False, "reason": "closing_consensus_same_line_required", "market": market, "entry_line": line, "closing_line": closing_line}
+    price = as_float(main_line.get(selection))
+    bookmaker_count = int(as_float(main_line.get("bookmaker_count")) or 0)
+    if price is None or not 1.01 <= price <= 1000 or bookmaker_count < MIN_CONSENSUS_BOOKMAKERS:
+        return {"ok": False, "reason": "closing_consensus_price_or_coverage_missing", "market": market, "selection": selection}
+    evidence_hash = _content_hash({
+        "fixture": fixture, "stage": "Closing", "snapshot_at": closing.get("snapshot_at"),
+        "market": market, "selection": selection, "line": line,
+        "price": price, "bookmaker_count": bookmaker_count, "market_snapshot": market_snapshot,
+    })
+    return {
+        "ok": True, "closing_decimal_price": price,
+        "closing_price_evidence_ref": f"snapshot:{evidence_hash}:Closing:{market}:{selection}",
+        "snapshot_at": closing.get("snapshot_at"), "evidence_hash": evidence_hash,
+    }
+
+
+def record_hypothesis_validation(hypothesis_id: Any, payload: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
     hypothesis_id = str(hypothesis_id or "").strip()
     payload = payload if isinstance(payload, dict) else {}
     freeze_id = str(payload.get("freeze_id") or "").strip()
@@ -8671,13 +8745,68 @@ def record_hypothesis_validation(hypothesis_id: Any, payload: Dict[str, Any]) ->
             if existing.get("evidence_hash") == evidence_hash:
                 return {**existing, "action": "unchanged"}
             raise HTTPException(status_code=409, detail="validation_sample_already_recorded")
-        evidence = {**evidence_content, "evidence_hash": evidence_hash, "recorded_at": int(time.time()), "action": "recorded"}
+        evidence = {**evidence_content, "evidence_hash": evidence_hash, "recorded_at": int(now_ts or time.time()), "action": "recorded"}
         rows.append(evidence)
         hypothesis["status"] = "SHADOW_VALIDATION"
         hypothesis["champion_effect"] = False
         store["version"] = VERSION
         write_snapshot_store(store)
         return evidence
+
+
+def refresh_learning_forward_validation_evidence(now_ts: Optional[int] = None, apply_changes: bool = True) -> Dict[str, Any]:
+    """Settle locked forward samples from verified postmatch and exact-line Closing evidence."""
+    now_ts = int(now_ts or time.time())
+    store = load_snapshot_store()
+    results = []
+    for hypothesis_id, locks in (store.get("learning_shadow_locks") or {}).items():
+        hypothesis = (store.get("learning_hypotheses") or {}).get(hypothesis_id)
+        if not isinstance(hypothesis, dict):
+            continue
+        recorded = {str(row.get("freeze_id")) for row in (hypothesis.get("validation_evidence") or []) if isinstance(row, dict)}
+        for freeze_id, shadow_lock in (locks or {}).items():
+            if freeze_id in recorded:
+                results.append({"hypothesis_id": hypothesis_id, "freeze_id": freeze_id, "action": "skipped", "reason": "validation_evidence_already_recorded"})
+                continue
+            postmatch = (store.get("learning_postmatch") or {}).get(freeze_id)
+            freeze = _learning_freeze_by_id(store, freeze_id)
+            if not isinstance(postmatch, dict) or not isinstance(freeze, dict):
+                results.append({"hypothesis_id": hypothesis_id, "freeze_id": freeze_id, "action": "blocked", "reason": "independent_settled_frozen_sample_required"})
+                continue
+            closing = _learning_closing_price_evidence(freeze, shadow_lock, store)
+            if closing.get("ok") is not True:
+                results.append({
+                    "hypothesis_id": hypothesis_id, "freeze_id": freeze_id,
+                    "action": "blocked", "reason": closing.get("reason"),
+                })
+                continue
+            if not apply_changes:
+                results.append({"hypothesis_id": hypothesis_id, "freeze_id": freeze_id, "action": "would_record", "closing_evidence_hash": closing.get("evidence_hash")})
+                continue
+            try:
+                evidence = record_hypothesis_validation(hypothesis_id, {
+                    "freeze_id": freeze_id,
+                    "evidence_summary": "Automatically derived from the immutable Shadow lock, verified postmatch record and exact-line Closing snapshot.",
+                    "shadow_lock_hash": shadow_lock.get("lock_hash"),
+                    "closing_decimal_price": closing.get("closing_decimal_price"),
+                    "closing_price_evidence_ref": closing.get("closing_price_evidence_ref"),
+                }, now_ts=now_ts)
+                results.append({
+                    "hypothesis_id": hypothesis_id, "freeze_id": freeze_id,
+                    "action": evidence.get("action"), "evidence_hash": evidence.get("evidence_hash"),
+                    "outcome": evidence.get("outcome"), "champion_effect": False,
+                })
+            except HTTPException as exc:
+                results.append({
+                    "hypothesis_id": hypothesis_id, "freeze_id": freeze_id,
+                    "action": "rejected", "status_code": exc.status_code, "reason": exc.detail,
+                })
+    return {
+        "version": VERSION, "result_count": len(results), "results": results,
+        "recorded_count": sum(row.get("action") == "recorded" for row in results),
+        "caller_supplied_validation_outcome_used": False,
+        "automatic_champion_change": False,
+    }
 
 
 def promotion_evidence_report(hypothesis_id: Any, store_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -8797,7 +8926,7 @@ def promotion_evidence_report(hypothesis_id: Any, store_override: Optional[Dict[
     }
 
 
-def create_promotion_candidate(hypothesis_id: Any, gate_audit: Any = None) -> Dict[str, Any]:
+def create_promotion_candidate(hypothesis_id: Any, gate_audit: Any = None, now_ts: Optional[int] = None) -> Dict[str, Any]:
     hypothesis_id = str(hypothesis_id or "").strip()
     if isinstance(gate_audit, dict) and gate_audit:
         raise HTTPException(status_code=400, detail="caller_supplied_promotion_gate_audit_forbidden")
@@ -8843,7 +8972,7 @@ def create_promotion_candidate(hypothesis_id: Any, gate_audit: Any = None) -> Di
         record = {
             **candidate_content,
             "candidate_hash": candidate_hash,
-            "created_at": int(time.time()),
+            "created_at": int(now_ts or time.time()),
             "status": "AWAITING_EXPLICIT_USER_CONFIRMATION",
             "champion_effect": False,
             "automatic_promotion": False,
@@ -8855,6 +8984,51 @@ def create_promotion_candidate(hypothesis_id: Any, gate_audit: Any = None) -> Di
         store["version"] = VERSION
         write_snapshot_store(store)
         return record
+
+
+def refresh_learning_promotion_candidates(now_ts: Optional[int] = None, apply_changes: bool = True) -> Dict[str, Any]:
+    """Create confirmation-only candidates when all derived gates pass; never activate Champion."""
+    now_ts = int(now_ts or time.time())
+    store = load_snapshot_store()
+    results = []
+    for hypothesis_id in sorted((store.get("learning_hypotheses") or {})):
+        existing = (store.get("learning_promotions") or {}).get(hypothesis_id)
+        if isinstance(existing, dict):
+            results.append({
+                "hypothesis_id": hypothesis_id, "action": "skipped",
+                "reason": "promotion_candidate_already_exists", "candidate_hash": existing.get("candidate_hash"),
+            })
+            continue
+        report = promotion_evidence_report(hypothesis_id, store_override=store)
+        if report.get("promotion_ready") is not True:
+            results.append({
+                "hypothesis_id": hypothesis_id, "action": "blocked",
+                "reason": "derived_promotion_evidence_incomplete",
+                "incomplete_gates": report.get("incomplete_gates"),
+                "report_hash": report.get("report_hash"),
+            })
+            continue
+        if not apply_changes:
+            results.append({"hypothesis_id": hypothesis_id, "action": "would_create", "report_hash": report.get("report_hash")})
+            continue
+        try:
+            candidate = create_promotion_candidate(hypothesis_id, None, now_ts=now_ts)
+            results.append({
+                "hypothesis_id": hypothesis_id, "action": candidate.get("action"),
+                "candidate_hash": candidate.get("candidate_hash"),
+                "status": candidate.get("status"), "champion_effect": False,
+            })
+        except HTTPException as exc:
+            results.append({
+                "hypothesis_id": hypothesis_id, "action": "rejected",
+                "status_code": exc.status_code, "reason": exc.detail,
+            })
+    return {
+        "version": VERSION, "result_count": len(results), "results": results,
+        "candidate_created_count": sum(row.get("action") == "candidate_created" for row in results),
+        "automatic_champion_change": False,
+        "explicit_user_confirmation_required": True,
+    }
 
 
 def _league_dna_candidate_status(candidate: Dict[str, Any], store: Dict[str, Any]) -> Dict[str, Any]:
@@ -10768,6 +10942,8 @@ def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[st
             "review_draft_count": existing.get("review_draft_count"),
             "research_proposal_version_count": existing.get("research_proposal_version_count"),
             "hypothesis_registered_count": existing.get("hypothesis_registered_count"),
+            "forward_validation_evidence_recorded_count": existing.get("forward_validation_evidence_recorded_count"),
+            "promotion_candidate_created_count": existing.get("promotion_candidate_created_count"),
         }
     try:
         result = run_learning_cycle(
@@ -10778,6 +10954,8 @@ def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[st
                 "auto_build_postmatch_review_drafts": True,
                 "auto_refresh_research_proposals": True,
                 "auto_register_preregistered_hypotheses": True,
+                "auto_record_forward_validation": True,
+                "auto_create_promotion_candidates": True,
             },
             now_ts=now_ts,
             fixture_rows=fixture_rows,
@@ -10794,6 +10972,8 @@ def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[st
             "shadow_lock_created_count": result.get("shadow_lock_created_count"),
             "research_proposal_version_count": result.get("research_proposal_version_count"),
             "hypothesis_registered_count": result.get("hypothesis_registered_count"),
+            "forward_validation_evidence_recorded_count": result.get("forward_validation_evidence_recorded_count"),
+            "promotion_candidate_created_count": result.get("promotion_candidate_created_count"),
             "settled_count": result.get("settled_count"),
             "rejected_count": result.get("rejected_count"),
             "postmatch_fact_results": result.get("postmatch_fact_results"),
@@ -10804,10 +10984,14 @@ def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[st
             "shadow_lock_results": result.get("shadow_lock_results"),
             "research_proposal_results": result.get("research_proposal_results"),
             "hypothesis_registration_results": result.get("hypothesis_registration_results"),
+            "forward_validation_evidence_results": result.get("forward_validation_evidence_results"),
+            "promotion_candidate_results": result.get("promotion_candidate_results"),
             "forward_validation_queue": result.get("forward_validation_queue"),
             "automatic_hypothesis_registration": result.get("automatic_hypothesis_registration") is True,
             "automatic_hypothesis_registration_policy": "preregistered_templates_only",
             "automatic_champion_change": False,
+            "automatic_promotion_candidate_creation": True,
+            "explicit_user_confirmation_required_for_champion": True,
         }
     except Exception as exc:
         print("[AUTO_LEARNING] daily cycle failed: " + str(exc))

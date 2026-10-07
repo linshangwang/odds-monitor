@@ -139,6 +139,7 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 - v2.06 增加自动学习运行就绪契约，将API-Football、The Odds API、TheStatsAPI、安全令牌、持久化主存储与备份、自动工作线程、顶级联赛注册表和14:30调度逐项列为硬门禁。普通手工Shadow可用不再被误解为无人值守闭环已运行；状态与发布报告只公开布尔检查和阻塞项，不泄露密钥。
 - v2.07 增加持久化每日执行健康审计。系统不再相信进程内“最后运行”状态，而是核对当日run id、固定执行顺序、开始时间和run hash；14:30后给予最多两轮询或600秒宽限，之后仍无有效记录即产生critical告警并撤销自动学习运行授权。服务重启后仍可从持久化账本证明当日是否真正执行。
 - v2.08 打通多场提案到前向验证的安全自动桥接，但禁止赛后临时编造理论。只有在全部发现样本之前就登记、且对联赛/市场/失败维度唯一匹配的不可变因果模板，才能自动实例化为`HYPOTHESIS_ONLY`；模板预先固定验证下限、消融模块和赔率无关Challenger。无模板、晚登记或多模板冲突均失败关闭，实例化后仍无Champion效力，只能使用登记后的新比赛进入Shadow验证。
+- v2.09 补齐前向验证的赛后自动结算与确认候选生成。系统从不可变Shadow锁、已核实Postmatch和赛前Closing共识快照派生Brier、CLV、模块消融、Process Accuracy与风险；Closing必须同市场、同选择、同档位且公司覆盖合格，缺失或跨档时失败关闭。九项门槛全部通过后只自动创建`AWAITING_EXPLICIT_USER_CONFIRMATION`，不会自动激活Champion。
 
 真实资金包通过`/shadow/model/prematch-evaluate`或`/shadow/evaluate`请求体中的`real_money_data`提交。示例结构：
 
