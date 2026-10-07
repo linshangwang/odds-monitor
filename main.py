@@ -24,7 +24,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "1.93.0"
+VERSION = "1.94.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -3920,7 +3920,7 @@ def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6, ri
 
 @app.get("/")
 def root():
-    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}", "/shadow/learning/cycle-plan", "/shadow/learning/run", "/shadow/learning/review-queue", "/shadow/learning/review-draft", "/shadow/learning/complete-review", "/shadow/learning/research-proposals", "/shadow/learning/research-proposals/refresh", "/shadow/learning/validation-queue", "/shadow/learning/freeze", "/shadow/learning/settle", "/shadow/learning/hypotheses", "/shadow/learning/hypotheses/{id}/shadow-lock", "/shadow/learning/hypotheses/{id}/promotion-evidence", "/shadow/learning/league-dna", "/shadow/learning/selection-quality", "/shadow/learning/status"]}
+    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}", "/shadow/learning/cycle-plan", "/shadow/learning/run", "/shadow/learning/review-queue", "/shadow/learning/review-draft", "/shadow/learning/complete-review", "/shadow/learning/research-proposals", "/shadow/learning/research-proposals/refresh", "/shadow/learning/validation-queue", "/shadow/learning/freeze", "/shadow/learning/settle", "/shadow/learning/hypotheses", "/shadow/learning/hypotheses/{id}/shadow-lock", "/shadow/learning/hypotheses/{id}/promotion-evidence", "/shadow/learning/league-dna", "/shadow/learning/league-dna/{tag_id}/activation-candidate", "/shadow/learning/league-dna/{tag_id}/confirm", "/shadow/learning/selection-quality", "/shadow/learning/status"]}
 
 
 @app.get("/health")
@@ -6411,7 +6411,14 @@ def _league_dna_candidate_status(candidate: Dict[str, Any], store: Dict[str, Any
     counterexample_count = sum(row.get("outcome") == "counterexample" for row in evidence)
     required = LEARNING_MIN_VALIDATION_SAMPLES
     activation = (store.get("league_dna_activation_candidates") or {}).get(candidate.get("tag_id"))
-    if activation:
+    active = (store.get("league_dna_active") or {}).get(candidate.get("tag_id"))
+    if (
+        active and active.get("status") == "VERIFIED_ACTIVE"
+        and active.get("evidence_confidence") == 100
+        and get_nested(active, ["user_confirmation", "confirmed"]) is True
+    ):
+        status, confidence = "VERIFIED_ACTIVE", 100
+    elif activation:
         status, confidence = "AWAITING_EXPLICIT_USER_CONFIRMATION", 99
     elif evidence:
         status = "SHADOW_VALIDATION"
@@ -6423,7 +6430,7 @@ def _league_dna_candidate_status(candidate: Dict[str, Any], store: Dict[str, Any
         "independent_support_count": support_count,
         "counterexample_count": counterexample_count,
         "required_independent_support_count": required,
-        "champion_effect": False,
+        "champion_effect": status == "VERIFIED_ACTIVE",
     }
 
 
@@ -6532,6 +6539,92 @@ def create_league_dna_activation_candidate(tag_id: Any) -> Dict[str, Any]:
         store["version"] = VERSION
         write_snapshot_store(store)
         return {**record, "action": "activation_candidate_created"}
+
+
+def confirm_league_dna_activation(tag_id: Any, payload: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Activate one fully validated League DNA tag only from an explicit hash-bound user confirmation."""
+    tag_id = str(tag_id or "").strip()
+    payload = payload if isinstance(payload, dict) else {}
+    activation_hash = str(payload.get("activation_hash") or "").strip()
+    actor = str(payload.get("confirmed_by") or "").strip()
+    reference = str(payload.get("confirmation_reference") or "").strip()
+    statement = str(payload.get("confirmation_statement") or "").strip()
+    expected_statement = f"CONFIRM LEAGUE_DNA {tag_id} {activation_hash}"
+    if payload.get("confirmed") is not True:
+        raise HTTPException(status_code=422, detail="explicit_confirmation_true_required")
+    if not activation_hash or not actor or not reference:
+        raise HTTPException(status_code=422, detail="activation_hash_actor_and_confirmation_reference_required")
+    if not hmac.compare_digest(statement, expected_statement):
+        raise HTTPException(status_code=422, detail={"error": "exact_confirmation_statement_required", "expected": expected_statement})
+    now_ts = int(now_ts or time.time())
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        candidate = (store.get("league_dna_candidates") or {}).get(tag_id)
+        activation = (store.get("league_dna_activation_candidates") or {}).get(tag_id)
+        if not candidate or not activation:
+            raise HTTPException(status_code=404, detail="league_dna_activation_candidate_not_found")
+        if activation.get("status") != "AWAITING_EXPLICIT_USER_CONFIRMATION":
+            raise HTTPException(status_code=409, detail="league_dna_activation_not_waiting_for_confirmation")
+        if activation_hash != activation.get("activation_hash"):
+            raise HTTPException(status_code=409, detail="latest_activation_candidate_hash_required")
+        promotion = (store.get("learning_promotions") or {}).get(candidate.get("hypothesis_id"))
+        if not promotion or promotion.get("candidate_hash") != activation.get("promotion_candidate_hash"):
+            raise HTTPException(status_code=409, detail="matching_validated_promotion_candidate_required")
+        active_rows = store.setdefault("league_dna_active", {})
+        existing = active_rows.get(tag_id)
+        if existing:
+            existing_confirmation = existing.get("user_confirmation") if isinstance(existing.get("user_confirmation"), dict) else {}
+            same_confirmation = (
+                existing.get("activation_candidate_hash") == activation_hash
+                and existing_confirmation.get("confirmed_by") == actor
+                and existing_confirmation.get("confirmation_reference") == reference
+                and existing_confirmation.get("confirmation_statement_hash") == _content_hash(statement)
+            )
+            if same_confirmation:
+                return {**existing, "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="league_dna_tag_already_active")
+        confirmation = {
+            "confirmed": True, "confirmed_by": actor,
+            "confirmation_reference": reference,
+            "confirmation_statement_hash": _content_hash(statement),
+            "confirmed_at": now_ts,
+            "activation_hash": activation_hash,
+        }
+        immutable_content = {
+            "tag_id": tag_id,
+            "tag_hash": candidate.get("content_hash"),
+            "hypothesis_id": candidate.get("hypothesis_id"),
+            "promotion_candidate_hash": promotion.get("candidate_hash"),
+            "activation_candidate_hash": activation_hash,
+            "scope": candidate.get("scope"),
+            "category": candidate.get("category"),
+            "market": candidate.get("market"),
+            "label": candidate.get("label"),
+            "magnitude_score": candidate.get("magnitude_score"),
+            "metric_definition": candidate.get("metric_definition"),
+            "baseline_definition": candidate.get("baseline_definition"),
+            "expected_model_effect": candidate.get("expected_model_effect"),
+            "anti_double_counting_rule": candidate.get("anti_double_counting_rule"),
+            "rollback_conditions": activation.get("rollback_conditions"),
+            "user_confirmation": confirmation,
+        }
+        active_hash = _content_hash(immutable_content)
+        record = {
+            **immutable_content,
+            "active_hash": active_hash,
+            "version": "league-dna-active-" + active_hash[:16],
+            "activated_at": now_ts,
+            "status": "VERIFIED_ACTIVE",
+            "evidence_confidence": 100,
+            "champion_effect": True,
+            "automatic_activation": False,
+            "immutable": True,
+            "action": "activated",
+        }
+        active_rows[tag_id] = record
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return record
 
 
 def league_dna_model_view(scope: Dict[str, Any], store_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -7521,6 +7614,16 @@ def shadow_learning_league_dna_activation_candidate(tag_id: str, token: Optional
     require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
     record = create_league_dna_activation_candidate(tag_id)
     return JSONResponse({"ok": True, "activation_candidate": record})
+
+
+@app.post("/shadow/learning/league-dna/{tag_id}/confirm")
+async def shadow_learning_league_dna_confirm(tag_id: str, request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="json_body_must_be_an_object")
+    record = confirm_league_dna_activation(tag_id, payload)
+    return JSONResponse({"ok": True, "verified_active": record})
 
 
 @app.get("/shadow/learning/league-dna/status")

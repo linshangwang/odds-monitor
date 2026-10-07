@@ -3487,6 +3487,59 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(report["automatic_activation"])
         self.assertEqual(main.league_dna_model_view(self.learning_payload()["scope"])["status"], "candidate_only")
 
+    def test_league_dna_activation_requires_hash_bound_explicit_user_confirmation(self):
+        _, candidate = self.register_league_dna_fixture("dna-confirm-hyp", "dna-confirm-tag")
+        for index in range(2):
+            self.settle_hypothesis_validation_fixture("dna-confirm-hyp", f"dna-confirm-validation-{index}", 8500 + index, 9100 + index)
+        with patch.object(main, "LEARNING_MIN_VALIDATION_SAMPLES", 2):
+            main.create_promotion_candidate("dna-confirm-hyp", None)
+            activation = main.create_league_dna_activation_candidate(candidate["tag_id"])
+
+        base = {
+            "confirmed": True,
+            "activation_hash": activation["activation_hash"],
+            "confirmed_by": "project-owner",
+            "confirmation_reference": "thread:test-turn-1",
+            "confirmation_statement": f"CONFIRM LEAGUE_DNA {candidate['tag_id']} {activation['activation_hash']}",
+        }
+        with self.assertRaises(main.HTTPException) as missing_true:
+            main.confirm_league_dna_activation(candidate["tag_id"], {**base, "confirmed": False}, now_ts=9200)
+        self.assertEqual(missing_true.exception.detail, "explicit_confirmation_true_required")
+
+        wrong_hash = "0" * 64
+        with self.assertRaises(main.HTTPException) as stale_hash:
+            main.confirm_league_dna_activation(candidate["tag_id"], {
+                **base,
+                "activation_hash": wrong_hash,
+                "confirmation_statement": f"CONFIRM LEAGUE_DNA {candidate['tag_id']} {wrong_hash}",
+            }, now_ts=9200)
+        self.assertEqual(stale_hash.exception.detail, "latest_activation_candidate_hash_required")
+
+        with self.assertRaises(main.HTTPException) as wrong_statement:
+            main.confirm_league_dna_activation(candidate["tag_id"], {**base, "confirmation_statement": "yes"}, now_ts=9200)
+        self.assertEqual(wrong_statement.exception.status_code, 422)
+
+        active = main.confirm_league_dna_activation(candidate["tag_id"], base, now_ts=9200)
+        self.assertEqual(active["status"], "VERIFIED_ACTIVE")
+        self.assertEqual(active["evidence_confidence"], 100)
+        self.assertTrue(active["champion_effect"])
+        self.assertFalse(active["automatic_activation"])
+        self.assertTrue(active["immutable"])
+
+        repeated = main.confirm_league_dna_activation(candidate["tag_id"], base, now_ts=9300)
+        self.assertEqual(repeated["action"], "unchanged")
+        self.assertEqual(repeated["active_hash"], active["active_hash"])
+        with self.assertRaises(main.HTTPException) as overwrite:
+            main.confirm_league_dna_activation(candidate["tag_id"], {**base, "confirmation_reference": "thread:different-turn"}, now_ts=9400)
+        self.assertEqual(overwrite.exception.detail, "league_dna_tag_already_active")
+
+        view = main.league_dna_model_view(self.learning_payload()["scope"])
+        self.assertEqual(view["status"], "VERIFIED_ACTIVE")
+        self.assertEqual(view["active_tag_count"], 1)
+        self.assertTrue(view["champion_effect"])
+        report = main.league_dna_status_report(39)
+        self.assertEqual(report["verified_active_count"], 1)
+
     def learning_prematch_packet(self, fixture_id, generated_at):
         return {
             "ok": True, "version": main.VERSION, "generated_at": generated_at,
