@@ -3898,7 +3898,9 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             self.settle_hypothesis_validation_fixture("hyp-ready", f"validation-{index}", 8400 + index, 9000 + index)
         with patch.object(main, "LEARNING_MIN_VALIDATION_SAMPLES", 2):
             evidence_report = main.promotion_evidence_report("hyp-ready")
-            candidate = main.create_promotion_candidate("hyp-ready", None)
+            refreshed = main.refresh_learning_promotion_candidates(now_ts=10000)
+        self.assertEqual(refreshed["candidate_created_count"], 1)
+        candidate = main.load_snapshot_store()["learning_promotions"]["hyp-ready"]
         self.assertTrue(evidence_report["promotion_ready"])
         self.assertTrue(all(row["status"] == "passed" for row in evidence_report["gates"].values()))
         self.assertFalse(evidence_report["caller_supplied_gate_status_used"])
@@ -3910,6 +3912,58 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         status = main.learning_status_report()
         self.assertEqual(status["promotion_candidate_count"], 1)
         self.assertFalse(status["automatic_champion_promotion"])
+
+    def test_forward_validation_evidence_is_automatically_derived_from_closing_snapshot(self):
+        discovery, _ = self.settle_learning_fixture("auto-evidence-discovery", 900, 1000)
+        main.register_learning_hypothesis({
+            "hypothesis_id": "auto-evidence-hyp", "type": "HYPOTHESIS_ONLY",
+            "title": "Automatic evidence hypothesis",
+            "definition": "Score only immutable forward locks against verified facts and Closing evidence.",
+            "applicable_scope": "England Premier League 1x2",
+            "expected_direction": "lower forward Brier",
+            "failure_conditions": "no gain or missing evidence",
+            "falsification_criteria": "any unresolved counterexample",
+            "discovery_freeze_ids": [discovery["freeze_id"]],
+            "validation_plan": self.learning_validation_plan(),
+        }, now_ts=8300)
+        frozen = main.freeze_learning_sample(
+            self.learning_payload_with_probability_replay("auto-evidence-validation", 8400, 9000), now_ts=8400,
+        )
+        main.generate_internal_shadow_lock(
+            "auto-evidence-hyp", frozen["freeze_id"],
+            model_runner=self.learning_shadow_runner(), now_ts=8410,
+        )
+        facts = self.collect_verified_learning_facts(frozen, 1, 1, 16200)
+        main.settle_learning_sample(
+            frozen["freeze_id"], {"status": "FT", "home_goals": 1, "away_goals": 1},
+            "PROCESS_CORRECT_RESULT_LOSS", {"status": "clean"}, 16200,
+            self.learning_postmatch_review(), facts["fact_hash"],
+        )
+        without_closing = main.refresh_learning_forward_validation_evidence(now_ts=16200)
+        self.assertEqual(without_closing["recorded_count"], 0)
+        self.assertEqual(without_closing["results"][0]["reason"], "verified_prematch_closing_snapshot_required")
+        store = main.load_snapshot_store()
+        market = main.empty_market_snapshot()
+        market["available"] = True
+        market["consensus_main_line"]["1x2"] = {
+            "source": "complete_company_array", "bookmaker_count": max(5, main.MIN_CONSENSUS_BOOKMAKERS),
+            "home": 2.5, "draw": 2.8, "away": 3.1,
+        }
+        store.setdefault("fixtures", {})["auto-evidence-validation"] = [{
+            "stage": "Closing", "snapshot_at": 8940, "market_snapshot": market,
+            "stage_timing_audit": {"status": "valid"}, "sequence_timing_audit": {"status": "valid"},
+        }]
+        main.write_snapshot_store(store)
+
+        refreshed = main.refresh_learning_forward_validation_evidence(now_ts=16201)
+        self.assertEqual(refreshed["recorded_count"], 1)
+        evidence = main.load_snapshot_store()["learning_hypotheses"]["auto-evidence-hyp"]["validation_evidence"][0]
+        self.assertEqual(evidence["freeze_id"], frozen["freeze_id"])
+        self.assertTrue(evidence["closing_price_evidence_ref"].startswith("snapshot:"))
+        self.assertFalse(evidence["outcome_derivation"]["caller_supplied_outcome_used"])
+        self.assertFalse(evidence["derived_metrics"]["result_outcome_used_as_rule_label"])
+        self.assertEqual(main.refresh_learning_forward_validation_evidence(now_ts=16202)["recorded_count"], 0)
+        self.assertNotIn("learning_promotions", main.load_snapshot_store())
 
     def test_shadow_validation_requires_forward_locked_sample_and_is_immutable(self):
         discovery, _ = self.settle_learning_fixture("shadow-discovery", 900, 1000)
