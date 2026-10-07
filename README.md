@@ -1,5 +1,11 @@
 # Football AI 影子分析 / Odds Monitor v0.9
 
+项目的正式模型规则与当前接管状态见：
+
+- [MODEL_RULES.md](MODEL_RULES.md)
+- [PROJECT_STATE.md](PROJECT_STATE.md)
+- [THE_ODDS_API.md](THE_ODDS_API.md)
+
 这是一个 Railway 可部署的 FastAPI 项目，用来测试：
 
 1. API-Football / API-SPORTS 的实时比赛、事件、技术统计接口

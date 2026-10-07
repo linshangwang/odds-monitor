@@ -19,9 +19,11 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+from the_odds_api_provider import collect_historical_timeline
+
 load_dotenv()
 
-VERSION = "1.86.0"
+VERSION = "1.87.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -77,7 +79,15 @@ API_FOOTBALL_BASE_URL = os.getenv("API_FOOTBALL_BASE_URL", "https://v3.football.
 THESTATS_API_KEY = os.getenv("THESTATS_API_KEY", "")
 THESTATS_BASE_URL = os.getenv("THESTATS_BASE_URL", "https://api.thestatsapi.com/api").rstrip("/")
 THE_ODDS_API_KEY = os.getenv("THE_ODDS_API_KEY", "")
-THE_ODDS_API_BASE_URL = "https://api.the-odds-api.com/v4"
+THE_ODDS_API_BASE_URL = os.getenv("THE_ODDS_API_BASE_URL", "https://api.the-odds-api.com/v4").rstrip("/")
+THE_ODDS_API_REGIONS = os.getenv("THE_ODDS_API_REGIONS", "fi,eu")
+THE_ODDS_API_BOOKMAKERS = os.getenv("THE_ODDS_API_BOOKMAKERS", "")
+THE_ODDS_API_OPENING_LOOKBACK_DAYS = max(1, min(int(os.getenv("THE_ODDS_API_OPENING_LOOKBACK_DAYS", "7")), 30))
+THE_ODDS_API_OPENING_SCAN_HOURS = max(1, min(int(os.getenv("THE_ODDS_API_OPENING_SCAN_HOURS", "12")), 24))
+THE_ODDS_API_MAX_HISTORY_REQUESTS = max(16, min(int(os.getenv("THE_ODDS_API_MAX_HISTORY_REQUESTS", "48")), 100))
+THE_ODDS_API_MIN_1X2_BOOKMAKERS = max(1, int(os.getenv("THE_ODDS_API_MIN_1X2_BOOKMAKERS", "5")))
+THE_ODDS_API_MIN_AH_BOOKMAKERS = max(1, int(os.getenv("THE_ODDS_API_MIN_AH_BOOKMAKERS", "3")))
+THE_ODDS_API_MIN_OU_BOOKMAKERS = max(1, int(os.getenv("THE_ODDS_API_MIN_OU_BOOKMAKERS", "3")))
 NAMI_API_USER = os.getenv("NAMI_API_USER", "")
 NAMI_API_SECRET = os.getenv("NAMI_API_SECRET", "")
 NAMI_API_BASE_URL = os.getenv("NAMI_API_BASE_URL", "https://open.sportnanoapi.com").rstrip("/")
@@ -158,7 +168,7 @@ def resolve_shadow_token(query_token: Optional[str], authorization: Optional[str
 
 
 def mask_secret(text: str) -> str:
-    configured = {str(key) for key in [API_FOOTBALL_KEY, THESTATS_API_KEY, ISPORTS_API_KEY, SHADOW_ACCESS_TOKEN, NAMI_API_USER, NAMI_API_SECRET] if key}
+    configured = {str(key) for key in [API_FOOTBALL_KEY, THESTATS_API_KEY, THE_ODDS_API_KEY, ISPORTS_API_KEY, SHADOW_ACCESS_TOKEN, NAMI_API_USER, NAMI_API_SECRET] if key}
     for key in sorted(configured, key=len, reverse=True):
         text = text.replace(key, "YOUR_SECRET")
     return text
@@ -283,7 +293,8 @@ def call_the_odds_api(path: str, params: Optional[Dict[str, Any]] = None) -> Dic
             "data": payload,
             "error": business_error,
             "quota_remaining": resp.headers.get("x-requests-remaining"),
-            "quota_used": resp.headers.get("x-requests-used")
+            "quota_used": resp.headers.get("x-requests-used"),
+            "quota_last": resp.headers.get("x-requests-last"),
         }
     except requests.RequestException as exc:
         return {"ok": False, "error": type(exc).__name__}
@@ -2149,13 +2160,16 @@ def import_prematch_packet(packet: Dict[str, Any], store_override: Optional[Dict
         raise HTTPException(status_code=400, detail="packet_must_be_an_object")
     if packet.get("schema_version") != "shadow_prematch_packet_v1":
         raise HTTPException(status_code=400, detail="unsupported_schema_version")
+    packet_source = str(packet.get("source") or "pang").strip().lower()
+    if packet_source not in {"pang", "the_odds_api"}:
+        raise HTTPException(status_code=400, detail="unsupported_prematch_packet_source")
     match = packet.get("match") or {}
     if not isinstance(match, dict):
         raise HTTPException(status_code=400, detail="match_must_be_an_object")
     fixture = str(match.get("match_id") or "").strip()
     if not fixture:
         raise HTTPException(status_code=400, detail="missing_match_id")
-    fixture_identity = fixture_identity_from_match(match, packet.get("league"), "pang")
+    fixture_identity = fixture_identity_from_match(match, packet.get("league"), packet_source)
     timeline = packet.get("timeline")
     if not isinstance(timeline, list):
         raise HTTPException(status_code=400, detail="timeline_must_be_an_array")
@@ -2190,6 +2204,7 @@ def import_prematch_packet(packet: Dict[str, Any], store_override: Optional[Dict
         observed_value = stage_data.get("latest_observed_at") or stage_data.get("target_at")
         observed_at = _parse_timestamp(observed_value)
         opening_source_audit = None
+        provider_audit = stage_data.get("provider_audit") if isinstance(stage_data.get("provider_audit"), dict) else None
         market_snapshot = imported_market_snapshot(stage_data)
         if stage == "Opening":
             verified_markets = [
@@ -2197,10 +2212,15 @@ def import_prematch_packet(packet: Dict[str, Any], store_override: Optional[Dict
                 if isinstance(row, dict) and row.get("source") == "complete_company_array" and int(row.get("bookmaker_count") or 0) >= 1
             ]
             opening_source_audit = {
-                "verified": bool(observed_at is not None and verified_markets),
+                "verified": bool(
+                    observed_at is not None and verified_markets
+                    and (packet_source != "the_odds_api" or get_nested(provider_audit or {}, ["opening_verified"]) is True)
+                ),
                 "observed_at_present": observed_at is not None,
                 "verified_markets": verified_markets,
-                "policy": "opening_requires_observation_time_and_recalculated_complete_company_array",
+                "provider_first_seen_verified": get_nested(provider_audit or {}, ["opening_verified"]),
+                "provider_preceding_absence_at": get_nested(provider_audit or {}, ["opening_preceding_absence_at"]),
+                "policy": "opening_requires_observation_time_recalculated_company_array_and_provider_first_seen_proof_when_source_is_the_odds_api",
             }
             if status == "available" and not opening_source_audit["verified"]:
                 status = "data_missing"
@@ -2208,14 +2228,15 @@ def import_prematch_packet(packet: Dict[str, Any], store_override: Optional[Dict
         snapshot_at = observed_at or int(time.time())
         information_search = normalize_information_search(stage_data.get("information_search"), snapshot_at)
         missing_reason = "opening_source_unverified" if stage == "Opening" and status == "data_missing" and opening_source_audit and not opening_source_audit["verified"] else stage_data.get("reason")
-        source_hash = _content_hash({"stage": stage, "status": status, "market_snapshot": market_snapshot, "missing_reason": missing_reason, "latest_observed_at": stage_data.get("latest_observed_at"), "target_at": stage_data.get("target_at"), "kickoff_utc": match.get("kickoff_utc"), "information_search": information_search, "opening_source_audit": opening_source_audit})
+        source_hash = _content_hash({"stage": stage, "status": status, "market_snapshot": market_snapshot, "missing_reason": missing_reason, "latest_observed_at": stage_data.get("latest_observed_at"), "target_at": stage_data.get("target_at"), "kickoff_utc": match.get("kickoff_utc"), "information_search": information_search, "opening_source_audit": opening_source_audit, "provider_audit": provider_audit})
         record = {
-            "version": VERSION, "fixture": fixture, "external_fixture_id": fixture, "source": "pang_import",
+            "version": VERSION, "fixture": fixture, "external_fixture_id": fixture, "source": f"{packet_source}_import",
             "stage": stage, "snapshot_at": snapshot_at,
-            "fixture_info": match, "data_quality": packet.get("data_quality"), "coverage": {"source": "pang", "quote_count": stage_data.get("quote_count"), "bookmaker_count": stage_data.get("bookmaker_count")},
+            "fixture_info": match, "data_quality": packet.get("data_quality"), "coverage": {"source": packet_source, "quote_count": stage_data.get("quote_count"), "bookmaker_count": stage_data.get("bookmaker_count")},
             "import_status": status, "missing_reason": missing_reason if status == "data_missing" else None,
             "market_snapshot": market_snapshot, "source_content_hash": source_hash, "market_dynamics": None,
             "information_search": information_search, "opening_source_audit": opening_source_audit,
+            "provider_audit": provider_audit,
         }
         record["stage_timing_audit"] = audit_stage_timing(stage, record["snapshot_at"], match.get("kickoff_utc"))
         records.append(record)
@@ -2223,6 +2244,11 @@ def import_prematch_packet(packet: Dict[str, Any], store_override: Optional[Dict
         store = store_override if store_override is not None else load_snapshot_store()
         external_prematch = store.setdefault("external_prematch", {})
         previous_meta = external_prematch.get(fixture) or {}
+        provider_fixture_ids = dict(previous_meta.get("provider_fixture_ids") or {})
+        if packet_source == "pang":
+            provider_fixture_ids["pang"] = fixture
+        else:
+            provider_fixture_ids["the_odds_api"] = str(match.get("the_odds_api_event_id") or "") or None
         next_meta_content = {
             "schema_version": packet.get("schema_version"), "league": packet.get("league") or previous_meta.get("league"),
             "exported_at": packet.get("exported_at") or previous_meta.get("exported_at"), "match": match or previous_meta.get("match"),
@@ -2230,7 +2256,8 @@ def import_prematch_packet(packet: Dict[str, Any], store_override: Optional[Dict
             "lineup_history": lineup_history if "lineup_history" in packet else previous_meta.get("lineup_history", []),
             "data_quality": packet.get("data_quality") or previous_meta.get("data_quality"),
             "fixture_identity": fixture_identity,
-            "provider_fixture_ids": {**(previous_meta.get("provider_fixture_ids") or {}), "pang": fixture},
+            "source": packet_source,
+            "provider_fixture_ids": {key: value for key, value in provider_fixture_ids.items() if value},
         }
         previous_meta_content = {key: previous_meta.get(key) for key in next_meta_content}
         metadata_changed = not previous_meta or _content_hash(next_meta_content) != _content_hash(previous_meta_content)
@@ -2292,6 +2319,68 @@ def import_prematch_packet_batch(packets: List[Dict[str, Any]]) -> Tuple[List[Di
         store = load_snapshot_store()
         results = [import_prematch_packet(packet, store_override=store, persist=False) for packet in packets]
         return results, store
+
+
+def collect_the_odds_api_timeline(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Collect and optionally persist one verified eight-node provider timeline."""
+    if not THE_ODDS_API_KEY:
+        raise HTTPException(status_code=503, detail="the_odds_api_not_configured")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="request_body_must_be_an_object")
+    required = ("fixture", "sport_key", "league", "home_team", "away_team", "kickoff_utc")
+    missing = [key for key in required if payload.get(key) in (None, "")]
+    if missing:
+        raise HTTPException(status_code=400, detail={"error": "missing_required_fields", "fields": missing})
+    fixture = str(payload.get("fixture")).strip()
+    if not fixture or len(fixture) > 128:
+        raise HTTPException(status_code=400, detail="invalid_fixture")
+    aliases = {}
+    for side in ("home", "away"):
+        raw = payload.get(f"{side}_aliases") or []
+        if not isinstance(raw, list) or len(raw) > 20 or any(not isinstance(value, str) or len(value) > 120 for value in raw):
+            raise HTTPException(status_code=400, detail=f"invalid_{side}_aliases")
+        aliases[side] = raw
+    regions = str(payload.get("regions") or THE_ODDS_API_REGIONS).strip().lower()
+    region_values = [value.strip() for value in regions.split(",") if value.strip()]
+    if not region_values or len(region_values) > 3 or any(not value.replace("_", "").isalnum() for value in region_values):
+        raise HTTPException(status_code=400, detail="invalid_the_odds_api_regions")
+    bookmakers = str(payload.get("bookmakers") or THE_ODDS_API_BOOKMAKERS).strip().lower()
+    bookmaker_values = [value.strip() for value in bookmakers.split(",") if value.strip()]
+    if len(bookmaker_values) > 20 or any(not value.replace("_", "").isalnum() for value in bookmaker_values):
+        raise HTTPException(status_code=400, detail="invalid_the_odds_api_bookmakers")
+    try:
+        result = collect_historical_timeline(
+            call_the_odds_api,
+            fixture=fixture,
+            sport_key=payload.get("sport_key"),
+            league=str(payload.get("league")),
+            home_team=str(payload.get("home_team")),
+            away_team=str(payload.get("away_team")),
+            kickoff_utc=payload.get("kickoff_utc"),
+            home_aliases=aliases["home"],
+            away_aliases=aliases["away"],
+            regions=",".join(region_values),
+            bookmakers=",".join(bookmaker_values),
+            opening_lookback_days=max(1, min(int(payload.get("opening_lookback_days") or THE_ODDS_API_OPENING_LOOKBACK_DAYS), 30)),
+            opening_scan_hours=max(1, min(int(payload.get("opening_scan_hours") or THE_ODDS_API_OPENING_SCAN_HOURS), 24)),
+            max_requests=THE_ODDS_API_MAX_HISTORY_REQUESTS,
+            minimums={
+                "1x2": THE_ODDS_API_MIN_1X2_BOOKMAKERS,
+                "asian_handicap": THE_ODDS_API_MIN_AH_BOOKMAKERS,
+                "over_under": THE_ODDS_API_MIN_OU_BOOKMAKERS,
+            },
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    persisted = None
+    if result.get("ok") and payload.get("persist", True) is not False:
+        persisted = import_prematch_packet(result["packet"])
+    return {
+        **result,
+        "persist_requested": payload.get("persist", True) is not False,
+        "persist_result": persisted,
+        "credential_exposed": False,
+    }
 
 
 def server_import_preflight(packets: List[Dict[str, Any]], expected_date: Optional[str] = None, require_prematch: bool = False, now_ts: Optional[int] = None) -> Dict[str, Any]:
@@ -3701,7 +3790,7 @@ def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6, ri
 
 @app.get("/")
 def root():
-    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/import-status", "/shadow/data-source-health", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}"]}
+    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}"]}
 
 
 @app.get("/health")
@@ -3713,7 +3802,7 @@ def health():
         "fresh_fixture_count": get_nested(route, ["pang", "fresh_fixture_count"], 0),
         "missing_action": route.get("missing_action"),
     }
-    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "has_thestats_key": bool(THESTATS_API_KEY), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "nami_odds_startup_probe": NAMI_ODDS_STARTUP_PROBE, "nami_odds_probe_ttl_seconds": NAMI_ODDS_PROBE_TTL_SECONDS, "market_data_route": route_summary, "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "snapshot_store_warn_bytes": SNAPSHOT_STORE_WARN_BYTES, "fundamental_version_retention": FUNDAMENTAL_VERSION_RETENTION, "portfolio_run_retention": PORTFOLIO_RUN_RETENTION, "external_data_stale_seconds": EXTERNAL_DATA_STALE_SECONDS, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}, "auto_provider_reconciliation": AUTO_RECONCILIATION_LAST_RESULT}
+    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "the_odds_api_base_url": THE_ODDS_API_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "has_thestats_key": bool(THESTATS_API_KEY), "has_the_odds_api_key": bool(THE_ODDS_API_KEY), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "nami_odds_startup_probe": NAMI_ODDS_STARTUP_PROBE, "nami_odds_probe_ttl_seconds": NAMI_ODDS_PROBE_TTL_SECONDS, "market_data_route": route_summary, "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "snapshot_store_warn_bytes": SNAPSHOT_STORE_WARN_BYTES, "fundamental_version_retention": FUNDAMENTAL_VERSION_RETENTION, "portfolio_run_retention": PORTFOLIO_RUN_RETENTION, "external_data_stale_seconds": EXTERNAL_DATA_STALE_SECONDS, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}, "auto_provider_reconciliation": AUTO_RECONCILIATION_LAST_RESULT}
 
 
 @app.get("/shadow/nami-capabilities")
@@ -3746,21 +3835,20 @@ def thestats_raw(path: str, token: Optional[str] = None, authorization: Optional
 @app.get("/shadow/historical-odds-test")
 def shadow_historical_odds_test(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse(historical_odds_selfcheck())
 
-    auth = call_the_odds_api("/sports")
 
-    result = {
-        "ok": False,
-        "auth_valid": auth.get("status_code") == 200,
-        "historical_access": False,
-        "sports_status": auth.get("status_code"),
-        "historical_status": None,
-        "quota_remaining": auth.get("quota_remaining"),
-        "quota_used": auth.get("quota_used")
-    }
-
-    if not result["auth_valid"]:
-        return JSONResponse(result)
+@app.post("/shadow/the-odds-api/collect-timeline")
+async def shadow_the_odds_api_collect_timeline(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    body = await request.body()
+    if len(body) > 100 * 1024:
+        raise HTTPException(status_code=413, detail="request_body_too_large")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="invalid_json_body") from exc
+    return JSONResponse(collect_the_odds_api_timeline(payload))
 
 def sportradar_live_selfcheck() -> Dict[str, Any]:
     if not SPORTRADAR_API_KEY:
@@ -3806,34 +3894,18 @@ def historical_odds_selfcheck() -> Dict[str, Any]:
     }
     if not result["auth_valid"]:
         return result
-    historical = call_the_odds_api("/historical/sports/soccer_epl/odds", {
-        "regions": "eu", "markets": "h2h", "oddsFormat": "decimal",
-        "date": "2024-01-01T12:00:00Z"
+    # The historical events endpoint costs one credit and is enough to verify
+    # paid historical entitlement without burning a market request.
+    historical = call_the_odds_api("/historical/sports/soccer_epl/events", {
+        "dateFormat": "iso", "date": "2024-01-01T12:00:00Z"
     })
-    result["historical_status"] = historical.get("status_code")
-    result["historical_access"] = historical.get("status_code") == 200
-    result["quota_remaining"] = historical.get("quota_remaining")
-    result["quota_used"] = historical.get("quota_used")
-    return result
-
-
-    historical = call_the_odds_api(
-        "/historical/sports/soccer_epl/odds",
-        {
-            "regions": "eu",
-            "markets": "h2h",
-            "oddsFormat": "decimal",
-            "date": "2024-01-01T12:00:00Z"
-        }
-    )
-
     result["historical_status"] = historical.get("status_code")
     result["historical_access"] = historical.get("status_code") == 200
     result["ok"] = result["historical_access"]
     result["quota_remaining"] = historical.get("quota_remaining")
     result["quota_used"] = historical.get("quota_used")
-
-    return JSONResponse(result)
+    result["quota_last"] = historical.get("quota_last")
+    return result
 
 
 @app.get("/prematch/target-fixtures")
@@ -4024,8 +4096,13 @@ def imported_fixture_freshness(metadata: Dict[str, Any], history: List[Dict[str,
     latest_row = latest_prematch_snapshot(available)
     latest = int((latest_row or {}).get("snapshot_at") or 0) or None
     age = now_ts - latest if latest else None
+    provider_primary_eligible = True
+    if str(metadata.get("source") or "pang") == "the_odds_api" and latest_row:
+        provider_primary_eligible = get_nested(latest_row, ["provider_audit", "coverage", "primary_reference_eligible"]) is True
     if not latest_row or not latest:
         state, eligible, reason = "data_missing", False, "no_available_market_snapshot"
+    elif not provider_primary_eligible:
+        state, eligible, reason = "data_missing", False, "the_odds_api_primary_coverage_gate_failed"
     elif age < -300:
         state, eligible, reason = "invalid_timestamp", False, "latest_market_snapshot_is_in_future"
     elif kickoff and now_ts >= kickoff:
@@ -4039,6 +4116,7 @@ def imported_fixture_freshness(metadata: Dict[str, Any], history: List[Dict[str,
         "latest_snapshot_at": latest, "age_seconds": age, "stale_after_seconds": EXTERNAL_DATA_STALE_SECONDS,
         "latest_stage": (latest_row or {}).get("stage"), "selection_policy": "latest_prematch_stage_not_latest_write_time",
         "future_tolerance_seconds": 300, "kickoff_at": kickoff,
+        "provider_source": metadata.get("source") or "pang", "provider_primary_reference_eligible": provider_primary_eligible,
     }
 
 
@@ -4046,21 +4124,30 @@ def market_data_route_report(store_override: Optional[Dict[str, Any]] = None, no
     """Describe verified decision data separately from merely configured collectors."""
     store = store_override if store_override is not None else load_snapshot_store()
     state_counts = {state: 0 for state in ("fresh", "stale", "historical", "invalid_timestamp", "data_missing")}
+    fresh_by_source: Dict[str, int] = {}
     for fixture, metadata in (store.get("external_prematch") or {}).items():
         history = (store.get("fixtures") or {}).get(str(fixture), []) or []
         freshness = imported_fixture_freshness(metadata, history, now_ts=now_ts)
         state = freshness.get("state")
         if state in state_counts:
             state_counts[state] += 1
+        if freshness.get("decision_eligible"):
+            source = str(metadata.get("source") or "pang")
+            fresh_by_source[source] = fresh_by_source.get(source, 0) + 1
     fresh_count = state_counts["fresh"]
     nami_cache = get_nested(store, ["provider_capability_cache", "nami_football_odds"], {}) or {}
     nami_available = nami_cache.get("available") is True and nami_cache.get("entitlement") == "available"
     collector_candidates = []
     if API_FOOTBALL_KEY:
         collector_candidates.append("api_football_configured_unverified_for_current_fixture")
+    if THE_ODDS_API_KEY:
+        collector_candidates.append("the_odds_api_configured_requires_verified_persisted_timeline")
     if nami_available:
         collector_candidates.append("nami_odds_entitled_unverified_for_current_fixture")
-    decision_route = "pang_persisted_snapshot" if fresh_count else None
+    decision_route = (
+        "the_odds_api_persisted_timeline" if fresh_by_source.get("the_odds_api") else
+        "pang_persisted_snapshot" if fresh_count else None
+    )
     if decision_route:
         status = "decision_data_available"
     elif collector_candidates:
@@ -4071,6 +4158,11 @@ def market_data_route_report(store_override: Optional[Dict[str, Any]] = None, no
         "status": status, "decision_eligible": bool(decision_route),
         "decision_route": decision_route, "collector_candidates": collector_candidates,
         "pang": {"policy": "read_only", "fresh_fixture_count": fresh_count, "state_counts": state_counts},
+        "the_odds_api": {
+            "configured": bool(THE_ODDS_API_KEY),
+            "fresh_fixture_count": fresh_by_source.get("the_odds_api", 0),
+            "role": "primary_reference_only_after_company_coverage_and_timeline_persistence_gates",
+        },
         "nami_odds": {
             "entitlement": nami_cache.get("entitlement") or NAMI_ODDS_STARTUP_PROBE.get("entitlement") or "unknown",
             "available": nami_available, "decision_use": False,
