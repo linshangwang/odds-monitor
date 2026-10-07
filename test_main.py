@@ -3,6 +3,7 @@ import copy
 import gzip
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
@@ -18,9 +19,11 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.old_store = main.SNAPSHOT_STORE_PATH
         self.tmp = tempfile.TemporaryDirectory()
         main.SNAPSHOT_STORE_PATH = os.path.join(self.tmp.name, "store.json")
+        main.THESTATS_FIXTURE_DAY_CACHE.clear()
 
     def tearDown(self):
         main.SNAPSHOT_STORE_PATH = self.old_store
+        main.THESTATS_FIXTURE_DAY_CACHE.clear()
         self.tmp.cleanup()
 
     def test_bounded_gzip_decompression_rejects_expansion_over_limit(self):
@@ -4812,6 +4815,39 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         frozen_identity = next(row for row in freeze_payload["source_refs"] if row.get("source") == "thestats")
         self.assertEqual(frozen_identity["match_id"], "mt_8045")
         self.assertEqual(frozen_identity["identity_bound_at"], observed_at)
+
+    def test_thestats_match_day_lookup_is_shared_across_concurrent_fixture_binding(self):
+        kickoff_at, observed_at = 300000, 290000
+        kickoff_iso = datetime.fromtimestamp(kickoff_at, tz=timezone.utc).isoformat()
+        response = {
+            "ok": True, "status_code": 200,
+            "data": {"data": [
+                {"id": "mt_a", "utc_date": kickoff_iso, "status": "scheduled", "home_team": {"name": "Home A"}, "away_team": {"name": "Away A"}},
+                {"id": "mt_b", "utc_date": kickoff_iso, "status": "scheduled", "home_team": {"name": "Home B"}, "away_team": {"name": "Away B"}},
+            ], "meta": {"total_pages": 1}},
+        }
+        fixtures = [
+            {"home": "Home A", "away": "Away A", "timestamp": kickoff_at},
+            {"home": "Home B", "away": "Away B", "timestamp": kickoff_at},
+        ]
+        with patch.object(main, "THESTATS_API_KEY", "configured-cache"), patch.object(main, "call_thestats", return_value=response) as fetch:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                identities = list(pool.map(lambda fixture: main._resolve_thestats_prematch_identity(fixture, observed_at), fixtures))
+        self.assertEqual({row["match_id"] for row in identities}, {"mt_a", "mt_b"})
+        self.assertEqual(sum(bool(row["lookup_cache_hit"]) for row in identities), 1)
+        fetch.assert_called_once()
+
+    def test_thestats_match_day_failure_is_not_cached(self):
+        kickoff_at, observed_at = 400000, 390000
+        fixture = {"home": "Home", "away": "Away", "timestamp": kickoff_at}
+        failed = {"ok": False, "status_code": 429, "error": "rate_limited"}
+        with patch.object(main, "THESTATS_API_KEY", "configured-failure"), patch.object(main, "call_thestats", return_value=failed) as fetch:
+            first = main._resolve_thestats_prematch_identity(fixture, observed_at)
+            second = main._resolve_thestats_prematch_identity(fixture, observed_at)
+        self.assertFalse(first["ok"])
+        self.assertFalse(second["ok"])
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(main.THESTATS_FIXTURE_DAY_CACHE, {})
 
     def test_thestats_postmatch_requires_exact_result_and_matching_material_events(self):
         kickoff_at = 1000

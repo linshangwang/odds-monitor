@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.03.0"
+VERSION = "2.04.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -89,6 +89,9 @@ AUTO_LEARNING_LAST_RESULT: Optional[Dict[str, Any]] = None
 LEARNING_SHADOW_MODEL_RUNNER: Optional[Any] = None
 LEARNING_CHALLENGER_MAX_MODULE_LOG_RATE_DELTA = 0.25
 LEARNING_CHALLENGER_MAX_COMBINED_LOG_RATE_DELTA = 0.40
+THESTATS_FIXTURE_DAY_CACHE_TTL_SECONDS = max(60, min(int(os.getenv("THESTATS_FIXTURE_DAY_CACHE_TTL_SECONDS", "600")), 3600))
+THESTATS_FIXTURE_DAY_CACHE_LOCK = threading.RLock()
+THESTATS_FIXTURE_DAY_CACHE: Dict[str, Dict[str, Any]] = {}
 NAMI_ODDS_STARTUP_PROBE: Dict[str, Any] = {"status": "pending", "decision_use": False}
 NAMI_ODDS_STARTUP_PROBE_STARTED = False
 NAMI_ODDS_PROBE_TTL_SECONDS = max(3600, int(os.getenv("NAMI_ODDS_PROBE_TTL_SECONDS", str(7 * 24 * 3600))))
@@ -195,7 +198,7 @@ LEARNING_TOP_FLIGHT_LEAGUES: Dict[int, Dict[str, str]] = {
 }
 LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
 LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
-LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.03").strip() or "MODEL_RULES.md@2026-10-08-v2.03"
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.04").strip() or "MODEL_RULES.md@2026-10-08-v2.04"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -4743,7 +4746,7 @@ def health():
         "fresh_fixture_count": get_nested(route, ["pang", "fresh_fixture_count"], 0),
         "missing_action": route.get("missing_action"),
     }
-    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "the_odds_api_base_url": THE_ODDS_API_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "has_thestats_key": bool(THESTATS_API_KEY), "has_the_odds_api_key": bool(THE_ODDS_API_KEY), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "nami_odds_startup_probe": NAMI_ODDS_STARTUP_PROBE, "nami_odds_probe_ttl_seconds": NAMI_ODDS_PROBE_TTL_SECONDS, "market_data_route": route_summary, "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "snapshot_store_warn_bytes": SNAPSHOT_STORE_WARN_BYTES, "fundamental_version_retention": FUNDAMENTAL_VERSION_RETENTION, "portfolio_run_retention": PORTFOLIO_RUN_RETENTION, "external_data_stale_seconds": EXTERNAL_DATA_STALE_SECONDS, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}, "auto_provider_reconciliation": AUTO_RECONCILIATION_LAST_RESULT}
+    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "the_odds_api_base_url": THE_ODDS_API_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "has_thestats_key": bool(THESTATS_API_KEY), "thestats_fixture_day_cache_ttl_seconds": THESTATS_FIXTURE_DAY_CACHE_TTL_SECONDS, "thestats_fixture_day_cache_entries": len(THESTATS_FIXTURE_DAY_CACHE), "has_the_odds_api_key": bool(THE_ODDS_API_KEY), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "nami_odds_startup_probe": NAMI_ODDS_STARTUP_PROBE, "nami_odds_probe_ttl_seconds": NAMI_ODDS_PROBE_TTL_SECONDS, "market_data_route": route_summary, "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "snapshot_store_warn_bytes": SNAPSHOT_STORE_WARN_BYTES, "fundamental_version_retention": FUNDAMENTAL_VERSION_RETENTION, "portfolio_run_retention": PORTFOLIO_RUN_RETENTION, "external_data_stale_seconds": EXTERNAL_DATA_STALE_SECONDS, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}, "auto_provider_reconciliation": AUTO_RECONCILIATION_LAST_RESULT}
 
 
 @app.get("/shadow/nami-capabilities")
@@ -5796,6 +5799,46 @@ def _thestats_match_identity(row: Any) -> Dict[str, Any]:
     }
 
 
+def _thestats_matches_for_utc_date(date_utc: str) -> Dict[str, Any]:
+    """Fetch one complete UTC match day once per short-lived process cache window."""
+    credential_fingerprint = hashlib.sha256(THESTATS_API_KEY.encode("utf-8")).hexdigest()[:12] if THESTATS_API_KEY else "missing"
+    cache_key = f"{THESTATS_BASE_URL}|{credential_fingerprint}|{date_utc}"
+    now_ts = int(time.time())
+    with THESTATS_FIXTURE_DAY_CACHE_LOCK:
+        cached = THESTATS_FIXTURE_DAY_CACHE.get(cache_key)
+        if cached and now_ts - int(cached.get("fetched_at") or 0) <= THESTATS_FIXTURE_DAY_CACHE_TTL_SECONDS:
+            return {"ok": True, "rows": copy.deepcopy(cached.get("rows") or []), "cache_hit": True, "page_count": cached.get("page_count")}
+        rows = []
+        total_pages = 1
+        for page in range(1, 11):
+            if page > total_pages:
+                break
+            response = call_thestats("/football/matches", {
+                "date_from": date_utc, "date_to": date_utc, "per_page": 100, "page": page,
+            })
+            if response.get("ok") is not True:
+                return {"ok": False, "error": "thestats_fixture_lookup_failed", "status_code": response.get("status_code"), "cache_hit": False}
+            payload = response.get("data") if isinstance(response.get("data"), dict) else {}
+            page_rows = _thestats_payload_data(response)
+            if not isinstance(page_rows, list):
+                return {"ok": False, "error": "thestats_fixture_lookup_schema_invalid", "status_code": response.get("status_code"), "cache_hit": False}
+            rows.extend(row for row in page_rows if isinstance(row, dict))
+            meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+            try:
+                total_pages = max(1, int(meta.get("total_pages") or 1))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "thestats_fixture_pagination_invalid", "cache_hit": False}
+            if total_pages > 10:
+                return {"ok": False, "error": "thestats_fixture_pagination_exceeds_safe_bound", "page_count": total_pages, "cache_hit": False}
+        record = {"fetched_at": now_ts, "rows": copy.deepcopy(rows), "page_count": total_pages}
+        THESTATS_FIXTURE_DAY_CACHE[cache_key] = record
+        if len(THESTATS_FIXTURE_DAY_CACHE) > 16:
+            evictable = [key for key in THESTATS_FIXTURE_DAY_CACHE if key != cache_key]
+            oldest = min(evictable, key=lambda key: int(THESTATS_FIXTURE_DAY_CACHE[key].get("fetched_at") or 0))
+            THESTATS_FIXTURE_DAY_CACHE.pop(oldest, None)
+        return {"ok": True, "rows": rows, "cache_hit": False, "page_count": total_pages}
+
+
 def _resolve_thestats_prematch_identity(fixture: Dict[str, Any], observed_at: Any) -> Dict[str, Any]:
     """Bind a unique TheStats match id before kickoff; ambiguity always fails closed."""
     if not THESTATS_API_KEY:
@@ -5811,34 +5854,20 @@ def _resolve_thestats_prematch_identity(fixture: Dict[str, Any], observed_at: An
         return {"ok": False, "error": "thestats_prematch_identity_inputs_invalid"}
     date_utc = datetime.fromtimestamp(kickoff_at, tz=timezone.utc).date().isoformat()
     candidates = []
-    total_pages = 1
-    for page in range(1, 6):
-        if page > total_pages:
-            break
-        response = call_thestats("/football/matches", {
-            "date_from": date_utc, "date_to": date_utc, "per_page": 100, "page": page,
-        })
-        if response.get("ok") is not True:
-            return {"ok": False, "error": "thestats_fixture_lookup_failed", "status_code": response.get("status_code")}
-        payload = response.get("data") if isinstance(response.get("data"), dict) else {}
-        rows = _thestats_payload_data(response)
-        rows = rows if isinstance(rows, list) else []
-        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
-        try:
-            total_pages = max(1, min(int(meta.get("total_pages") or 1), 5))
-        except (TypeError, ValueError):
-            total_pages = 1
-        for row in rows:
-            identity = _thestats_match_identity(row)
-            if (
-                identity["match_id"]
-                and identity["status"] not in {"live", "finished", "cancelled", "canceled", "abandoned", "forfeit"}
-                and identity["kickoff_at"] is not None
-                and abs(identity["kickoff_at"] - kickoff_at) <= 900
-                and normalize_fixture_identity_name(identity["home_team"]) == normalize_fixture_identity_name(home_team)
-                and normalize_fixture_identity_name(identity["away_team"]) == normalize_fixture_identity_name(away_team)
-            ):
-                candidates.append(identity)
+    day = _thestats_matches_for_utc_date(date_utc)
+    if day.get("ok") is not True:
+        return day
+    for row in day.get("rows") or []:
+        identity = _thestats_match_identity(row)
+        if (
+            identity["match_id"]
+            and identity["status"] not in {"live", "finished", "cancelled", "canceled", "abandoned", "forfeit"}
+            and identity["kickoff_at"] is not None
+            and abs(identity["kickoff_at"] - kickoff_at) <= 900
+            and normalize_fixture_identity_name(identity["home_team"]) == normalize_fixture_identity_name(home_team)
+            and normalize_fixture_identity_name(identity["away_team"]) == normalize_fixture_identity_name(away_team)
+        ):
+            candidates.append(identity)
     unique = {row["match_id"]: row for row in candidates}
     if len(unique) != 1:
         return {"ok": False, "error": "thestats_fixture_identity_not_unique", "match_count": len(unique)}
@@ -5847,7 +5876,10 @@ def _resolve_thestats_prematch_identity(fixture: Dict[str, Any], observed_at: An
         "source": "thestats", "match_id": match["match_id"],
         "kickoff_at": kickoff_at, "home_team": home_team, "away_team": away_team,
     }
-    return {"ok": True, **content, "source_hash": _content_hash(content)}
+    return {
+        "ok": True, **content, "source_hash": _content_hash(content),
+        "lookup_cache_hit": day.get("cache_hit"), "lookup_page_count": day.get("page_count"),
+    }
 
 
 def _parse_event_minute(value: Any, offset: Any = None) -> Tuple[int, Optional[int]]:
