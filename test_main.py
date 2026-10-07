@@ -1,4 +1,5 @@
 import os
+import copy
 import gzip
 import tempfile
 import unittest
@@ -1108,6 +1109,99 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(packet["market"]["total_asian_handicap_move"], 0.0)
         self.assertEqual(packet["decision_layer"]["decision"], "PASS")
         self.assertIn("line_movement_requires_two_real_comparable_stages", packet["decision_layer"]["pass_reasons"])
+
+    def standings_model_fixture(self, observed_at=900):
+        def row(team_id, home_played, home_for, home_against, away_played, away_for, away_against):
+            return {
+                "team": {"id": team_id, "name": f"Team {team_id}"},
+                "home": {"played": home_played, "goals": {"for": home_for, "against": home_against}},
+                "away": {"played": away_played, "goals": {"for": away_for, "against": away_against}},
+            }
+        response = {
+            "ok": True,
+            "data": {"response": [{"league": {"standings": [[
+                row(1, 10, 18, 8, 10, 11, 13),
+                row(2, 10, 14, 12, 10, 15, 14),
+                row(3, 10, 16, 10, 10, 9, 16),
+            ]]}}]},
+        }
+        return main.independent_model_inputs_from_standings(
+            response, 1, 2, observed_at=observed_at, lineup_confidence=.9,
+        )
+
+    def test_standings_probability_replay_is_odds_independent_and_recomputable(self):
+        bundle = self.standings_model_fixture()
+        self.assertEqual(bundle["status"], "ready")
+        self.assertFalse(bundle["uses_market_odds"])
+        self.assertAlmostEqual(bundle["inputs"]["home_attack_rate"], 1.8)
+        self.assertAlmostEqual(bundle["inputs"]["away_attack_rate"], 1.5)
+        replay = main.build_learning_probability_replay("1", bundle, generated_at=950)
+        self.assertEqual(replay["status"], "ready")
+        self.assertTrue(replay["decision_eligible"])
+        audit = main.audit_learning_probability_replay(replay, "1", 950, 2000)
+        self.assertEqual(audit["status"], "ready")
+        self.assertTrue(audit["decision_eligible"])
+
+        forged = copy.deepcopy(replay)
+        forged["model"]["probabilities"]["1x2"]["home"] += .01
+        rejected = main.audit_learning_probability_replay(forged, "1", 950, 2000)
+        self.assertEqual(rejected["status"], "invalid")
+        self.assertIn("probability_output_mismatch", rejected["issues"])
+        self.assertIn("replay_hash_mismatch", rejected["issues"])
+
+        contaminated = copy.deepcopy(replay)
+        contaminated["inputs"]["market_odds"] = {"home": 2.0}
+        contaminated["input_hash"] = main._content_hash(contaminated["inputs"])
+        contaminated["replay_hash"] = main._content_hash({key: value for key, value in contaminated.items() if key != "replay_hash"})
+        rejected = main.audit_learning_probability_replay(contaminated, "1", 950, 2000)
+        self.assertEqual(rejected["status"], "invalid")
+        self.assertTrue(any(issue.startswith("unexpected_model_input_fields") for issue in rejected["issues"]))
+        self.assertIn("market_derived_model_input_field_forbidden", rejected["issues"])
+
+    def test_shadow_ai_packet_binds_probability_but_not_unpersisted_current_odds(self):
+        current_market = main.empty_market_snapshot()
+        current_market["available"] = True
+        current_market["consensus_main_line"]["1x2"] = {
+            "home": 2.0, "draw": 3.5, "away": 4.0,
+            "source": "complete_company_array", "bookmaker_count": 4,
+        }
+        data = {
+            "ok": True, "generated_at": 950,
+            "fixture": {"fixture_id": 1, "home": "H", "away": "A", "date": 2000},
+            "structured_inputs": {
+                "odds_market_snapshot": current_market,
+                "independent_model_inputs": self.standings_model_fixture(),
+                "lineups_available": True, "lineups_confirmed": True,
+            },
+            "coverage": {}, "data_quality": {}, "shadow_summary": {},
+        }
+        with patch.object(main, "collect_prematch_data", return_value=data), patch.object(main, "get_fixture_snapshots", return_value=[]), patch.object(main, "get_fundamental_versions", return_value=[]):
+            packet = main.build_shadow_ai_packet(1)
+        self.assertEqual(packet["probability_replay"]["status"], "ready")
+        self.assertEqual(packet["decision_layer"]["model_probability"], packet["probability_replay"]["model"]["probabilities"])
+        self.assertFalse(packet["decision_layer"]["market_evidence_binding"]["current_unpersisted_quote_used"])
+        self.assertEqual(packet["decision_layer"]["candidates"], [])
+        self.assertEqual(packet["decision_layer"]["decision"], "PASS")
+
+        candidate = {
+            "fixture_id": 1, "timestamp": 2000, "status": "NS",
+            "target_analysis_node": "T-12h", "scope": {"competition_id": 39},
+        }
+        frozen = main.build_learning_freeze_payload(candidate, packet, now_ts=950)
+        self.assertTrue(frozen["analysis"]["probability_replay_audit"]["decision_eligible"])
+        forged_action = copy.deepcopy(packet)
+        forged_action["decision_layer"].update({
+            "decision": "home", "execution_action": "BET",
+            "best_market": {"market": "1x2", "selection": "home"},
+        })
+        with self.assertRaises(main.HTTPException) as unbound_market:
+            main.build_learning_freeze_payload(candidate, forged_action, now_ts=950)
+        self.assertEqual(unbound_market.exception.detail, "actionable_decision_market_snapshot_not_hash_bound")
+        tampered = copy.deepcopy(packet)
+        tampered["probability_replay"]["inputs"]["home_attack_rate"] = 4.0
+        with self.assertRaises(main.HTTPException) as rejected:
+            main.build_learning_freeze_payload(candidate, tampered, now_ts=950)
+        self.assertEqual(rejected.exception.detail["error"], "learning_probability_replay_invalid")
 
     def test_decision_layer_calculates_no_vig_edge_ev(self):
         snapshot = main.empty_market_snapshot()
@@ -3399,16 +3493,40 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             for module in modules
         }
 
+    def learning_shadow_runner(self, champion=None, challenger=None, ablation=None, market="1x2"):
+        champion = champion or {"home": 0.45, "draw": 0.25, "away": 0.30}
+        challenger = challenger or {"home": 0.30, "draw": 0.45, "away": 0.25}
+        ablation = ablation or {"home": 0.33, "draw": 0.34, "away": 0.33}
+
+        def runner(request):
+            generated_at = int(request["freeze"]["captured_at"]) + 5
+            modules = request["hypothesis"]["ablation_plan"]["required_modules"]
+            content = {
+                "schema": "learning_shadow_model_run_v1",
+                "runner_id": "test-pit-runner", "runner_version": "1.0",
+                "generated_at": generated_at, "input_hash": request["input_hash"],
+                "freeze_hash": request["freeze"]["content_hash"],
+                "hypothesis_hash": request["hypothesis"]["hypothesis_hash"],
+                "champion_probabilities": champion,
+                "challenger_probabilities": challenger,
+                "module_ablations": {module: {"probabilities": ablation} for module in modules},
+                "selected_expression": {
+                    "market": market, "selection": "draw" if market == "1x2" else "under",
+                    "line": None if market == "1x2" else 2.75,
+                    "entry_decimal_price": 3.0 if market == "1x2" else 1.91,
+                    "entry_price_evidence_ref": f"test:internal-runner:{market}",
+                },
+                "risk": {"champion_tail_risk": 0.10, "challenger_tail_risk": 0.10},
+            }
+            return {**content, "run_hash": main._content_hash(content)}
+
+        return runner
+
     def settle_hypothesis_validation_fixture(self, hypothesis_id, fixture, captured_at, kickoff_at, modules=("MSCB",)):
         frozen = main.freeze_learning_sample(self.learning_payload(fixture, captured_at, kickoff_at), now_ts=captured_at)
-        shadow_lock = main.lock_hypothesis_shadow_prediction(hypothesis_id, {
-            "freeze_id": frozen["freeze_id"],
-            "champion_probabilities": {"home": 0.45, "draw": 0.25, "away": 0.30},
-            "challenger_probabilities": {"home": 0.30, "draw": 0.45, "away": 0.25},
-            "module_ablation_outputs": self.module_ablation_outputs(captured_at + 5, modules=modules),
-            "selected_expression": {"market": "1x2", "selection": "draw", "entry_decimal_price": 3.0, "entry_price_evidence_ref": f"test:entry:{fixture}"},
-            "risk": {"champion_tail_risk": 0.10, "challenger_tail_risk": 0.10},
-        }, now_ts=captured_at + 10)
+        shadow_lock = main.generate_internal_shadow_lock(
+            hypothesis_id, frozen["freeze_id"], model_runner=self.learning_shadow_runner(), now_ts=captured_at + 10,
+        )
         facts = self.collect_verified_learning_facts(frozen, 1, 1, kickoff_at + 7200)
         main.settle_learning_sample(
             frozen["freeze_id"], {"status": "FT", "home_goals": 1, "away_goals": 1},
@@ -3848,6 +3966,87 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(set(gate["module_metrics"]), set(modules))
         self.assertTrue(all(row["sample_count"] == 2 for row in gate["module_metrics"].values()))
 
+    def test_internal_shadow_runner_hash_and_identity_are_fail_closed(self):
+        discovery, _ = self.settle_learning_fixture("runner-hash-discovery", 900, 1000)
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "runner-hash-hyp", "type": "HYPOTHESIS_ONLY",
+                "title": "Runner hash", "definition": "Only verified internal model runs may lock.",
+                "applicable_scope": "men top flights", "expected_direction": "lower forward Brier",
+                "failure_conditions": "runner identity fails", "falsification_criteria": "invalid run hash",
+                "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": self.learning_validation_plan(),
+            })
+        payload = self.learning_payload("runner-hash-validation", 8400, 9000)
+        payload["decision"] = {
+            "decision": "BET", "selected_expression": {"market": "1x2", "selection": "draw", "price": 3.0},
+        }
+        frozen = main.freeze_learning_sample(payload, now_ts=8400)
+
+        valid_runner = self.learning_shadow_runner()
+        def tampered_runner(request):
+            result = valid_runner(request)
+            return {**result, "run_hash": "0" * 64}
+
+        with self.assertRaises(main.HTTPException) as tampered:
+            main.generate_internal_shadow_lock(
+                "runner-hash-hyp", frozen["freeze_id"], model_runner=tampered_runner, now_ts=8410,
+            )
+        self.assertEqual(tampered.exception.detail, "internal_shadow_model_run_hash_mismatch")
+        self.assertNotIn(frozen["freeze_id"], main.load_snapshot_store().get("learning_shadow_locks", {}).get("runner-hash-hyp", {}))
+
+    def test_learning_cycle_automatically_locks_forward_sample_with_internal_runner(self):
+        discovery, _ = self.settle_learning_fixture("cycle-runner-discovery", 900, 1000)
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "cycle-runner-hyp", "type": "HYPOTHESIS_ONLY",
+                "title": "Automatic runner", "definition": "Cycle invokes the trusted PIT runner.",
+                "applicable_scope": "men top flights", "expected_direction": "lower forward Brier",
+                "failure_conditions": "no runnable calculator", "falsification_criteria": "invalid forward output",
+                "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": self.learning_validation_plan(),
+            })
+        payload = self.learning_payload("cycle-runner-validation", 8400, 10000)
+        payload["decision"] = {
+            "decision": "BET", "selected_expression": {"market": "1x2", "selection": "draw", "price": 3.0},
+        }
+        frozen = main.freeze_learning_sample(payload, now_ts=8400)
+        result = main.run_learning_cycle(
+            {"apply": True, "run_id": "internal-runner-cycle", "auto_prepare_prematch": False},
+            now_ts=8500, fixture_rows=[], shadow_model_runner=self.learning_shadow_runner(),
+        )
+        self.assertEqual(result["shadow_lock_created_count"], 1)
+        self.assertEqual(result["shadow_lock_results"][0]["action"], "locked")
+        self.assertEqual(result["forward_validation_queue"]["queue_count"], 0)
+        lock = main.load_snapshot_store()["learning_shadow_locks"]["cycle-runner-hyp"][frozen["freeze_id"]]
+        self.assertEqual(lock["calculator_provenance"]["origin"], "internal_shadow_runner")
+        self.assertTrue(lock["calculator_provenance"]["promotion_eligible"])
+
+    def test_learning_cycle_reports_runner_blocker_without_accepting_external_outputs(self):
+        discovery, _ = self.settle_learning_fixture("cycle-no-runner-discovery", 900, 1000)
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "cycle-no-runner-hyp", "type": "HYPOTHESIS_ONLY",
+                "title": "Missing runner", "definition": "Missing calculator remains blocked.",
+                "applicable_scope": "men top flights", "expected_direction": "lower forward Brier",
+                "failure_conditions": "calculator unavailable", "falsification_criteria": "no internal run",
+                "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": self.learning_validation_plan(),
+            })
+        payload = self.learning_payload("cycle-no-runner-validation", 8400, 10000)
+        payload["decision"] = {
+            "decision": "BET", "selected_expression": {"market": "1x2", "selection": "draw", "price": 3.0},
+        }
+        frozen = main.freeze_learning_sample(payload, now_ts=8400)
+        result = main.run_learning_cycle(
+            {"apply": True, "run_id": "missing-runner-cycle", "auto_prepare_prematch": False},
+            now_ts=8500, fixture_rows=[],
+        )
+        self.assertEqual(result["shadow_lock_created_count"], 0)
+        self.assertEqual(result["shadow_lock_results"][0]["action"], "blocked")
+        self.assertEqual(result["shadow_lock_results"][0]["reason"], "internal_shadow_model_runner_not_configured")
+        self.assertNotIn(frozen["freeze_id"], main.load_snapshot_store().get("learning_shadow_locks", {}).get("cycle-no-runner-hyp", {}))
+
     def register_league_dna_fixture(self, hypothesis_id="league-dna-hyp", tag_id="eng-goal-environment"):
         discovery, _ = self.settle_learning_fixture(f"{tag_id}-discovery", 900, 1000)
         with patch.object(main.time, "time", return_value=8300):
@@ -4014,7 +4213,10 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         payload = {"apply": True, "run_id": "cycle-20261008-a", "auto_prepare_prematch": True}
         first = main.run_learning_cycle(payload, now_ts=now_ts, fixture_rows=[fixture_row], prematch_packet_builder=builder)
         self.assertEqual(first["frozen_count"], 1)
+        self.assertEqual(first["probability_replay_ready_count"], 0)
+        self.assertEqual(first["probability_replay_missing_count"], 1)
         self.assertEqual(first["freeze_results"][0]["decision"], "PASS")
+        self.assertEqual(first["freeze_results"][0]["probability_replay_status"], "data_missing")
         self.assertEqual(builder_calls, [72])
         store = main.load_snapshot_store()
         self.assertIn("72", store["learning_frozen"])
