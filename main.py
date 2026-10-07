@@ -3919,7 +3919,7 @@ def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6, ri
 
 @app.get("/")
 def root():
-    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}", "/shadow/learning/cycle-plan", "/shadow/learning/run", "/shadow/learning/review-queue", "/shadow/learning/review-draft", "/shadow/learning/research-proposals", "/shadow/learning/research-proposals/refresh", "/shadow/learning/validation-queue", "/shadow/learning/freeze", "/shadow/learning/settle", "/shadow/learning/hypotheses", "/shadow/learning/hypotheses/{id}/shadow-lock", "/shadow/learning/hypotheses/{id}/promotion-evidence", "/shadow/learning/league-dna", "/shadow/learning/selection-quality", "/shadow/learning/status"]}
+    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}", "/shadow/learning/cycle-plan", "/shadow/learning/run", "/shadow/learning/review-queue", "/shadow/learning/review-draft", "/shadow/learning/complete-review", "/shadow/learning/research-proposals", "/shadow/learning/research-proposals/refresh", "/shadow/learning/validation-queue", "/shadow/learning/freeze", "/shadow/learning/settle", "/shadow/learning/hypotheses", "/shadow/learning/hypotheses/{id}/shadow-lock", "/shadow/learning/hypotheses/{id}/promotion-evidence", "/shadow/learning/league-dna", "/shadow/learning/selection-quality", "/shadow/learning/status"]}
 
 
 @app.get("/health")
@@ -5226,6 +5226,154 @@ def build_learning_postmatch_review_draft(freeze_id: Any, now_ts: Optional[int] 
         return record
 
 
+def _derive_frozen_selection_outcome(freeze: Dict[str, Any], facts: Dict[str, Any]) -> Dict[str, Any]:
+    """Derive only unambiguous settlement outcomes after process quality has been graded."""
+    expression = _learning_selected_expression(freeze.get("decision"))
+    market = str(expression.get("market") or "").strip().casefold()
+    selection = str(expression.get("selection") or "").strip().casefold()
+    line = as_float(expression.get("line"))
+    result = facts.get("result") if isinstance(facts.get("result"), dict) else {}
+    try:
+        home_goals, away_goals = int(result.get("home_goals")), int(result.get("away_goals"))
+    except (TypeError, ValueError):
+        return {"status": "data_missing", "outcome": None, "reason": "verified_goals_missing"}
+    outcome = None
+    method = None
+    if market in {"1x2", "match_winner", "moneyline"}:
+        actual = "home" if home_goals > away_goals else ("away" if away_goals > home_goals else "draw")
+        aliases = {"主胜": "home", "home": "home", "draw": "draw", "平": "draw", "客胜": "away", "away": "away"}
+        normalized = aliases.get(selection)
+        if normalized:
+            outcome, method = ("win" if normalized == actual else "loss"), "verified_1x2_result"
+    elif market in {"over_under", "total", "goals"} and line is not None:
+        total = home_goals + away_goals
+        if total == line:
+            return {"status": "push", "outcome": None, "reason": "total_goals_equal_line", "market": market, "line": line}
+        if selection in {"over", "大", "o"}:
+            outcome, method = ("win" if total > line else "loss"), "verified_total_goals_vs_line"
+        elif selection in {"under", "小", "u"}:
+            outcome, method = ("win" if total < line else "loss"), "verified_total_goals_vs_line"
+    elif market in {"btts", "both_teams_to_score"}:
+        actual_yes = home_goals > 0 and away_goals > 0
+        if selection in {"yes", "是", "btts yes"}:
+            outcome, method = ("win" if actual_yes else "loss"), "verified_btts_result"
+        elif selection in {"no", "否", "btts no"}:
+            outcome, method = ("win" if not actual_yes else "loss"), "verified_btts_result"
+    elif market in {"home_team_total", "away_team_total"} and line is not None:
+        goals = home_goals if market == "home_team_total" else away_goals
+        if goals == line:
+            return {"status": "push", "outcome": None, "reason": "team_goals_equal_line", "market": market, "line": line}
+        if selection in {"over", "大", "o"}:
+            outcome, method = ("win" if goals > line else "loss"), "verified_team_goals_vs_line"
+        elif selection in {"under", "小", "u"}:
+            outcome, method = ("win" if goals < line else "loss"), "verified_team_goals_vs_line"
+    if outcome is None:
+        return {
+            "status": "unsupported", "outcome": None,
+            "reason": "frozen_expression_not_unambiguously_settleable",
+            "market": market or None, "selection": selection or None, "line": line,
+        }
+    return {
+        "status": "derived", "outcome": outcome, "method": method,
+        "market": market, "selection": selection, "line": line,
+        "result_used_only_after_process_grade": True,
+    }
+
+
+def complete_learning_postmatch_review(payload: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Settle from a hash-bound evidence review while deriving, never accepting, Process classification."""
+    payload = payload if isinstance(payload, dict) else {}
+    freeze_id = str(payload.get("freeze_id") or "").strip()
+    draft_hash = str(payload.get("draft_hash") or "").strip()
+    if not freeze_id or not draft_hash:
+        raise HTTPException(status_code=400, detail="freeze_id_and_draft_hash_required")
+    now_ts = int(now_ts or time.time())
+    store = load_snapshot_store()
+    freeze = _learning_freeze_by_id(store, freeze_id)
+    if not freeze:
+        raise HTTPException(status_code=404, detail="frozen_learning_sample_not_found")
+    fact_versions = (store.get("learning_postmatch_facts") or {}).get(freeze_id) or []
+    draft_versions = (store.get("learning_postmatch_drafts") or {}).get(freeze_id) or []
+    facts = max(fact_versions, key=lambda row: int(row.get("version_number") or 0), default=None)
+    draft = max(draft_versions, key=lambda row: int(row.get("version_number") or 0), default=None)
+    if not facts or get_nested(facts, ["verification", "settlement_eligible"]) is not True:
+        raise HTTPException(status_code=409, detail="latest_independently_verified_facts_required")
+    if not draft or draft.get("draft_hash") != draft_hash or draft.get("fact_hash") != facts.get("fact_hash"):
+        raise HTTPException(status_code=409, detail="latest_matching_review_draft_hash_required")
+    review = payload.get("review") if isinstance(payload.get("review"), dict) else {}
+    review_audit = audit_learning_postmatch_review(review)
+    if not review_audit["eligible"]:
+        raise HTTPException(status_code=422, detail={"error": "postmatch_review_incomplete_or_backfit_risk", "reasons": review_audit["reasons"]})
+    normalized = review_audit["normalized"]
+    if normalized.get("review_mode") not in {"scheduled_agent", "automatic_evidence_review"}:
+        raise HTTPException(status_code=422, detail="evidence_review_mode_required")
+    if normalized.get("outcome_not_used_for_process_grade") is not True:
+        raise HTTPException(status_code=422, detail="outcome_non_use_attestation_required")
+    freeze_hash = str(freeze.get("content_hash") or "")
+    fact_hash = str(facts.get("fact_hash") or "")
+    evidence_failures = []
+    for section in LEARNING_REVIEW_SECTIONS:
+        row = normalized.get(section) if isinstance(normalized.get(section), dict) else {}
+        if row.get("status") not in {"passed", "failed"}:
+            continue
+        refs = [str(value) for value in (row.get("evidence_refs") or []) if str(value)] if isinstance(row.get("evidence_refs"), list) else []
+        required_hashes = {freeze_hash}
+        if section == "state_tree_coverage":
+            required_hashes.add(fact_hash)
+        if not refs or not any(any(hash_value and hash_value in ref for hash_value in required_hashes) for ref in refs):
+            evidence_failures.append(f"{section}_hash_bound_evidence_required")
+        if len(str(row.get("reason") or "").strip()) < 20:
+            evidence_failures.append(f"{section}_reason_too_short")
+    if evidence_failures:
+        raise HTTPException(status_code=422, detail={"error": "automatic_review_evidence_incomplete", "reasons": evidence_failures})
+    event_audit = payload.get("event_audit") if isinstance(payload.get("event_audit"), dict) else {}
+    event_status = str(event_audit.get("status") or "data_missing").strip().lower()
+    if event_status not in {"clean", "contaminated", "data_missing"}:
+        raise HTTPException(status_code=422, detail="invalid_automatic_event_audit_status")
+    event_refs = [str(value) for value in (event_audit.get("evidence_refs") or []) if str(value)] if isinstance(event_audit.get("evidence_refs"), list) else []
+    if event_status in {"clean", "contaminated"} and not any(fact_hash in ref or draft_hash in ref for ref in event_refs):
+        raise HTTPException(status_code=422, detail="event_audit_hash_bound_evidence_required")
+    event_evidence = draft.get("event_evidence") if isinstance(draft.get("event_evidence"), dict) else {}
+    if event_evidence.get("pollution_flags") and event_status == "clean" and len(str(event_audit.get("pollution_reasoning") or "").strip()) < 20:
+        raise HTTPException(status_code=422, detail="pollution_flags_require_explicit_reasoning")
+
+    statuses = [get_nested(normalized, [section, "status"]) for section in LEARNING_REVIEW_SECTIONS]
+    if event_status == "contaminated":
+        classification = "EVENT_CONTAMINATED"
+        process_grade = "not_graded_event_contaminated"
+        outcome_audit = {"status": "not_used", "reason": "event_contamination_precedes_process_grade"}
+    elif any(status in {"inconclusive", "data_missing", None} for status in statuses):
+        classification = "DATA_INSUFFICIENT"
+        process_grade = "not_graded_incomplete_review"
+        outcome_audit = {"status": "not_used", "reason": "review_evidence_incomplete"}
+    elif get_nested(event_evidence, ["event_verification"]) != "verified" and get_nested(normalized, ["state_tree_coverage", "status"]) in {"passed", "failed"}:
+        classification = "DATA_INSUFFICIENT"
+        process_grade = "not_graded_event_sequence_unverified"
+        outcome_audit = {"status": "not_used", "reason": "event_sequence_not_independently_verified"}
+    else:
+        process_grade = "error" if "failed" in statuses else "correct"
+        outcome_audit = _derive_frozen_selection_outcome(freeze, facts)
+        if outcome_audit.get("outcome") not in {"win", "loss"}:
+            classification = "DATA_INSUFFICIENT"
+        else:
+            classification = f"PROCESS_{process_grade.upper()}_RESULT_{str(outcome_audit['outcome']).upper()}"
+    derived_audit = {
+        "classification": classification,
+        "process_grade": process_grade,
+        "process_grade_derived_before_outcome": True,
+        "section_statuses": dict(zip(LEARNING_REVIEW_SECTIONS, statuses)),
+        "selection_outcome_audit": outcome_audit,
+        "freeze_hash": freeze_hash, "fact_hash": fact_hash, "draft_hash": draft_hash,
+        "caller_supplied_process_classification_used": False,
+        "result_backfit_used": False,
+    }
+    enriched_event_audit = {**event_audit, "automatic_review_derivation": derived_audit}
+    return settle_learning_sample(
+        freeze_id, facts.get("result"), classification, enriched_event_audit,
+        payload.get("settled_at") or now_ts, review, fact_hash,
+    )
+
+
 def learning_review_queue() -> Dict[str, Any]:
     """Expose frozen context plus versioned facts for evidence-led postmatch review."""
     store = load_snapshot_store()
@@ -5311,6 +5459,7 @@ def run_learning_cycle(
     prematch_packets = payload.get("prematch_packets") if isinstance(payload.get("prematch_packets"), dict) else {}
     postmatch_fact_packets = payload.get("postmatch_fact_packets") if isinstance(payload.get("postmatch_fact_packets"), dict) else {}
     settlement_packets = payload.get("settlement_packets") if isinstance(payload.get("settlement_packets"), list) else []
+    review_completion_packets = payload.get("review_completion_packets") if isinstance(payload.get("review_completion_packets"), list) else []
     due_ids = {str(row.get("freeze_id")) for row in postmatch_plan.get("settlement_due") or []}
     settlement_results = []
     for row in settlement_packets:
@@ -5393,6 +5542,29 @@ def run_learning_cycle(
                 })
             except HTTPException as exc:
                 draft_results.append({"freeze_id": freeze_id, "action": "rejected", "status_code": exc.status_code, "reason": exc.detail})
+    review_completion_results = []
+    for row in review_completion_packets:
+        row = row if isinstance(row, dict) else {}
+        freeze_id = str(row.get("freeze_id") or "").strip()
+        if freeze_id not in due_ids:
+            review_completion_results.append({"freeze_id": freeze_id or None, "action": "skipped", "reason": "freeze_not_due_in_current_cycle"})
+            continue
+        if not apply_changes:
+            review_completion_results.append({"freeze_id": freeze_id, "action": "would_complete_evidence_review"})
+            continue
+        try:
+            completed = complete_learning_postmatch_review(row, now_ts=now_ts)
+            review_completion_results.append({
+                "freeze_id": freeze_id, "action": completed.get("action"),
+                "postmatch_hash": completed.get("postmatch_hash"),
+                "process_classification": completed.get("process_classification"),
+                "caller_supplied_process_classification_used": False,
+            })
+        except HTTPException as exc:
+            review_completion_results.append({
+                "freeze_id": freeze_id, "action": "rejected",
+                "status_code": exc.status_code, "reason": exc.detail,
+            })
     research_proposal_results = []
     if auto_refresh_research_proposals:
         if apply_changes:
@@ -5460,6 +5632,7 @@ def run_learning_cycle(
         "settlement_results": settlement_results,
         "postmatch_fact_results": fact_results,
         "postmatch_review_draft_results": draft_results,
+        "review_completion_results": review_completion_results,
         "research_proposal_results": research_proposal_results,
         "freeze_results": freeze_results,
         "forward_validation_queue": forward_validation_queue,
@@ -5469,11 +5642,11 @@ def run_learning_cycle(
     }
     result = {
         **immutable_summary,
-        "settled_count": sum(row.get("action") == "settled" for row in settlement_results),
+        "settled_count": sum(row.get("action") == "settled" for row in settlement_results + review_completion_results),
         "frozen_count": sum(row.get("action") == "frozen" for row in freeze_results),
         "review_draft_count": sum(row.get("action") == "drafted" for row in draft_results),
         "research_proposal_version_count": sum(row.get("action") == "proposed" for row in research_proposal_results),
-        "rejected_count": sum(row.get("action") in {"rejected", "would_reject"} for row in settlement_results + fact_results + draft_results + freeze_results),
+        "rejected_count": sum(row.get("action") in {"rejected", "would_reject"} for row in settlement_results + fact_results + draft_results + review_completion_results + freeze_results),
         "action": "completed" if apply_changes else "previewed",
     }
     if apply_changes:
@@ -5616,12 +5789,16 @@ def audit_learning_postmatch_review(review: Any) -> Dict[str, Any]:
     }
     if implementation_gap and not normalized_disposition["regression_test_required"]:
         reasons.append("implementation_gap_requires_regression_test")
+    review_mode = str(review.get("review_mode") or "manual").strip().lower()
+    outcome_not_used_for_process_grade = review.get("outcome_not_used_for_process_grade")
     return {
         "eligible": not reasons,
         "reasons": reasons,
         "normalized": {
             **normalized_sections,
             "process_reasoning": process_reasoning,
+            "review_mode": review_mode,
+            "outcome_not_used_for_process_grade": outcome_not_used_for_process_grade,
             "learning_disposition": normalized_disposition,
         },
         "policy": "review process and expression against the immutable prematch freeze; never infer a rule from the final score",
@@ -7247,6 +7424,16 @@ async def shadow_learning_review_draft(request: Request, token: Optional[str] = 
     return JSONResponse({"ok": True, "draft": draft})
 
 
+@app.post("/shadow/learning/complete-review")
+async def shadow_learning_complete_review(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="json_body_must_be_an_object")
+    postmatch = complete_learning_postmatch_review(payload)
+    return JSONResponse({"ok": True, "postmatch": postmatch})
+
+
 @app.post("/shadow/learning/settle")
 async def shadow_learning_settle(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
@@ -7552,6 +7739,7 @@ def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[st
             "rejected_count": result.get("rejected_count"),
             "postmatch_fact_results": result.get("postmatch_fact_results"),
             "postmatch_review_draft_results": result.get("postmatch_review_draft_results"),
+            "review_completion_results": result.get("review_completion_results"),
             "research_proposal_results": result.get("research_proposal_results"),
             "forward_validation_queue": result.get("forward_validation_queue"),
             "automatic_hypothesis_registration": False,
