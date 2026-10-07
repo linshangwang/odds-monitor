@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.06.0"
+VERSION = "2.07.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -198,7 +198,7 @@ LEARNING_TOP_FLIGHT_LEAGUES: Dict[int, Dict[str, str]] = {
 }
 LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
 LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
-LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.06").strip() or "MODEL_RULES.md@2026-10-08-v2.06"
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.07").strip() or "MODEL_RULES.md@2026-10-08-v2.07"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -9459,7 +9459,58 @@ def automatic_learning_runtime_readiness(
     }
 
 
-def learning_status_report() -> Dict[str, Any]:
+def automatic_learning_schedule_health(
+    now_ts: Optional[int] = None,
+    store_override: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Audit today's persisted 14:30 run instead of trusting in-memory worker state."""
+    now_ts = int(now_ts or time.time())
+    local_now = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(ZoneInfo("Asia/Shanghai"))
+    scheduled_local = local_now.replace(hour=14, minute=30, second=0, microsecond=0)
+    scheduled_at = int(scheduled_local.astimezone(timezone.utc).timestamp())
+    run_id = f"daily-{local_now.date().strftime('%Y%m%d')}-1430"
+    grace_seconds = max(AUTO_SNAPSHOT_POLL_SECONDS * 2, 600)
+    store = store_override if isinstance(store_override, dict) else load_snapshot_store()
+    record = (store.get("learning_runs") or {}).get(run_id)
+    record_valid = bool(
+        isinstance(record, dict)
+        and str(record.get("run_hash") or "").strip()
+        and record.get("execution_order") == ["past_36h_postmatch", "future_24h_prematch"]
+        and int(record.get("started_at") or 0) >= scheduled_at
+        and int(record.get("started_at") or 0) <= now_ts + 300
+    )
+    if record_valid:
+        started_at = int(record.get("started_at") or 0)
+        return {
+            "status": "completed", "healthy": True, "run_id": run_id,
+            "scheduled_at": scheduled_at, "started_at": started_at,
+            "trigger_delay_seconds": max(0, started_at - scheduled_at),
+            "run_hash": record.get("run_hash"), "grace_seconds": grace_seconds,
+            "persisted_evidence": True,
+        }
+    if isinstance(record, dict):
+        return {
+            "status": "invalid_persisted_run", "healthy": False, "run_id": run_id,
+            "scheduled_at": scheduled_at, "grace_seconds": grace_seconds,
+            "persisted_evidence": False,
+        }
+    seconds_until_due = scheduled_at - now_ts
+    if seconds_until_due > 0:
+        status, healthy = "not_due", True
+    elif now_ts - scheduled_at <= grace_seconds:
+        status, healthy = "awaiting_worker_poll", True
+    else:
+        status, healthy = "overdue", False
+    return {
+        "status": status, "healthy": healthy, "run_id": run_id,
+        "scheduled_at": scheduled_at, "grace_seconds": grace_seconds,
+        "seconds_until_due": max(0, seconds_until_due),
+        "overdue_seconds": max(0, now_ts - scheduled_at - grace_seconds),
+        "persisted_evidence": False,
+    }
+
+
+def learning_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
     store = load_snapshot_store()
     frozen = store.get("learning_frozen") or {}
     postmatches = store.get("learning_postmatch") or {}
@@ -9484,6 +9535,7 @@ def learning_status_report() -> Dict[str, Any]:
     implementation_gap_count = sum(get_nested(row, ["review", "learning_disposition", "existing_rule_implementation_gap"]) is True for row in postmatch_rows)
     hypothesis_disposition_count = sum(get_nested(row, ["review", "learning_disposition", "new_theory_status"]) in LEARNING_HYPOTHESIS_TYPES for row in postmatch_rows)
     runtime_readiness = automatic_learning_runtime_readiness()
+    schedule_health = automatic_learning_schedule_health(now_ts=now_ts, store_override=store)
     return {
         "version": VERSION,
         "frozen_fixture_count": len(frozen),
@@ -9521,6 +9573,7 @@ def learning_status_report() -> Dict[str, Any]:
         "full_historical_odds_sample_limit": None,
         "automatic_champion_promotion": False,
         "automatic_learning_runtime": runtime_readiness,
+        "automatic_learning_schedule": schedule_health,
         "policy": "single matches cannot create model rules; promotion candidates require all gates and explicit user confirmation",
     }
 
@@ -9539,6 +9592,7 @@ def operations_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
     pending = [task for task in queue if task.get("status") == "pending"]
     overdue = [task for task in pending if task.get("overdue")]
     calibration = calibration_report()
+    learning_schedule = automatic_learning_schedule_health(now_ts=now_ts, store_override=store)
     alerts = []
     if not integrity.get("operational"):
         alerts.append({"severity": "critical", "code": "snapshot_store_unavailable"})
@@ -9555,6 +9609,13 @@ def operations_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         alerts.append({"severity": "warning", "code": "auto_snapshot_last_cycle_failed", "error_type": AUTO_SNAPSHOT_LAST_ERROR})
     if isinstance(AUTO_LEARNING_LAST_RESULT, dict) and AUTO_LEARNING_LAST_RESULT.get("status") == "error":
         alerts.append({"severity": "warning", "code": "auto_learning_last_cycle_failed", "error_type": AUTO_LEARNING_LAST_RESULT.get("error_type")})
+    if learning_schedule.get("status") in {"overdue", "invalid_persisted_run"}:
+        alerts.append({
+            "severity": "critical", "code": "auto_learning_daily_cycle_not_completed",
+            "schedule_status": learning_schedule.get("status"),
+            "run_id": learning_schedule.get("run_id"),
+            "overdue_seconds": learning_schedule.get("overdue_seconds"),
+        })
     if overdue:
         alerts.append({"severity": "warning", "code": "overdue_fundamental_revalidation", "count": len(overdue)})
     unhealthy_freshness = freshness_counts["stale"] + freshness_counts["invalid_timestamp"]
@@ -9569,10 +9630,11 @@ def operations_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         "store": integrity,
         "auto_snapshot_worker": {"enabled": worker_expected, "started": AUTO_SNAPSHOT_THREAD_STARTED, "alive": thread_alive, "last_cycle_at": AUTO_SNAPSHOT_LAST_CYCLE_AT, "last_cycle_age_seconds": worker_cycle_age, "last_error": AUTO_SNAPSHOT_LAST_ERROR},
         "auto_learning_cycle": AUTO_LEARNING_LAST_RESULT or {"status": "not_run"},
+        "automatic_learning_schedule": learning_schedule,
         "external_fixture_freshness": {"fixture_count": len(fixtures), "state_counts": freshness_counts},
         "revalidation_queue": {"pending_count": len(pending), "overdue_count": len(overdue)},
         "calibration": {"settled_count": calibration["settled_count"], "minimum_sample": CALIBRATION_MIN_SAMPLE, "sample_ready": calibration["settled_count"] >= CALIBRATION_MIN_SAMPLE, "average_brier_score": calibration["average_brier_score"], "roi": calibration["roi"]},
-        "learning": learning_status_report(),
+        "learning": learning_status_report(now_ts=now_ts),
     }
 
 
@@ -9648,6 +9710,13 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         store_integrity=operations.get("store"),
         worker_alive=get_nested(operations, ["auto_snapshot_worker", "alive"]),
     )
+    automatic_learning_schedule = operations.get("automatic_learning_schedule")
+    if not isinstance(automatic_learning_schedule, dict):
+        automatic_learning_schedule = automatic_learning_schedule_health(now_ts=now_ts)
+    automatic_learning_authorized = (
+        automatic_learning.get("ready") is True
+        and automatic_learning_schedule.get("healthy") is True
+    )
     available_paths = {route.path for route in app.routes}
     required_paths = {
         "/shadow/readiness/{fixture}", "/shadow/calibration/lock", "/shadow/calibration/settle",
@@ -9675,7 +9744,7 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         warnings.append("calibration_minimum_sample_not_reached")
     if not checks["real_fixture_shadow_path_validated"]:
         warnings.append("real_fixture_shadow_path_not_yet_validated")
-    if automatic_learning.get("ready") is not True:
+    if not automatic_learning_authorized:
         warnings.append("automatic_learning_runtime_not_ready")
     shadow_usable = not blockers
     controlled_decision_candidate = shadow_usable and operations["calibration"].get("sample_ready") is True
@@ -9684,7 +9753,7 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         "version": VERSION, "release_channel": RELEASE_CHANNEL,
         "status": "shadow_usable" if shadow_usable else "not_ready",
         "shadow_use_authorized": shadow_usable,
-        "automatic_learning_runtime_authorized": automatic_learning.get("ready") is True,
+        "automatic_learning_runtime_authorized": automatic_learning_authorized,
         "real_money_use_authorized": False,
         "controlled_decision_candidate": controlled_decision_candidate,
         "usable_scope": {
@@ -9701,6 +9770,7 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         "calibration_sample": operations.get("calibration"),
         "fixture_acceptance": fixture_acceptance,
         "automatic_learning_runtime": automatic_learning,
+        "automatic_learning_schedule": automatic_learning_schedule,
         "release_candidate_self_test": self_test,
         "per_fixture_gate": "/shadow/readiness/{fixture} must return decision_ready before any recommendation is considered",
         "remaining_external_gaps": [

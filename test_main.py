@@ -2655,6 +2655,13 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("auto_snapshot_cycle_stale", codes)
         self.assertIn("auto_snapshot_last_cycle_failed", codes)
 
+        after_daily_grace = int(datetime(2026, 10, 8, 6, 45, tzinfo=timezone.utc).timestamp())
+        with patch.object(main, "AUTO_SNAPSHOT_ENABLED", False):
+            missed = main.operations_status_report(now_ts=after_daily_grace)
+        self.assertEqual(missed["automatic_learning_schedule"]["status"], "overdue")
+        self.assertIn("auto_learning_daily_cycle_not_completed", [alert["code"] for alert in missed["alerts"]])
+        self.assertEqual(missed["status"], "blocked")
+
     def test_v130_release_acceptance_authorizes_shadow_not_real_money_use(self):
         operations = {
             "status": "healthy",
@@ -2725,6 +2732,35 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("persistent_store_configured", blocked["blockers"])
         self.assertIn("persistent_backup_ready", blocked["blockers"])
         self.assertIn("auto_snapshot_worker_alive", blocked["blockers"])
+
+    def test_automatic_learning_schedule_health_uses_persisted_daily_run(self):
+        before_due = int(datetime(2026, 10, 8, 6, 29, tzinfo=timezone.utc).timestamp())
+        just_due = int(datetime(2026, 10, 8, 6, 35, tzinfo=timezone.utc).timestamp())
+        overdue = int(datetime(2026, 10, 8, 6, 45, tzinfo=timezone.utc).timestamp())
+        empty = {"learning_runs": {}}
+        self.assertEqual(main.automatic_learning_schedule_health(before_due, empty)["status"], "not_due")
+        self.assertEqual(main.automatic_learning_schedule_health(just_due, empty)["status"], "awaiting_worker_poll")
+        late = main.automatic_learning_schedule_health(overdue, empty)
+        self.assertEqual(late["status"], "overdue")
+        self.assertFalse(late["healthy"])
+
+        run_id = "daily-20261008-1430"
+        completed_store = {"learning_runs": {run_id: {
+            "run_id": run_id, "started_at": just_due,
+            "execution_order": ["past_36h_postmatch", "future_24h_prematch"],
+            "run_hash": "persisted-run-hash",
+        }}}
+        completed = main.automatic_learning_schedule_health(overdue, completed_store)
+        self.assertEqual(completed["status"], "completed")
+        self.assertTrue(completed["healthy"])
+        self.assertEqual(completed["trigger_delay_seconds"], 5 * 60)
+        self.assertTrue(completed["persisted_evidence"])
+
+        invalid = {"learning_runs": {run_id: {"started_at": just_due}}}
+        self.assertEqual(
+            main.automatic_learning_schedule_health(overdue, invalid)["status"],
+            "invalid_persisted_run",
+        )
 
     def test_fixture_acceptance_requires_a_real_ready_fixture(self):
         reports = {
