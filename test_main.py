@@ -2,6 +2,7 @@ import os
 import gzip
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
 import main
@@ -3235,7 +3236,10 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         after = main.load_snapshot_store()
         self.assertEqual(plan["settlement_due_count"], 1)
         self.assertEqual(plan["settlement_due"][0]["freeze_id"], "due:v2")
-        self.assertEqual(plan["remaining_freeze_capacity"], main.LEARNING_DAILY_FREEZE_CAP - 1)
+        self.assertIsNone(plan["remaining_freeze_capacity"])
+        self.assertIsNone(plan["match_limit"])
+        self.assertIsNone(plan["full_historical_odds_sample_limit"])
+        self.assertEqual(plan["learning_prematch_stages"], ["Opening", "T-12h", "T-6h", "T-1h"])
         self.assertEqual(plan["reanalysis_today_count"], 1)
         self.assertEqual(plan["discovery"]["candidate_count"], 1)
         self.assertEqual(before, after)
@@ -3537,8 +3541,8 @@ class ShadowV4UpgradeTests(unittest.TestCase):
 
     def test_learning_cycle_creates_one_version_per_due_clock_node(self):
         kickoff_at = 200000
-        t24_now = kickoff_at - 20 * 3600
         t12_now = kickoff_at - 10 * 3600
+        t6_now = kickoff_at - 5 * 3600
         fixture_row = self.learning_fixture_row(720, 39, kickoff_at)
         builder_times = []
 
@@ -3546,26 +3550,26 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             generated_at = builder_times[-1]
             return self.learning_prematch_packet(fixture_id, generated_at)
 
-        builder_times.append(t24_now)
-        first = main.run_learning_cycle(
-            {"apply": True, "run_id": "node-t24"}, now_ts=t24_now,
-            fixture_rows=[fixture_row], prematch_packet_builder=builder,
-        )
-        self.assertEqual(first["frozen_count"], 1)
-        self.assertEqual(first["freeze_results"][0]["analysis_node"], "T-24h")
-
         builder_times.append(t12_now)
-        second = main.run_learning_cycle(
+        first = main.run_learning_cycle(
             {"apply": True, "run_id": "node-t12"}, now_ts=t12_now,
             fixture_rows=[fixture_row], prematch_packet_builder=builder,
         )
+        self.assertEqual(first["frozen_count"], 1)
+        self.assertEqual(first["freeze_results"][0]["analysis_node"], "T-12h")
+
+        builder_times.append(t6_now)
+        second = main.run_learning_cycle(
+            {"apply": True, "run_id": "node-t6"}, now_ts=t6_now,
+            fixture_rows=[fixture_row], prematch_packet_builder=builder,
+        )
         self.assertEqual(second["frozen_count"], 1)
-        self.assertEqual(second["freeze_results"][0]["analysis_node"], "T-12h")
+        self.assertEqual(second["freeze_results"][0]["analysis_node"], "T-6h")
         self.assertEqual(second["freeze_results"][0]["reason"], "analysis_node_advanced")
 
         calls_before = len(builder_times)
         same_node = main.run_learning_cycle(
-            {"apply": True, "run_id": "node-t12-repeat"}, now_ts=t12_now + 60,
+            {"apply": True, "run_id": "node-t6-repeat"}, now_ts=t6_now + 60,
             fixture_rows=[fixture_row],
             prematch_packet_builder=Mock(side_effect=AssertionError("same node must not rebuild")),
         )
@@ -3618,12 +3622,12 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(candidate["analysis_due"])
         self.assertEqual(candidate["analysis_due_reason"], "no_new_node_or_material_evidence")
 
-    def test_learning_plan_uses_closing_only_when_real_snapshot_exists(self):
+    def test_learning_plan_ignores_non_learning_closing_snapshot(self):
         kickoff_at = 400000
         now_ts = kickoff_at - 5 * 60
         fixture_row = self.learning_fixture_row(722, 39, kickoff_at)
         without_closing = main.learning_cycle_plan(now_ts=now_ts, fixture_rows=[fixture_row])
-        self.assertEqual(without_closing["discovery"]["candidates"][0]["target_analysis_node"], "T-30m")
+        self.assertEqual(without_closing["discovery"]["candidates"][0]["target_analysis_node"], "T-1h")
 
         market = main.empty_market_snapshot()
         market["available"] = True
@@ -3636,7 +3640,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         }]
         main.write_snapshot_store(store)
         with_closing = main.learning_cycle_plan(now_ts=now_ts, fixture_rows=[fixture_row])
-        self.assertEqual(with_closing["discovery"]["candidates"][0]["target_analysis_node"], "Closing")
+        self.assertEqual(with_closing["discovery"]["candidates"][0]["target_analysis_node"], "T-1h")
 
     def test_learning_freeze_payload_reaudits_caller_supplied_stage_time(self):
         generated_at = 500000
@@ -3645,47 +3649,57 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             now_ts=generated_at,
             fixture_rows=[self.learning_fixture_row(723, 39, kickoff_at)],
         )["candidates"][0]
-        candidate["target_analysis_node"] = "T-24h"
+        candidate["target_analysis_node"] = "Opening"
         packet = self.learning_prematch_packet(723, generated_at)
         packet["market"]["timeline"] = [{
             "stage": "Closing", "status": "available", "snapshot_at": generated_at,
             "source_content_hash": "caller-forged-future-closing",
         }]
-        payload = main.build_learning_freeze_payload(candidate, packet, now_ts=generated_at)
-        self.assertEqual(payload["analysis"]["analysis_node"], "T-24h")
-        self.assertIsNone(payload["analysis"]["source_snapshot_stage"])
-        self.assertIsNone(payload["analysis"]["source_snapshot_hash"])
+        with self.assertRaises(main.HTTPException) as rejected:
+            main.build_learning_freeze_payload(candidate, packet, now_ts=generated_at)
+        self.assertEqual(rejected.exception.status_code, 409)
+        self.assertEqual(rejected.exception.detail, "verified_opening_snapshot_required_for_learning_node")
 
-    def test_auto_snapshot_cycle_runs_learning_only_when_plan_has_due_work(self):
-        empty_targets = {"fixtures": []}
-        due_plan = {
-            "discovery": {"candidates": []},
-            "postmatch_fact_collection_due_count": 1,
-        }
+    def test_auto_learning_cycle_runs_only_in_daily_1430_window(self):
+        before_due = datetime(2026, 10, 8, 6, 29, tzinfo=timezone.utc)
+        due = datetime(2026, 10, 8, 6, 30, tzinfo=timezone.utc)
         cycle_result = {
             "frozen_count": 0, "settled_count": 0, "rejected_count": 0,
+            "review_draft_count": 0,
+            "execution_order": ["past_36h_postmatch", "future_24h_prematch"],
             "postmatch_fact_results": [{"action": "facts_collected"}],
+            "postmatch_review_draft_results": [],
         }
-        with patch.object(main, "target_fixtures_for_date", return_value=empty_targets), \
-             patch.object(main, "learning_cycle_plan", return_value=due_plan), \
-             patch.object(main, "run_learning_cycle", return_value=cycle_result) as runner:
-            result = main.auto_snapshot_cycle()
+        with patch.object(main, "run_learning_cycle", return_value=cycle_result) as runner:
+            idle = main.auto_learning_daily_cycle(before_due, [])
+            result = main.auto_learning_daily_cycle(due, [])
+        self.assertEqual(idle["status"], "not_due")
         self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["run_id"], "daily-20261008-1430")
+        self.assertEqual(result["execution_order"], ["past_36h_postmatch", "future_24h_prematch"])
         self.assertEqual(result["postmatch_fact_results"][0]["action"], "facts_collected")
         self.assertFalse(result["automatic_hypothesis_registration"])
         self.assertFalse(result["automatic_champion_change"])
         runner.assert_called_once()
 
-        idle_plan = {
-            "discovery": {"candidates": [{"analysis_due": False}]},
-            "postmatch_fact_collection_due_count": 0,
-        }
-        with patch.object(main, "target_fixtures_for_date", return_value=empty_targets), \
-             patch.object(main, "learning_cycle_plan", return_value=idle_plan), \
-             patch.object(main, "run_learning_cycle") as idle_runner:
-            idle = main.auto_snapshot_cycle()
-        self.assertEqual(idle["status"], "idle")
-        idle_runner.assert_not_called()
+    def test_snapshot_worker_enters_daily_learning_before_future_fixture_collection(self):
+        due = datetime(2026, 10, 8, 6, 30, tzinfo=timezone.utc)
+        calls = []
+
+        def daily(now, fixture_rows=None):
+            calls.append("learning")
+            self.assertIsNone(fixture_rows)
+            return {"status": "completed", "execution_order": ["past_36h_postmatch", "future_24h_prematch"]}
+
+        def targets(date_str, timezone_name):
+            calls.append("raw_snapshot_fixture_discovery")
+            return {"fixtures": []}
+
+        with patch.object(main, "auto_learning_daily_cycle", side_effect=daily), \
+             patch.object(main, "target_fixtures_for_date", side_effect=targets):
+            result = main.auto_snapshot_cycle(due)
+        self.assertEqual(calls[0], "learning")
+        self.assertEqual(result["execution_order"], ["past_36h_postmatch", "future_24h_prematch"])
 
     def test_learning_cycle_only_builds_packets_for_top_flight_not_started_candidates(self):
         now_ts = 100000
@@ -3848,6 +3862,89 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(queue["automatic_process_classification"])
         self.assertFalse(queue["result_backfit_allowed"])
         self.assertFalse(queue["automatic_champion_change"])
+
+    def test_postmatch_review_draft_is_immutable_and_never_grades_process_from_result(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("draft-1", 900, 1000), now_ts=900)
+        facts = self.collect_verified_learning_facts(frozen, 4, 0, 9000)
+        first = main.build_learning_postmatch_review_draft(frozen["freeze_id"], now_ts=9001)
+        second = main.build_learning_postmatch_review_draft(frozen["freeze_id"], now_ts=9002)
+
+        self.assertEqual(first["action"], "drafted")
+        self.assertEqual(second["action"], "unchanged")
+        self.assertEqual(first["freeze_hash"], frozen["content_hash"])
+        self.assertEqual(first["fact_hash"], facts["fact_hash"])
+        self.assertEqual(first["suggested_process_classification"], "DATA_INSUFFICIENT")
+        self.assertTrue(first["manual_review_required"])
+        self.assertFalse(first["automatic_settlement_eligible"])
+        self.assertFalse(first["result_outcome_used_to_grade_process"])
+        self.assertFalse(first["automatic_hypothesis_registration"])
+        self.assertFalse(first["automatic_champion_change"])
+        store = main.load_snapshot_store()
+        self.assertNotIn(frozen["freeze_id"], store.get("learning_postmatch", {}))
+        self.assertNotIn("learning_hypotheses", store)
+
+    def test_postmatch_review_draft_requires_two_source_result_verification(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("draft-single", 900, 1000), now_ts=900)
+        main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(),
+        )
+        with self.assertRaises(main.HTTPException) as rejected:
+            main.build_learning_postmatch_review_draft(frozen["freeze_id"], now_ts=9001)
+        self.assertEqual(rejected.exception.status_code, 409)
+        self.assertEqual(rejected.exception.detail, "independent_result_verification_required_for_review_draft")
+
+    def test_postmatch_review_draft_flags_event_pollution_without_auto_classification(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("draft-red", 900, 1000), now_ts=900)
+        packet = self.learning_postmatch_facts(("api_football", "official_league"), 2, 1)
+        packet["events"].append({"elapsed": 55, "type": "Card", "detail": "Red Card", "team": "Away"})
+        packet["source_audit"].extend([
+            {"source": "api_football", "component": "events", "ok": True, "evidence_ref": "test:api:events"},
+            {"source": "official_league", "component": "events", "ok": True, "evidence_ref": "test:official:events"},
+        ])
+        main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000, fact_fetcher=lambda fixture_id: packet,
+        )
+        draft = main.build_learning_postmatch_review_draft(frozen["freeze_id"], now_ts=9001)
+        self.assertEqual(draft["event_evidence"]["pollution_status"], "requires_human_review")
+        self.assertEqual(draft["event_evidence"]["pollution_flags"], ["red_card"])
+        self.assertEqual(draft["suggested_process_classification"], "DATA_INSUFFICIENT")
+        self.assertTrue(draft["manual_review_required"])
+
+    def test_learning_cycle_finishes_postmatch_evidence_before_future_prematch(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("order-past", 900, 1000), now_ts=900)
+        future = self.learning_fixture_row(809, 39, 10000)
+        calls = []
+
+        def fetcher(fixture_id):
+            calls.append("postmatch")
+            return self.learning_postmatch_facts(("api_football", "official_league"))
+
+        def builder(fixture_id):
+            calls.append("prematch")
+            return self.learning_prematch_packet(fixture_id, 9000)
+
+        result = main.run_learning_cycle(
+            {"apply": True, "run_id": "ordered-cycle"}, now_ts=9000,
+            fixture_rows=[future], prematch_packet_builder=builder,
+            postmatch_fact_fetcher=fetcher,
+        )
+        self.assertEqual(calls, ["postmatch", "prematch"])
+        self.assertEqual(result["execution_order"], ["past_36h_postmatch", "future_24h_prematch"])
+        self.assertEqual(result["postmatch_review_draft_results"][0]["action"], "drafted")
+        self.assertEqual(result["review_draft_count"], 1)
+        self.assertEqual(result["frozen_count"], 1)
+        self.assertNotIn(frozen["freeze_id"], main.load_snapshot_store().get("learning_postmatch", {}))
+
+    def test_learning_plan_has_no_daily_match_or_historical_sample_limit(self):
+        now_ts = 100000
+        fixtures = [self.learning_fixture_row(900 + index, 39, now_ts + 3600) for index in range(12)]
+        plan = main.learning_cycle_plan(now_ts=now_ts, fixture_rows=fixtures)
+        self.assertEqual(plan["discovery"]["candidate_count"], 12)
+        self.assertIsNone(plan["match_limit"])
+        self.assertIsNone(plan["daily_freeze_cap"])
+        self.assertIsNone(plan["full_historical_odds_sample_limit"])
+        self.assertIsNone(plan["remaining_freeze_capacity"])
 
     def test_settlement_cannot_bypass_latest_verified_fact_packet(self):
         frozen = main.freeze_learning_sample(self.learning_payload("808", 900, 1000), now_ts=900)
