@@ -5560,6 +5560,20 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertNotIn("learning_promotions", store)
 
     def test_learning_cycle_refreshes_repeated_signal_before_future_discovery(self):
+        template = main.register_learning_hypothesis_template({
+            "template_id": "expression-template", "type": "HYPOTHESIS_ONLY",
+            "title": "Preregistered expression challenger",
+            "definition": "Test a fixed odds-independent MSCB intervention after repeated expression audit failures.",
+            "applicable_scope": "England Premier League over_under",
+            "expected_direction": "lower out-of-sample Brier without worse tail risk",
+            "failure_conditions": "no forward gain or any unresolved counterexample",
+            "falsification_criteria": "challenger fails any derived promotion gate",
+            "signal_dimensions": ["expression"],
+            "validation_plan": self.learning_validation_plan(
+                minimum_samples=main.LEARNING_MIN_VALIDATION_SAMPLES, markets=("over_under",),
+            ),
+        }, now_ts=100)
+        self.assertFalse(template["champion_effect"])
         for index in range(3):
             self.settle_selection_quality_sample(
                 f"cycle-proposal-{index}", "PROCESS_CORRECT_RESULT_WIN", expression_status="failed",
@@ -5571,7 +5585,57 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["execution_order"], ["past_36h_postmatch", "future_24h_prematch"])
         self.assertEqual(result["research_proposal_version_count"], 1)
         self.assertEqual(result["research_proposal_results"][0]["action"], "proposed")
-        self.assertFalse(result["automatic_hypothesis_registration"])
+        self.assertTrue(result["automatic_hypothesis_registration"])
+        self.assertEqual(result["hypothesis_registered_count"], 1)
+        hypothesis = next(iter(main.load_snapshot_store()["learning_hypotheses"].values()))
+        self.assertEqual(hypothesis["registration_provenance"]["template_id"], "expression-template")
+        self.assertTrue(hypothesis["registration_provenance"]["all_supporting_samples_postdate_template"])
+        self.assertFalse(hypothesis["registration_provenance"]["result_outcome_used"])
+        self.assertFalse(hypothesis["champion_effect"])
+        self.assertNotIn("learning_promotions", main.load_snapshot_store())
+
+    def test_late_or_ambiguous_hypothesis_template_cannot_auto_register(self):
+        proposal = self.create_expression_research_proposal()
+        base = {
+            "type": "HYPOTHESIS_ONLY",
+            "title": "Late expression challenger",
+            "definition": "A fixed intervention that was not preregistered before discovery evidence.",
+            "applicable_scope": "England Premier League over_under",
+            "expected_direction": "lower out-of-sample Brier",
+            "failure_conditions": "no forward gain",
+            "falsification_criteria": "any unresolved counterexample",
+            "signal_dimensions": ["expression"],
+            "validation_plan": self.learning_validation_plan(
+                minimum_samples=main.LEARNING_MIN_VALIDATION_SAMPLES, markets=("over_under",),
+            ),
+        }
+        late_template = main.register_learning_hypothesis_template({**base, "template_id": "late-template"}, now_ts=8300)
+        with self.assertRaises(main.HTTPException) as spoofed:
+            main.register_learning_hypothesis({
+                **base, "hypothesis_id": "spoofed-auto-hypothesis",
+                "discovery_freeze_ids": proposal["evidence"]["supporting_freeze_ids"],
+                "source_proposal_id": proposal["proposal_id"],
+                "source_proposal_hash": proposal["proposal_hash"],
+                "registration_provenance": {
+                    "mode": "automatic_from_preregistered_template",
+                    "template_id": "late-template", "template_hash": late_template["template_hash"],
+                    "proposal_id": proposal["proposal_id"], "proposal_hash": proposal["proposal_hash"],
+                },
+            }, now_ts=8400)
+        self.assertEqual(spoofed.exception.detail, "hypothesis_template_must_predate_all_discovery_samples")
+        blocked = main.instantiate_preregistered_learning_hypotheses(now_ts=8400)
+        self.assertEqual(blocked["registered_count"], 0)
+        self.assertEqual(blocked["results"][0]["reason"], "no_preregistered_template")
+        self.assertNotIn("learning_hypotheses", main.load_snapshot_store())
+
+        store = main.load_snapshot_store()
+        store["learning_hypothesis_templates"] = {}
+        main.write_snapshot_store(store)
+        main.register_learning_hypothesis_template({**base, "template_id": "early-a"}, now_ts=100)
+        main.register_learning_hypothesis_template({**base, "template_id": "early-b", "title": "Second early template"}, now_ts=101)
+        ambiguous = main.instantiate_preregistered_learning_hypotheses(now_ts=8400)
+        self.assertEqual(ambiguous["registered_count"], 0)
+        self.assertEqual(ambiguous["results"][0]["reason"], "ambiguous_preregistered_templates")
         self.assertNotIn("learning_hypotheses", main.load_snapshot_store())
 
     def create_expression_research_proposal(self):
