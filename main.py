@@ -24,7 +24,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "1.95.0"
+VERSION = "1.96.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -59,6 +59,22 @@ MAX_CONSENSUS_PRICE_SPREAD = max(0.01, float(os.getenv("MAX_CONSENSUS_PRICE_SPRE
 MAX_CONSENSUS_NO_VIG_PROBABILITY_SPREAD = max(0.005, float(os.getenv("MAX_CONSENSUS_NO_VIG_PROBABILITY_SPREAD", "0.05")))
 MIN_MARKET_IMPLIED_PROBABILITY_TOTAL = min(1.0, max(0.5, float(os.getenv("MIN_MARKET_IMPLIED_PROBABILITY_TOTAL", "0.80"))))
 MAX_MARKET_IMPLIED_PROBABILITY_TOTAL = max(1.0, min(2.0, float(os.getenv("MAX_MARKET_IMPLIED_PROBABILITY_TOTAL", "1.40"))))
+REAL_MONEY_MAX_AGE_SECONDS = max(300, int(os.getenv("REAL_MONEY_MAX_AGE_SECONDS", "21600")))
+REAL_MONEY_SOURCE_TYPES = {"bookmaker_official", "betting_exchange", "regulated_market_data", "verified_money_vendor"}
+try:
+    _real_money_registry_raw = json.loads(os.getenv("REAL_MONEY_SOURCE_REGISTRY_JSON", "{}"))
+    REAL_MONEY_SOURCE_REGISTRY = {
+        str(domain).strip().lower(): entry
+        for domain, entry in (_real_money_registry_raw.items() if isinstance(_real_money_registry_raw, dict) else [])
+        if str(domain).strip() and isinstance(entry, dict)
+    }
+except (TypeError, ValueError, json.JSONDecodeError):
+    REAL_MONEY_SOURCE_REGISTRY = {}
+REAL_MONEY_MARKET_SELECTIONS = {
+    "1x2": ("home", "draw", "away"), "asian_handicap": ("home", "away"),
+    "over_under": ("over", "under"), "btts": ("yes", "no"),
+    "home_team_total": ("over", "under"), "away_team_total": ("over", "under"),
+}
 AUTO_SNAPSHOT_ENABLED = os.getenv("AUTO_SNAPSHOT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 AUTO_SNAPSHOT_POLL_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_POLL_SECONDS", "300")))
 AUTO_SNAPSHOT_WINDOW_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_WINDOW_SECONDS", "600")))
@@ -166,7 +182,7 @@ LEARNING_TOP_FLIGHT_LEAGUES: Dict[int, Dict[str, str]] = {
 }
 LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
 LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
-LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v1.95").strip() or "MODEL_RULES.md@2026-10-08-v1.95"
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v1.96").strip() or "MODEL_RULES.md@2026-10-08-v1.96"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -1525,6 +1541,153 @@ def force_pass_decision(decision: Dict[str, Any], reasons: Any) -> Dict[str, Any
     return decision
 
 
+def _normalize_real_money_percentages(value: Any, selections: Tuple[str, ...], field: str) -> Tuple[Optional[Dict[str, float]], List[str]]:
+    if value in (None, {}):
+        return None, []
+    if not isinstance(value, dict):
+        return None, [f"{field}_must_be_object"]
+    unknown = sorted(str(key) for key in value if key not in selections)
+    missing = [key for key in selections if key not in value]
+    normalized = {key: as_float(value.get(key)) for key in selections}
+    invalid = [key for key, number in normalized.items() if number is None or not 0 <= number <= 100]
+    reasons = []
+    if unknown:
+        reasons.append(f"{field}_unknown_selections:" + ",".join(unknown))
+    if missing:
+        reasons.append(f"{field}_missing_selections:" + ",".join(missing))
+    if invalid:
+        reasons.append(f"{field}_percent_out_of_range:" + ",".join(invalid))
+    if not reasons and abs(sum(normalized.values()) - 100.0) > 1.5:
+        reasons.append(f"{field}_percentages_must_sum_to_100")
+    return ({key: round(float(normalized[key]), 4) for key in selections} if not reasons else None), reasons
+
+
+def audit_real_money_data(payload: Any, expected_fixture: Any = None, data_cutoff_at: Any = None, kickoff_at: Any = None, now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Validate a separately sourced A-grade money packet; odds movements can never satisfy this schema."""
+    if payload in (None, {}):
+        return {
+            "schema": "real_money_v1", "status": "data_missing", "decision_eligible": False,
+            "evidence_grade": "data_missing", "is_real_money": False,
+            "money_percent": None, "bet_percent": None, "turnover": None,
+            "markets": {}, "reasons": ["real_money_packet_not_supplied"],
+        }
+    if not isinstance(payload, dict):
+        return {
+            "schema": "real_money_v1", "status": "rejected", "decision_eligible": False,
+            "evidence_grade": "rejected", "is_real_money": False, "markets": {},
+            "reasons": ["real_money_packet_must_be_object"],
+        }
+    reasons = []
+    if payload.get("schema") != "real_money_v1":
+        reasons.append("real_money_schema_must_be_real_money_v1")
+    fixture = str(payload.get("fixture") or "").strip()
+    if expected_fixture is not None and fixture != str(expected_fixture):
+        reasons.append("real_money_fixture_mismatch")
+    source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+    source_name = str(source.get("name") or "").strip()
+    source_type = str(source.get("type") or "").strip().lower()
+    evidence_ref = str(source.get("evidence_ref") or "").strip()
+    methodology = str(source.get("methodology") or "").strip()
+    parsed_ref = urlparse(evidence_ref)
+    if not source_name:
+        reasons.append("real_money_source_name_required")
+    if source_type not in REAL_MONEY_SOURCE_TYPES:
+        reasons.append("real_money_source_type_not_a_grade")
+    if parsed_ref.scheme not in {"http", "https"} or not parsed_ref.hostname or parsed_ref.path in {"", "/"}:
+        reasons.append("real_money_locatable_http_evidence_required")
+    authority_domain = parsed_ref.hostname.lower() if parsed_ref.hostname else None
+    registry_entry = REAL_MONEY_SOURCE_REGISTRY.get(authority_domain) if authority_domain else None
+    if not isinstance(registry_entry, dict):
+        reasons.append("real_money_source_not_in_verified_registry")
+    else:
+        if not str(registry_entry.get("registry_id") or "").strip():
+            reasons.append("real_money_registered_source_requires_stable_id")
+        allowed_types = registry_entry.get("allowed_types") if isinstance(registry_entry.get("allowed_types"), list) else []
+        if source_type not in allowed_types:
+            reasons.append("real_money_source_type_not_allowed_for_registered_domain")
+    if source.get("authority_verified") is not True:
+        reasons.append("real_money_source_authority_verification_required")
+    if source.get("methodology_verified") is not True or len(methodology) < 20:
+        reasons.append("real_money_verified_methodology_required")
+    observed_at = _parse_timestamp(payload.get("observed_at"))
+    cutoff_at = _parse_timestamp(data_cutoff_at) or int(now_ts or time.time())
+    kickoff_ts = _parse_timestamp(kickoff_at)
+    if observed_at is None:
+        reasons.append("real_money_observed_at_required")
+        age_seconds = None
+    else:
+        age_seconds = cutoff_at - observed_at
+        if observed_at > cutoff_at:
+            reasons.append("real_money_observation_after_data_cutoff")
+        if kickoff_ts is not None and observed_at >= kickoff_ts:
+            reasons.append("real_money_observation_not_prematch")
+        if age_seconds > REAL_MONEY_MAX_AGE_SECONDS:
+            reasons.append("real_money_observation_stale")
+        if age_seconds < -300:
+            reasons.append("real_money_observation_in_future")
+    raw_markets = payload.get("markets") if isinstance(payload.get("markets"), dict) else {}
+    if not raw_markets:
+        reasons.append("real_money_markets_required")
+    unknown_markets = sorted(str(key) for key in raw_markets if key not in REAL_MONEY_MARKET_SELECTIONS)
+    if unknown_markets:
+        reasons.append("real_money_unknown_markets:" + ",".join(unknown_markets))
+    markets = {}
+    for market, selections in REAL_MONEY_MARKET_SELECTIONS.items():
+        if market not in raw_markets:
+            continue
+        row = raw_markets.get(market) if isinstance(raw_markets.get(market), dict) else {}
+        if not row:
+            reasons.append(f"real_money_{market}_must_be_object")
+            continue
+        money, money_reasons = _normalize_real_money_percentages(row.get("money_percent"), selections, f"{market}_money_percent")
+        bets, bet_reasons = _normalize_real_money_percentages(row.get("bet_percent"), selections, f"{market}_bet_percent")
+        reasons.extend(money_reasons + bet_reasons)
+        if money is None and bets is None:
+            reasons.append(f"real_money_{market}_money_or_bet_percent_required")
+        line = as_float(row.get("line")) if market not in {"1x2", "btts"} else None
+        if market not in {"1x2", "btts"} and line is None:
+            reasons.append(f"real_money_{market}_line_required")
+        turnover = as_float(row.get("turnover"))
+        currency = str(row.get("currency") or "").strip().upper() or None
+        if row.get("turnover") is not None and (turnover is None or turnover < 0 or currency is None):
+            reasons.append(f"real_money_{market}_turnover_requires_nonnegative_value_and_currency")
+        concentration = money or bets or {}
+        ordered = sorted(concentration.items(), key=lambda item: item[1], reverse=True)
+        direction = ordered[0][0] if ordered and (len(ordered) == 1 or ordered[0][1] > ordered[1][1]) else None
+        concentration_gap = round((ordered[0][1] - ordered[1][1]) / 100.0, 6) if len(ordered) >= 2 and direction else None
+        markets[market] = {
+            "line": line, "money_percent": money, "bet_percent": bets,
+            "turnover": turnover, "currency": currency,
+            "direction": direction, "direction_basis": "money_percent_top_share" if money else ("bet_percent_top_share" if bets else None),
+            "concentration_gap": concentration_gap,
+        }
+    eligible = not reasons and bool(markets)
+    normalized = {
+        "schema": "real_money_v1", "fixture": fixture,
+        "source": {
+            "name": source_name, "type": source_type, "evidence_ref": evidence_ref,
+            "authority_domain": authority_domain,
+            "registry_id": str((registry_entry or {}).get("registry_id") or "").strip() or None,
+            "authority_verified": source.get("authority_verified") is True,
+            "methodology_verified": source.get("methodology_verified") is True,
+            "methodology": methodology,
+        },
+        "observed_at": observed_at, "data_cutoff_at": cutoff_at, "age_seconds": age_seconds,
+        "maximum_age_seconds": REAL_MONEY_MAX_AGE_SECONDS,
+        "markets": markets,
+    }
+    return {
+        **normalized,
+        "status": "available" if eligible else "rejected",
+        "decision_eligible": eligible,
+        "evidence_grade": "A" if eligible else "rejected",
+        "is_real_money": eligible,
+        "reasons": reasons,
+        "evidence_hash": _content_hash(normalized) if eligible else None,
+        "policy": "only this independently audited schema may populate real Money%/Bet%/turnover fields; odds paths remain a separate proxy",
+    }
+
+
 def _movement_probability_delta(dynamics: Dict[str, Any], market: str, selection: str) -> Optional[float]:
     detail = (dynamics.get("no_vig_probability_movements") or {}).get(market) or {}
     if detail.get("status") != "compared":
@@ -1544,6 +1707,23 @@ def _market_axis_for_candidate(candidate: Dict[str, Any]) -> str:
         side = "Home TT" if market == "home_team_total" else "Away TT"
         return f"{side} {str(selection).title()}"
     return f"{market}:{selection}"
+
+
+def _candidate_real_money_signal(candidate: Dict[str, Any], real_money_data: Dict[str, Any]) -> Tuple[Optional[float], str, Optional[Dict[str, Any]]]:
+    if not isinstance(real_money_data, dict) or real_money_data.get("decision_eligible") is not True:
+        return None, "data_missing", None
+    market, selection = str(candidate.get("market") or ""), str(candidate.get("selection") or "")
+    row = (real_money_data.get("markets") or {}).get(market)
+    if not isinstance(row, dict) or row.get("direction") is None:
+        return None, "data_missing", None
+    candidate_line, evidence_line = as_float(candidate.get("line")), as_float(row.get("line"))
+    if market not in {"1x2", "btts"} and (candidate_line is None or evidence_line is None or abs(candidate_line - evidence_line) > 1e-9):
+        return None, "real_money_line_mismatch", row
+    magnitude = as_float(row.get("concentration_gap"))
+    if magnitude is None:
+        return None, "real_money_direction_concentration_missing", row
+    signed = max(0.005, magnitude) if row.get("direction") == selection else -max(0.005, magnitude)
+    return signed, f"a_grade_{market}_money_distribution", row
 
 
 def _candidate_pressure_signal(candidate: Dict[str, Any], dynamics: Dict[str, Any]) -> Tuple[Optional[float], str]:
@@ -1610,16 +1790,35 @@ def _pressure_strength(value: Optional[float]) -> str:
     return "neutral"
 
 
-def market_language_for_candidate(candidate: Dict[str, Any], dynamics: Dict[str, Any], timeline_audit: Dict[str, Any]) -> Dict[str, Any]:
+def market_language_for_candidate(candidate: Dict[str, Any], dynamics: Dict[str, Any], timeline_audit: Dict[str, Any], real_money_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     axis = _market_axis_for_candidate(candidate)
     if not timeline_audit.get("decision_eligible") or dynamics.get("comparison_status") != "compared":
+        real_pressure, real_basis, real_market = _candidate_real_money_signal(candidate, real_money_data or {})
         return {
-            "axis": axis, "capital_pressure": {"status": "data_missing", "evidence_grade": "C_or_missing", "is_real_money": False},
+            "axis": axis,
+            "capital_pressure": {
+                "status": "real_money_available" if real_pressure is not None else "data_missing",
+                "label": "Real Funds" if real_pressure is not None else "data_missing",
+                "signed_toward_candidate": round(real_pressure, 6) if real_pressure is not None else None,
+                "strength": _pressure_strength(real_pressure), "basis": real_basis,
+                "evidence_grade": "A" if real_pressure is not None else "C_or_missing",
+                "is_real_money": real_pressure is not None,
+                "money_percent": (real_market or {}).get("money_percent") if real_pressure is not None else None,
+                "bet_percent": (real_market or {}).get("bet_percent") if real_pressure is not None else None,
+                "turnover": (real_market or {}).get("turnover") if real_pressure is not None else None,
+                "currency": (real_market or {}).get("currency") if real_pressure is not None else None,
+                "real_money_evidence_hash": (real_money_data or {}).get("evidence_hash") if real_pressure is not None else None,
+            },
             "line_response": {"status": "data_missing", "response": "data_missing"},
             "market_acceptance": "data_missing", "diagnostic": "insufficient_comparable_timeline",
             "expression_risk": "unknown",
         }
-    pressure, basis = _candidate_pressure_signal(candidate, dynamics)
+    real_pressure, real_basis, real_market = _candidate_real_money_signal(candidate, real_money_data or {})
+    if real_pressure is not None:
+        pressure, basis, pressure_is_real = real_pressure, real_basis, True
+    else:
+        pressure, basis = _candidate_pressure_signal(candidate, dynamics)
+        pressure_is_real = False
     response = _candidate_line_response(candidate, dynamics, pressure)
     strength = _pressure_strength(pressure)
     if pressure is None:
@@ -1650,12 +1849,17 @@ def market_language_for_candidate(candidate: Dict[str, Any], dynamics: Dict[str,
     return {
         "axis": axis,
         "capital_pressure": {
-            "status": "proxy_available" if pressure is not None else "data_missing",
-            "label": "Capital Pressure Proxy" if pressure is not None else "data_missing",
+            "status": "real_money_available" if pressure is not None and pressure_is_real else ("proxy_available" if pressure is not None else "data_missing"),
+            "label": "Real Funds" if pressure is not None and pressure_is_real else ("Capital Pressure Proxy" if pressure is not None else "data_missing"),
             "signed_toward_candidate": round(pressure, 6) if pressure is not None else None,
             "direction": axis if pressure is not None and pressure >= 0.005 else (opposite if pressure is not None and pressure <= -0.005 else "neutral"),
-            "strength": strength, "basis": basis, "evidence_grade": "B" if pressure is not None else "C_or_missing",
-            "is_real_money": False, "money_percent": None, "bet_percent": None, "turnover": None,
+            "strength": strength, "basis": basis, "evidence_grade": "A" if pressure_is_real else ("B" if pressure is not None else "C_or_missing"),
+            "is_real_money": pressure_is_real,
+            "money_percent": (real_market or {}).get("money_percent") if pressure_is_real else None,
+            "bet_percent": (real_market or {}).get("bet_percent") if pressure_is_real else None,
+            "turnover": (real_market or {}).get("turnover") if pressure_is_real else None,
+            "currency": (real_market or {}).get("currency") if pressure_is_real else None,
+            "real_money_evidence_hash": (real_money_data or {}).get("evidence_hash") if pressure_is_real else None,
         },
         "line_response": response,
         "market_acceptance": acceptance,
@@ -1688,27 +1892,29 @@ def _candidate_is_qualified(candidate: Dict[str, Any]) -> bool:
     )
 
 
-def apply_market_language_and_expression_optimizer(decision: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[str, Any]:
+def apply_market_language_and_expression_optimizer(decision: Dict[str, Any], history: List[Dict[str, Any]], real_money_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     audit = decision.get("line_movement_audit") or audit_line_movement_timeline(history)
     latest = latest_prematch_snapshot(history)
     dynamics = (latest or {}).get("market_dynamics") if isinstance((latest or {}).get("market_dynamics"), dict) else {}
     axis_language = {
-        "Home": market_language_for_candidate({"market": "asian_handicap", "selection": "home"}, dynamics, audit),
-        "Away": market_language_for_candidate({"market": "asian_handicap", "selection": "away"}, dynamics, audit),
-        "Over": market_language_for_candidate({"market": "over_under", "selection": "over"}, dynamics, audit),
-        "Under": market_language_for_candidate({"market": "over_under", "selection": "under"}, dynamics, audit),
+        "Home": market_language_for_candidate({"market": "asian_handicap", "selection": "home"}, dynamics, audit, real_money_data),
+        "Away": market_language_for_candidate({"market": "asian_handicap", "selection": "away"}, dynamics, audit, real_money_data),
+        "Over": market_language_for_candidate({"market": "over_under", "selection": "over"}, dynamics, audit, real_money_data),
+        "Under": market_language_for_candidate({"market": "over_under", "selection": "under"}, dynamics, audit, real_money_data),
     }
-    real_money_data = {
+    normalized_real_money = real_money_data if isinstance(real_money_data, dict) else {
         "status": "data_missing", "money_percent": None, "bet_percent": None, "turnover": None,
         "policy": "real funds require an independently sourced and timestamped A-grade feed",
     }
+    real_money_used = any(get_nested(row, ["capital_pressure", "is_real_money"]) is True for row in axis_language.values())
     candidates = []
     for raw in decision.get("candidates") or []:
         candidate = dict(raw)
-        candidate["market_language"] = market_language_for_candidate(candidate, dynamics, audit)
+        candidate["market_language"] = market_language_for_candidate(candidate, dynamics, audit, real_money_data)
         candidate["expression_family"] = _expression_family(candidate)
         candidate["expression_qualified"] = _candidate_is_qualified(candidate)
         candidates.append(candidate)
+    real_money_used = real_money_used or any(get_nested(row, ["market_language", "capital_pressure", "is_real_money"]) is True for row in candidates)
     decision["candidates"] = candidates
     candidate_map = {(row.get("market"), row.get("selection"), row.get("line")): row for row in candidates}
     original_raw = decision.get("best_market") if isinstance(decision.get("best_market"), dict) else None
@@ -1717,7 +1923,7 @@ def apply_market_language_and_expression_optimizer(decision: Dict[str, Any], his
         decision["execution_action"] = "PASS"
         decision["market_language"] = {
             "status": "data_missing" if not audit.get("decision_eligible") else "available_no_eligible_expression",
-            "axes": axis_language, "real_money_data": real_money_data, "capital_pressure_is_proxy_only": True,
+            "axes": axis_language, "real_money_data": normalized_real_money, "capital_pressure_is_proxy_only": not real_money_used,
         }
         decision["expression_optimizer"] = {"action": "PASS", "original_expression": original, "selected_expression": None, "switch_type": None, "reason": "mandatory_gate_failed_or_no_eligible_expression", "automatic_direction_reversal": False}
         return decision
@@ -1758,7 +1964,7 @@ def apply_market_language_and_expression_optimizer(decision: Dict[str, Any], his
     decision["execution_action"] = action
     decision["market_language"] = {
         "status": "available", "axes": axis_language,
-        "real_money_data": real_money_data, "capital_pressure_is_proxy_only": True,
+        "real_money_data": normalized_real_money, "capital_pressure_is_proxy_only": not real_money_used,
         "selected_axis": get_nested(selected, ["market_language", "axis"]),
         "selected_acceptance": get_nested(selected, ["market_language", "market_acceptance"]),
         "selected_diagnostic": get_nested(selected, ["market_language", "diagnostic"]),
@@ -1773,14 +1979,14 @@ def apply_market_language_and_expression_optimizer(decision: Dict[str, Any], his
     return decision
 
 
-def apply_line_movement_gate(decision: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[str, Any]:
+def apply_line_movement_gate(decision: Dict[str, Any], history: List[Dict[str, Any]], real_money_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     audit = audit_line_movement_timeline(history)
     latest = latest_prematch_snapshot(history)
     decision["line_movement"] = (latest or {}).get("market_dynamics") or {"status": "data_missing"}
     decision["line_movement_audit"] = audit
     if not audit.get("decision_eligible"):
         force_pass_decision(decision, audit.get("reason") or "line_movement_insufficient")
-    return apply_market_language_and_expression_optimizer(decision, history)
+    return apply_market_language_and_expression_optimizer(decision, history, real_money_data)
 
 
 def snapshot_stage_usable(row: Dict[str, Any]) -> bool:
@@ -3744,8 +3950,17 @@ def audit_decision_output(decision: Dict[str, Any]) -> Dict[str, Any]:
         axes = get_nested(decision, ["market_language", "axes"])
         if not isinstance(axes, dict) or any(axis not in axes for axis in ("Home", "Away", "Over", "Under")):
             consistency_issues.append("terminal_market_language_requires_four_axes")
-        if get_nested(decision, ["market_language", "capital_pressure_is_proxy_only"]) is not True:
-            consistency_issues.append("odds_path_must_be_labeled_capital_pressure_proxy")
+        any_real_axis = isinstance(axes, dict) and any(get_nested(axes, [axis, "capital_pressure", "is_real_money"]) is True for axis in ("Home", "Away", "Over", "Under"))
+        any_real_candidate = any(get_nested(row, ["market_language", "capital_pressure", "is_real_money"]) is True for row in (decision.get("candidates") or []) if isinstance(row, dict))
+        any_real_pressure = any_real_axis or any_real_candidate
+        proxy_only_flag = get_nested(decision, ["market_language", "capital_pressure_is_proxy_only"])
+        if proxy_only_flag != (not any_real_pressure):
+            consistency_issues.append("capital_pressure_proxy_flag_mismatch")
+        if any_real_pressure and (
+            get_nested(decision, ["market_language", "real_money_data", "decision_eligible"]) is not True
+            or not get_nested(decision, ["market_language", "real_money_data", "evidence_hash"])
+        ):
+            consistency_issues.append("real_money_axis_requires_audited_evidence_hash")
         if get_nested(decision, ["expression_optimizer", "automatic_direction_reversal"]) is not False:
             consistency_issues.append("expression_optimizer_must_forbid_automatic_direction_reversal")
         optimizer_action = get_nested(decision, ["expression_optimizer", "action"])
@@ -3830,13 +4045,22 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
     latest = latest_prematch_snapshot(available)
     market = (latest or {}).get("market_snapshot") or empty_market_snapshot()
     freshness = imported_fixture_freshness(metadata, history)
+    evaluation_cutoff = int(time.time())
+    match_metadata = metadata.get("match") if isinstance(metadata.get("match"), dict) else {}
+    kickoff_at = match_metadata.get("kickoff_utc") or match_metadata.get("date") or match_metadata.get("kickoff_at")
+    real_money_audit = audit_real_money_data(
+        payload.get("real_money_data"), expected_fixture=fixture,
+        data_cutoff_at=evaluation_cutoff, kickoff_at=kickoff_at, now_ts=evaluation_cutoff,
+    )
     decision = decision_layer(
         market, model.get("probabilities"), payload.get("script_coverage"),
         as_float(payload.get("crowding")), lineup_audit.get("effective_confidence"), payload.get("death_path") if "death_path" in payload else None,
     )
     decision["lineup_confidence_audit"] = lineup_audit
-    decision = apply_line_movement_gate(decision, history)
+    decision = apply_line_movement_gate(decision, history, real_money_audit)
     decision["data_freshness"] = freshness
+    if payload.get("real_money_data") not in (None, {}) and real_money_audit.get("status") == "rejected":
+        decision["pass_reasons"].append("real_money_data_rejected")
     if model.get("status") != "ready":
         decision["pass_reasons"].append("model_input_confidence_below_0_6")
     if not freshness.get("decision_eligible"):
@@ -5443,9 +5667,17 @@ def build_learning_postmatch_review_draft(freeze_id: Any, now_ts: Optional[int] 
     line_path_ready = available_stage_count >= 2 and latest_dynamics.get("comparison_status") == "compared"
     frozen_market_language = analysis.get("market_language") if isinstance(analysis.get("market_language"), dict) else {}
     proxy_labeled = frozen_market_language.get("capital_pressure_is_proxy_only") is True
-    real_money_missing = get_nested(frozen_market_language, ["real_money_data", "status"]) == "data_missing"
+    real_money_status = get_nested(frozen_market_language, ["real_money_data", "status"]) or "data_missing"
+    real_money_contract_ready = (
+        (real_money_status == "data_missing" and proxy_labeled)
+        or (
+            real_money_status == "available"
+            and get_nested(frozen_market_language, ["real_money_data", "decision_eligible"]) is True
+            and bool(get_nested(frozen_market_language, ["real_money_data", "evidence_hash"]))
+        )
+    )
     four_axes_present = all(axis in (frozen_market_language.get("axes") or {}) for axis in ("Home", "Away", "Over", "Under"))
-    market_language_ready = proxy_labeled and real_money_missing and four_axes_present
+    market_language_ready = real_money_contract_ready and four_axes_present
     market_language_contract_applicable = version_at_least(get_nested(freeze, ["versions", "service"]), (1, 95, 0))
     if line_path_ready and (market_language_ready or not market_language_contract_applicable):
         market_status = "passed"
@@ -5495,7 +5727,8 @@ def build_learning_postmatch_review_draft(freeze_id: Any, now_ts: Optional[int] 
             "latest_comparison_status": latest_dynamics.get("comparison_status"),
             "frozen_market_classification": latest_dynamics.get("classification"),
             "capital_pressure_proxy_only": proxy_labeled,
-            "real_money_data_status": get_nested(frozen_market_language, ["real_money_data", "status"]) or "data_missing",
+            "real_money_data_status": real_money_status,
+            "real_money_contract_ready": real_money_contract_ready,
             "four_axis_language_present": four_axes_present,
             "selected_acceptance": frozen_market_language.get("selected_acceptance"),
             "v1_95_contract_applicable": market_language_contract_applicable,
@@ -7575,6 +7808,13 @@ def shadow_data_source_health(probe_nami: bool = False, token: Optional[str] = N
         "ok": True, "version": VERSION, "generated_at": int(time.time()),
         "pang": {"write_policy": "read_only_source_no_remote_tasks", "sync": store.get("import_sync_status") or {"status": "never_imported"}, "fixture_state_counts": state_counts, "fixtures": fixtures},
         "nami": nami, "decision_gate": {"requires_fresh_prematch_data": True, "stale_action": "PASS"},
+        "real_money": {
+            "registered_authority_count": len(REAL_MONEY_SOURCE_REGISTRY),
+            "registered_authorities": sorted(REAL_MONEY_SOURCE_REGISTRY),
+            "maximum_age_seconds": REAL_MONEY_MAX_AGE_SECONDS,
+            "status": "configured" if REAL_MONEY_SOURCE_REGISTRY else "data_missing",
+            "missing_policy": "odds paths remain Capital Pressure Proxy; real Money%/Bet%/turnover stay null",
+        },
         "market_data_route": market_data_route_report(store_override=store),
     })
 
@@ -8089,11 +8329,19 @@ async def shadow_evaluate(request: Request, token: Optional[str] = None, authori
     history = get_fixture_snapshots(fixture)
     latest = latest_prematch_snapshot(history)
     current = ((latest or {}).get("market_snapshot")) or empty_market_snapshot()
+    evaluation_cutoff = int(time.time())
+    kickoff_at = get_nested(latest or {}, ["fixture_info", "date"]) or get_nested(latest or {}, ["fixture_info", "kickoff_at"])
+    real_money_audit = audit_real_money_data(
+        payload.get("real_money_data"), expected_fixture=fixture,
+        data_cutoff_at=evaluation_cutoff, kickoff_at=kickoff_at, now_ts=evaluation_cutoff,
+    )
     result = decision_layer(
         current, payload.get("model_probabilities"), payload.get("script_coverage"),
         as_float(payload.get("crowding")), as_float(payload.get("lineup_confidence")), payload.get("death_path") if "death_path" in payload else None
     )
-    result = apply_line_movement_gate(result, history)
+    result = apply_line_movement_gate(result, history, real_money_audit)
+    if payload.get("real_money_data") not in (None, {}) and real_money_audit.get("status") == "rejected":
+        force_pass_decision(result, "real_money_data_rejected")
     return JSONResponse({"ok": True, "version": VERSION, "fixture": fixture, "evaluation": result})
 
 

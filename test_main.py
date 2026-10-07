@@ -846,6 +846,119 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(result["capital_pressure"]["is_real_money"])
         self.assertEqual(result["market_acceptance"], "data_missing")
 
+    def test_real_money_schema_requires_bound_fresh_a_grade_evidence(self):
+        packet = {
+            "schema": "real_money_v1", "fixture": "fixture-1", "observed_at": 900,
+            "source": {
+                "name": "Verified Exchange Feed", "type": "betting_exchange",
+                "evidence_ref": "https://exchange.example/markets/fixture-1",
+                "authority_verified": True, "methodology_verified": True,
+                "methodology": "Matched exchange stakes aggregated by selection before kickoff.",
+            },
+            "markets": {
+                "asian_handicap": {
+                    "line": -.5, "money_percent": {"home": 70, "away": 30},
+                    "bet_percent": {"home": 60, "away": 40}, "turnover": 125000, "currency": "USD",
+                },
+                "over_under": {"line": 2.5, "money_percent": {"over": 65, "under": 35}},
+            },
+        }
+        registry = {"exchange.example": {"registry_id": "exchange-1", "allowed_types": ["betting_exchange"]}}
+        with patch.object(main, "REAL_MONEY_SOURCE_REGISTRY", registry):
+            audited = main.audit_real_money_data(packet, expected_fixture="fixture-1", data_cutoff_at=1000, kickoff_at=2000)
+        self.assertEqual(audited["status"], "available")
+        self.assertTrue(audited["decision_eligible"])
+        self.assertTrue(audited["is_real_money"])
+        self.assertEqual(audited["evidence_grade"], "A")
+        self.assertEqual(audited["source"]["authority_domain"], "exchange.example")
+        self.assertEqual(audited["markets"]["asian_handicap"]["direction"], "home")
+        self.assertEqual(audited["markets"]["asian_handicap"]["concentration_gap"], .4)
+        self.assertTrue(audited["evidence_hash"])
+
+    def test_real_money_schema_rejects_mismatch_stale_and_nonclosing_percentages(self):
+        packet = {
+            "schema": "real_money_v1", "fixture": "wrong-fixture", "observed_at": 1,
+            "source": {
+                "name": "Claimed Feed", "type": "verified_money_vendor",
+                "evidence_ref": "https://money.example/item/1",
+                "authority_verified": True, "methodology_verified": True,
+                "methodology": "Verified stake and ticket distribution captured before kickoff.",
+            },
+            "markets": {"over_under": {"line": 2.5, "money_percent": {"over": 75, "under": 15}}},
+        }
+        audited = main.audit_real_money_data(packet, expected_fixture="fixture-1", data_cutoff_at=30000, kickoff_at=40000)
+        self.assertEqual(audited["status"], "rejected")
+        self.assertFalse(audited["decision_eligible"])
+        self.assertFalse(audited["is_real_money"])
+        self.assertIsNone(audited["evidence_hash"])
+        self.assertIn("real_money_fixture_mismatch", audited["reasons"])
+        self.assertIn("real_money_observation_stale", audited["reasons"])
+        self.assertIn("over_under_money_percent_percentages_must_sum_to_100", audited["reasons"])
+
+    def test_unverified_or_unlocatable_money_source_never_becomes_a_grade(self):
+        packet = {
+            "schema": "real_money_v1", "fixture": "fixture-1", "observed_at": 900,
+            "source": {
+                "name": "Anonymous", "type": "social_media",
+                "evidence_ref": "rumor", "authority_verified": False,
+                "methodology_verified": False, "methodology": "unknown",
+            },
+            "markets": {"asian_handicap": {"line": -.5, "money_percent": {"home": 55, "away": 45}}},
+        }
+        audited = main.audit_real_money_data(packet, expected_fixture="fixture-1", data_cutoff_at=1000, kickoff_at=2000)
+        self.assertEqual(audited["status"], "rejected")
+        self.assertIn("real_money_source_type_not_a_grade", audited["reasons"])
+        self.assertIn("real_money_locatable_http_evidence_required", audited["reasons"])
+        self.assertIn("real_money_source_not_in_verified_registry", audited["reasons"])
+        self.assertIn("real_money_source_authority_verification_required", audited["reasons"])
+
+    def test_a_grade_real_money_is_distinct_from_proxy_and_does_not_replace_line_response(self):
+        packet = {
+            "schema": "real_money_v1", "fixture": "fixture-1", "observed_at": 900,
+            "source": {
+                "name": "Official Stakes", "type": "bookmaker_official",
+                "evidence_ref": "https://book.example/fixture-1/stakes",
+                "authority_verified": True, "methodology_verified": True,
+                "methodology": "Official prematch stake distribution across the quoted handicap line.",
+            },
+            "markets": {"asian_handicap": {"line": -.5, "money_percent": {"home": 70, "away": 30}, "bet_percent": {"home": 55, "away": 45}}},
+        }
+        registry = {"book.example": {"registry_id": "book-1", "allowed_types": ["bookmaker_official"]}}
+        with patch.object(main, "REAL_MONEY_SOURCE_REGISTRY", registry):
+            real = main.audit_real_money_data(packet, expected_fixture="fixture-1", data_cutoff_at=1000, kickoff_at=2000)
+        dynamics = {
+            "comparison_status": "compared",
+            "no_vig_probability_movements": {"1x2": {"status": "compared", "deltas": {"home": -.02, "away": .02}}},
+            "market_movements": {"asian_handicap": {"line": 0.0}},
+        }
+        language = main.market_language_for_candidate(
+            {"market": "asian_handicap", "selection": "home", "line": -.5},
+            dynamics, {"decision_eligible": True}, real,
+        )
+        self.assertEqual(language["capital_pressure"]["label"], "Real Funds")
+        self.assertEqual(language["capital_pressure"]["evidence_grade"], "A")
+        self.assertTrue(language["capital_pressure"]["is_real_money"])
+        self.assertEqual(language["capital_pressure"]["money_percent"]["home"], 70)
+        self.assertEqual(language["line_response"]["response"], "static")
+        self.assertEqual(language["market_acceptance"], "Resistance")
+        candidate = {
+            "market": "asian_handicap", "selection": "home", "line": -.5, "price": 1.91,
+            "model_probability": .57, "market_no_vig_probability": .52, "edge": .05, "ev": .089,
+            "script_coverage": .82, "market_coverage_eligible": True,
+            "consensus_source_eligible": True, "dispersion_eligible": True,
+        }
+        decision = {
+            "decision": "asian_handicap:home", "best_market": candidate, "candidates": [candidate],
+            "edge": .05, "ev": .089, "pass_reasons": [], "line_movement_audit": {"decision_eligible": True},
+            "recommendation_tiers": {"first_choice_high_consistency": candidate, "second_choice_higher_return": None, "high_variance_single": None},
+        }
+        optimized = main.apply_market_language_and_expression_optimizer(
+            decision, [{"stage": "T-1h", "snapshot_at": 1000, "market_dynamics": dynamics}], real,
+        )
+        self.assertFalse(optimized["market_language"]["capital_pressure_is_proxy_only"])
+        self.assertEqual(optimized["market_language"]["real_money_data"]["status"], "available")
+        self.assertEqual(optimized["market_language"]["real_money_data"]["evidence_hash"], real["evidence_hash"])
+
     def test_expression_optimizer_switches_same_script_not_direction(self):
         over = {
             "market": "over_under", "selection": "over", "line": 2.5, "price": 1.9,
