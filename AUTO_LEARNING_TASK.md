@@ -178,6 +178,8 @@ League DNA具备单独的哈希绑定确认入口`POST /shadow/learning/league-d
 
 `GET /shadow/learning/validation-queue`只列出假设登记之后生成、未参与发现、尚未开赛、联赛和市场范围匹配的新冻结比赛。同一真实比赛即使有多个冻结版本，也只能建立一次Shadow锁。系统只安排验证机会，不自动编造Champion、Challenger或Ablation概率；这些输出必须在开赛前实际计算并锁定。
 
+内部Shadow运行器执行前必须重新审计冻结样本的`learning_probability_replay_v1`并绑定其`replay_hash`。没有可重放PIT输入的冻结样本保持阻塞，运行器不会收到请求；运行器返回的Champion概率必须等于冻结基线，不能通过改写Champion制造Challenger增益。
+
 ## 七、优化赛前选择方向
 
 优化优先级固定为：

@@ -7179,6 +7179,7 @@ def lock_hypothesis_shadow_prediction(
             "freeze_hash": freeze.get("content_hash"),
             "hypothesis_hash": hypothesis.get("content_hash"),
             "ablation_plan_hash": _content_hash(ablation_plan),
+            "probability_replay_hash": get_nested(freeze, ["analysis", "probability_replay", "replay_hash"]),
         })
         if calculator_provenance is None:
             normalized_calculator_provenance = {
@@ -7213,6 +7214,7 @@ def lock_hypothesis_shadow_prediction(
             "freeze_id": freeze_id,
             "freeze_hash": freeze.get("content_hash"),
             "champion_decision_hash": _content_hash(freeze.get("decision") or {}),
+            "probability_replay_hash": get_nested(freeze, ["analysis", "probability_replay", "replay_hash"]),
             "champion_probabilities": champion_probabilities,
             "challenger_probabilities": challenger_probabilities,
             "ablation_plan_hash": _content_hash(ablation_plan),
@@ -7273,16 +7275,35 @@ def generate_internal_shadow_lock(
         raise HTTPException(status_code=404, detail="hypothesis_not_found")
     if not freeze:
         raise HTTPException(status_code=404, detail="frozen_learning_sample_not_found")
+    probability_replay = get_nested(freeze, ["analysis", "probability_replay"], {}) or {}
+    replay_audit = audit_learning_probability_replay(
+        probability_replay,
+        expected_fixture=freeze.get("fixture"),
+        data_cutoff_at=freeze.get("data_cutoff_at"),
+        kickoff_at=freeze.get("kickoff_at"),
+    )
+    if replay_audit.get("status") != "ready" or replay_audit.get("decision_eligible") is not True:
+        raise HTTPException(status_code=409, detail={
+            "error": "forward_shadow_requires_replayable_pit_probability_inputs",
+            "replay_audit": replay_audit,
+        })
+    frozen_champion_probabilities = _normalize_1x2_probabilities(
+        get_nested(probability_replay, ["model", "probabilities", "1x2"]),
+        "frozen_champion",
+    )
     ablation_plan = get_nested(hypothesis, ["pre_registered_validation_plan", "ablation_plan"], {}) or {}
     input_hash = _content_hash({
         "freeze_hash": freeze.get("content_hash"),
         "hypothesis_hash": hypothesis.get("content_hash"),
         "ablation_plan_hash": _content_hash(ablation_plan),
+        "probability_replay_hash": probability_replay.get("replay_hash"),
     })
     request_content = {
         "schema": "learning_shadow_model_request_v1",
         "requested_at": now_ts,
         "input_hash": input_hash,
+        "probability_replay_hash": probability_replay.get("replay_hash"),
+        "frozen_champion_probabilities": frozen_champion_probabilities,
         "freeze": freeze,
         "hypothesis": {
             "hypothesis_id": hypothesis_id,
@@ -7317,6 +7338,8 @@ def generate_internal_shadow_lock(
     runner_version = str(result.get("runner_version") or "").strip()
     if not runner_id or not runner_version:
         raise HTTPException(status_code=422, detail="internal_shadow_model_runner_identity_required")
+    if _normalize_1x2_probabilities(result.get("champion_probabilities"), "champion") != frozen_champion_probabilities:
+        raise HTTPException(status_code=422, detail="internal_shadow_champion_must_match_frozen_probability_replay")
     required_modules = list(ablation_plan.get("required_modules") or [])
     raw_modules = result.get("module_ablations") if isinstance(result.get("module_ablations"), dict) else {}
     if set(raw_modules) != set(required_modules):
