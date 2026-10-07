@@ -23,7 +23,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "1.91.0"
+VERSION = "1.92.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -162,8 +162,6 @@ LEARNING_TOP_FLIGHT_LEAGUES: Dict[int, Dict[str, str]] = {
 }
 LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
 LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
-LEARNING_DAILY_FREEZE_CAP = max(1, min(int(os.getenv("LEARNING_DAILY_FREEZE_CAP", "8")), 50))
-LEARNING_DAILY_REANALYSIS_CAP = max(1, min(int(os.getenv("LEARNING_DAILY_REANALYSIS_CAP", "50")), 200))
 LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08").strip() or "MODEL_RULES.md@2026-10-08"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
@@ -187,6 +185,7 @@ TRACKING_STAGES = [
 ]
 STAGE_ORDER = [x["key"] for x in TRACKING_STAGES]
 PREMATCH_STAGE_ORDER = [x for x in STAGE_ORDER if x != "FT"]
+LEARNING_PREMATCH_STAGE_ORDER = ["Opening", "T-12h", "T-6h", "T-1h"]
 STAGE_ALIASES = {}
 for s in TRACKING_STAGES:
     STAGE_ALIASES[s["key"].lower()] = s["key"]
@@ -3917,7 +3916,7 @@ def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6, ri
 
 @app.get("/")
 def root():
-    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}", "/shadow/learning/cycle-plan", "/shadow/learning/run", "/shadow/learning/review-queue", "/shadow/learning/freeze", "/shadow/learning/settle", "/shadow/learning/hypotheses", "/shadow/learning/hypotheses/{id}/shadow-lock", "/shadow/learning/hypotheses/{id}/promotion-evidence", "/shadow/learning/league-dna", "/shadow/learning/selection-quality", "/shadow/learning/status"]}
+    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}", "/shadow/learning/cycle-plan", "/shadow/learning/run", "/shadow/learning/review-queue", "/shadow/learning/review-draft", "/shadow/learning/freeze", "/shadow/learning/settle", "/shadow/learning/hypotheses", "/shadow/learning/hypotheses/{id}/shadow-lock", "/shadow/learning/hypotheses/{id}/promotion-evidence", "/shadow/learning/league-dna", "/shadow/learning/selection-quality", "/shadow/learning/status"]}
 
 
 @app.get("/health")
@@ -4588,21 +4587,17 @@ def discover_learning_fixtures(now_ts: Optional[int] = None, fixture_rows: Optio
 
 
 def scheduled_learning_analysis_node(now_ts: int, kickoff_at: int) -> Optional[str]:
-    """Return the latest clock node that is genuinely due; never synthesize Closing."""
+    """Return the latest fixed learning node due by clock; Opening requires real evidence."""
     seconds_before = int(kickoff_at) - int(now_ts)
     if seconds_before <= 0 or seconds_before > LEARNING_DISCOVERY_HORIZON_HOURS * 3600:
         return None
-    if seconds_before <= 30 * 60:
-        return "T-30m"
     if seconds_before <= 3600:
         return "T-1h"
-    if seconds_before <= 3 * 3600:
-        return "T-3h"
     if seconds_before <= 6 * 3600:
         return "T-6h"
     if seconds_before <= 12 * 3600:
         return "T-12h"
-    return "T-24h"
+    return None
 
 
 def _learning_snapshot_marker(store: Dict[str, Any], fixture: str, now_ts: int) -> Optional[Dict[str, Any]]:
@@ -4610,6 +4605,7 @@ def _learning_snapshot_marker(store: Dict[str, Any], fixture: str, now_ts: int) 
     available = [
         row for row in complete_prematch_timeline(rows)
         if row.get("timeline_status") == "available"
+        and row.get("stage") in LEARNING_PREMATCH_STAGE_ORDER
         and int(row.get("snapshot_at") or 0) <= int(now_ts)
     ]
     latest = latest_prematch_snapshot(available)
@@ -4631,7 +4627,7 @@ def _learning_snapshot_marker(store: Dict[str, Any], fixture: str, now_ts: int) 
 
 def _learning_freeze_analysis_node(row: Dict[str, Any]) -> Optional[str]:
     node = get_nested(row, ["analysis", "analysis_node"])
-    if node in PREMATCH_STAGE_ORDER and node != "Opening":
+    if node in LEARNING_PREMATCH_STAGE_ORDER:
         return node
     captured_at = int(row.get("captured_at") or 0)
     kickoff_at = int(row.get("kickoff_at") or 0)
@@ -4651,11 +4647,10 @@ def learning_candidate_analysis_state(
     latest_freeze = max(rows, key=lambda row: int(row.get("version_number") or 0), default=None)
     marker = _learning_snapshot_marker(store, fixture, now_ts)
     target_node = scheduled_node
-    if marker and marker.get("stage") in PREMATCH_STAGE_ORDER:
+    if marker and marker.get("stage") in LEARNING_PREMATCH_STAGE_ORDER:
         marker_stage = marker["stage"]
-        if marker_stage == "Closing" or (
-            target_node in PREMATCH_STAGE_ORDER
-            and PREMATCH_STAGE_ORDER.index(marker_stage) > PREMATCH_STAGE_ORDER.index(target_node)
+        if target_node not in LEARNING_PREMATCH_STAGE_ORDER or (
+            LEARNING_PREMATCH_STAGE_ORDER.index(marker_stage) > LEARNING_PREMATCH_STAGE_ORDER.index(target_node)
         ):
             target_node = marker_stage
     latest_node = _learning_freeze_analysis_node(latest_freeze or {})
@@ -4664,9 +4659,9 @@ def learning_candidate_analysis_state(
         due_reason = "analysis_clock_node_not_due"
     elif latest_freeze is None:
         due_reason = "initial_analysis_node_due"
-    elif latest_node not in PREMATCH_STAGE_ORDER:
+    elif latest_node not in LEARNING_PREMATCH_STAGE_ORDER:
         due_reason = "legacy_freeze_missing_analysis_node"
-    elif PREMATCH_STAGE_ORDER.index(target_node) > PREMATCH_STAGE_ORDER.index(latest_node):
+    elif LEARNING_PREMATCH_STAGE_ORDER.index(target_node) > LEARNING_PREMATCH_STAGE_ORDER.index(latest_node):
         due_reason = "analysis_node_advanced"
     else:
         last_source_hash = str(get_nested(latest_freeze, ["analysis", "source_snapshot_hash"]) or "").strip()
@@ -4682,8 +4677,8 @@ def learning_candidate_analysis_state(
                 and str(task.get("fixture") or "") == fixture
                 and task.get("status") == "pending"
                 and int(task.get("created_at") or 0) > latest_capture
-                and task.get("stage") in PREMATCH_STAGE_ORDER
-                and PREMATCH_STAGE_ORDER.index(task["stage"]) <= PREMATCH_STAGE_ORDER.index(target_node)
+                and task.get("stage") in LEARNING_PREMATCH_STAGE_ORDER
+                and LEARNING_PREMATCH_STAGE_ORDER.index(task["stage"]) <= LEARNING_PREMATCH_STAGE_ORDER.index(target_node)
             ]
             if pending:
                 due_reason = "material_revalidation_trigger"
@@ -4703,10 +4698,21 @@ def learning_candidate_analysis_state(
     }
 
 
-def learning_cycle_plan(now_ts: Optional[int] = None, fixture_rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def learning_cycle_plan(
+    now_ts: Optional[int] = None,
+    fixture_rows: Optional[List[Dict[str, Any]]] = None,
+    include_discovery: bool = True,
+) -> Dict[str, Any]:
     """Build a non-mutating daily work plan; never invent analysis or process classifications."""
     now_ts = int(now_ts or time.time())
-    discovery = discover_learning_fixtures(now_ts=now_ts, fixture_rows=fixture_rows)
+    discovery = discover_learning_fixtures(now_ts=now_ts, fixture_rows=fixture_rows) if include_discovery else {
+        "ok": True, "generated_at": now_ts, "window_start": now_ts,
+        "window_end": now_ts + LEARNING_DISCOVERY_HORIZON_HOURS * 3600,
+        "horizon_hours": LEARNING_DISCOVERY_HORIZON_HOURS,
+        "candidate_count": 0, "candidates": [], "excluded_count": 0,
+        "excluded_counts": {}, "source_audit": [{"source": "deferred_until_postmatch_phase", "ok": True}],
+        "policy": "future fixture discovery is deferred until postmatch processing completes",
+    }
     store = load_snapshot_store()
     frozen = store.get("learning_frozen") or {}
     postmatches = store.get("learning_postmatch") or {}
@@ -4728,6 +4734,20 @@ def learning_cycle_plan(now_ts: Optional[int] = None, fixture_rows: Optional[Lis
         row for row in settlement_due
         if not (existing_fact_versions.get(str(row.get("freeze_id"))) or [])
     ]
+    existing_draft_versions = store.get("learning_postmatch_drafts") or {}
+    review_draft_due = []
+    for row in settlement_due:
+        freeze_id = str(row.get("freeze_id") or "")
+        fact_versions = existing_fact_versions.get(freeze_id) or []
+        if not fact_versions:
+            continue
+        latest_fact = max(fact_versions, key=lambda item: int(item.get("version_number") or 0))
+        if get_nested(latest_fact, ["verification", "settlement_eligible"]) is not True:
+            continue
+        draft_versions = existing_draft_versions.get(freeze_id) or []
+        latest_draft = max(draft_versions, key=lambda item: int(item.get("version_number") or 0), default=None)
+        if not latest_draft or latest_draft.get("fact_hash") != latest_fact.get("fact_hash"):
+            review_draft_due.append({**row, "fact_hash": latest_fact.get("fact_hash")})
     local_date = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(ZoneInfo("Asia/Shanghai")).date()
     frozen_today = [
         row for versions in frozen.values() for row in versions or []
@@ -4743,16 +4763,21 @@ def learning_cycle_plan(now_ts: Optional[int] = None, fixture_rows: Optional[Lis
         "settlement_due_count": len(settlement_due), "settlement_due": sorted(settlement_due, key=lambda row: row["kickoff_at"]),
         "postmatch_fact_collection_due_count": len(fact_collection_due),
         "postmatch_fact_collection_due": sorted(fact_collection_due, key=lambda row: row["kickoff_at"]),
+        "postmatch_review_draft_due_count": len(review_draft_due),
+        "postmatch_review_draft_due": sorted(review_draft_due, key=lambda row: row["kickoff_at"]),
         "discovery": {**discovery, "candidates": discovery_candidates},
-        "daily_freeze_cap": LEARNING_DAILY_FREEZE_CAP,
-        "daily_new_fixture_cap": LEARNING_DAILY_FREEZE_CAP,
-        "daily_reanalysis_cap": LEARNING_DAILY_REANALYSIS_CAP,
+        "learning_prematch_stages": LEARNING_PREMATCH_STAGE_ORDER,
+        "daily_freeze_cap": None,
+        "daily_new_fixture_cap": None,
+        "daily_reanalysis_cap": None,
+        "match_limit": None,
+        "full_historical_odds_sample_limit": None,
         "frozen_today_count": len(frozen_today),
         "admitted_today_count": len(admitted_today),
         "reanalysis_today_count": len(reanalyses_today),
-        "remaining_freeze_capacity": max(0, LEARNING_DAILY_FREEZE_CAP - len(admitted_today)),
-        "remaining_new_fixture_capacity": max(0, LEARNING_DAILY_FREEZE_CAP - len(admitted_today)),
-        "remaining_reanalysis_capacity": max(0, LEARNING_DAILY_REANALYSIS_CAP - len(reanalyses_today)),
+        "remaining_freeze_capacity": None,
+        "remaining_new_fixture_capacity": None,
+        "remaining_reanalysis_capacity": None,
         "mutation_policy": "plan_only; freezing requires a complete PIT analysis and settlement requires verified facts plus an explicit process classification",
         "automatic_champion_promotion": False,
     }
@@ -4788,7 +4813,7 @@ def build_learning_freeze_payload(candidate: Dict[str, Any], packet: Dict[str, A
     packet_timeline = get_nested(packet, ["market", "timeline"], []) or []
     available_packet_rows = []
     for row in packet_timeline:
-        if not isinstance(row, dict) or row.get("status") != "available" or row.get("stage") not in PREMATCH_STAGE_ORDER:
+        if not isinstance(row, dict) or row.get("status") != "available" or row.get("stage") not in LEARNING_PREMATCH_STAGE_ORDER:
             continue
         snapshot_at = _parse_timestamp(row.get("snapshot_at"))
         if snapshot_at is None or snapshot_at > generated_at:
@@ -4798,19 +4823,21 @@ def build_learning_freeze_payload(candidate: Dict[str, Any], packet: Dict[str, A
         available_packet_rows.append(row)
     latest_packet_row = max(
         available_packet_rows,
-        key=lambda row: (PREMATCH_STAGE_ORDER.index(row["stage"]), int(row.get("snapshot_at") or 0)),
+        key=lambda row: (LEARNING_PREMATCH_STAGE_ORDER.index(row["stage"]), int(row.get("snapshot_at") or 0)),
         default=None,
     )
     target_node = candidate.get("target_analysis_node")
     if latest_packet_row and (
-        target_node not in PREMATCH_STAGE_ORDER
-        or PREMATCH_STAGE_ORDER.index(latest_packet_row["stage"]) > PREMATCH_STAGE_ORDER.index(target_node)
+        target_node not in LEARNING_PREMATCH_STAGE_ORDER
+        or LEARNING_PREMATCH_STAGE_ORDER.index(latest_packet_row["stage"]) > LEARNING_PREMATCH_STAGE_ORDER.index(target_node)
     ):
         target_node = latest_packet_row["stage"]
-    if target_node not in PREMATCH_STAGE_ORDER or target_node == "Opening":
+    if target_node not in LEARNING_PREMATCH_STAGE_ORDER:
         target_node = scheduled_learning_analysis_node(generated_at, kickoff_at)
-    if target_node not in PREMATCH_STAGE_ORDER or target_node == "Opening":
+    if target_node not in LEARNING_PREMATCH_STAGE_ORDER:
         raise HTTPException(status_code=409, detail="learning_analysis_node_not_due")
+    if target_node == "Opening" and (not latest_packet_row or latest_packet_row.get("stage") != "Opening"):
+        raise HTTPException(status_code=409, detail="verified_opening_snapshot_required_for_learning_node")
     packet_source_hash = str((latest_packet_row or {}).get("source_content_hash") or "").strip()
     if not packet_source_hash and latest_packet_row:
         packet_source_hash = _content_hash(latest_packet_row)
@@ -4818,6 +4845,7 @@ def build_learning_freeze_payload(candidate: Dict[str, Any], packet: Dict[str, A
         "prematch_only": True,
         "packet_generated_at": generated_at,
         "analysis_node": target_node,
+        "required_learning_timeline": LEARNING_PREMATCH_STAGE_ORDER,
         "analysis_trigger": candidate.get("analysis_due_reason") or "explicit_prematch_packet",
         "source_snapshot_stage": (latest_packet_row or {}).get("stage") or candidate.get("source_snapshot_stage"),
         "source_snapshot_at": (latest_packet_row or {}).get("snapshot_at") or candidate.get("source_snapshot_at"),
@@ -4991,6 +5019,210 @@ def collect_learning_postmatch_facts(freeze_id: Any, now_ts: Optional[int] = Non
         return record
 
 
+def _postmatch_event_evidence(facts: Dict[str, Any]) -> Dict[str, Any]:
+    """Describe the realised state path and pollution flags without grading the prematch model."""
+    events = [row for row in (facts.get("events") or []) if isinstance(row, dict)]
+    goals, red_cards, penalties, own_goals = [], [], [], []
+    for row in events:
+        event_type = str(row.get("type") or "").strip().casefold()
+        detail = str(row.get("detail") or "").strip().casefold()
+        minute = int(as_float(row.get("elapsed")) or 0)
+        normalized = {
+            "minute": minute, "extra": row.get("extra"),
+            "team_id": row.get("team_id"), "team": row.get("team"),
+            "player": row.get("player"), "type": row.get("type"), "detail": row.get("detail"),
+        }
+        if event_type == "goal":
+            goals.append(normalized)
+        if event_type == "card" and ("red" in detail or "second yellow" in detail):
+            red_cards.append(normalized)
+        if "penalty" in detail:
+            penalties.append(normalized)
+        if "own goal" in detail:
+            own_goals.append(normalized)
+    event_sources = sorted({
+        str(row.get("source") or "").strip().casefold()
+        for row in (facts.get("source_audit") or [])
+        if isinstance(row, dict) and row.get("ok") is True
+        and str(row.get("component") or "").strip().casefold() == "events"
+        and str(row.get("source") or "").strip()
+        and str(row.get("evidence_ref") or "").strip()
+    })
+    pollution_flags = []
+    if red_cards:
+        pollution_flags.append("red_card")
+    if penalties:
+        pollution_flags.append("penalty_event")
+    if own_goals:
+        pollution_flags.append("own_goal")
+    first_goal = min(goals, key=lambda row: (row["minute"], int(row.get("extra") or 0)), default=None)
+    result = facts.get("result") if isinstance(facts.get("result"), dict) else {}
+    return {
+        "event_count": len(events),
+        "event_source_count": len(event_sources),
+        "event_sources": event_sources,
+        "event_verification": "verified" if len(event_sources) >= 2 else ("single_source" if event_sources else "data_missing"),
+        "first_goal": first_goal,
+        "goal_count_in_event_feed": len(goals),
+        "red_cards": red_cards,
+        "penalties": penalties,
+        "own_goals": own_goals,
+        "pollution_flags": pollution_flags,
+        "pollution_status": "requires_human_review" if pollution_flags else ("clean_verified" if len(event_sources) >= 2 else "clean_unverified"),
+        "actual_state_path": {
+            "first_goal_side_or_team": (first_goal or {}).get("team"),
+            "first_goal_minute": (first_goal or {}).get("minute"),
+            "final_home_goals": result.get("home_goals"),
+            "final_away_goals": result.get("away_goals"),
+            "red_card_count": len(red_cards),
+            "penalty_event_count": len(penalties),
+            "own_goal_count": len(own_goals),
+        },
+        "policy": "events describe the realised path only; final score and incidents do not grade the frozen process",
+    }
+
+
+def build_learning_postmatch_review_draft(freeze_id: Any, now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Create an immutable evidence draft; never settle, classify correctness, or create theory."""
+    freeze_id = str(freeze_id or "").strip()
+    if not freeze_id:
+        raise HTTPException(status_code=400, detail="freeze_id_required")
+    now_ts = int(now_ts or time.time())
+    store = load_snapshot_store()
+    freeze = _learning_freeze_by_id(store, freeze_id)
+    if not freeze:
+        raise HTTPException(status_code=404, detail="frozen_learning_sample_not_found")
+    if freeze_id in (store.get("learning_postmatch") or {}):
+        raise HTTPException(status_code=409, detail="learning_sample_already_settled")
+    fact_versions = (store.get("learning_postmatch_facts") or {}).get(freeze_id) or []
+    if not fact_versions:
+        raise HTTPException(status_code=409, detail="verified_postmatch_fact_packet_required")
+    facts = max(fact_versions, key=lambda row: int(row.get("version_number") or 0))
+    if get_nested(facts, ["verification", "settlement_eligible"]) is not True:
+        raise HTTPException(status_code=409, detail="independent_result_verification_required_for_review_draft")
+
+    analysis = freeze.get("analysis") if isinstance(freeze.get("analysis"), dict) else {}
+    decision = freeze.get("decision") if isinstance(freeze.get("decision"), dict) else {}
+    is_pass = str(decision.get("decision") or "").strip().upper() == "PASS"
+    fundamental = analysis.get("fundamental_chain") if isinstance(analysis.get("fundamental_chain"), dict) else {}
+    chain_audit = audit_fundamental_chain(fundamental)
+    if chain_audit.get("decision_eligible") is True:
+        fundamental_status, fundamental_reason = "passed", "frozen_fundamental_chain_was_decision_eligible"
+    elif is_pass:
+        fundamental_status, fundamental_reason = "passed", "incomplete_chain_was_preserved_as_safe_pass"
+    else:
+        fundamental_status, fundamental_reason = "failed", "non_pass_decision_used_an_ineligible_fundamental_chain"
+
+    market = analysis.get("market_timeline") if isinstance(analysis.get("market_timeline"), dict) else {}
+    available_stage_count = int(market.get("available_prematch_stage_count") or 0)
+    latest_dynamics = market.get("latest_dynamics") if isinstance(market.get("latest_dynamics"), dict) else {}
+    line_path_ready = available_stage_count >= 2 and latest_dynamics.get("comparison_status") == "compared"
+    if line_path_ready:
+        market_status, market_reason = "passed", "frozen_market_path_had_two_or_more_comparable_nodes"
+    elif is_pass:
+        market_status, market_reason = "passed", "insufficient_market_path_was_preserved_as_safe_pass"
+    else:
+        market_status, market_reason = "failed", "non_pass_decision_lacked_a_comparable_market_path"
+
+    state_tree = analysis.get("state_tree") if isinstance(analysis.get("state_tree"), dict) else {}
+    states = state_tree.get("states") if isinstance(state_tree.get("states"), dict) else {}
+    populated_states = sorted(key for key, value in states.items() if value not in (None, "", [], {}))
+    event_evidence = _postmatch_event_evidence(facts)
+    if not populated_states:
+        state_status, state_reason = "data_missing", "frozen_state_tree_had_no_testable_state_predictions"
+    elif event_evidence["event_verification"] == "data_missing":
+        state_status, state_reason = "data_missing", "event_sequence_evidence_is_missing"
+    else:
+        state_status, state_reason = "inconclusive", "state_predictions_exist_but_tactical_response_requires_human_event_review"
+
+    selected_expression = _learning_selected_expression(decision)
+    decision_contract = audit_decision_output(decision)
+    if decision_contract.get("decision_eligible") is True:
+        expression_status, expression_reason = "passed", "frozen_decision_output_contract_was_complete"
+    elif is_pass and decision.get("pass_reasons"):
+        expression_status, expression_reason = "passed", "safe_pass_has_explicit_reasons_and_no_actionable_expression"
+    else:
+        expression_status, expression_reason = "data_missing", "frozen_expression_contract_is_not_complete_enough_for_automatic_audit"
+    entry_price = as_float(selected_expression.get("price"))
+    price_status = "inconclusive" if entry_price is not None else "data_missing"
+    price_reason = "entry_price_present_but_verified_closing_price_is_not_in_postmatch_facts" if entry_price is not None else "entry_or_closing_price_evidence_missing"
+    match_rating = decision.get("match_rating")
+    match_status = "inconclusive" if match_rating is not None else "data_missing"
+    match_reason = "frozen_match_rating_present_but_selection_quality_requires_cross_match_comparison" if match_rating is not None else "frozen_match_rating_missing"
+
+    draft_review = {
+        "match_selection_quality": {"status": match_status, "reason": match_reason, "frozen_match_rating": match_rating},
+        "fundamental_chain_audit": {"status": fundamental_status, "reason": fundamental_reason, "audit": chain_audit},
+        "state_tree_coverage": {
+            "status": state_status, "reason": state_reason,
+            "populated_frozen_states": populated_states,
+            "actual_state_path": event_evidence["actual_state_path"],
+        },
+        "market_language_audit": {
+            "status": market_status, "reason": market_reason,
+            "available_stage_count": available_stage_count,
+            "latest_comparison_status": latest_dynamics.get("comparison_status"),
+            "frozen_market_classification": latest_dynamics.get("classification"),
+        },
+        "expression_audit": {
+            "status": expression_status, "reason": expression_reason,
+            "selected_expression": selected_expression,
+            "decision_contract": decision_contract,
+        },
+        "price_execution_audit": {"status": price_status, "reason": price_reason, "entry_price": entry_price},
+        "process_reasoning": "System draft audits only frozen PIT completeness, decision-rule execution and verified event evidence; it does not infer process correctness from the final score.",
+        "learning_disposition": {
+            "result_backfit_used": False,
+            "champion_change_requested": False,
+            "new_theory_status": "none",
+            "existing_rule_implementation_gap": False,
+        },
+    }
+    review_audit = audit_learning_postmatch_review(draft_review)
+    immutable_content = {
+        "freeze_id": freeze_id,
+        "fixture": freeze.get("fixture"),
+        "freeze_hash": freeze.get("content_hash"),
+        "fact_hash": facts.get("fact_hash"),
+        "fact_version_number": facts.get("version_number"),
+        "event_evidence": event_evidence,
+        "review": review_audit["normalized"],
+        "review_audit": {"eligible": review_audit["eligible"], "reasons": review_audit["reasons"]},
+        "suggested_process_classification": "DATA_INSUFFICIENT",
+        "manual_review_required": True,
+        "automatic_settlement_eligible": False,
+        "result_outcome_used_to_grade_process": False,
+        "automatic_hypothesis_registration": False,
+        "automatic_champion_change": False,
+    }
+    draft_hash = _content_hash(immutable_content)
+    with SNAPSHOT_STORE_LOCK:
+        latest_store = load_snapshot_store()
+        latest_fact_versions = (latest_store.get("learning_postmatch_facts") or {}).get(freeze_id) or []
+        if not latest_fact_versions:
+            raise HTTPException(status_code=409, detail="verified_postmatch_fact_packet_required")
+        latest_facts = max(latest_fact_versions, key=lambda row: int(row.get("version_number") or 0))
+        if latest_facts.get("fact_hash") != facts.get("fact_hash"):
+            raise HTTPException(status_code=409, detail="postmatch_facts_changed_during_review_draft")
+        rows = latest_store.setdefault("learning_postmatch_drafts", {}).setdefault(freeze_id, [])
+        duplicate = next((row for row in rows if row.get("draft_hash") == draft_hash), None)
+        if duplicate:
+            return {**duplicate, "action": "unchanged"}
+        version_number = max([int(row.get("version_number") or 0) for row in rows] + [0]) + 1
+        record = {
+            **immutable_content,
+            "version_number": version_number,
+            "draft_hash": draft_hash,
+            "drafted_at": now_ts,
+            "immutable": True,
+            "action": "drafted",
+        }
+        rows.append(record)
+        latest_store["version"] = VERSION
+        write_snapshot_store(latest_store)
+        return record
+
+
 def learning_review_queue() -> Dict[str, Any]:
     """Expose frozen context plus versioned facts for evidence-led postmatch review."""
     store = load_snapshot_store()
@@ -5004,6 +5236,9 @@ def learning_review_queue() -> Dict[str, Any]:
             continue
         latest = max(fact_versions, key=lambda row: int(row.get("version_number") or 0))
         verification = latest.get("verification") if isinstance(latest.get("verification"), dict) else {}
+        draft_versions = (store.get("learning_postmatch_drafts") or {}).get(freeze_id) or []
+        latest_draft = max(draft_versions, key=lambda row: int(row.get("version_number") or 0), default=None)
+        draft_matches_facts = bool(latest_draft and latest_draft.get("fact_hash") == latest.get("fact_hash"))
         rows.append({
             "freeze_id": freeze_id,
             "fixture": freeze.get("fixture"),
@@ -5017,6 +5252,8 @@ def learning_review_queue() -> Dict[str, Any]:
                 "source_audit": latest.get("source_audit"), "verification": verification,
             },
             "review_ready": verification.get("settlement_eligible") is True,
+            "automatic_review_draft": latest_draft if draft_matches_facts else None,
+            "automatic_review_draft_ready": draft_matches_facts,
             "required_next_action": "compare_process_to_frozen_prematch_without_result_backfit" if verification.get("settlement_eligible") is True else "obtain_independent_result_verification",
             "allowed_process_classes": sorted(LEARNING_PROCESS_CLASSES),
             "automatic_champion_change": False,
@@ -5026,6 +5263,7 @@ def learning_review_queue() -> Dict[str, Any]:
         "version": VERSION,
         "queue_count": len(rows),
         "review_ready_count": sum(row["review_ready"] for row in rows),
+        "automatic_review_draft_ready_count": sum(row["automatic_review_draft_ready"] for row in rows),
         "waiting_for_verification_count": sum(not row["review_ready"] for row in rows),
         "items": rows,
         "result_backfit_allowed": False,
@@ -5052,11 +5290,14 @@ def run_learning_cycle(
     auto_collect_facts = payload.get("auto_collect_postmatch_facts", True)
     if not isinstance(auto_collect_facts, bool):
         raise HTTPException(status_code=400, detail="auto_collect_postmatch_facts_must_be_boolean")
+    auto_build_review_drafts = payload.get("auto_build_postmatch_review_drafts", True)
+    if not isinstance(auto_build_review_drafts, bool):
+        raise HTTPException(status_code=400, detail="auto_build_postmatch_review_drafts_must_be_boolean")
     supplied_run_id = str(payload.get("run_id") or "").strip()
     safe_run_id = supplied_run_id and len(supplied_run_id) <= 100 and all(char in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in supplied_run_id)
     if apply_changes and not safe_run_id:
         raise HTTPException(status_code=400, detail="safe_run_id_required_when_apply_is_true")
-    plan = learning_cycle_plan(now_ts=now_ts, fixture_rows=fixture_rows)
+    postmatch_plan = learning_cycle_plan(now_ts=now_ts, fixture_rows=[], include_discovery=False)
     if apply_changes:
         existing = (load_snapshot_store().get("learning_runs") or {}).get(supplied_run_id)
         if existing:
@@ -5064,9 +5305,7 @@ def run_learning_cycle(
     prematch_packets = payload.get("prematch_packets") if isinstance(payload.get("prematch_packets"), dict) else {}
     postmatch_fact_packets = payload.get("postmatch_fact_packets") if isinstance(payload.get("postmatch_fact_packets"), dict) else {}
     settlement_packets = payload.get("settlement_packets") if isinstance(payload.get("settlement_packets"), list) else []
-    if len(prematch_packets) > LEARNING_DAILY_FREEZE_CAP or len(postmatch_fact_packets) > 50 or len(settlement_packets) > 50:
-        raise HTTPException(status_code=413, detail="learning_cycle_batch_too_large")
-    due_ids = {str(row.get("freeze_id")) for row in plan.get("settlement_due") or []}
+    due_ids = {str(row.get("freeze_id")) for row in postmatch_plan.get("settlement_due") or []}
     settlement_results = []
     for row in settlement_packets:
         row = row if isinstance(row, dict) else {}
@@ -5105,8 +5344,9 @@ def run_learning_cycle(
             versions = existing_facts.get(freeze_id) or []
             if versions and supplied_facts is None:
                 latest = max(versions, key=lambda row: int(row.get("version_number") or 0))
+                verified = get_nested(latest, ["verification", "settlement_eligible"]) is True
                 fact_results.append({
-                    "freeze_id": freeze_id, "action": "awaiting_independent_verification",
+                    "freeze_id": freeze_id, "action": "facts_verified_awaiting_review" if verified else "awaiting_independent_verification",
                     "verification": latest.get("verification"), "fact_hash": latest.get("fact_hash"),
                 })
                 continue
@@ -5122,11 +5362,35 @@ def run_learning_cycle(
                 })
             except HTTPException as exc:
                 fact_results.append({"freeze_id": freeze_id, "action": "rejected", "status_code": exc.status_code, "reason": exc.detail})
-    remaining = int(plan.get("remaining_new_fixture_capacity") or 0)
-    remaining_reanalyses = int(plan.get("remaining_reanalysis_capacity") or 0)
+    draft_results = []
+    if auto_build_review_drafts:
+        current_store = load_snapshot_store()
+        for freeze_id in sorted(due_ids):
+            if freeze_id in settled_or_existing or freeze_id in (current_store.get("learning_postmatch") or {}):
+                draft_results.append({"freeze_id": freeze_id, "action": "skipped", "reason": "postmatch_already_settled"})
+                continue
+            fact_versions = (current_store.get("learning_postmatch_facts") or {}).get(freeze_id) or []
+            latest_fact = max(fact_versions, key=lambda row: int(row.get("version_number") or 0), default=None)
+            if not latest_fact or get_nested(latest_fact, ["verification", "settlement_eligible"]) is not True:
+                draft_results.append({"freeze_id": freeze_id, "action": "skipped", "reason": "independent_result_verification_required"})
+                continue
+            if not apply_changes:
+                draft_results.append({"freeze_id": freeze_id, "action": "would_build_review_draft", "fact_hash": latest_fact.get("fact_hash")})
+                continue
+            try:
+                draft = build_learning_postmatch_review_draft(freeze_id, now_ts=now_ts)
+                draft_results.append({
+                    "freeze_id": freeze_id, "action": draft.get("action"),
+                    "draft_hash": draft.get("draft_hash"),
+                    "suggested_process_classification": draft.get("suggested_process_classification"),
+                    "manual_review_required": draft.get("manual_review_required"),
+                })
+            except HTTPException as exc:
+                draft_results.append({"freeze_id": freeze_id, "action": "rejected", "status_code": exc.status_code, "reason": exc.detail})
+    prematch_plan = learning_cycle_plan(now_ts=now_ts, fixture_rows=fixture_rows, include_discovery=True)
     freeze_results = []
     builder = prematch_packet_builder or build_shadow_ai_packet
-    for candidate in plan.get("discovery", {}).get("candidates") or []:
+    for candidate in prematch_plan.get("discovery", {}).get("candidates") or []:
         fixture = str(candidate.get("fixture_id") or "")
         if not candidate.get("analysis_due"):
             freeze_results.append({
@@ -5134,12 +5398,6 @@ def run_learning_cycle(
                 "latest_analysis_node": candidate.get("latest_analysis_node"),
                 "target_analysis_node": candidate.get("target_analysis_node"),
             })
-            continue
-        if candidate.get("already_frozen") and remaining_reanalyses <= 0:
-            freeze_results.append({"fixture": fixture, "action": "skipped", "reason": "daily_reanalysis_cap_reached"})
-            continue
-        if not candidate.get("already_frozen") and remaining <= 0:
-            freeze_results.append({"fixture": fixture, "action": "skipped", "reason": "daily_freeze_cap_reached"})
             continue
         packet = prematch_packets.get(fixture)
         if packet is None and auto_prepare and apply_changes:
@@ -5168,20 +5426,18 @@ def run_learning_cycle(
                 "reason": candidate.get("analysis_due_reason"),
                 "decision": get_nested(record, ["decision", "decision"]),
             })
-            if record.get("action") == "frozen":
-                if candidate.get("already_frozen"):
-                    remaining_reanalyses -= 1
-                else:
-                    remaining -= 1
         except HTTPException as exc:
             freeze_results.append({"fixture": fixture, "action": "rejected", "status_code": exc.status_code, "reason": exc.detail})
     immutable_summary = {
         "run_id": supplied_run_id or None,
         "mode": "apply" if apply_changes else "dry_run",
         "started_at": now_ts,
-        "plan_generated_at": plan.get("generated_at"),
+        "postmatch_plan_generated_at": postmatch_plan.get("generated_at"),
+        "prematch_plan_generated_at": prematch_plan.get("generated_at"),
+        "execution_order": ["past_36h_postmatch", "future_24h_prematch"],
         "settlement_results": settlement_results,
         "postmatch_fact_results": fact_results,
+        "postmatch_review_draft_results": draft_results,
         "freeze_results": freeze_results,
         "automatic_hypothesis_registration": False,
         "automatic_champion_change": False,
@@ -5191,7 +5447,8 @@ def run_learning_cycle(
         **immutable_summary,
         "settled_count": sum(row.get("action") == "settled" for row in settlement_results),
         "frozen_count": sum(row.get("action") == "frozen" for row in freeze_results),
-        "rejected_count": sum(row.get("action") in {"rejected", "would_reject"} for row in settlement_results + fact_results + freeze_results),
+        "review_draft_count": sum(row.get("action") == "drafted" for row in draft_results),
+        "rejected_count": sum(row.get("action") in {"rejected", "would_reject"} for row in settlement_results + fact_results + draft_results + freeze_results),
         "action": "completed" if apply_changes else "previewed",
     }
     if apply_changes:
@@ -6094,6 +6351,7 @@ def learning_status_report() -> Dict[str, Any]:
     frozen = store.get("learning_frozen") or {}
     postmatches = store.get("learning_postmatch") or {}
     postmatch_facts = store.get("learning_postmatch_facts") or {}
+    postmatch_drafts = store.get("learning_postmatch_drafts") or {}
     runs = store.get("learning_runs") or {}
     hypotheses = store.get("learning_hypotheses") or {}
     shadow_locks = store.get("learning_shadow_locks") or {}
@@ -6116,6 +6374,8 @@ def learning_status_report() -> Dict[str, Any]:
         "frozen_version_count": len(frozen_rows),
         "postmatch_count": len(postmatches),
         "postmatch_fact_queue_count": len(postmatch_facts),
+        "postmatch_review_draft_queue_count": len(postmatch_drafts),
+        "postmatch_review_draft_version_count": sum(len(rows or []) for rows in postmatch_drafts.values()),
         "postmatch_fact_pending_verification_count": sum(
             bool(rows) and max(rows, key=lambda row: int(row.get("version_number") or 0)).get("verification", {}).get("settlement_eligible") is not True
             for rows in postmatch_facts.values()
@@ -6132,6 +6392,14 @@ def learning_status_report() -> Dict[str, Any]:
         "league_dna_activation_candidate_count": len(league_dna_activations),
         "league_dna_verified_active_count": len(verified_active_dna),
         "minimum_independent_support_samples": LEARNING_MIN_VALIDATION_SAMPLES,
+        "schedule": {
+            "timezone": "Asia/Shanghai",
+            "daily_local_time": "14:30",
+            "execution_order": ["past_36h_postmatch", "future_24h_prematch"],
+        },
+        "learning_prematch_stages": LEARNING_PREMATCH_STAGE_ORDER,
+        "match_limit": None,
+        "full_historical_odds_sample_limit": None,
         "automatic_champion_promotion": False,
         "policy": "single matches cannot create model rules; promotion candidates require all gates and explicit user confirmation",
     }
@@ -6642,6 +6910,16 @@ def shadow_learning_review_queue(token: Optional[str] = None, authorization: Opt
     return JSONResponse({"ok": True, "review_queue": learning_review_queue()})
 
 
+@app.post("/shadow/learning/review-draft")
+async def shadow_learning_review_draft(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="json_body_must_be_an_object")
+    draft = build_learning_postmatch_review_draft(payload.get("freeze_id"), payload.get("drafted_at"))
+    return JSONResponse({"ok": True, "draft": draft})
+
+
 @app.post("/shadow/learning/settle")
 async def shadow_learning_settle(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
@@ -6886,14 +7164,59 @@ def completed_auto_snapshot_stages(history: List[Dict[str, Any]]) -> set:
     }
 
 
-def auto_snapshot_cycle() -> Dict[str, Any]:
-    now = datetime.now(timezone.utc)
+def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Run the learning loop once near 14:30 Asia/Shanghai with a deterministic daily id."""
+    now = now.astimezone(timezone.utc)
+    local_now = now.astimezone(ZoneInfo("Asia/Shanghai"))
+    now_ts = int(now.timestamp())
+    if local_now.hour != 14 or not 30 <= local_now.minute <= 39:
+        return {
+            "status": "not_due", "at": now_ts,
+            "schedule_timezone": "Asia/Shanghai", "scheduled_local_time": "14:30",
+        }
+    run_id = f"daily-{local_now.date().strftime('%Y%m%d')}-1430"
+    existing = (load_snapshot_store().get("learning_runs") or {}).get(run_id)
+    if existing:
+        return {
+            "status": "already_completed", "at": now_ts, "run_id": run_id,
+            "frozen_count": existing.get("frozen_count"),
+            "review_draft_count": existing.get("review_draft_count"),
+        }
+    try:
+        result = run_learning_cycle(
+            {
+                "apply": True, "run_id": run_id,
+                "auto_prepare_prematch": True,
+                "auto_collect_postmatch_facts": True,
+                "auto_build_postmatch_review_drafts": True,
+            },
+            now_ts=now_ts,
+            fixture_rows=fixture_rows,
+        )
+        return {
+            "status": "completed", "at": now_ts, "run_id": run_id,
+            "execution_order": result.get("execution_order"),
+            "frozen_count": result.get("frozen_count"),
+            "review_draft_count": result.get("review_draft_count"),
+            "settled_count": result.get("settled_count"),
+            "rejected_count": result.get("rejected_count"),
+            "postmatch_fact_results": result.get("postmatch_fact_results"),
+            "postmatch_review_draft_results": result.get("postmatch_review_draft_results"),
+            "automatic_hypothesis_registration": False,
+            "automatic_champion_change": False,
+        }
+    except Exception as exc:
+        print("[AUTO_LEARNING] daily cycle failed: " + str(exc))
+        return {"status": "error", "at": now_ts, "run_id": run_id, "error_type": type(exc).__name__}
+
+
+def auto_snapshot_cycle(now: Optional[datetime] = None) -> Dict[str, Any]:
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    learning_result = auto_learning_daily_cycle(now)
     dates = sorted({(now + timedelta(days=i)).astimezone(ZoneInfo(AUTO_FETCH_TIMEZONE)).date().isoformat() for i in range(AUTO_SNAPSHOT_DAYS_AHEAD + 1)})
-    learning_fixture_rows: List[Dict[str, Any]] = []
     for date_str in dates:
         try:
             fixtures = target_fixtures_for_date(date_str, AUTO_FETCH_TIMEZONE)
-            learning_fixture_rows.extend(row for row in fixtures.get("fixtures", []) if isinstance(row, dict))
             for fx in fixtures.get("fixtures", []):
                 if fx.get("status") != "NS" or not fx.get("fixture_id"):
                     continue
@@ -6944,41 +7267,7 @@ def auto_snapshot_cycle() -> Dict[str, Any]:
                             print("[AUTO_SNAPSHOT] fixture failed: " + str(exc))
         except Exception as exc:
             print("[AUTO_SNAPSHOT] date failed: " + date_str + " " + str(exc))
-    now_ts = int(now.timestamp())
-    learning_plan = learning_cycle_plan(now_ts=now_ts, fixture_rows=learning_fixture_rows)
-    prematch_due = any(
-        row.get("analysis_due") is True
-        for row in get_nested(learning_plan, ["discovery", "candidates"], [])
-    )
-    facts_due = int(learning_plan.get("postmatch_fact_collection_due_count") or 0) > 0
-    if not prematch_due and not facts_due:
-        return {
-            "status": "idle", "at": now_ts,
-            "prematch_due_count": 0, "postmatch_fact_collection_due_count": 0,
-        }
-    run_id = f"auto-learning-{now_ts // AUTO_SNAPSHOT_POLL_SECONDS}"
-    try:
-        result = run_learning_cycle(
-            {
-                "apply": True, "run_id": run_id,
-                "auto_prepare_prematch": True,
-                "auto_collect_postmatch_facts": True,
-            },
-            now_ts=now_ts,
-            fixture_rows=learning_fixture_rows,
-        )
-        return {
-            "status": "completed", "at": now_ts, "run_id": run_id,
-            "frozen_count": result.get("frozen_count"),
-            "settled_count": result.get("settled_count"),
-            "rejected_count": result.get("rejected_count"),
-            "postmatch_fact_results": result.get("postmatch_fact_results"),
-            "automatic_hypothesis_registration": False,
-            "automatic_champion_change": False,
-        }
-    except Exception as exc:
-        print("[AUTO_LEARNING] cycle failed: " + str(exc))
-        return {"status": "error", "at": now_ts, "run_id": run_id, "error_type": type(exc).__name__}
+    return learning_result
 
 
 def auto_snapshot_worker() -> None:
@@ -6990,7 +7279,9 @@ def auto_snapshot_worker() -> None:
             except Exception as exc:
                 AUTO_RECONCILIATION_LAST_RESULT = {"status": "error", "error_type": type(exc).__name__, "at": int(time.time())}
                 print("[AUTO_RECONCILIATION] failed: " + str(exc))
-            AUTO_LEARNING_LAST_RESULT = auto_snapshot_cycle()
+            learning_result = auto_snapshot_cycle()
+            if learning_result.get("status") != "not_due":
+                AUTO_LEARNING_LAST_RESULT = learning_result
             AUTO_SNAPSHOT_LAST_CYCLE_AT = int(time.time())
             AUTO_SNAPSHOT_LAST_ERROR = None
         except Exception as exc:

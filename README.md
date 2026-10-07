@@ -122,6 +122,7 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 - v1.89 增加`GET /shadow/learning/review-queue`：单源赛果只能待核实，至少两个可定位且比分一致的独立来源才进入复盘就绪；事实与赛前冻结并列展示，Process分类仍必须基于过程审计而不是比分倒推。
 - v1.90 增加前向Shadow验证锁与派生Promotion证据：验证比赛必须在开赛前锁定Champion/Challenger/消融概率、入场价格和风险；赛后由系统计算Brier、CLV、消融、过程准确率和风险门槛。调用方提交自述的passed审计会被拒绝，所有门槛仍只生成待用户确认候选。
 - v1.91 将自动学习改为节点驱动版本链：T-24h至T-30m按时钟推进，Closing必须有真实合格快照；同节点仅在快照指纹或基本面复核证据变化时复算。后台5分钟快照线程只在存在节点更新或首次赛后事实待采时触发幂等学习周期；首次纳入上限与同场复算上限分离，Opening和错过节点均不得回填。
+- v1.92 按最新学习任务规则将自动学习固定为每天上海时间14:30运行：严格先处理过去36小时赛后事实和不可变复盘证据草稿，再发现未来24小时赛程；学习节点收缩为`Opening → T-12h → T-6h → T-1h`，取消每日比赛数及完整历史赔率样本数上限。该变更只作用于学习闭环，普通赛前八节点时间轴保持不变。双源赛果通过后系统只生成绑定冻结/事实哈希的人工复核草稿，不会用赛果自动判定过程、结算、登记理论或修改Champion。
 - Opening 导入必须同时包含可解析的观测时间和非空公司盘口数组；缺一项即标记 `opening_source_unverified`，上游汇总值不能单独充当开盘证据。
 - 每个节点保存 1X2、亚洲让球、大小球，并在上游提供时保存 BTTS、主队进球数、客队进球数。
 - `primary` 字段继续保留以兼容旧调用方，但内容改为基于完整公司数组计算的 `consensus_main_line`，不再机械取第一家公司。
@@ -443,6 +444,7 @@ POST /shadow/learning/freeze
 GET  /shadow/learning/cycle-plan
 POST /shadow/learning/run
 GET  /shadow/learning/review-queue
+POST /shadow/learning/review-draft
 POST /shadow/learning/settle
 POST /shadow/learning/hypotheses
 POST /shadow/learning/hypotheses/{HYPOTHESIS_ID}/shadow-lock
@@ -463,15 +465,16 @@ GET  /shadow/learning/status
 ```json
 {
   "apply": true,
-  "run_id": "daily-20261008-0930",
+  "run_id": "daily-20261008-1430",
   "auto_prepare_prematch": true,
   "auto_collect_postmatch_facts": true,
+  "auto_build_postmatch_review_drafts": true,
   "postmatch_fact_packets": {},
   "settlement_packets": []
 }
 ```
 
-`postmatch_fact_packets`用于补入第二个独立结果来源；两个来源必须分别带可定位`evidence_ref`且比分一致。即使事实已核实，运行器也不会自动生成Process分类；结构化复盘仍通过`settlement_packets`提交并接受反倒推门禁，并且必须携带复盘队列返回的最新已核实`fact_hash`。
+`postmatch_fact_packets`用于补入第二个独立结果来源；两个来源必须分别带可定位`evidence_ref`且比分一致。事实核实后，运行器只生成绑定冻结与事实哈希的不可变复盘证据草稿；不会自动生成Process分类或结算。结构化复盘仍通过`settlement_packets`提交并接受反倒推门禁，而且必须携带复盘队列返回的最新已核实`fact_hash`。
 
 POST 请求可直接传一个数据包、数据包数组，或 `{ "packets": [...] }`。
 外部 UUID 与原有数字 fixture ID 分开使用；缺失节点保留为 `data_missing`，不会用当前盘口反推。
