@@ -4702,7 +4702,118 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         rows = main.load_snapshot_store()["learning_postmatch_facts"][frozen["freeze_id"]]
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[-1]["verification"]["independent_source_count"], 2)
-        self.assertNotIn(frozen["freeze_id"], main.load_snapshot_store().get("learning_postmatch", {}))
+        postmatch = main.load_snapshot_store()["learning_postmatch"][frozen["freeze_id"]]
+        self.assertEqual(postmatch["process_classification"], "DATA_INSUFFICIENT")
+        self.assertEqual(postmatch["review"]["review_mode"], "automatic_evidence_review")
+        self.assertFalse(postmatch["event_audit"]["automatic_review_derivation"]["result_backfit_used"])
+        self.assertEqual(
+            postmatch["event_audit"]["automatic_review_derivation"]["selection_outcome_audit"]["status"],
+            "not_used",
+        )
+
+    def test_learning_freeze_binds_the_odds_api_identity_before_kickoff(self):
+        now_ts, kickoff_at = 100000, 100000 + 3600
+        candidate = main.discover_learning_fixtures(
+            now_ts=now_ts, fixture_rows=[self.learning_fixture_row(8041, 39, kickoff_at)],
+        )["candidates"][0]
+        packet = self.learning_prematch_packet(8041, now_ts)
+        identity = {
+            "source": "the_odds_api", "sport_key": "soccer_epl",
+            "event_id": "0123456789abcdef0123456789abcdef",
+            "home_team": "Home", "away_team": "Away",
+        }
+        packet["provider_identity"] = {**identity, "source_hash": main._content_hash(identity)}
+        freeze_payload = main.build_learning_freeze_payload(candidate, packet, now_ts=now_ts)
+        frozen_identity = next(row for row in freeze_payload["source_refs"] if isinstance(row, dict) and row.get("source") == "the_odds_api")
+        self.assertEqual(frozen_identity["event_id"], identity["event_id"])
+        self.assertEqual(frozen_identity["identity_bound_at"], now_ts)
+        self.assertEqual(frozen_identity["identity_source_hash"], main._content_hash(identity))
+
+    def test_the_odds_api_score_corroboration_requires_exact_frozen_event_and_teams(self):
+        identity = {
+            "source": "the_odds_api", "sport_key": "soccer_epl",
+            "event_id": "0123456789abcdef0123456789abcdef",
+            "home_team": "Home United", "away_team": "Away City",
+        }
+        payload = self.learning_payload("8042", 900, 1000)
+        payload["source_refs"] = [{
+            **identity, "identity_bound_at": 900,
+            "identity_source_hash": main._content_hash(identity),
+        }]
+        frozen = main.freeze_learning_sample(payload, now_ts=900)
+        response = {
+            "ok": True, "status_code": 200,
+            "data": [{
+                "id": identity["event_id"], "sport_key": identity["sport_key"], "completed": True,
+                "home_team": "Home United", "away_team": "Away City",
+                "scores": [{"name": "Home United", "score": "2"}, {"name": "Away City", "score": "1"}],
+            }],
+        }
+        with patch.object(main, "call_the_odds_api", return_value=response) as scores:
+            evidence = main._the_odds_api_frozen_result_evidence(frozen)
+        self.assertTrue(evidence["ok"])
+        self.assertEqual((evidence["home_goals"], evidence["away_goals"]), (2, 1))
+        self.assertEqual(scores.call_args.args[0], "/sports/soccer_epl/scores")
+        self.assertEqual(scores.call_args.args[1]["eventIds"], identity["event_id"])
+
+        mismatched = copy.deepcopy(response)
+        mismatched["data"][0]["home_team"] = "Different Team"
+        with patch.object(main, "call_the_odds_api", return_value=mismatched):
+            rejected = main._the_odds_api_frozen_result_evidence(frozen)
+        self.assertFalse(rejected["ok"])
+        self.assertEqual(rejected["error"], "the_odds_api_bound_event_team_mismatch")
+
+        failed_response = copy.deepcopy(response)
+        failed_response["ok"] = False
+        with patch.object(main, "call_the_odds_api", return_value=failed_response):
+            rejected = main._the_odds_api_frozen_result_evidence(frozen)
+        self.assertFalse(rejected["ok"])
+        self.assertEqual(rejected["error"], "the_odds_api_score_request_failed")
+
+    def test_the_odds_api_mismatched_score_never_verifies_postmatch_result(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("8043", 900, 1000), now_ts=900)
+        packet = self.learning_postmatch_facts(home_goals=2, away_goals=1)
+        packet["source_audit"] = [
+            {"source": "api_football", "component": "result", "ok": True, "evidence_ref": "https://api-football.example/8043", "home_goals": 2, "away_goals": 1},
+            {"source": "the_odds_api", "component": "result", "ok": True, "evidence_ref": "https://api.the-odds-api.com/8043", "home_goals": 1, "away_goals": 2},
+        ]
+        facts = main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000, fact_fetcher=lambda _: packet,
+        )
+        self.assertEqual(facts["verification"]["status"], "single_source_pending")
+        self.assertFalse(facts["verification"]["settlement_eligible"])
+        self.assertEqual(facts["verification"]["independent_source_count"], 1)
+
+    def test_automatic_review_does_not_equate_verified_events_with_state_tree_correctness(self):
+        payload = self.learning_payload("8044", 900, 1000)
+        payload["analysis"]["state_tree"] = {"states": {"FGH": {"prediction": "home_first_goal"}}}
+        payload["decision"] = {
+            "decision": "BET", "execution_action": "BET", "match_rating": "B",
+            "model_probability": 0.56, "market_no_vig_probability": 0.51,
+            "edge": 0.05, "ev": 0.0696, "script_coverage": 0.70,
+            "crowding": 0.50, "line_movement": "stable", "lineup_confidence": 0.80,
+            "death_path": [], "pass_reasons": [],
+            "best_market": {
+                "market": "over_under", "selection": "under", "line": 2.75, "price": 1.91,
+                "model_probability": 0.56, "market_no_vig_probability": 0.51,
+                "edge": 0.05, "ev": 0.0696, "script_coverage": 0.70,
+            },
+            "selected_expression": {"market": "over_under", "selection": "under", "line": 2.75, "price": 1.91},
+        }
+        frozen = main.freeze_learning_sample(payload, now_ts=900)
+        main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda _: self.verified_event_fact_packet(1, 0),
+        )
+        main.build_learning_postmatch_review_draft(frozen["freeze_id"], now_ts=9001)
+        completed = main.complete_automatic_learning_postmatch_review(frozen["freeze_id"], now_ts=9002)
+        self.assertEqual(completed["process_classification"], "DATA_INSUFFICIENT")
+        self.assertEqual(completed["review"]["match_selection_quality"]["status"], "inconclusive")
+        self.assertEqual(completed["review"]["state_tree_coverage"]["status"], "inconclusive")
+        self.assertEqual(
+            completed["event_audit"]["automatic_review_derivation"]["selection_outcome_audit"]["status"],
+            "not_used",
+        )
 
     def test_fact_verification_counts_only_matching_result_evidence(self):
         frozen = main.freeze_learning_sample(self.learning_payload("805", 900, 1000), now_ts=900)
@@ -4970,7 +5081,9 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["postmatch_review_draft_results"][0]["action"], "drafted")
         self.assertEqual(result["review_draft_count"], 1)
         self.assertEqual(result["frozen_count"], 1)
-        self.assertNotIn(frozen["freeze_id"], main.load_snapshot_store().get("learning_postmatch", {}))
+        postmatch = main.load_snapshot_store()["learning_postmatch"][frozen["freeze_id"]]
+        self.assertEqual(postmatch["process_classification"], "DATA_INSUFFICIENT")
+        self.assertEqual(postmatch["review"]["review_mode"], "automatic_evidence_review")
 
     def test_learning_plan_has_no_daily_match_or_historical_sample_limit(self):
         now_ts = 100000
