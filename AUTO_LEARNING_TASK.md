@@ -37,7 +37,9 @@
 
 学习池不限制合格比赛数量，也暂不设置完整历史赔率样本额度上限。幂等、节点去重、时间审计和来源审计仍然生效，防止重复请求或伪造节点。
 
-赛后自动采集先建立`learning_postmatch_facts`版本：单一来源保持`single_source_pending`，两个带证据定位且比分一致的独立来源才标记`settlement_eligible`。随后生成不可变`learning_postmatch_drafts`证据草稿，绑定`freeze_hash`和`fact_hash`，整理实际状态路径、事件污染、冻结流程完整度和待人工判断项。草稿固定为`DATA_INSUFFICIENT`建议，不自动给出过程正误，不自动结算、登记理论或修改Champion。`GET /shadow/learning/review-queue`并列提供冻结、事实和对应草稿；`POST /shadow/learning/review-draft`可幂等重建最新事实版本的草稿。最终结算必须人工提交结构化复盘并引用最新已核实`fact_hash`。
+赛后自动采集先建立`learning_postmatch_facts`版本：单一来源保持`single_source_pending`，两个带证据定位且比分一致的独立来源才标记`settlement_eligible`。随后生成不可变`learning_postmatch_drafts`证据草稿，绑定`freeze_hash`和`fact_hash`，整理实际状态路径、事件污染、冻结流程完整度和待复核项。草稿本身固定为`DATA_INSUFFICIENT`建议，不直接给出过程正误，不自动登记理论或修改Champion。`GET /shadow/learning/review-queue`并列提供冻结、事实和对应草稿；`POST /shadow/learning/review-draft`可幂等重建最新事实版本的草稿。
+
+自动任务可以通过`POST /shadow/learning/complete-review`完成证据驱动的结构化复盘，但接口不接受调用方Process分类。六个复盘对象中任何`passed/failed`判断都必须包含绑定冻结或事实哈希的证据和完整理由，并明确`outcome_not_used_for_process_grade=true`。系统先从六项审计派生Process正确/错误，之后才独立结算冻结选择的win/loss；最终输赢永远不能反向改变Process等级。事件污染优先，证据不完整、事件路径未独立核实、盘口无法无歧义结算或走盘时统一进入`DATA_INSUFFICIENT`。
 
 ## 四、赛前阶段
 
@@ -111,7 +113,7 @@
 
 赛后报告写入`SNAPSHOT_STORE_PATH`内的`learning_postmatch`持久化命名空间，并以`freeze_id`绑定冻结版本；仓库中的`learning/postmatch/`仅供人工导出。不得把“赢”直接写成模型正确，也不得把“输”直接写成模型错误。
 
-结算接口必须同时提交结构化`review`，逐项覆盖：场次选择质量、基本面链、State Tree覆盖、盘口语言、市场表达和价格执行。`learning_disposition.result_backfit_used`与`champion_change_requested`必须明确为`false`。单场发现的新想法最多标记为`HYPOTHESIS_ONLY`或`LEAGUE_TAG_CANDIDATE`；实现错误必须引用已有规则，并声明需要回归测试。缺少这些字段时拒绝结算，不能把只有比分的记录伪装成赛后复盘。
+结算接口必须同时提交结构化`review`，逐项覆盖：场次选择质量、基本面链、State Tree覆盖、盘口语言、市场表达和价格执行。`learning_disposition.result_backfit_used`与`champion_change_requested`必须明确为`false`。自动证据复盘还必须绑定最新`draft_hash`且由系统派生分类；调用方提交的分类字段会被忽略。单场发现的新想法最多标记为`HYPOTHESIS_ONLY`或`LEAGUE_TAG_CANDIDATE`；实现错误必须引用已有规则，并声明需要回归测试。缺少这些字段时拒绝结算，不能把只有比分的记录伪装成赛后复盘。
 
 ## 六、学习点治理
 

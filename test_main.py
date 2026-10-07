@@ -3911,6 +3911,131 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(draft["suggested_process_classification"], "DATA_INSUFFICIENT")
         self.assertTrue(draft["manual_review_required"])
 
+    def verified_event_fact_packet(self, home_goals=3, away_goals=2):
+        packet = self.learning_postmatch_facts(("api_football", "official_league"), home_goals, away_goals)
+        packet["events"] = [
+            {"elapsed": 12, "type": "Goal", "detail": "Normal Goal", "team": "Home"},
+            {"elapsed": 40, "type": "Goal", "detail": "Normal Goal", "team": "Away"},
+        ]
+        packet["source_audit"].extend([
+            {"source": "api_football", "component": "events", "ok": True, "evidence_ref": "test:api:events"},
+            {"source": "official_league", "component": "events", "ok": True, "evidence_ref": "test:official:events"},
+        ])
+        return packet
+
+    def automatic_evidence_review(self, frozen, facts, expression_status="passed"):
+        freeze_ref = f"freeze:{frozen['content_hash']}"
+        fact_ref = f"fact:{facts['fact_hash']}"
+        review = self.learning_postmatch_review()
+        statuses = {
+            "match_selection_quality": "passed",
+            "fundamental_chain_audit": "passed",
+            "state_tree_coverage": "passed",
+            "market_language_audit": "passed",
+            "expression_audit": expression_status,
+            "price_execution_audit": "passed",
+        }
+        for section, status in statuses.items():
+            review[section] = {
+                "status": status,
+                "reason": f"Hash-bound evidence supports the {section} process assessment.",
+                "evidence_refs": [fact_ref if section == "state_tree_coverage" else freeze_ref],
+            }
+        review["review_mode"] = "scheduled_agent"
+        review["outcome_not_used_for_process_grade"] = True
+        review["process_reasoning"] = "The process grade is derived from frozen inputs and hash-bound event evidence before the separately calculated selection outcome."
+        return review
+
+    def test_evidence_review_derives_process_before_selection_outcome_and_ignores_caller_class(self):
+        payload = self.learning_payload("auto-review-error", 900, 1000)
+        payload["decision"] = {
+            "decision": "BET", "match_rating": "B",
+            "selected_expression": {"market": "over_under", "selection": "under", "line": 2.75, "price": 1.91},
+        }
+        frozen = main.freeze_learning_sample(payload, now_ts=900)
+        facts = main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.verified_event_fact_packet(3, 2),
+        )
+        draft = main.build_learning_postmatch_review_draft(frozen["freeze_id"], now_ts=9001)
+        completed = main.complete_learning_postmatch_review({
+            "freeze_id": frozen["freeze_id"], "draft_hash": draft["draft_hash"],
+            "process_classification": "PROCESS_CORRECT_RESULT_WIN",
+            "review": self.automatic_evidence_review(frozen, facts, expression_status="failed"),
+            "event_audit": {"status": "clean", "evidence_refs": [f"fact:{facts['fact_hash']}"]},
+            "settled_at": 9002,
+        }, now_ts=9002)
+        self.assertEqual(completed["process_classification"], "PROCESS_ERROR_RESULT_LOSS")
+        derivation = completed["event_audit"]["automatic_review_derivation"]
+        self.assertEqual(derivation["process_grade"], "error")
+        self.assertTrue(derivation["process_grade_derived_before_outcome"])
+        self.assertEqual(derivation["selection_outcome_audit"]["outcome"], "loss")
+        self.assertFalse(derivation["caller_supplied_process_classification_used"])
+        self.assertFalse(derivation["result_backfit_used"])
+
+    def test_evidence_review_can_mark_process_correct_despite_selection_loss(self):
+        payload = self.learning_payload("auto-review-correct-loss", 900, 1000)
+        payload["decision"] = {
+            "decision": "BET", "match_rating": "B",
+            "selected_expression": {"market": "over_under", "selection": "under", "line": 2.75, "price": 1.91},
+        }
+        frozen = main.freeze_learning_sample(payload, now_ts=900)
+        facts = main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.verified_event_fact_packet(3, 2),
+        )
+        draft = main.build_learning_postmatch_review_draft(frozen["freeze_id"], now_ts=9001)
+        completed = main.complete_learning_postmatch_review({
+            "freeze_id": frozen["freeze_id"], "draft_hash": draft["draft_hash"],
+            "review": self.automatic_evidence_review(frozen, facts, expression_status="passed"),
+            "event_audit": {"status": "clean", "evidence_refs": [f"draft:{draft['draft_hash']}"]},
+        }, now_ts=9002)
+        self.assertEqual(completed["process_classification"], "PROCESS_CORRECT_RESULT_LOSS")
+
+    def test_automatic_evidence_review_rejects_unbound_section_assertions(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("auto-review-unbound", 900, 1000), now_ts=900)
+        facts = main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.verified_event_fact_packet(1, 1),
+        )
+        draft = main.build_learning_postmatch_review_draft(frozen["freeze_id"], now_ts=9001)
+        review = self.automatic_evidence_review(frozen, facts)
+        review["market_language_audit"]["evidence_refs"] = ["unbound:claim"]
+        with self.assertRaises(main.HTTPException) as rejected:
+            main.complete_learning_postmatch_review({
+                "freeze_id": frozen["freeze_id"], "draft_hash": draft["draft_hash"],
+                "review": review,
+                "event_audit": {"status": "clean", "evidence_refs": [f"fact:{facts['fact_hash']}"]},
+            }, now_ts=9002)
+        self.assertEqual(rejected.exception.status_code, 422)
+        self.assertIn("market_language_audit_hash_bound_evidence_required", rejected.exception.detail["reasons"])
+
+    def test_learning_cycle_can_complete_hash_bound_evidence_review(self):
+        payload = self.learning_payload("cycle-auto-review", 900, 1000)
+        payload["decision"] = {
+            "decision": "BET", "match_rating": "B",
+            "selected_expression": {"market": "over_under", "selection": "under", "line": 2.75, "price": 1.91},
+        }
+        frozen = main.freeze_learning_sample(payload, now_ts=900)
+        facts = main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.verified_event_fact_packet(3, 2),
+        )
+        draft = main.build_learning_postmatch_review_draft(frozen["freeze_id"], now_ts=9001)
+        result = main.run_learning_cycle({
+            "apply": True, "run_id": "cycle-complete-review",
+            "auto_collect_postmatch_facts": False,
+            "review_completion_packets": [{
+                "freeze_id": frozen["freeze_id"], "draft_hash": draft["draft_hash"],
+                "review": self.automatic_evidence_review(frozen, facts),
+                "event_audit": {"status": "clean", "evidence_refs": [f"fact:{facts['fact_hash']}"]},
+            }],
+        }, now_ts=9002, fixture_rows=[])
+        self.assertEqual(result["settled_count"], 1)
+        self.assertEqual(result["review_completion_results"][0]["action"], "settled")
+        self.assertEqual(result["review_completion_results"][0]["process_classification"], "PROCESS_CORRECT_RESULT_LOSS")
+        self.assertFalse(result["review_completion_results"][0]["caller_supplied_process_classification_used"])
+
     def test_learning_cycle_finishes_postmatch_evidence_before_future_prematch(self):
         frozen = main.freeze_learning_sample(self.learning_payload("order-past", 900, 1000), now_ts=900)
         future = self.learning_fixture_row(809, 39, 10000)
