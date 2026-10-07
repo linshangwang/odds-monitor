@@ -2672,10 +2672,12 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(release["version"], main.VERSION)
         self.assertEqual(release["status"], "shadow_usable")
         self.assertTrue(release["shadow_use_authorized"])
+        self.assertFalse(release["automatic_learning_runtime_authorized"])
         self.assertFalse(release["real_money_use_authorized"])
         self.assertFalse(release["controlled_decision_candidate"])
         self.assertIn("calibration_minimum_sample_not_reached", release["warnings"])
         self.assertIn("real_fixture_shadow_path_not_yet_validated", release["warnings"])
+        self.assertIn("automatic_learning_runtime_not_ready", release["warnings"])
         self.assertFalse(release["fixture_acceptance"]["shadow_path_validated"])
         self.assertTrue(release["usable_scope"]["system_usable"])
         self.assertEqual(release["usable_scope"]["operating_mode"], "manual_or_api_import_shadow")
@@ -2690,6 +2692,39 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(blocked["shadow_use_authorized"])
         self.assertIn("persistent_store_operational", blocked["blockers"])
         self.assertIn("protected_api_configured", blocked["blockers"])
+
+    def test_automatic_learning_runtime_readiness_requires_all_unattended_gates(self):
+        alive = Mock()
+        alive.is_alive.return_value = True
+        integrity = {"operational": True, "recovery_ready": True}
+        with patch.object(main, "API_FOOTBALL_KEY", "configured-api-football"), \
+             patch.object(main, "THE_ODDS_API_KEY", "configured-odds"), \
+             patch.object(main, "THESTATS_API_KEY", "configured-events"), \
+             patch.object(main, "SHADOW_ACCESS_TOKEN", "configured-shadow"), \
+             patch.object(main, "SNAPSHOT_STORE_PATH", "/data/shadow_snapshots.json"), \
+             patch.object(main, "AUTO_SNAPSHOT_ENABLED", True), \
+             patch.object(main, "AUTO_SNAPSHOT_THREAD", alive):
+            ready = main.automatic_learning_runtime_readiness(store_integrity=integrity)
+        self.assertTrue(ready["ready"])
+        self.assertEqual(ready["blockers"], [])
+        self.assertFalse(ready["secrets_exposed"])
+
+        with patch.object(main, "API_FOOTBALL_KEY", ""), \
+             patch.object(main, "THE_ODDS_API_KEY", ""), \
+             patch.object(main, "THESTATS_API_KEY", ""), \
+             patch.object(main, "SHADOW_ACCESS_TOKEN", ""), \
+             patch.object(main, "SNAPSHOT_STORE_PATH", "/tmp/shadow_snapshots.json"), \
+             patch.object(main, "AUTO_SNAPSHOT_ENABLED", False):
+            blocked = main.automatic_learning_runtime_readiness(
+                store_integrity={"operational": True, "recovery_ready": False}, worker_alive=False,
+            )
+        self.assertFalse(blocked["ready"])
+        self.assertIn("api_football_configured", blocked["blockers"])
+        self.assertIn("the_odds_api_configured", blocked["blockers"])
+        self.assertIn("thestats_configured", blocked["blockers"])
+        self.assertIn("persistent_store_configured", blocked["blockers"])
+        self.assertIn("persistent_backup_ready", blocked["blockers"])
+        self.assertIn("auto_snapshot_worker_alive", blocked["blockers"])
 
     def test_fixture_acceptance_requires_a_real_ready_fixture(self):
         reports = {

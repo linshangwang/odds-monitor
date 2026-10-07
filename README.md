@@ -136,6 +136,7 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 - v2.03 接入TheStatsAPI作为第二独立事件权威。系统只能在开赛前通过UTC日期、主客队和开赛时间唯一匹配`match_id`并将身份哈希写入冻结；赛后再按该ID读取match detail与`/timeline`。最终比分须与API-Football一致，关键事件序列还必须在进球、红牌、点球、乌龙的类型、主客侧及分钟容差上逐项一致。两个事件来源都必须绑定同一`event_signature_hash`，缺哈希、错比赛、比分或事件不一致均保持单源/`DATA_INSUFFICIENT`。
 - v2.04 将TheStatsAPI赛前身份发现改为按UTC比赛日批量复用。一次完整分页结果在进程内短时缓存，同日多场及并发冻结共享同一份只读副本，避免逐场重复请求触发供应商分钟限速；失败、无效schema或不完整分页绝不缓存。缓存键绑定API域名、密钥指纹和UTC日期，默认TTL为600秒且最多保留16个比赛日键，不含真实密钥。
 - v2.05 加固每日14:30调度可靠性。14:30前严格不运行，之后由当日首个可用轮询补跑，不再因服务重启或轮询越过十分钟窗口而永久漏掉该日闭环；日期化run_id继续保证最多一次不可变写入，并记录计划时间与实际触发延迟。跨日不会伪造旧日期PIT运行。
+- v2.06 增加自动学习运行就绪契约，将API-Football、The Odds API、TheStatsAPI、安全令牌、持久化主存储与备份、自动工作线程、顶级联赛注册表和14:30调度逐项列为硬门禁。普通手工Shadow可用不再被误解为无人值守闭环已运行；状态与发布报告只公开布尔检查和阻塞项，不泄露密钥。
 
 真实资金包通过`/shadow/model/prematch-evaluate`或`/shadow/evaluate`请求体中的`real_money_data`提交。示例结构：
 

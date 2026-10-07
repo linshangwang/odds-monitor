@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.05.0"
+VERSION = "2.06.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -198,7 +198,7 @@ LEARNING_TOP_FLIGHT_LEAGUES: Dict[int, Dict[str, str]] = {
 }
 LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
 LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
-LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.05").strip() or "MODEL_RULES.md@2026-10-08-v2.05"
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.06").strip() or "MODEL_RULES.md@2026-10-08-v2.06"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -9414,6 +9414,51 @@ def learning_research_proposal_report() -> Dict[str, Any]:
     }
 
 
+def automatic_learning_runtime_readiness(
+    store_integrity: Optional[Dict[str, Any]] = None,
+    worker_alive: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Expose the exact configuration gate for an unattended learning loop without secrets."""
+    integrity = store_integrity if isinstance(store_integrity, dict) else snapshot_store_integrity()
+    if worker_alive is None:
+        worker_alive = bool(AUTO_SNAPSHOT_THREAD and AUTO_SNAPSHOT_THREAD.is_alive())
+    checks = {
+        "api_football_configured": bool(API_FOOTBALL_KEY),
+        "the_odds_api_configured": bool(THE_ODDS_API_KEY),
+        "thestats_configured": bool(THESTATS_API_KEY),
+        "protected_api_configured": bool(SHADOW_ACCESS_TOKEN),
+        "persistent_store_configured": str(SNAPSHOT_STORE_PATH).replace("\\", "/").startswith("/data/"),
+        "persistent_store_operational": integrity.get("operational") is True,
+        "persistent_backup_ready": integrity.get("recovery_ready") is True,
+        "auto_snapshot_enabled": AUTO_SNAPSHOT_ENABLED is True,
+        "auto_snapshot_worker_alive": worker_alive is True,
+        "top_flight_registry_configured": bool(LEARNING_TOP_FLIGHT_LEAGUES),
+        "daily_schedule_configured": True,
+    }
+    required = (
+        "api_football_configured", "the_odds_api_configured", "thestats_configured",
+        "protected_api_configured", "persistent_store_configured",
+        "persistent_store_operational", "persistent_backup_ready",
+        "auto_snapshot_enabled", "auto_snapshot_worker_alive",
+        "top_flight_registry_configured", "daily_schedule_configured",
+    )
+    blockers = [name for name in required if checks.get(name) is not True]
+    return {
+        "status": "ready" if not blockers else "not_ready",
+        "ready": not blockers,
+        "checks": checks,
+        "blockers": blockers,
+        "provider_contract": {
+            "fixture_and_primary_facts": "api_football",
+            "odds_timeline_and_independent_result": "the_odds_api",
+            "independent_event_timeline": "thestats",
+        },
+        "schedule": {"timezone": "Asia/Shanghai", "daily_local_time": "14:30", "same_day_catch_up": True},
+        "secrets_exposed": False,
+        "policy": "automatic learning is authorized only when every provider, persistence, worker and security gate is ready",
+    }
+
+
 def learning_status_report() -> Dict[str, Any]:
     store = load_snapshot_store()
     frozen = store.get("learning_frozen") or {}
@@ -9438,6 +9483,7 @@ def learning_status_report() -> Dict[str, Any]:
     postmatch_rows = list(postmatches.values())
     implementation_gap_count = sum(get_nested(row, ["review", "learning_disposition", "existing_rule_implementation_gap"]) is True for row in postmatch_rows)
     hypothesis_disposition_count = sum(get_nested(row, ["review", "learning_disposition", "new_theory_status"]) in LEARNING_HYPOTHESIS_TYPES for row in postmatch_rows)
+    runtime_readiness = automatic_learning_runtime_readiness()
     return {
         "version": VERSION,
         "frozen_fixture_count": len(frozen),
@@ -9474,6 +9520,7 @@ def learning_status_report() -> Dict[str, Any]:
         "match_limit": None,
         "full_historical_odds_sample_limit": None,
         "automatic_champion_promotion": False,
+        "automatic_learning_runtime": runtime_readiness,
         "policy": "single matches cannot create model rules; promotion candidates require all gates and explicit user confirmation",
     }
 
@@ -9597,6 +9644,10 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
     operations = operations_status_report(now_ts=now_ts)
     fixture_acceptance = fixture_acceptance_summary(now_ts=now_ts)
     self_test = release_candidate_self_test()
+    automatic_learning = automatic_learning_runtime_readiness(
+        store_integrity=operations.get("store"),
+        worker_alive=get_nested(operations, ["auto_snapshot_worker", "alive"]),
+    )
     available_paths = {route.path for route in app.routes}
     required_paths = {
         "/shadow/readiness/{fixture}", "/shadow/calibration/lock", "/shadow/calibration/settle",
@@ -9624,6 +9675,8 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         warnings.append("calibration_minimum_sample_not_reached")
     if not checks["real_fixture_shadow_path_validated"]:
         warnings.append("real_fixture_shadow_path_not_yet_validated")
+    if automatic_learning.get("ready") is not True:
+        warnings.append("automatic_learning_runtime_not_ready")
     shadow_usable = not blockers
     controlled_decision_candidate = shadow_usable and operations["calibration"].get("sample_ready") is True
     operating_mode = "live_feed_shadow" if fixture_acceptance["shadow_path_validated"] else "manual_or_api_import_shadow"
@@ -9631,6 +9684,7 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         "version": VERSION, "release_channel": RELEASE_CHANNEL,
         "status": "shadow_usable" if shadow_usable else "not_ready",
         "shadow_use_authorized": shadow_usable,
+        "automatic_learning_runtime_authorized": automatic_learning.get("ready") is True,
         "real_money_use_authorized": False,
         "controlled_decision_candidate": controlled_decision_candidate,
         "usable_scope": {
@@ -9646,6 +9700,7 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         "operations_status": operations.get("status"),
         "calibration_sample": operations.get("calibration"),
         "fixture_acceptance": fixture_acceptance,
+        "automatic_learning_runtime": automatic_learning,
         "release_candidate_self_test": self_test,
         "per_fixture_gate": "/shadow/readiness/{fixture} must return decision_ready before any recommendation is considered",
         "remaining_external_gaps": [
