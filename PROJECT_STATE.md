@@ -58,6 +58,7 @@
 - Champion/Challenger验证已升级为模块级消融契约：Hypothesis必须预登记结构化联赛/市场和目标模块，每个样本在开赛前锁定全部模块的固定干预、概率、时间与证据引用；系统逐模块派生Brier增益并自动产生support/counterexample，调用方不能自报支持结论。晋级门禁逐项检查MSCB、State Tree及已选状态参数的独立贡献。
 - 自动赛前概率不再是空模型PASS：API-Football同一PIT积分榜的主客场分项会生成联赛主客场基准及双方场地攻防率，服务端内置估计器与Poisson模型保存完整输入、来源内容、估计器、概率及整包哈希并在冻结前重算。任何篡改、赛后时间或盘口污染都会拒绝；资料不足则明确`PASS/data_missing`。
 - 学习决策的盘口证据已经与持久化节点隔离：刚抓取但未保存的即时赔率不再参与冻结决策；非PASS表达必须绑定Timing Audit通过的节点时间与内容哈希。每日周期会分别报告概率重放ready与missing数量。
+- 前向Shadow内部运行器现在只接受概率重放审计为ready的冻结样本，计算请求哈希显式绑定`probability_replay_hash`；运行器返回的Champion概率必须与冻结基线一致，缺失PIT重放输入或改写Champion都会fail-closed，不能进入Promotion证据。
 
 ## 当前真实阻塞
 

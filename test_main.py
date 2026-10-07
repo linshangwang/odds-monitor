@@ -3451,6 +3451,35 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "source_refs": ["source:test"],
         }
 
+    def learning_payload_with_probability_replay(self, fixture, captured_at, kickoff_at):
+        source_hash = main._content_hash({"fixture": fixture, "observed_at": captured_at, "source": "test-standings"})
+        inputs = {
+            "league_home_rate": 1.5, "league_away_rate": 1.2,
+            "home_attack_rate": 1.7, "home_defense_rate": 1.0,
+            "away_attack_rate": 1.3, "away_defense_rate": 1.4,
+            "home_sample_size": 10, "away_sample_size": 10, "league_sample_size": 100,
+            "metric_type": "goals", "home_adjustment": 1.0, "away_adjustment": 1.0,
+            "lineup_confidence": .9,
+            "provenance": {
+                "source": "test_standings_venue_split", "uses_market_odds": False,
+                "observed_at": captured_at, "source_content_hash": source_hash,
+            },
+        }
+        replay = main.build_learning_probability_replay(
+            fixture,
+            {"status": "ready", "inputs": inputs, "source_content_hash": source_hash},
+            generated_at=captured_at,
+        )
+        payload = self.learning_payload(
+            fixture, captured_at, kickoff_at,
+            analysis={"fundamental_chain": {"status": "complete"}, "probability_replay": replay},
+        )
+        payload["decision"].update({
+            "model_probability": replay["model"]["probabilities"],
+            "probability_replay_hash": replay["replay_hash"],
+        })
+        return payload
+
     def settle_learning_fixture(self, fixture, captured_at, kickoff_at):
         frozen = main.freeze_learning_sample(self.learning_payload(fixture, captured_at, kickoff_at), now_ts=captured_at)
         facts = self.collect_verified_learning_facts(frozen, 1, 1, kickoff_at + 7200)
@@ -3494,11 +3523,11 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         }
 
     def learning_shadow_runner(self, champion=None, challenger=None, ablation=None, market="1x2"):
-        champion = champion or {"home": 0.45, "draw": 0.25, "away": 0.30}
         challenger = challenger or {"home": 0.30, "draw": 0.45, "away": 0.25}
         ablation = ablation or {"home": 0.33, "draw": 0.34, "away": 0.33}
 
         def runner(request):
+            champion_output = champion or request["frozen_champion_probabilities"]
             generated_at = int(request["freeze"]["captured_at"]) + 5
             modules = request["hypothesis"]["ablation_plan"]["required_modules"]
             content = {
@@ -3507,7 +3536,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
                 "generated_at": generated_at, "input_hash": request["input_hash"],
                 "freeze_hash": request["freeze"]["content_hash"],
                 "hypothesis_hash": request["hypothesis"]["hypothesis_hash"],
-                "champion_probabilities": champion,
+                "champion_probabilities": champion_output,
                 "challenger_probabilities": challenger,
                 "module_ablations": {module: {"probabilities": ablation} for module in modules},
                 "selected_expression": {
@@ -3523,7 +3552,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         return runner
 
     def settle_hypothesis_validation_fixture(self, hypothesis_id, fixture, captured_at, kickoff_at, modules=("MSCB",)):
-        frozen = main.freeze_learning_sample(self.learning_payload(fixture, captured_at, kickoff_at), now_ts=captured_at)
+        frozen = main.freeze_learning_sample(self.learning_payload_with_probability_replay(fixture, captured_at, kickoff_at), now_ts=captured_at)
         shadow_lock = main.generate_internal_shadow_lock(
             hypothesis_id, frozen["freeze_id"], model_runner=self.learning_shadow_runner(), now_ts=captured_at + 10,
         )
@@ -3977,7 +4006,20 @@ class ShadowV4UpgradeTests(unittest.TestCase):
                 "discovery_freeze_ids": [discovery["freeze_id"]],
                 "validation_plan": self.learning_validation_plan(),
             })
-        payload = self.learning_payload("runner-hash-validation", 8400, 9000)
+        no_replay_payload = self.learning_payload("runner-no-replay", 8350, 9000)
+        no_replay_payload["decision"] = {
+            "decision": "BET", "selected_expression": {"market": "1x2", "selection": "draw", "price": 3.0},
+        }
+        no_replay = main.freeze_learning_sample(no_replay_payload, now_ts=8350)
+        should_not_run = Mock(side_effect=AssertionError("runner must not receive an unauditable freeze"))
+        with self.assertRaises(main.HTTPException) as missing_replay:
+            main.generate_internal_shadow_lock(
+                "runner-hash-hyp", no_replay["freeze_id"], model_runner=should_not_run, now_ts=8360,
+            )
+        self.assertEqual(missing_replay.exception.detail["error"], "forward_shadow_requires_replayable_pit_probability_inputs")
+        should_not_run.assert_not_called()
+
+        payload = self.learning_payload_with_probability_replay("runner-hash-validation", 8400, 9000)
         payload["decision"] = {
             "decision": "BET", "selected_expression": {"market": "1x2", "selection": "draw", "price": 3.0},
         }
@@ -3995,6 +4037,14 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(tampered.exception.detail, "internal_shadow_model_run_hash_mismatch")
         self.assertNotIn(frozen["freeze_id"], main.load_snapshot_store().get("learning_shadow_locks", {}).get("runner-hash-hyp", {}))
 
+        with self.assertRaises(main.HTTPException) as champion_mismatch:
+            main.generate_internal_shadow_lock(
+                "runner-hash-hyp", frozen["freeze_id"],
+                model_runner=self.learning_shadow_runner(champion={"home": .45, "draw": .25, "away": .30}),
+                now_ts=8410,
+            )
+        self.assertEqual(champion_mismatch.exception.detail, "internal_shadow_champion_must_match_frozen_probability_replay")
+
     def test_learning_cycle_automatically_locks_forward_sample_with_internal_runner(self):
         discovery, _ = self.settle_learning_fixture("cycle-runner-discovery", 900, 1000)
         with patch.object(main.time, "time", return_value=8300):
@@ -4006,7 +4056,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
                 "discovery_freeze_ids": [discovery["freeze_id"]],
                 "validation_plan": self.learning_validation_plan(),
             })
-        payload = self.learning_payload("cycle-runner-validation", 8400, 10000)
+        payload = self.learning_payload_with_probability_replay("cycle-runner-validation", 8400, 10000)
         payload["decision"] = {
             "decision": "BET", "selected_expression": {"market": "1x2", "selection": "draw", "price": 3.0},
         }
