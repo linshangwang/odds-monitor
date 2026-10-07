@@ -23,7 +23,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "1.87.0"
+VERSION = "1.88.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -71,6 +71,33 @@ NAMI_ODDS_STARTUP_PROBE: Dict[str, Any] = {"status": "pending", "decision_use": 
 NAMI_ODDS_STARTUP_PROBE_STARTED = False
 NAMI_ODDS_PROBE_TTL_SECONDS = max(3600, int(os.getenv("NAMI_ODDS_PROBE_TTL_SECONDS", str(7 * 24 * 3600))))
 CALIBRATION_MIN_SAMPLE = max(1, int(os.getenv("CALIBRATION_MIN_SAMPLE", "30")))
+LEARNING_MIN_VALIDATION_SAMPLES = max(2, int(os.getenv("LEARNING_MIN_VALIDATION_SAMPLES", "30")))
+LEARNING_PROCESS_CLASSES = {
+    "PROCESS_CORRECT_RESULT_WIN", "PROCESS_CORRECT_RESULT_LOSS",
+    "PROCESS_ERROR_RESULT_WIN", "PROCESS_ERROR_RESULT_LOSS",
+    "EVENT_CONTAMINATED", "DATA_INSUFFICIENT",
+}
+LEARNING_HYPOTHESIS_TYPES = {"HYPOTHESIS_ONLY", "LEAGUE_TAG_CANDIDATE"}
+LEARNING_VALIDATION_OUTCOMES = {"support", "counterexample", "inconclusive"}
+LEARNING_REVIEW_STATUSES = {"passed", "failed", "inconclusive", "data_missing", "not_applicable"}
+LEARNING_REVIEW_SECTIONS = (
+    "match_selection_quality", "fundamental_chain_audit", "state_tree_coverage",
+    "market_language_audit", "expression_audit", "price_execution_audit",
+)
+LEAGUE_DNA_CATEGORIES = {
+    "goal_environment", "handicap_and_parity", "corner_environment",
+    "tempo_and_state_elasticity", "match_context",
+    "discipline_and_officiating", "market_microstructure",
+}
+LEAGUE_DNA_MARKETS = {
+    "goals", "1x2", "asian_handicap", "over_under", "btts",
+    "corners", "cards", "state_tree", "market_expression",
+}
+LEARNING_PROMOTION_REQUIRED_GATES = (
+    "pre_registration", "pit_integrity", "event_pollution_audit",
+    "out_of_sample_shadow", "ablation", "calibration",
+    "clv_or_price_quality", "process_accuracy", "risk_review",
+)
 API_FOOTBALL_RATE_LIMIT_UNTIL = 0
 SNAPSHOT_STORE_LOCK = threading.RLock()
 
@@ -112,6 +139,29 @@ DEFAULT_TARGET_LEAGUES: Dict[int, str] = {
     203: "Turkey Super Lig",
     848: "UEFA Conference League",
 }
+# Curated learning scope is intentionally separate from the broader analysis
+# target list above. Continental and national-team competitions must never be
+# admitted merely because they are general analysis targets.
+LEARNING_TOP_FLIGHT_LEAGUES: Dict[int, Dict[str, str]] = {
+    39: {"name": "England Premier League", "country": "England"},
+    61: {"name": "France Ligue 1", "country": "France"},
+    71: {"name": "Brazil Serie A", "country": "Brazil"},
+    78: {"name": "Germany Bundesliga", "country": "Germany"},
+    88: {"name": "Netherlands Eredivisie", "country": "Netherlands"},
+    94: {"name": "Portugal Primeira Liga", "country": "Portugal"},
+    103: {"name": "Norway Eliteserien", "country": "Norway"},
+    113: {"name": "Sweden Allsvenskan", "country": "Sweden"},
+    128: {"name": "Argentina Liga Profesional", "country": "Argentina"},
+    135: {"name": "Italy Serie A", "country": "Italy"},
+    140: {"name": "Spain La Liga", "country": "Spain"},
+    144: {"name": "Belgium Pro League", "country": "Belgium"},
+    203: {"name": "Turkey Super Lig", "country": "Turkey"},
+    244: {"name": "Finland Veikkausliiga", "country": "Finland"},
+    253: {"name": "USA Major League Soccer", "country": "USA"},
+}
+LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
+LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
+LEARNING_DAILY_FREEZE_CAP = max(1, min(int(os.getenv("LEARNING_DAILY_FREEZE_CAP", "8")), 50))
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -157,6 +207,23 @@ class SnapshotStoreReadError(RuntimeError):
 def require_shadow_token(token: Optional[str]) -> None:
     if SHADOW_ACCESS_TOKEN and not hmac.compare_digest(str(token or ""), str(SHADOW_ACCESS_TOKEN)):
         raise HTTPException(status_code=401, detail="Invalid or missing token")
+
+
+def require_configured_shadow_token(token: Optional[str], unavailable_detail: str = "shadow_access_token_required") -> None:
+    """Fail closed for endpoints that can mutate learning state or consume paid quota."""
+    if not SHADOW_ACCESS_TOKEN:
+        raise HTTPException(status_code=503, detail=unavailable_detail)
+    require_shadow_token(token)
+
+
+def require_learning_token(token: Optional[str]) -> None:
+    """Learning writes and discovery fail closed until an access token exists."""
+    require_configured_shadow_token(token, "shadow_access_token_required_for_learning")
+
+
+def require_paid_odds_token(token: Optional[str]) -> None:
+    """Paid historical-odds requests must never become public when auth is unset."""
+    require_configured_shadow_token(token, "shadow_access_token_required_for_paid_odds")
 
 
 def resolve_shadow_token(query_token: Optional[str], authorization: Optional[str], header_token: Optional[str]) -> Optional[str]:
@@ -2249,12 +2316,30 @@ def import_prematch_packet(packet: Dict[str, Any], store_override: Optional[Dict
             provider_fixture_ids["pang"] = fixture
         else:
             provider_fixture_ids["the_odds_api"] = str(match.get("the_odds_api_event_id") or "") or None
+        next_data_quality = packet.get("data_quality") or previous_meta.get("data_quality")
+        if packet_source == "the_odds_api" and isinstance(packet.get("data_quality"), dict) and isinstance(previous_meta.get("data_quality"), dict):
+            previous_quality = previous_meta["data_quality"]
+            incoming_quality = packet["data_quality"]
+            eligible_stages = [
+                stage for stage in PREMATCH_STAGE_ORDER
+                if stage in set(previous_quality.get("primary_reference_eligible_stages") or [])
+                or stage in set(incoming_quality.get("primary_reference_eligible_stages") or [])
+            ]
+            next_data_quality = {
+                **previous_quality,
+                **incoming_quality,
+                "primary_reference_eligible_stages": eligible_stages,
+                "primary_reference_eligible_stage_count": len(eligible_stages),
+                "required_stage_count": len(PREMATCH_STAGE_ORDER),
+                "last_requested_stages": list(incoming_quality.get("requested_stages") or []),
+                "incremental_collection": bool(incoming_quality.get("incremental_collection")),
+            }
         next_meta_content = {
             "schema_version": packet.get("schema_version"), "league": packet.get("league") or previous_meta.get("league"),
             "exported_at": packet.get("exported_at") or previous_meta.get("exported_at"), "match": match or previous_meta.get("match"),
             "required_timeline": packet.get("required_timeline") or previous_meta.get("required_timeline") or PREMATCH_STAGE_ORDER,
             "lineup_history": lineup_history if "lineup_history" in packet else previous_meta.get("lineup_history", []),
-            "data_quality": packet.get("data_quality") or previous_meta.get("data_quality"),
+            "data_quality": next_data_quality,
             "fixture_identity": fixture_identity,
             "source": packet_source,
             "provider_fixture_ids": {key: value for key, value in provider_fixture_ids.items() if value},
@@ -2322,7 +2407,7 @@ def import_prematch_packet_batch(packets: List[Dict[str, Any]]) -> Tuple[List[Di
 
 
 def collect_the_odds_api_timeline(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Collect and optionally persist one verified eight-node provider timeline."""
+    """Collect and optionally persist missing nodes of a verified timeline."""
     if not THE_ODDS_API_KEY:
         raise HTTPException(status_code=503, detail="the_odds_api_not_configured")
     if not isinstance(payload, dict):
@@ -2334,6 +2419,40 @@ def collect_the_odds_api_timeline(payload: Dict[str, Any]) -> Dict[str, Any]:
     fixture = str(payload.get("fixture")).strip()
     if not fixture or len(fixture) > 128:
         raise HTTPException(status_code=400, detail="invalid_fixture")
+    requested_stages = payload.get("requested_stages")
+    if requested_stages is not None:
+        if not isinstance(requested_stages, list) or not requested_stages or any(not isinstance(stage, str) for stage in requested_stages):
+            raise HTTPException(status_code=400, detail="invalid_requested_stages")
+        requested_stages = list(dict.fromkeys(requested_stages))
+        invalid_stages = [stage for stage in requested_stages if stage not in PREMATCH_STAGE_ORDER]
+        if invalid_stages:
+            raise HTTPException(status_code=400, detail={"error": "invalid_requested_stage", "stages": invalid_stages})
+    else:
+        requested_stages = list(PREMATCH_STAGE_ORDER)
+    only_missing = payload.get("only_missing", True)
+    retry_data_missing = payload.get("retry_data_missing", False)
+    if not isinstance(only_missing, bool) or not isinstance(retry_data_missing, bool):
+        raise HTTPException(status_code=400, detail="incremental_flags_must_be_boolean")
+    store = load_snapshot_store()
+    existing_rows = list((store.get("fixtures") or {}).get(fixture) or [])
+    if retry_data_missing:
+        completed_stages = {row.get("stage") for row in existing_rows if snapshot_stage_usable(row)}
+    else:
+        completed_stages = {row.get("stage") for row in existing_rows if row.get("stage") in PREMATCH_STAGE_ORDER}
+    stages_to_fetch = [stage for stage in requested_stages if not only_missing or stage not in completed_stages]
+    metadata = (store.get("external_prematch") or {}).get(fixture) or {}
+    provider_ids = metadata.get("provider_fixture_ids") if isinstance(metadata.get("provider_fixture_ids"), dict) else {}
+    known_event_id = str(payload.get("the_odds_api_event_id") or provider_ids.get("the_odds_api") or "").strip()
+    if len(known_event_id) > 200 or any(ord(char) < 32 for char in known_event_id):
+        raise HTTPException(status_code=400, detail="invalid_the_odds_api_event_id")
+    if not stages_to_fetch:
+        return {
+            "ok": True, "source": "the_odds_api", "fixture": fixture,
+            "request_count": 0, "request_audit": [], "requested_stages": requested_stages,
+            "stages_to_fetch": [], "skipped_existing_stages": requested_stages,
+            "incremental_noop": True, "persist_requested": payload.get("persist", True) is not False,
+            "persist_result": None, "credential_exposed": False,
+        }
     aliases = {}
     for side in ("home", "away"):
         raw = payload.get(f"{side}_aliases") or []
@@ -2369,6 +2488,8 @@ def collect_the_odds_api_timeline(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "asian_handicap": THE_ODDS_API_MIN_AH_BOOKMAKERS,
                 "over_under": THE_ODDS_API_MIN_OU_BOOKMAKERS,
             },
+            requested_stages=stages_to_fetch,
+            known_event_id=known_event_id or None,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2377,6 +2498,9 @@ def collect_the_odds_api_timeline(payload: Dict[str, Any]) -> Dict[str, Any]:
         persisted = import_prematch_packet(result["packet"])
     return {
         **result,
+        "stages_to_fetch": stages_to_fetch,
+        "skipped_existing_stages": [stage for stage in requested_stages if stage not in stages_to_fetch],
+        "incremental_noop": False,
         "persist_requested": payload.get("persist", True) is not False,
         "persist_result": persisted,
         "credential_exposed": False,
@@ -3790,7 +3914,7 @@ def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6, ri
 
 @app.get("/")
 def root():
-    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}"]}
+    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}", "/shadow/learning/cycle-plan", "/shadow/learning/freeze", "/shadow/learning/settle", "/shadow/learning/hypotheses", "/shadow/learning/league-dna", "/shadow/learning/selection-quality", "/shadow/learning/status"]}
 
 
 @app.get("/health")
@@ -3834,13 +3958,13 @@ def thestats_raw(path: str, token: Optional[str] = None, authorization: Optional
 
 @app.get("/shadow/historical-odds-test")
 def shadow_historical_odds_test(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
-    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    require_paid_odds_token(resolve_shadow_token(token, authorization, x_shadow_token))
     return JSONResponse(historical_odds_selfcheck())
 
 
 @app.post("/shadow/the-odds-api/collect-timeline")
 async def shadow_the_odds_api_collect_timeline(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
-    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    require_paid_odds_token(resolve_shadow_token(token, authorization, x_shadow_token))
     body = await request.body()
     if len(body) > 100 * 1024:
         raise HTTPException(status_code=413, detail="request_body_too_large")
@@ -4318,6 +4442,870 @@ def calibration_report() -> Dict[str, Any]:
     }
 
 
+def audit_learning_scope(scope: Any) -> Dict[str, Any]:
+    """Require explicit evidence that a learning sample is a men's professional domestic top flight."""
+    scope = scope if isinstance(scope, dict) else {}
+    reasons = []
+    competition_type = str(scope.get("competition_type") or "").strip().lower()
+    gender = str(scope.get("gender") or "").strip().lower()
+    team_level = str(scope.get("team_level") or "").strip().lower()
+    try:
+        tier = int(scope.get("tier"))
+    except (TypeError, ValueError):
+        tier = None
+    try:
+        competition_id = int(scope.get("competition_id"))
+    except (TypeError, ValueError):
+        competition_id = None
+    registry = LEARNING_TOP_FLIGHT_LEAGUES.get(competition_id)
+    verification_refs = scope.get("verification_refs") if isinstance(scope.get("verification_refs"), list) else []
+    valid_verification_refs = [
+        ref for ref in verification_refs
+        if isinstance(ref, dict)
+        and str(ref.get("source") or "").strip()
+        and str(ref.get("url") or ref.get("id") or ref.get("title") or "").strip()
+    ]
+    if competition_type != "domestic_league":
+        reasons.append("domestic_league_required")
+    if tier != 1:
+        reasons.append("tier_one_required")
+    if gender not in ("men", "male"):
+        reasons.append("mens_competition_required")
+    if scope.get("professional") is not True:
+        reasons.append("professional_competition_required")
+    if team_level != "first_team":
+        reasons.append("first_team_required")
+    if not str(scope.get("competition_name") or "").strip():
+        reasons.append("competition_name_required")
+    if not str(scope.get("season") or "").strip():
+        reasons.append("season_required")
+    if registry:
+        supplied_name = normalize_fixture_identity_name(scope.get("competition_name"))
+        registered_name = normalize_fixture_identity_name(registry.get("name"))
+        if supplied_name != registered_name:
+            reasons.append("competition_name_registry_mismatch")
+        supplied_country = normalize_fixture_identity_name(scope.get("country"))
+        registered_country = normalize_fixture_identity_name(registry.get("country"))
+        if supplied_country and supplied_country != registered_country:
+            reasons.append("competition_country_registry_mismatch")
+        verification_method = "curated_top_flight_registry"
+    elif str(scope.get("verification_status") or "").strip().lower() == "verified" and valid_verification_refs:
+        verification_method = "explicit_external_evidence"
+    else:
+        verification_method = "unverified"
+        reasons.append("top_flight_verification_required")
+    return {
+        "eligible": not reasons,
+        "reasons": reasons,
+        "normalized": {
+            "competition_name": str(scope.get("competition_name") or "").strip(),
+            "competition_id": competition_id,
+            "country": str(scope.get("country") or (registry or {}).get("country") or "").strip(),
+            "competition_type": competition_type or None,
+            "tier": tier,
+            "gender": gender or None,
+            "professional": scope.get("professional") is True,
+            "team_level": team_level or None,
+            "season": str(scope.get("season") or "").strip(),
+            "phase": str(scope.get("phase") or "unknown").strip(),
+            "format_version": str(scope.get("format_version") or "unknown").strip(),
+            "verification_method": verification_method,
+            "verification_refs": valid_verification_refs[:10],
+        },
+        "policy": "only registry-verified or externally evidenced men's professional domestic tier-one first-team competitions are eligible",
+    }
+
+
+def discover_learning_fixtures(now_ts: Optional[int] = None, fixture_rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Discover only registry-verified domestic top-flight fixtures in the next horizon."""
+    now_ts = int(now_ts or time.time())
+    horizon_ts = now_ts + LEARNING_DISCOVERY_HORIZON_HOURS * 3600
+    source_audit = []
+    rows: List[Dict[str, Any]] = []
+    if fixture_rows is not None:
+        rows = [row for row in fixture_rows if isinstance(row, dict)]
+        source_audit.append({"source": "injected_fixture_rows", "ok": True, "row_count": len(rows)})
+    else:
+        local_now = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(ZoneInfo("Asia/Shanghai"))
+        dates = sorted({local_now.date().isoformat(), (local_now + timedelta(days=1)).date().isoformat()})
+        for date_str in dates:
+            result = call_api_football("/fixtures", {"date": date_str, "timezone": "Asia/Shanghai"})
+            batch = response_list(result)
+            rows.extend(row for row in batch if isinstance(row, dict))
+            source_audit.append({
+                "source": "api_football", "date": date_str, "ok": bool(result.get("ok")),
+                "status_code": result.get("status_code"), "row_count": len(batch), "error": result.get("error"),
+            })
+    candidates, excluded = [], []
+    seen = set()
+    for row in rows:
+        summary = fixture_summary(row)
+        fixture_id = summary.get("fixture_id")
+        league_id = summary.get("league_id")
+        kickoff = fixture_datetime_utc(summary)
+        reason = None
+        if league_id not in LEARNING_TOP_FLIGHT_LEAGUES:
+            reason = "competition_not_in_top_flight_registry"
+        elif summary.get("status") != "NS":
+            reason = "fixture_not_not_started"
+        elif not fixture_id or not kickoff:
+            reason = "fixture_identity_or_kickoff_missing"
+        elif not now_ts < int(kickoff.timestamp()) <= horizon_ts:
+            reason = "outside_learning_discovery_horizon"
+        elif str(fixture_id) in seen:
+            reason = "duplicate_fixture"
+        if reason:
+            excluded.append({"fixture_id": fixture_id, "league_id": league_id, "reason": reason})
+            continue
+        seen.add(str(fixture_id))
+        registry = LEARNING_TOP_FLIGHT_LEAGUES[league_id]
+        candidates.append({
+            **summary,
+            "scope": {
+                "competition_id": league_id, "competition_name": registry["name"],
+                "country": registry["country"], "competition_type": "domestic_league",
+                "tier": 1, "gender": "men", "professional": True,
+                "team_level": "first_team", "season": str(summary.get("season") or ""),
+                "phase": str(summary.get("league_round") or "unknown"),
+                "verification_status": "verified",
+            },
+            "learning_scope_verified": True,
+        })
+    candidates.sort(key=lambda row: (int(row.get("timestamp") or 0), str(row.get("fixture_id"))))
+    excluded_counts = {reason: sum(row["reason"] == reason for row in excluded) for reason in sorted({row["reason"] for row in excluded})}
+    return {
+        "ok": all(row.get("ok") for row in source_audit) if source_audit else False,
+        "generated_at": now_ts, "window_start": now_ts, "window_end": horizon_ts,
+        "horizon_hours": LEARNING_DISCOVERY_HORIZON_HOURS,
+        "candidate_count": len(candidates), "candidates": candidates,
+        "excluded_count": len(excluded), "excluded_counts": excluded_counts,
+        "source_audit": source_audit,
+        "policy": "men's professional domestic tier-one first-team fixtures only; non-registry competitions require separate evidence review before admission",
+    }
+
+
+def learning_cycle_plan(now_ts: Optional[int] = None, fixture_rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Build a non-mutating daily work plan; never invent analysis or process classifications."""
+    now_ts = int(now_ts or time.time())
+    discovery = discover_learning_fixtures(now_ts=now_ts, fixture_rows=fixture_rows)
+    store = load_snapshot_store()
+    frozen = store.get("learning_frozen") or {}
+    postmatches = store.get("learning_postmatch") or {}
+    settlement_due = []
+    for fixture, versions in frozen.items():
+        latest = max((row for row in versions or [] if isinstance(row, dict)), key=lambda row: int(row.get("version_number") or 0), default=None)
+        if not latest or latest.get("freeze_id") in postmatches:
+            continue
+        kickoff_at = int(latest.get("kickoff_at") or 0)
+        age = now_ts - kickoff_at
+        if 2 * 3600 <= age <= LEARNING_POSTMATCH_LOOKBACK_HOURS * 3600:
+            settlement_due.append({
+                "fixture": fixture, "freeze_id": latest.get("freeze_id"),
+                "kickoff_at": kickoff_at, "hours_since_kickoff": round(age / 3600, 2),
+                "required_action": "verify_result_and_events_then_classify_process_without_result_backfit",
+            })
+    local_date = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(ZoneInfo("Asia/Shanghai")).date()
+    frozen_today = [
+        row for versions in frozen.values() for row in versions or []
+        if datetime.fromtimestamp(int(row.get("captured_at") or 0), tz=timezone.utc).astimezone(ZoneInfo("Asia/Shanghai")).date() == local_date
+    ]
+    already_frozen_fixtures = set(frozen)
+    discovery_candidates = []
+    for row in discovery["candidates"]:
+        fixture_key = str(row.get("fixture_id"))
+        discovery_candidates.append({**row, "already_frozen": fixture_key in already_frozen_fixtures})
+    return {
+        "version": VERSION, "generated_at": now_ts,
+        "settlement_due_count": len(settlement_due), "settlement_due": sorted(settlement_due, key=lambda row: row["kickoff_at"]),
+        "discovery": {**discovery, "candidates": discovery_candidates},
+        "daily_freeze_cap": LEARNING_DAILY_FREEZE_CAP,
+        "frozen_today_count": len(frozen_today),
+        "remaining_freeze_capacity": max(0, LEARNING_DAILY_FREEZE_CAP - len(frozen_today)),
+        "mutation_policy": "plan_only; freezing requires a complete PIT analysis and settlement requires verified facts plus an explicit process classification",
+        "automatic_champion_promotion": False,
+    }
+
+
+def _learning_freeze_by_id(store: Dict[str, Any], freeze_id: str) -> Optional[Dict[str, Any]]:
+    for rows in (store.get("learning_frozen") or {}).values():
+        for row in rows or []:
+            if row.get("freeze_id") == freeze_id:
+                return row
+    return None
+
+
+def freeze_learning_sample(payload: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    fixture = str(payload.get("fixture") or "").strip()
+    if not fixture:
+        raise HTTPException(status_code=400, detail="fixture_required")
+    scope_audit = audit_learning_scope(payload.get("scope"))
+    if not scope_audit["eligible"]:
+        raise HTTPException(status_code=422, detail={"error": "top_flight_scope_not_verified", "reasons": scope_audit["reasons"]})
+    captured_at = _parse_timestamp(payload.get("captured_at")) or int(now_ts or time.time())
+    data_cutoff_at = _parse_timestamp(payload.get("data_cutoff_at")) or captured_at
+    kickoff_at = _parse_timestamp(payload.get("kickoff_at"))
+    if kickoff_at is None:
+        raise HTTPException(status_code=400, detail="valid_kickoff_at_required")
+    if data_cutoff_at > captured_at:
+        raise HTTPException(status_code=409, detail="data_cutoff_cannot_follow_capture")
+    if captured_at >= kickoff_at or data_cutoff_at >= kickoff_at:
+        raise HTTPException(status_code=409, detail="learning_sample_must_be_frozen_before_kickoff")
+    analysis = payload.get("analysis")
+    decision = payload.get("decision")
+    if not isinstance(analysis, dict) or not isinstance(decision, dict):
+        raise HTTPException(status_code=400, detail="analysis_and_decision_objects_required")
+    versions = payload.get("versions") if isinstance(payload.get("versions"), dict) else {}
+    if not str(versions.get("rules") or "").strip():
+        raise HTTPException(status_code=400, detail="rules_version_required")
+    league_dna_view = league_dna_model_view(scope_audit["normalized"])
+    requested_league_dna = str(versions.get("league_dna") or "data_missing").strip()
+    if league_dna_view["status"] == "VERIFIED_ACTIVE":
+        if requested_league_dna != league_dna_view["version"]:
+            raise HTTPException(status_code=409, detail={"error": "league_dna_version_mismatch", "required_version": league_dna_view["version"]})
+    elif requested_league_dna not in {"data_missing", "candidate_only"}:
+        raise HTTPException(status_code=409, detail="unverified_league_dna_cannot_enter_prematch_freeze")
+    immutable_content = {
+        "fixture": fixture,
+        "kickoff_at": kickoff_at,
+        "data_cutoff_at": data_cutoff_at,
+        "scope": scope_audit["normalized"],
+        "versions": {
+            "service": str(versions.get("service") or VERSION),
+            "model": str(versions.get("model") or VERSION),
+            "rules": str(versions.get("rules")),
+            "league_dna": league_dna_view["version"] or league_dna_view["status"],
+        },
+        "league_dna_audit": {
+            "status": league_dna_view["status"], "version": league_dna_view["version"],
+            "active_tag_count": league_dna_view["active_tag_count"],
+            "candidate_tag_count": league_dna_view["candidate_tag_count"],
+            "champion_effect": league_dna_view["champion_effect"],
+        },
+        "analysis": analysis,
+        "decision": decision,
+        "source_refs": payload.get("source_refs") if isinstance(payload.get("source_refs"), list) else [],
+    }
+    content_hash = _content_hash(immutable_content)
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        rows = store.setdefault("learning_frozen", {}).setdefault(fixture, [])
+        duplicate = next((row for row in rows if row.get("content_hash") == content_hash), None)
+        if duplicate:
+            return {**duplicate, "action": "unchanged"}
+        if rows and captured_at <= max(int(row.get("captured_at") or 0) for row in rows):
+            raise HTTPException(status_code=409, detail="learning_freeze_time_must_increase")
+        version_number = max([int(row.get("version_number") or 0) for row in rows] + [0]) + 1
+        freeze_id = f"{fixture}:v{version_number}"
+        record = {
+            **immutable_content,
+            "freeze_id": freeze_id,
+            "version_number": version_number,
+            "captured_at": captured_at,
+            "content_hash": content_hash,
+            "scope_audit": scope_audit,
+            "status": "frozen",
+            "immutable": True,
+            "champion_effect": False,
+        }
+        rows.append(record)
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return {**record, "action": "frozen"}
+
+
+def audit_learning_postmatch_review(review: Any) -> Dict[str, Any]:
+    review = review if isinstance(review, dict) else {}
+    reasons = []
+    normalized_sections = {}
+    for section in LEARNING_REVIEW_SECTIONS:
+        row = review.get(section) if isinstance(review.get(section), dict) else {}
+        status = str(row.get("status") or "").strip().lower()
+        if status not in LEARNING_REVIEW_STATUSES:
+            reasons.append(f"{section}_status_required")
+            status = "data_missing"
+        normalized_sections[section] = {**row, "status": status}
+    process_reasoning = str(review.get("process_reasoning") or "").strip()
+    if len(process_reasoning) < 20:
+        reasons.append("process_reasoning_too_short")
+    disposition = review.get("learning_disposition") if isinstance(review.get("learning_disposition"), dict) else {}
+    result_backfit_used = disposition.get("result_backfit_used")
+    champion_change_requested = disposition.get("champion_change_requested")
+    new_theory_status = str(disposition.get("new_theory_status") or "none").strip()
+    if result_backfit_used is not False:
+        reasons.append("result_backfit_must_be_explicitly_false")
+    if champion_change_requested is not False:
+        reasons.append("single_match_champion_change_forbidden")
+    if new_theory_status not in {"none", *LEARNING_HYPOTHESIS_TYPES}:
+        reasons.append("invalid_single_match_theory_disposition")
+    implementation_gap = disposition.get("existing_rule_implementation_gap") is True
+    existing_rule_ref = str(disposition.get("existing_rule_ref") or "").strip()
+    if implementation_gap and not existing_rule_ref:
+        reasons.append("implementation_gap_requires_existing_rule_reference")
+    normalized_disposition = {
+        "result_backfit_used": result_backfit_used,
+        "champion_change_requested": champion_change_requested,
+        "new_theory_status": new_theory_status,
+        "existing_rule_implementation_gap": implementation_gap,
+        "existing_rule_ref": existing_rule_ref or None,
+        "regression_test_required": bool(disposition.get("regression_test_required")) if implementation_gap else False,
+    }
+    if implementation_gap and not normalized_disposition["regression_test_required"]:
+        reasons.append("implementation_gap_requires_regression_test")
+    return {
+        "eligible": not reasons,
+        "reasons": reasons,
+        "normalized": {
+            **normalized_sections,
+            "process_reasoning": process_reasoning,
+            "learning_disposition": normalized_disposition,
+        },
+        "policy": "review process and expression against the immutable prematch freeze; never infer a rule from the final score",
+    }
+
+
+def settle_learning_sample(freeze_id: Any, result: Any, process_classification: Any, event_audit: Any = None, settled_at: Any = None, review: Any = None) -> Dict[str, Any]:
+    freeze_id = str(freeze_id or "").strip()
+    if not freeze_id:
+        raise HTTPException(status_code=400, detail="freeze_id_required")
+    if process_classification not in LEARNING_PROCESS_CLASSES:
+        raise HTTPException(status_code=400, detail="invalid_process_classification")
+    result = result if isinstance(result, dict) else {}
+    try:
+        home_goals, away_goals = int(result.get("home_goals")), int(result.get("away_goals"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="final_goals_required")
+    if home_goals < 0 or away_goals < 0 or str(result.get("status") or "").upper() not in ("FT", "AET", "PEN"):
+        raise HTTPException(status_code=400, detail="verified_final_result_required")
+    event_audit = event_audit if isinstance(event_audit, dict) else {"status": "data_missing"}
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        freeze = _learning_freeze_by_id(store, freeze_id)
+        if not freeze:
+            raise HTTPException(status_code=404, detail="frozen_learning_sample_not_found")
+        review_audit = audit_learning_postmatch_review(review)
+        if not review_audit["eligible"]:
+            raise HTTPException(status_code=422, detail={"error": "postmatch_review_incomplete_or_backfit_risk", "reasons": review_audit["reasons"]})
+        settled_ts = _parse_timestamp(settled_at) or int(time.time())
+        if settled_ts < int(freeze.get("kickoff_at") or 0):
+            raise HTTPException(status_code=409, detail="postmatch_settlement_cannot_precede_kickoff")
+        immutable_content = {
+            "freeze_id": freeze_id,
+            "fixture": freeze.get("fixture"),
+            "freeze_hash": freeze.get("content_hash"),
+            "result": {**result, "home_goals": home_goals, "away_goals": away_goals},
+            "process_classification": process_classification,
+            "event_audit": event_audit,
+            "review": review_audit["normalized"],
+        }
+        postmatch_hash = _content_hash(immutable_content)
+        postmatches = store.setdefault("learning_postmatch", {})
+        existing = postmatches.get(freeze_id)
+        if existing:
+            if existing.get("postmatch_hash") == postmatch_hash:
+                return {**existing, "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="postmatch_already_recorded")
+        record = {
+            **immutable_content,
+            "settled_at": settled_ts,
+            "postmatch_hash": postmatch_hash,
+            "review_audit": {"eligible": True, "policy": review_audit["policy"]},
+            "immutable": True,
+            "champion_effect": False,
+            "action": "settled",
+        }
+        postmatches[freeze_id] = record
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return record
+
+
+def register_learning_hypothesis(payload: Dict[str, Any]) -> Dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    hypothesis_type = str(payload.get("type") or "").strip()
+    if hypothesis_type not in LEARNING_HYPOTHESIS_TYPES:
+        raise HTTPException(status_code=400, detail="invalid_hypothesis_type")
+    required_text = ("title", "definition", "applicable_scope", "expected_direction", "failure_conditions", "falsification_criteria")
+    missing = [key for key in required_text if not str(payload.get(key) or "").strip()]
+    if missing:
+        raise HTTPException(status_code=400, detail={"error": "hypothesis_fields_required", "missing": missing})
+    discovery = [str(value).strip() for value in (payload.get("discovery_freeze_ids") or []) if str(value).strip()]
+    if not discovery:
+        raise HTTPException(status_code=400, detail="discovery_freeze_ids_required")
+    base = {key: str(payload.get(key)).strip() for key in required_text}
+    hypothesis_id = str(payload.get("hypothesis_id") or f"hyp-{_content_hash({**base, 'type': hypothesis_type})[:16]}").strip()
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        unknown = [freeze_id for freeze_id in discovery if not _learning_freeze_by_id(store, freeze_id)]
+        unsettled = [freeze_id for freeze_id in discovery if freeze_id not in (store.get("learning_postmatch") or {})]
+        if unknown:
+            raise HTTPException(status_code=404, detail={"error": "discovery_freeze_not_found", "freeze_ids": unknown})
+        if unsettled:
+            raise HTTPException(status_code=409, detail={"error": "discovery_sample_not_settled", "freeze_ids": unsettled})
+        content = {
+            "hypothesis_id": hypothesis_id,
+            "type": hypothesis_type,
+            **base,
+            "discovery_freeze_ids": sorted(set(discovery)),
+            "pre_registered_validation_plan": payload.get("validation_plan") if isinstance(payload.get("validation_plan"), dict) else {},
+        }
+        content_hash = _content_hash(content)
+        hypotheses = store.setdefault("learning_hypotheses", {})
+        existing = hypotheses.get(hypothesis_id)
+        if existing:
+            if existing.get("content_hash") == content_hash:
+                return {**existing, "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="hypothesis_id_already_registered")
+        record = {
+            **content,
+            "registered_at": int(time.time()),
+            "content_hash": content_hash,
+            "status": hypothesis_type,
+            "validation_evidence": [],
+            "champion_effect": False,
+            "action": "registered",
+        }
+        hypotheses[hypothesis_id] = record
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return record
+
+
+def record_hypothesis_validation(hypothesis_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+    hypothesis_id = str(hypothesis_id or "").strip()
+    payload = payload if isinstance(payload, dict) else {}
+    freeze_id = str(payload.get("freeze_id") or "").strip()
+    outcome = str(payload.get("outcome") or "").strip().lower()
+    if not freeze_id or outcome not in LEARNING_VALIDATION_OUTCOMES:
+        raise HTTPException(status_code=400, detail="valid_freeze_id_and_validation_outcome_required")
+    if not str(payload.get("evidence_summary") or "").strip():
+        raise HTTPException(status_code=400, detail="evidence_summary_required")
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        hypothesis = (store.get("learning_hypotheses") or {}).get(hypothesis_id)
+        if not hypothesis:
+            raise HTTPException(status_code=404, detail="hypothesis_not_found")
+        if freeze_id in (hypothesis.get("discovery_freeze_ids") or []):
+            raise HTTPException(status_code=409, detail="discovery_sample_cannot_validate_same_hypothesis")
+        freeze = _learning_freeze_by_id(store, freeze_id)
+        if not freeze or freeze_id not in (store.get("learning_postmatch") or {}):
+            raise HTTPException(status_code=409, detail="independent_settled_frozen_sample_required")
+        evidence_content = {
+            "freeze_id": freeze_id,
+            "freeze_hash": freeze.get("content_hash"),
+            "postmatch_hash": store["learning_postmatch"][freeze_id].get("postmatch_hash"),
+            "outcome": outcome,
+            "evidence_summary": str(payload.get("evidence_summary")).strip(),
+            "pit_audit": payload.get("pit_audit") if isinstance(payload.get("pit_audit"), dict) else {},
+            "event_pollution_audit": payload.get("event_pollution_audit") if isinstance(payload.get("event_pollution_audit"), dict) else {},
+        }
+        evidence_hash = _content_hash(evidence_content)
+        rows = hypothesis.setdefault("validation_evidence", [])
+        existing = next((row for row in rows if row.get("freeze_id") == freeze_id), None)
+        if existing:
+            if existing.get("evidence_hash") == evidence_hash:
+                return {**existing, "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="validation_sample_already_recorded")
+        evidence = {**evidence_content, "evidence_hash": evidence_hash, "recorded_at": int(time.time()), "action": "recorded"}
+        rows.append(evidence)
+        hypothesis["status"] = "SHADOW_VALIDATION"
+        hypothesis["champion_effect"] = False
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return evidence
+
+
+def create_promotion_candidate(hypothesis_id: Any, gate_audit: Any) -> Dict[str, Any]:
+    hypothesis_id = str(hypothesis_id or "").strip()
+    gate_audit = gate_audit if isinstance(gate_audit, dict) else {}
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        hypothesis = (store.get("learning_hypotheses") or {}).get(hypothesis_id)
+        if not hypothesis:
+            raise HTTPException(status_code=404, detail="hypothesis_not_found")
+        evidence = hypothesis.get("validation_evidence") or []
+        support_count = sum(row.get("outcome") == "support" for row in evidence)
+        counterexamples = [row for row in evidence if row.get("outcome") == "counterexample"]
+        missing_gates = []
+        normalized_gates = {}
+        for gate in LEARNING_PROMOTION_REQUIRED_GATES:
+            audit = gate_audit.get(gate) if isinstance(gate_audit.get(gate), dict) else {}
+            passed = audit.get("status") == "passed"
+            evidence_refs = audit.get("evidence_refs") if isinstance(audit.get("evidence_refs"), list) else []
+            normalized_gates[gate] = {"status": "passed" if passed else "missing", "evidence_refs": evidence_refs}
+            if not passed or not evidence_refs:
+                missing_gates.append(gate)
+        blockers = []
+        if support_count < LEARNING_MIN_VALIDATION_SAMPLES:
+            blockers.append("independent_support_sample_minimum_not_reached")
+        if counterexamples:
+            blockers.append("unresolved_counterexamples_present")
+        if missing_gates:
+            blockers.append("promotion_gates_incomplete")
+        if blockers:
+            raise HTTPException(status_code=409, detail={
+                "error": "promotion_candidate_not_ready",
+                "blockers": blockers,
+                "support_count": support_count,
+                "required_support_count": LEARNING_MIN_VALIDATION_SAMPLES,
+                "counterexample_count": len(counterexamples),
+                "missing_gates": missing_gates,
+            })
+        candidate_content = {
+            "hypothesis_id": hypothesis_id,
+            "hypothesis_hash": hypothesis.get("content_hash"),
+            "support_count": support_count,
+            "validation_evidence_hashes": [row.get("evidence_hash") for row in evidence],
+            "gate_audit": normalized_gates,
+        }
+        candidate_hash = _content_hash(candidate_content)
+        promotions = store.setdefault("learning_promotions", {})
+        existing = promotions.get(hypothesis_id)
+        if existing:
+            if existing.get("candidate_hash") == candidate_hash:
+                return {**existing, "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="promotion_candidate_already_exists")
+        record = {
+            **candidate_content,
+            "candidate_hash": candidate_hash,
+            "created_at": int(time.time()),
+            "status": "AWAITING_EXPLICIT_USER_CONFIRMATION",
+            "champion_effect": False,
+            "automatic_promotion": False,
+            "action": "candidate_created",
+        }
+        promotions[hypothesis_id] = record
+        hypothesis["status"] = "PROMOTION_CANDIDATE"
+        hypothesis["champion_effect"] = False
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return record
+
+
+def _league_dna_candidate_status(candidate: Dict[str, Any], store: Dict[str, Any]) -> Dict[str, Any]:
+    hypothesis = (store.get("learning_hypotheses") or {}).get(candidate.get("hypothesis_id")) or {}
+    evidence = hypothesis.get("validation_evidence") or []
+    support_count = sum(row.get("outcome") == "support" for row in evidence)
+    counterexample_count = sum(row.get("outcome") == "counterexample" for row in evidence)
+    required = LEARNING_MIN_VALIDATION_SAMPLES
+    activation = (store.get("league_dna_activation_candidates") or {}).get(candidate.get("tag_id"))
+    if activation:
+        status, confidence = "AWAITING_EXPLICIT_USER_CONFIRMATION", 99
+    elif evidence:
+        status = "SHADOW_VALIDATION"
+        confidence = min(90, int(90 * min(support_count, required) / required))
+    else:
+        status, confidence = "LEAGUE_TAG_CANDIDATE", 0
+    return {
+        "status": status, "evidence_confidence": confidence,
+        "independent_support_count": support_count,
+        "counterexample_count": counterexample_count,
+        "required_independent_support_count": required,
+        "champion_effect": False,
+    }
+
+
+def register_league_dna_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    hypothesis_id = str(payload.get("hypothesis_id") or "").strip()
+    tag_id = str(payload.get("tag_id") or "").strip()
+    if not hypothesis_id or not tag_id or len(tag_id) > 120 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in tag_id):
+        raise HTTPException(status_code=400, detail="safe_tag_id_and_hypothesis_id_required")
+    category = str(payload.get("category") or "").strip().lower()
+    market = str(payload.get("market") or "").strip().lower()
+    if category not in LEAGUE_DNA_CATEGORIES or market not in LEAGUE_DNA_MARKETS:
+        raise HTTPException(status_code=400, detail="invalid_league_dna_category_or_market")
+    magnitude = as_float(payload.get("magnitude_score"))
+    if magnitude is None or not -3 <= magnitude <= 3:
+        raise HTTPException(status_code=400, detail="magnitude_score_must_be_between_minus_3_and_plus_3")
+    scope_audit = audit_learning_scope(payload.get("scope"))
+    if not scope_audit["eligible"]:
+        raise HTTPException(status_code=422, detail={"error": "league_dna_scope_not_verified", "reasons": scope_audit["reasons"]})
+    sample_window = payload.get("sample_window") if isinstance(payload.get("sample_window"), dict) else {}
+    required_window_fields = ("training_start", "training_end", "validation_start", "validation_end", "minimum_independent_samples")
+    missing_window = [key for key in required_window_fields if sample_window.get(key) in (None, "")]
+    try:
+        planned_minimum = int(sample_window.get("minimum_independent_samples"))
+    except (TypeError, ValueError):
+        planned_minimum = 0
+    if missing_window or planned_minimum < LEARNING_MIN_VALIDATION_SAMPLES:
+        raise HTTPException(status_code=400, detail={
+            "error": "complete_league_dna_sample_window_required",
+            "missing": missing_window,
+            "minimum_independent_samples": LEARNING_MIN_VALIDATION_SAMPLES,
+        })
+    required_text = ("label", "metric_definition", "baseline_definition", "expected_model_effect", "anti_double_counting_rule")
+    missing_text = [key for key in required_text if not str(payload.get(key) or "").strip()]
+    if missing_text:
+        raise HTTPException(status_code=400, detail={"error": "league_dna_fields_required", "missing": missing_text})
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        hypothesis = (store.get("learning_hypotheses") or {}).get(hypothesis_id)
+        if not hypothesis:
+            raise HTTPException(status_code=404, detail="linked_hypothesis_not_found")
+        if hypothesis.get("type") != "LEAGUE_TAG_CANDIDATE":
+            raise HTTPException(status_code=409, detail="league_dna_requires_league_tag_candidate_hypothesis")
+        content = {
+            "tag_id": tag_id, "hypothesis_id": hypothesis_id,
+            "scope": scope_audit["normalized"], "category": category, "market": market,
+            "label": str(payload.get("label")).strip(), "magnitude_score": magnitude,
+            "metric_definition": str(payload.get("metric_definition")).strip(),
+            "baseline_definition": str(payload.get("baseline_definition")).strip(),
+            "expected_model_effect": str(payload.get("expected_model_effect")).strip(),
+            "anti_double_counting_rule": str(payload.get("anti_double_counting_rule")).strip(),
+            "sample_window": {**sample_window, "minimum_independent_samples": planned_minimum},
+        }
+        content_hash = _content_hash(content)
+        candidates = store.setdefault("league_dna_candidates", {})
+        existing = candidates.get(tag_id)
+        if existing:
+            if existing.get("content_hash") == content_hash:
+                return {**existing, **_league_dna_candidate_status(existing, store), "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="league_dna_tag_id_already_registered")
+        record = {
+            **content, "content_hash": content_hash, "registered_at": int(time.time()),
+            "status": "LEAGUE_TAG_CANDIDATE", "evidence_confidence": 0,
+            "champion_effect": False, "immutable": True,
+        }
+        candidates[tag_id] = record
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return {**record, "action": "registered"}
+
+
+def create_league_dna_activation_candidate(tag_id: Any) -> Dict[str, Any]:
+    tag_id = str(tag_id or "").strip()
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        candidate = (store.get("league_dna_candidates") or {}).get(tag_id)
+        if not candidate:
+            raise HTTPException(status_code=404, detail="league_dna_candidate_not_found")
+        promotion = (store.get("learning_promotions") or {}).get(candidate.get("hypothesis_id"))
+        if not promotion or promotion.get("status") != "AWAITING_EXPLICIT_USER_CONFIRMATION":
+            raise HTTPException(status_code=409, detail="validated_hypothesis_promotion_candidate_required")
+        content = {
+            "tag_id": tag_id, "tag_hash": candidate.get("content_hash"),
+            "hypothesis_id": candidate.get("hypothesis_id"),
+            "promotion_candidate_hash": promotion.get("candidate_hash"),
+            "proposed_magnitude_score": candidate.get("magnitude_score"),
+            "proposed_scope": candidate.get("scope"),
+            "rollback_conditions": [
+                "new_season_or_format_change", "unresolved_counterexample",
+                "out_of_sample_decay", "bookmaker_coverage_regime_change",
+            ],
+        }
+        activation_hash = _content_hash(content)
+        activations = store.setdefault("league_dna_activation_candidates", {})
+        existing = activations.get(tag_id)
+        if existing:
+            if existing.get("activation_hash") == activation_hash:
+                return {**existing, "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="league_dna_activation_candidate_already_exists")
+        record = {
+            **content, "activation_hash": activation_hash, "created_at": int(time.time()),
+            "status": "AWAITING_EXPLICIT_USER_CONFIRMATION", "evidence_confidence": 99,
+            "champion_effect": False, "automatic_activation": False,
+        }
+        activations[tag_id] = record
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return {**record, "action": "activation_candidate_created"}
+
+
+def league_dna_model_view(scope: Dict[str, Any], store_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Return only explicitly confirmed VERIFIED_ACTIVE priors to prematch callers."""
+    store = store_override if store_override is not None else load_snapshot_store()
+    try:
+        competition_id = int((scope or {}).get("competition_id"))
+    except (TypeError, ValueError):
+        competition_id = None
+    season = str((scope or {}).get("season") or "").strip()
+    phase = str((scope or {}).get("phase") or "unknown").strip()
+    active = []
+    rejected_active = []
+    for row in (store.get("league_dna_active") or {}).values():
+        row_scope = row.get("scope") if isinstance(row.get("scope"), dict) else {}
+        matches = (
+            row_scope.get("competition_id") == competition_id
+            and str(row_scope.get("season") or "") == season
+            and str(row_scope.get("phase") or "all") in {"all", phase}
+        )
+        if not matches:
+            continue
+        confirmed = get_nested(row, ["user_confirmation", "confirmed"]) is True
+        eligible = row.get("status") == "VERIFIED_ACTIVE" and row.get("evidence_confidence") == 100 and confirmed
+        if eligible:
+            active.append(row)
+        else:
+            rejected_active.append({"tag_id": row.get("tag_id"), "reason": "verified_active_confirmation_invariant_failed"})
+    active.sort(key=lambda row: str(row.get("tag_id")))
+    matching_candidates = [
+        row for row in (store.get("league_dna_candidates") or {}).values()
+        if get_nested(row, ["scope", "competition_id"]) == competition_id
+        and str(get_nested(row, ["scope", "season"]) or "") == season
+    ]
+    version = "league-dna-" + _content_hash([{"tag_id": row.get("tag_id"), "version": row.get("version"), "hash": row.get("content_hash")} for row in active])[:16] if active else None
+    return {
+        "status": "VERIFIED_ACTIVE" if active else ("candidate_only" if matching_candidates else "data_missing"),
+        "version": version, "active_tags": active,
+        "active_tag_count": len(active), "candidate_tag_count": len(matching_candidates),
+        "rejected_active_records": rejected_active,
+        "champion_effect": bool(active),
+        "policy": "only evidence_confidence=100 VERIFIED_ACTIVE records with explicit user confirmation enter the prematch prior",
+    }
+
+
+def league_dna_status_report(competition_id: Optional[int] = None) -> Dict[str, Any]:
+    store = load_snapshot_store()
+    candidates = []
+    for row in (store.get("league_dna_candidates") or {}).values():
+        if competition_id is not None and get_nested(row, ["scope", "competition_id"]) != int(competition_id):
+            continue
+        candidates.append({**row, **_league_dna_candidate_status(row, store)})
+    active_rows = [row for row in (store.get("league_dna_active") or {}).values() if competition_id is None or get_nested(row, ["scope", "competition_id"]) == int(competition_id)]
+    valid_active = [row for row in active_rows if row.get("status") == "VERIFIED_ACTIVE" and row.get("evidence_confidence") == 100 and get_nested(row, ["user_confirmation", "confirmed"]) is True]
+    return {
+        "version": VERSION, "competition_id": competition_id,
+        "candidate_count": len(candidates), "candidates": sorted(candidates, key=lambda row: str(row.get("tag_id"))),
+        "activation_candidate_count": sum(row.get("tag_id") in {candidate.get("tag_id") for candidate in candidates} for row in (store.get("league_dna_activation_candidates") or {}).values()),
+        "verified_active_count": len(valid_active), "verified_active": valid_active,
+        "automatic_activation": False,
+        "policy": "candidate and shadow tags never affect Champion; activation requires a separately recorded explicit user confirmation",
+    }
+
+
+def _learning_selected_expression(decision: Any) -> Dict[str, Any]:
+    decision = decision if isinstance(decision, dict) else {}
+    for candidate in (
+        decision.get("selected_expression"), decision.get("best_market"),
+        get_nested(decision, ["recommendation_tiers", "first_choice_high_consistency"]),
+    ):
+        if isinstance(candidate, dict):
+            return {
+                "market": str(candidate.get("market") or "data_missing"),
+                "selection": candidate.get("selection"), "line": candidate.get("line"),
+                "price": candidate.get("price"),
+            }
+    return {"market": "data_missing", "selection": None, "line": None, "price": None}
+
+
+def learning_selection_quality_report(minimum_samples: Optional[int] = None) -> Dict[str, Any]:
+    """Aggregate process quality without using win/loss as a model-change signal."""
+    minimum_samples = max(2, int(minimum_samples or LEARNING_MIN_VALIDATION_SAMPLES))
+    store = load_snapshot_store()
+    groups: Dict[str, Dict[str, Any]] = {}
+    excluded_counts = {"event_contaminated": 0, "data_insufficient": 0, "frozen_sample_missing": 0}
+    for freeze_id, postmatch in (store.get("learning_postmatch") or {}).items():
+        freeze = _learning_freeze_by_id(store, freeze_id)
+        if not freeze:
+            excluded_counts["frozen_sample_missing"] += 1
+            continue
+        process_class = str(postmatch.get("process_classification") or "")
+        if process_class == "EVENT_CONTAMINATED":
+            excluded_counts["event_contaminated"] += 1
+            continue
+        if process_class == "DATA_INSUFFICIENT":
+            excluded_counts["data_insufficient"] += 1
+            continue
+        expression = _learning_selected_expression(freeze.get("decision"))
+        competition_id = get_nested(freeze, ["scope", "competition_id"])
+        competition_name = get_nested(freeze, ["scope", "competition_name"])
+        group_key = f"{competition_id}:{expression['market']}"
+        group = groups.setdefault(group_key, {
+            "competition_id": competition_id, "competition_name": competition_name,
+            "market": expression["market"], "eligible_sample_count": 0,
+            "process_correct_count": 0, "process_error_count": 0,
+            "match_selection_failed_count": 0, "expression_failed_count": 0,
+            "price_execution_failed_count": 0, "inconclusive_review_count": 0,
+            "freeze_ids": [],
+        })
+        group["eligible_sample_count"] += 1
+        group["freeze_ids"].append(freeze_id)
+        if process_class.startswith("PROCESS_CORRECT_"):
+            group["process_correct_count"] += 1
+        elif process_class.startswith("PROCESS_ERROR_"):
+            group["process_error_count"] += 1
+        review = postmatch.get("review") if isinstance(postmatch.get("review"), dict) else {}
+        section_statuses = {
+            "match_selection": get_nested(review, ["match_selection_quality", "status"]),
+            "expression": get_nested(review, ["expression_audit", "status"]),
+            "price_execution": get_nested(review, ["price_execution_audit", "status"]),
+        }
+        if section_statuses["match_selection"] == "failed":
+            group["match_selection_failed_count"] += 1
+        if section_statuses["expression"] == "failed":
+            group["expression_failed_count"] += 1
+        if section_statuses["price_execution"] == "failed":
+            group["price_execution_failed_count"] += 1
+        if any(status in {"inconclusive", "data_missing", None} for status in section_statuses.values()):
+            group["inconclusive_review_count"] += 1
+    cards = []
+    for group in groups.values():
+        count = group["eligible_sample_count"]
+        sample_ready = count >= minimum_samples
+        rates = {
+            "process_accuracy": round(group["process_correct_count"] / count, 6) if count else None,
+            "match_selection_failure_rate": round(group["match_selection_failed_count"] / count, 6) if count else None,
+            "expression_failure_rate": round(group["expression_failed_count"] / count, 6) if count else None,
+            "price_execution_failure_rate": round(group["price_execution_failed_count"] / count, 6) if count else None,
+        }
+        has_failure_evidence = any(group[key] > 0 for key in ("match_selection_failed_count", "expression_failed_count", "price_execution_failed_count", "process_error_count"))
+        cards.append({
+            **group, "freeze_ids": group["freeze_ids"][:100], "freeze_ids_truncated": len(group["freeze_ids"]) > 100,
+            "minimum_samples": minimum_samples, "sample_ready": sample_ready, "rates": rates,
+            "research_signal": "HYPOTHESIS_ONLY_REVIEW_ALLOWED" if sample_ready and has_failure_evidence else "COLLECT_MORE_INDEPENDENT_SAMPLES",
+            "champion_effect": False, "automatic_weight_change": False,
+            "result_outcome_used_for_optimization": False,
+        })
+    cards.sort(key=lambda row: (str(row.get("competition_name")), str(row.get("market"))))
+    return {
+        "version": VERSION, "minimum_samples": minimum_samples,
+        "card_count": len(cards), "sample_ready_card_count": sum(row["sample_ready"] for row in cards),
+        "cards": cards, "excluded_counts": excluded_counts,
+        "automatic_hypothesis_registration": False,
+        "automatic_champion_change": False,
+        "policy": "aggregate frozen process reviews only; final win/loss is not an optimization target and any signal must be preregistered as a new hypothesis",
+    }
+
+
+def learning_status_report() -> Dict[str, Any]:
+    store = load_snapshot_store()
+    frozen = store.get("learning_frozen") or {}
+    postmatches = store.get("learning_postmatch") or {}
+    hypotheses = store.get("learning_hypotheses") or {}
+    promotions = store.get("learning_promotions") or {}
+    league_dna_candidates = store.get("league_dna_candidates") or {}
+    league_dna_activations = store.get("league_dna_activation_candidates") or {}
+    verified_active_dna = [
+        row for row in (store.get("league_dna_active") or {}).values()
+        if row.get("status") == "VERIFIED_ACTIVE"
+        and row.get("evidence_confidence") == 100
+        and get_nested(row, ["user_confirmation", "confirmed"]) is True
+    ]
+    frozen_rows = [row for rows in frozen.values() for row in (rows or [])]
+    postmatch_rows = list(postmatches.values())
+    implementation_gap_count = sum(get_nested(row, ["review", "learning_disposition", "existing_rule_implementation_gap"]) is True for row in postmatch_rows)
+    hypothesis_disposition_count = sum(get_nested(row, ["review", "learning_disposition", "new_theory_status"]) in LEARNING_HYPOTHESIS_TYPES for row in postmatch_rows)
+    return {
+        "version": VERSION,
+        "frozen_fixture_count": len(frozen),
+        "frozen_version_count": len(frozen_rows),
+        "postmatch_count": len(postmatches),
+        "postmatch_process_class_counts": {status: sum(row.get("process_classification") == status for row in postmatch_rows) for status in sorted(LEARNING_PROCESS_CLASSES)},
+        "implementation_gap_count": implementation_gap_count,
+        "single_match_hypothesis_disposition_count": hypothesis_disposition_count,
+        "hypothesis_count": len(hypotheses),
+        "hypothesis_status_counts": {status: sum(row.get("status") == status for row in hypotheses.values()) for status in (*LEARNING_HYPOTHESIS_TYPES, "SHADOW_VALIDATION", "PROMOTION_CANDIDATE")},
+        "promotion_candidate_count": len(promotions),
+        "league_dna_candidate_count": len(league_dna_candidates),
+        "league_dna_activation_candidate_count": len(league_dna_activations),
+        "league_dna_verified_active_count": len(verified_active_dna),
+        "minimum_independent_support_samples": LEARNING_MIN_VALIDATION_SAMPLES,
+        "automatic_champion_promotion": False,
+        "policy": "single matches cannot create model rules; promotion candidates require all gates and explicit user confirmation",
+    }
+
+
 def operations_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
     now_ts = int(now_ts or time.time())
     store = load_snapshot_store()
@@ -4362,6 +5350,7 @@ def operations_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         "external_fixture_freshness": {"fixture_count": len(fixtures), "state_counts": freshness_counts},
         "revalidation_queue": {"pending_count": len(pending), "overdue_count": len(overdue)},
         "calibration": {"settled_count": calibration["settled_count"], "minimum_sample": CALIBRATION_MIN_SAMPLE, "sample_ready": calibration["settled_count"] >= CALIBRATION_MIN_SAMPLE, "average_brier_score": calibration["average_brier_score"], "roi": calibration["roi"]},
+        "learning": learning_status_report(),
     }
 
 
@@ -4783,6 +5772,83 @@ async def shadow_calibration_settle(request: Request, token: Optional[str] = Non
 def shadow_calibration_report(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     return JSONResponse({"ok": True, "calibration": calibration_report()})
+
+
+@app.post("/shadow/learning/freeze")
+async def shadow_learning_freeze(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    record = freeze_learning_sample(await request.json())
+    return JSONResponse({"ok": True, "record": record})
+
+
+@app.get("/shadow/learning/cycle-plan")
+def shadow_learning_cycle_plan(now_ts: Optional[int] = None, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "plan": learning_cycle_plan(now_ts=now_ts)})
+
+
+@app.post("/shadow/learning/settle")
+async def shadow_learning_settle(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    payload = await request.json()
+    record = settle_learning_sample(payload.get("freeze_id"), payload.get("result"), payload.get("process_classification"), payload.get("event_audit"), payload.get("settled_at"), payload.get("review"))
+    return JSONResponse({"ok": True, "postmatch": record})
+
+
+@app.post("/shadow/learning/hypotheses")
+async def shadow_learning_hypothesis(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    record = register_learning_hypothesis(await request.json())
+    return JSONResponse({"ok": True, "hypothesis": record})
+
+
+@app.post("/shadow/learning/hypotheses/{hypothesis_id}/validation")
+async def shadow_learning_validation(hypothesis_id: str, request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    record = record_hypothesis_validation(hypothesis_id, await request.json())
+    return JSONResponse({"ok": True, "evidence": record})
+
+
+@app.post("/shadow/learning/hypotheses/{hypothesis_id}/promotion-candidate")
+async def shadow_learning_promotion_candidate(hypothesis_id: str, request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    payload = await request.json()
+    record = create_promotion_candidate(hypothesis_id, payload.get("gate_audit"))
+    return JSONResponse({"ok": True, "promotion_candidate": record})
+
+
+@app.post("/shadow/learning/league-dna")
+async def shadow_learning_league_dna_candidate(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    record = register_league_dna_candidate(await request.json())
+    return JSONResponse({"ok": True, "league_dna_candidate": record})
+
+
+@app.post("/shadow/learning/league-dna/{tag_id}/activation-candidate")
+def shadow_learning_league_dna_activation_candidate(tag_id: str, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    record = create_league_dna_activation_candidate(tag_id)
+    return JSONResponse({"ok": True, "activation_candidate": record})
+
+
+@app.get("/shadow/learning/league-dna/status")
+def shadow_learning_league_dna_status(competition_id: Optional[int] = None, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "league_dna": league_dna_status_report(competition_id)})
+
+
+@app.get("/shadow/learning/selection-quality")
+def shadow_learning_selection_quality(minimum_samples: Optional[int] = None, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    if minimum_samples is not None and not 2 <= minimum_samples <= 10000:
+        raise HTTPException(status_code=400, detail="minimum_samples_must_be_between_2_and_10000")
+    return JSONResponse({"ok": True, "selection_quality": learning_selection_quality_report(minimum_samples)})
+
+
+@app.get("/shadow/learning/status")
+def shadow_learning_status(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "learning": learning_status_report()})
 
 
 @app.get("/shadow/operations/status")
