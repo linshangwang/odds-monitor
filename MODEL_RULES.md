@@ -130,6 +130,15 @@ A级真实资金包固定使用`real_money_v1`：必须绑定比赛ID、注册�
 
 核心评价指标是 `PriorityQuality` 和 `SelectionQuality`，不是单场命中率。赢了不自动证明排序正确；输了也不自动证明决策错误。
 
+每个已完成结构化复盘的冻结版本生成一张不可变 `Learning Card`，绑定 `freeze_hash`、`fact_hash` 和 `postmatch_hash`：
+
+- `PriorityQuality` 只取自 `match_selection_quality` 的过程审计。
+- `SelectionQuality` 只取自 `expression_audit` 与 `price_execution_audit`；任一失败即失败，两项都通过才通过，其余保持 `ungraded`。
+- 最终比分不复制进卡片，赛果只以 `postmatch_hash` 作为隔离的审计引用，不参与上述标签。
+- 只有赛前明确冻结的 `match_rating`、`market_rating` 才能进入相应校准分组；缺失评级必须排除，不得用赛果或赛后印象补造。
+- 同一真实比赛只使用最新已结算冻结版本参与校准；历史版本保留审计但不得重复计样本。
+- 达到最低样本量只表示内部过程校准可读，不自动调权、不登记理论、不修改 Champion。
+
 错误归因仅允许使用当时输入和赛后过程数据进行模块诊断：
 
 `DATA_ERROR`、`ABILITY_ERROR`、`LINEUP_ERROR`、`UTILITY_ERROR`、`STATE_ERROR`、`MARGIN_ERROR`、`GOAL_OWNERSHIP_ERROR`、`PRICE_ERROR`、`MARKET_ERROR`、`EVENT_SHOCK`、`FINISHING_VARIANCE`。

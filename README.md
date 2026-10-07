@@ -127,6 +127,7 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 - v1.94 增加League DNA显式用户确认入口。完成全部Shadow门槛仍只形成99分激活候选；只有绑定最新`activation_hash`、确认人、可追溯凭据和精确确认语句的交互式请求才能写入100分`VERIFIED_ACTIVE`。定时任务和无人值守流程禁止调用该入口。
 - v1.95 将盘口语言正式接入决策终态：Home/Away/Over/Under分别输出`Capital Pressure Proxy`、盘口响应和`Accepted/Partial/Resistance/Rejected`，真实Money%/Bet%/成交额缺失时固定为`data_missing`。Expression Optimizer只在同一赛前剧本内寻找更低阻力表达；不能自动反向。Resistance无更优表达时输出`WAIT`，组合构建器只接纳`BET`腿；赛后不会把`WAIT/PASS`的监控表达伪装成已执行投注结算。
 - v1.96 增加独立`real_money_v1`输入契约。真实Money%/Bet%/成交额必须绑定同一比赛、受控来源注册表、可定位HTTP证据、已核实方法、赛前观测时间、具体盘口档位和闭合百分比；缺失、过期、跨比赛、未注册域名或自称A级的来源一律拒绝。合格资金证据标为A级并带不可变`evidence_hash`，只替代压力证据，不替代独立盘口响应；未配置来源注册表时继续安全使用Capital Pressure Proxy。
+- v1.97 增加不可变 Learning Card 与内部过程校准。每张卡绑定赛前冻结、赛后事实和复盘哈希；`PriorityQuality`来自场次选择审计，`SelectionQuality`来自表达与价格执行审计。最终比分不复制进卡片，缺失的赛前评级不补造，同场只以最新结算冻结版本参与校准；报告不自动调权、登记理论或修改Champion。
 
 真实资金包通过`/shadow/model/prematch-evaluate`或`/shadow/evaluate`请求体中的`real_money_data`提交。示例结构：
 
@@ -479,6 +480,8 @@ POST /shadow/learning/run
 GET  /shadow/learning/review-queue
 POST /shadow/learning/review-draft
 POST /shadow/learning/complete-review
+POST /shadow/learning/quality-cards/refresh
+GET  /shadow/learning/quality-calibration
 GET  /shadow/learning/research-proposals
 POST /shadow/learning/research-proposals/refresh
 GET  /shadow/learning/validation-queue
@@ -507,6 +510,7 @@ GET  /shadow/learning/status
   "auto_prepare_prematch": true,
   "auto_collect_postmatch_facts": true,
   "auto_build_postmatch_review_drafts": true,
+  "auto_refresh_quality_cards": true,
   "auto_refresh_research_proposals": true,
   "postmatch_fact_packets": {},
   "review_completion_packets": [],

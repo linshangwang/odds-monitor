@@ -194,6 +194,8 @@ League DNA具备单独的哈希绑定确认入口`POST /shadow/learning/league-d
 
 `GET /shadow/learning/selection-quality`按联赛与市场汇总冻结样本的Process Accuracy、场次选择失败率、表达失败率和价格执行失败率。`EVENT_CONTAMINATED`与`DATA_INSUFFICIENT`不进入有效样本。最终赢/输不得作为优化目标；即使达到最低样本量，报告也只能输出`HYPOTHESIS_ONLY_REVIEW_ALLOWED`研究信号，不会自动登记假设、调权或修改Champion。
 
+每次完成可结算复盘后，周期在生成多场研究提案之前先刷新不可变 Learning Card。`POST /shadow/learning/quality-cards/refresh`按冻结版本保存哈希绑定卡片；`GET /shadow/learning/quality-calibration`只使用赛前明确冻结的评级与过程审计做`PriorityQuality`、`SelectionQuality`内部校准。同一比赛仅最新结算版本计入，缺失评级不补猜，比分与输赢不得进入质量标签。该报告无自动调权、自动理论登记或Champion效力。
+
 ## 八、每日汇报
 
 仅在以下情况通知用户：
