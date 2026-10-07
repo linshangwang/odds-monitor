@@ -3841,6 +3841,29 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(facts["verification"]["independent_source_count"], 1)
         self.assertFalse(facts["verification"]["settlement_eligible"])
 
+    def test_fact_verification_rejects_duplicate_refs_and_same_domain_aliases(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("805-alias", 900, 1000), now_ts=900)
+        supplied = self.learning_postmatch_facts(("source_a", "source_b"))
+        supplied["source_audit"][0]["evidence_ref"] = "https://scores.example.test/match/805"
+        supplied["source_audit"][1]["evidence_ref"] = "https://scores.example.test/match/805?mirror=1"
+        facts = main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000, fact_fetcher=lambda fixture_id: supplied,
+        )
+        self.assertEqual(facts["verification"]["independent_source_count"], 1)
+        self.assertEqual(facts["verification"]["verified_source_authorities"], ["scores.example.test"])
+        self.assertFalse(facts["verification"]["settlement_eligible"])
+
+        frozen_duplicate = main.freeze_learning_sample(self.learning_payload("805-duplicate", 901, 1001), now_ts=901)
+        duplicate = self.learning_postmatch_facts(("source_a", "source_b"))
+        duplicate["source_audit"][0]["evidence_ref"] = "opaque:same-result-record"
+        duplicate["source_audit"][1]["evidence_ref"] = "opaque:same-result-record"
+        duplicate_facts = main.collect_learning_postmatch_facts(
+            frozen_duplicate["freeze_id"], now_ts=9000, fact_fetcher=lambda fixture_id: duplicate,
+        )
+        self.assertEqual(duplicate_facts["verification"]["unique_evidence_ref_count"], 1)
+        self.assertEqual(duplicate_facts["verification"]["independent_source_count"], 1)
+        self.assertFalse(duplicate_facts["verification"]["settlement_eligible"])
+
     def test_review_queue_prioritizes_verified_facts_and_preserves_frozen_context(self):
         waiting = main.freeze_learning_sample(self.learning_payload("806", 900, 1000), now_ts=900)
         ready = main.freeze_learning_sample(self.learning_payload("807", 901, 1001), now_ts=901)
@@ -3910,6 +3933,21 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(draft["event_evidence"]["pollution_flags"], ["red_card"])
         self.assertEqual(draft["suggested_process_classification"], "DATA_INSUFFICIENT")
         self.assertTrue(draft["manual_review_required"])
+
+    def test_event_verification_rejects_same_domain_aliases(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("draft-event-alias", 900, 1000), now_ts=900)
+        packet = self.learning_postmatch_facts(("api_football", "official_league"), 2, 1)
+        packet["source_audit"].extend([
+            {"source": "event_feed_a", "component": "events", "ok": True, "evidence_ref": "https://events.example.test/match/1"},
+            {"source": "event_feed_b", "component": "events", "ok": True, "evidence_ref": "https://events.example.test/match/1/timeline"},
+        ])
+        main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000, fact_fetcher=lambda fixture_id: packet,
+        )
+        draft = main.build_learning_postmatch_review_draft(frozen["freeze_id"], now_ts=9001)
+        self.assertEqual(draft["event_evidence"]["event_source_count"], 1)
+        self.assertEqual(draft["event_evidence"]["event_verification"], "single_source")
+        self.assertEqual(draft["event_evidence"]["event_source_authorities"], ["events.example.test"])
 
     def verified_event_fact_packet(self, home_goals=3, away_goals=2):
         packet = self.learning_postmatch_facts(("api_football", "official_league"), home_goals, away_goals)
