@@ -1,4 +1,5 @@
 import json
+import copy
 import gzip
 import io
 import math
@@ -24,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "1.98.0"
+VERSION = "1.99.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -85,6 +86,7 @@ AUTO_SNAPSHOT_LAST_CYCLE_AT: Optional[int] = None
 AUTO_SNAPSHOT_LAST_ERROR: Optional[str] = None
 AUTO_RECONCILIATION_LAST_RESULT: Optional[Dict[str, Any]] = None
 AUTO_LEARNING_LAST_RESULT: Optional[Dict[str, Any]] = None
+LEARNING_SHADOW_MODEL_RUNNER: Optional[Any] = None
 NAMI_ODDS_STARTUP_PROBE: Dict[str, Any] = {"status": "pending", "decision_use": False}
 NAMI_ODDS_STARTUP_PROBE_STARTED = False
 NAMI_ODDS_PROBE_TTL_SECONDS = max(3600, int(os.getenv("NAMI_ODDS_PROBE_TTL_SECONDS", str(7 * 24 * 3600))))
@@ -191,7 +193,7 @@ LEARNING_TOP_FLIGHT_LEAGUES: Dict[int, Dict[str, str]] = {
 }
 LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
 LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
-LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v1.98").strip() or "MODEL_RULES.md@2026-10-08-v1.98"
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v1.99").strip() or "MODEL_RULES.md@2026-10-08-v1.99"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -774,6 +776,116 @@ def standings_for_team(result: Dict[str, Any], team_id: Optional[int]) -> Option
     return None
 
 
+def independent_model_inputs_from_standings(
+    result: Dict[str, Any],
+    home_id: Optional[int],
+    away_id: Optional[int],
+    observed_at: Optional[int] = None,
+    lineup_confidence: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Build odds-independent, venue-split model inputs from one PIT standings response.
+
+    This deliberately refuses total-only or incomplete tables.  It never substitutes
+    bookmaker prices, provider predictions, later results, or another observation.
+    """
+    observed_at = int(observed_at or time.time())
+    groups = get_nested(response_list(result), [0, "league", "standings"], [])
+    rows = [row for group in groups if isinstance(group, list) for row in group if isinstance(row, dict)]
+    home_row = next((row for row in rows if get_nested(row, ["team", "id"]) == home_id), None)
+    away_row = next((row for row in rows if get_nested(row, ["team", "id"]) == away_id), None)
+
+    def venue_values(row: Optional[Dict[str, Any]], venue: str) -> Optional[Dict[str, float]]:
+        played = as_float(get_nested(row or {}, [venue, "played"]))
+        goals_for = as_float(get_nested(row or {}, [venue, "goals", "for"]))
+        goals_against = as_float(get_nested(row or {}, [venue, "goals", "against"]))
+        if played is None or played < 1 or goals_for is None or goals_against is None:
+            return None
+        return {
+            "played": played,
+            "goals_for": goals_for,
+            "goals_against": goals_against,
+            "attack_rate": goals_for / played,
+            "defense_rate": goals_against / played,
+        }
+
+    home_values = venue_values(home_row, "home")
+    away_values = venue_values(away_row, "away")
+    league_home_goals = league_away_goals = league_matches = 0.0
+    usable_league_rows = 0
+    for row in rows:
+        home_split = venue_values(row, "home")
+        away_split = venue_values(row, "away")
+        if not home_split or not away_split:
+            continue
+        # Every league match appears once in the aggregate home split.  Requiring
+        # equal home/away sample counts prevents silently accepting malformed tables.
+        if abs(home_split["played"] - away_split["played"]) > 1:
+            continue
+        league_matches += home_split["played"]
+        league_home_goals += home_split["goals_for"]
+        league_away_goals += away_split["goals_for"]
+        usable_league_rows += 1
+
+    blockers = []
+    if not rows:
+        blockers.append("standings_response_missing")
+    if home_values is None:
+        blockers.append("home_team_home_split_missing")
+    if away_values is None:
+        blockers.append("away_team_away_split_missing")
+    if usable_league_rows < 2 or league_matches < 10:
+        blockers.append("league_venue_baseline_sample_insufficient")
+    if blockers:
+        return {
+            "status": "data_missing",
+            "decision_eligible": False,
+            "blockers": blockers,
+            "observed_at": observed_at,
+            "uses_market_odds": False,
+        }
+
+    relevant_table = [{
+        "team_id": get_nested(row, ["team", "id"]),
+        "home": row.get("home"),
+        "away": row.get("away"),
+    } for row in rows]
+    source_hash = _content_hash(relevant_table)
+    lineup_confidence = as_float(lineup_confidence)
+    if lineup_confidence is None or not 0.0 <= lineup_confidence <= 1.0:
+        lineup_confidence = 0.0
+    model_inputs = {
+        "league_home_rate": round(league_home_goals / league_matches, 6),
+        "league_away_rate": round(league_away_goals / league_matches, 6),
+        "home_attack_rate": round(home_values["attack_rate"], 6),
+        "home_defense_rate": round(home_values["defense_rate"], 6),
+        "away_attack_rate": round(away_values["attack_rate"], 6),
+        "away_defense_rate": round(away_values["defense_rate"], 6),
+        "home_sample_size": int(home_values["played"]),
+        "away_sample_size": int(away_values["played"]),
+        "league_sample_size": int(league_matches),
+        "metric_type": "goals",
+        "home_adjustment": 1.0,
+        "away_adjustment": 1.0,
+        "lineup_confidence": lineup_confidence,
+        "provenance": {
+            "source": "api_football_standings_venue_split",
+            "uses_market_odds": False,
+            "observed_at": observed_at,
+            "source_content_hash": source_hash,
+        },
+    }
+    return {
+        "status": "ready",
+        "decision_eligible": True,
+        "observed_at": observed_at,
+        "uses_market_odds": False,
+        "usable_league_team_count": usable_league_rows,
+        "source_content_hash": source_hash,
+        "inputs": model_inputs,
+        "input_hash": _content_hash(model_inputs),
+    }
+
+
 def season_stats_summary(result: Dict[str, Any]) -> Dict[str, Any]:
     row = get_nested(result, ["data", "response"], {})
     if not isinstance(row, dict) or not row:
@@ -1182,9 +1294,14 @@ def collect_prematch_data(fixture_id: int, include_raw: bool = False) -> Dict[st
     coverage = {name: coverage_summary(result) for name, result in calls.items()}
     market_snapshot = extract_market_snapshot(calls.get("odds_prematch", {}))
     normalized_lineups = lineup_summary(calls.get("lineups", {}))
-    structured = {"standings": {"home": standings_for_team(calls.get("standings", {}), home_id), "away": standings_for_team(calls.get("standings", {}), away_id)}, "recent_form_last_10": {"home": recent_form(response_list(calls.get("home_recent_10", {})), home_id), "away": recent_form(response_list(calls.get("away_recent_10", {})), away_id)}, "season_stats": {"home": season_stats_summary(calls.get("home_team_season_stats", {})), "away": season_stats_summary(calls.get("away_team_season_stats", {}))}, "head_to_head_count": len(response_list(calls.get("head_to_head_last_10", {}))), "injuries": injuries_summary(calls.get("injuries", {}), home_id, away_id), "prediction": prediction_summary(calls.get("predictions", {})), "odds": odds_summary(calls.get("odds_prematch", {})), "odds_market_snapshot": market_snapshot, "lineups": normalized_lineups, "lineups_available": normalized_lineups.get("available", False), "lineups_confirmed": normalized_lineups.get("confirmed", False), "snapshot_requirements": {"required_markets": ["1x2", "asian_handicap", "over_under"], "optional_markets": ["btts", "home_team_total", "away_team_total"], "metrics_supported": ["line_crossing", "continuous_strengthening", "reversal", "market_saturation", "cross_market_divergence", "fundamental_revalidation"]}}
+    generated_at = int(time.time())
+    independent_model_inputs = independent_model_inputs_from_standings(
+        calls.get("standings", {}), home_id, away_id, generated_at,
+        normalized_lineups.get("confidence"),
+    )
+    structured = {"standings": {"home": standings_for_team(calls.get("standings", {}), home_id), "away": standings_for_team(calls.get("standings", {}), away_id)}, "recent_form_last_10": {"home": recent_form(response_list(calls.get("home_recent_10", {})), home_id), "away": recent_form(response_list(calls.get("away_recent_10", {})), away_id)}, "season_stats": {"home": season_stats_summary(calls.get("home_team_season_stats", {})), "away": season_stats_summary(calls.get("away_team_season_stats", {}))}, "head_to_head_count": len(response_list(calls.get("head_to_head_last_10", {}))), "injuries": injuries_summary(calls.get("injuries", {}), home_id, away_id), "prediction": prediction_summary(calls.get("predictions", {})), "independent_model_inputs": independent_model_inputs, "odds": odds_summary(calls.get("odds_prematch", {})), "odds_market_snapshot": market_snapshot, "lineups": normalized_lineups, "lineups_available": normalized_lineups.get("available", False), "lineups_confirmed": normalized_lineups.get("confirmed", False), "snapshot_requirements": {"required_markets": ["1x2", "asian_handicap", "over_under"], "optional_markets": ["btts", "home_team_total", "away_team_total"], "metrics_supported": ["line_crossing", "continuous_strengthening", "reversal", "market_saturation", "cross_market_divergence", "fundamental_revalidation"]}}
     quality = data_quality(coverage)
-    return {"ok": True, "version": VERSION, "generated_at": int(time.time()), "fixture": {k: v for k, v in ctx.items() if k not in ["fixture_detail", "fixture_row"]}, "coverage": coverage, "data_quality": quality, "structured_inputs": structured, "shadow_summary": make_shadow_summary(ctx, structured, quality), "football_ai_prompt": make_prompt(ctx), "raw_data_pack": {"fixture_detail": ctx.get("fixture_detail"), **{k: compact_result(v) for k, v in calls.items()}} if include_raw else None}
+    return {"ok": True, "version": VERSION, "generated_at": generated_at, "fixture": {k: v for k, v in ctx.items() if k not in ["fixture_detail", "fixture_row"]}, "coverage": coverage, "data_quality": quality, "structured_inputs": structured, "shadow_summary": make_shadow_summary(ctx, structured, quality), "football_ai_prompt": make_prompt(ctx), "raw_data_pack": {"fixture_detail": ctx.get("fixture_detail"), **{k: compact_result(v) for k, v in calls.items()}} if include_raw else None}
 
 
 
@@ -2521,6 +2638,171 @@ def imported_market_snapshot(stage: Dict[str, Any]) -> Dict[str, Any]:
 def _content_hash(value: Any) -> str:
     raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def build_learning_probability_replay(
+    fixture: Any,
+    model_input_bundle: Any,
+    generated_at: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Run the built-in odds-independent calculator and retain every replay input."""
+    generated_at = int(generated_at or time.time())
+    fixture_key = str(fixture or "").strip()
+    bundle = model_input_bundle if isinstance(model_input_bundle, dict) else {}
+    if bundle.get("status") != "ready" or not isinstance(bundle.get("inputs"), dict):
+        return {
+            "schema": "learning_probability_replay_v1",
+            "status": "data_missing",
+            "decision_eligible": False,
+            "fixture": fixture_key or None,
+            "generated_at": generated_at,
+            "uses_market_odds": False,
+            "blockers": list(bundle.get("blockers") or ["independent_model_inputs_missing"]),
+        }
+    inputs = copy.deepcopy(bundle["inputs"])
+    estimator = fundamental_expected_goals(inputs)
+    if estimator.get("ok") is not True:
+        return {
+            "schema": "learning_probability_replay_v1",
+            "status": "data_missing",
+            "decision_eligible": False,
+            "fixture": fixture_key or None,
+            "generated_at": generated_at,
+            "uses_market_odds": False,
+            "input_hash": _content_hash(inputs),
+            "inputs": inputs,
+            "blockers": ["independent_estimator_input_invalid", *(estimator.get("errors") or [])],
+        }
+    expected_goals = estimator["expected_goals"]
+    model = poisson_probability_model(
+        expected_goals["home"], expected_goals["away"], estimator["confidence"], inputs.get("provenance")
+    )
+    if model.get("ok") is not True:
+        return {
+            "schema": "learning_probability_replay_v1",
+            "status": "data_missing",
+            "decision_eligible": False,
+            "fixture": fixture_key or None,
+            "generated_at": generated_at,
+            "uses_market_odds": False,
+            "input_hash": _content_hash(inputs),
+            "inputs": inputs,
+            "estimator": estimator,
+            "blockers": ["probability_model_input_invalid", *(model.get("errors") or [])],
+        }
+    contract = {
+        "schema": "learning_probability_replay_v1",
+        "status": "ready" if estimator.get("status") == "ready" and model.get("status") == "ready" else "insufficient_confidence",
+        "decision_eligible": estimator.get("status") == "ready" and model.get("status") == "ready",
+        "fixture": fixture_key,
+        "generated_at": generated_at,
+        "calculator": {"runner_id": "builtin_fundamental_poisson", "runner_version": "1", "uses_market_odds": False},
+        "uses_market_odds": False,
+        "input_hash": _content_hash(inputs),
+        "inputs": inputs,
+        "estimator": estimator,
+        "model": model,
+        "source_content_hash": bundle.get("source_content_hash"),
+    }
+    contract["replay_hash"] = _content_hash(contract)
+    return contract
+
+
+def audit_learning_probability_replay(
+    replay: Any,
+    expected_fixture: Any,
+    data_cutoff_at: Any,
+    kickoff_at: Any,
+) -> Dict[str, Any]:
+    """Recompute a frozen probability contract; caller-supplied outputs never suffice."""
+    replay = replay if isinstance(replay, dict) else {}
+    if replay.get("status") == "data_missing":
+        return {
+            "status": "data_missing",
+            "decision_eligible": False,
+            "blockers": list(replay.get("blockers") or ["learning_probability_replay_inputs_missing"]),
+            "recomputed": False,
+        }
+    issues = []
+    if replay.get("schema") != "learning_probability_replay_v1":
+        issues.append("unsupported_replay_schema")
+    if str(replay.get("fixture") or "") != str(expected_fixture or ""):
+        issues.append("replay_fixture_mismatch")
+    generated_at = _parse_timestamp(replay.get("generated_at"))
+    cutoff = _parse_timestamp(data_cutoff_at)
+    kickoff = _parse_timestamp(kickoff_at)
+    if generated_at is None:
+        issues.append("replay_generated_at_missing")
+    elif cutoff is not None and generated_at > cutoff:
+        issues.append("replay_generated_after_packet_cutoff")
+    if generated_at is not None and kickoff is not None and generated_at >= kickoff:
+        issues.append("replay_generated_after_kickoff")
+    inputs = replay.get("inputs") if isinstance(replay.get("inputs"), dict) else {}
+    provenance = inputs.get("provenance") if isinstance(inputs.get("provenance"), dict) else {}
+    allowed_input_fields = {
+        "league_home_rate", "league_away_rate", "home_attack_rate", "home_defense_rate",
+        "away_attack_rate", "away_defense_rate", "home_sample_size", "away_sample_size",
+        "league_sample_size", "metric_type", "home_adjustment", "away_adjustment",
+        "lineup_confidence", "provenance",
+    }
+    unexpected_input_fields = sorted(set(inputs) - allowed_input_fields)
+    if unexpected_input_fields:
+        issues.append("unexpected_model_input_fields:" + ",".join(unexpected_input_fields))
+    forbidden_tokens = ("odd", "bookmaker", "market_probability", "implied_probability", "line_movement")
+    if any(any(token in str(field).lower() for token in forbidden_tokens) for field in inputs):
+        issues.append("market_derived_model_input_field_forbidden")
+    observed_at = _parse_timestamp(provenance.get("observed_at"))
+    if replay.get("uses_market_odds") is not False or provenance.get("uses_market_odds") is not False:
+        issues.append("market_odds_forbidden_in_probability_calculator")
+    if observed_at is None:
+        issues.append("model_input_observed_at_missing")
+    elif cutoff is not None and observed_at > cutoff:
+        issues.append("model_input_observed_after_packet_cutoff")
+    if observed_at is not None and kickoff is not None and observed_at >= kickoff:
+        issues.append("model_input_observed_after_kickoff")
+    if replay.get("input_hash") != _content_hash(inputs):
+        issues.append("model_input_hash_mismatch")
+    source_content_hash = str(provenance.get("source_content_hash") or "")
+    if len(source_content_hash) != 64 or any(char not in "0123456789abcdef" for char in source_content_hash.lower()):
+        issues.append("model_input_source_content_hash_invalid")
+    if replay.get("source_content_hash") != source_content_hash:
+        issues.append("replay_source_content_hash_mismatch")
+    calculator = replay.get("calculator") if isinstance(replay.get("calculator"), dict) else {}
+    if calculator != {"runner_id": "builtin_fundamental_poisson", "runner_version": "1", "uses_market_odds": False}:
+        issues.append("untrusted_probability_calculator")
+    supplied_hash = replay.get("replay_hash")
+    replay_without_hash = {key: value for key, value in replay.items() if key != "replay_hash"}
+    if supplied_hash != _content_hash(replay_without_hash):
+        issues.append("replay_hash_mismatch")
+    estimator = fundamental_expected_goals(inputs) if inputs else {"ok": False}
+    recomputed_model = {"ok": False}
+    if estimator.get("ok") is True:
+        xg = estimator["expected_goals"]
+        recomputed_model = poisson_probability_model(
+            xg["home"], xg["away"], estimator["confidence"], inputs.get("provenance")
+        )
+    supplied_estimator = replay.get("estimator") if isinstance(replay.get("estimator"), dict) else {}
+    supplied_model = replay.get("model") if isinstance(replay.get("model"), dict) else {}
+    if estimator.get("ok") is not True:
+        issues.append("recomputed_estimator_invalid")
+    elif supplied_estimator.get("estimator_hash") != estimator.get("estimator_hash") or supplied_estimator.get("expected_goals") != estimator.get("expected_goals"):
+        issues.append("estimator_output_mismatch")
+    if recomputed_model.get("ok") is not True:
+        issues.append("recomputed_model_invalid")
+    elif supplied_model.get("model_hash") != recomputed_model.get("model_hash") or supplied_model.get("probabilities") != recomputed_model.get("probabilities"):
+        issues.append("probability_output_mismatch")
+    expected_eligible = estimator.get("status") == "ready" and recomputed_model.get("status") == "ready"
+    if bool(replay.get("decision_eligible")) != expected_eligible:
+        issues.append("replay_eligibility_mismatch")
+    return {
+        "status": "invalid" if issues else ("ready" if expected_eligible else "insufficient_confidence"),
+        "decision_eligible": not issues and expected_eligible,
+        "issues": issues,
+        "recomputed": True,
+        "input_hash": _content_hash(inputs) if inputs else None,
+        "estimator_hash": estimator.get("estimator_hash"),
+        "model_hash": recomputed_model.get("model_hash"),
+    }
 
 
 def normalize_fixture_identity_name(value: Any) -> str:
@@ -5338,9 +5620,33 @@ def build_learning_freeze_payload(candidate: Dict[str, Any], packet: Dict[str, A
         raise HTTPException(status_code=409, detail="prematch_packet_timestamp_in_future")
     if generated_at >= kickoff_at:
         raise HTTPException(status_code=409, detail="prematch_packet_generated_after_kickoff")
-    decision = packet.get("decision_layer") if isinstance(packet.get("decision_layer"), dict) else {}
+    decision = copy.deepcopy(packet.get("decision_layer")) if isinstance(packet.get("decision_layer"), dict) else {}
     if not decision:
         decision = {"decision": "PASS", "pass_reasons": ["decision_layer_data_missing"]}
+    probability_replay = packet.get("probability_replay") if isinstance(packet.get("probability_replay"), dict) else {
+        "schema": "learning_probability_replay_v1",
+        "status": "data_missing",
+        "decision_eligible": False,
+        "blockers": ["learning_probability_replay_inputs_missing"],
+    }
+    replay_audit = audit_learning_probability_replay(
+        probability_replay,
+        expected_fixture=fixture,
+        data_cutoff_at=generated_at,
+        kickoff_at=kickoff_at,
+    )
+    if replay_audit.get("status") == "invalid":
+        raise HTTPException(status_code=422, detail={"error": "learning_probability_replay_invalid", "audit": replay_audit})
+    if replay_audit.get("decision_eligible") is not True:
+        reasons = decision.get("pass_reasons") if isinstance(decision.get("pass_reasons"), list) else []
+        decision["pass_reasons"] = list(dict.fromkeys([*reasons, "learning_probability_replay_inputs_missing"]))
+        decision["decision"] = "PASS"
+        decision["execution_action"] = "PASS"
+        decision["best_market"] = None
+    elif decision.get("model_probability") != get_nested(probability_replay, ["model", "probabilities"]):
+        raise HTTPException(status_code=422, detail="decision_model_probability_not_bound_to_replay_contract")
+    elif decision.get("probability_replay_hash") != probability_replay.get("replay_hash"):
+        raise HTTPException(status_code=422, detail="decision_probability_replay_hash_mismatch")
     packet_timeline = get_nested(packet, ["market", "timeline"], []) or []
     available_packet_rows = []
     for row in packet_timeline:
@@ -5357,6 +5663,23 @@ def build_learning_freeze_payload(candidate: Dict[str, Any], packet: Dict[str, A
         key=lambda row: (LEARNING_PREMATCH_STAGE_ORDER.index(row["stage"]), int(row.get("snapshot_at") or 0)),
         default=None,
     )
+    actionable_decision = (
+        decision.get("decision") != "PASS"
+        or decision.get("execution_action") in {"BET", "WAIT", "PENDING_MARKET_LANGUAGE"}
+        or isinstance(decision.get("best_market"), dict)
+    )
+    if replay_audit.get("decision_eligible") is True:
+        market_binding = decision.get("market_evidence_binding") if isinstance(decision.get("market_evidence_binding"), dict) else {}
+        if market_binding.get("current_unpersisted_quote_used") is not False:
+            raise HTTPException(status_code=422, detail="unpersisted_current_quote_cannot_drive_learning_decision")
+        if actionable_decision and (
+            not latest_packet_row
+            or market_binding.get("source") != "persisted_timing_audited_snapshot"
+            or market_binding.get("stage") != latest_packet_row.get("stage")
+            or _parse_timestamp(market_binding.get("snapshot_at")) != _parse_timestamp(latest_packet_row.get("snapshot_at"))
+            or market_binding.get("source_content_hash") != latest_packet_row.get("source_content_hash")
+        ):
+            raise HTTPException(status_code=422, detail="actionable_decision_market_snapshot_not_hash_bound")
     target_node = candidate.get("target_analysis_node")
     if latest_packet_row and (
         target_node not in LEARNING_PREMATCH_STAGE_ORDER
@@ -5383,6 +5706,8 @@ def build_learning_freeze_payload(candidate: Dict[str, Any], packet: Dict[str, A
         "source_snapshot_hash": packet_source_hash or candidate.get("source_snapshot_hash"),
         "data_quality": packet.get("data_quality"),
         "coverage": packet.get("coverage"),
+        "probability_replay": probability_replay,
+        "probability_replay_audit": replay_audit,
         "fundamental_chain": packet.get("pure_fundamental_script") or packet.get("fundamentals") or {"status": "data_missing"},
         "state_tree": get_nested(packet, ["pure_fundamental_script", "chain", "game_state_elasticity"], {"status": "data_missing"}),
         "market_timeline": packet.get("market") or {"status": "data_missing"},
@@ -6014,6 +6339,7 @@ def run_learning_cycle(
     fixture_rows: Optional[List[Dict[str, Any]]] = None,
     prematch_packet_builder: Optional[Any] = None,
     postmatch_fact_fetcher: Optional[Any] = None,
+    shadow_model_runner: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Execute one bounded learning cycle. It never creates hypotheses or changes Champion."""
     payload = payload if isinstance(payload, dict) else {}
@@ -6034,6 +6360,9 @@ def run_learning_cycle(
     auto_refresh_quality_cards = payload.get("auto_refresh_quality_cards", True)
     if not isinstance(auto_refresh_quality_cards, bool):
         raise HTTPException(status_code=400, detail="auto_refresh_quality_cards_must_be_boolean")
+    auto_lock_forward_validation = payload.get("auto_lock_forward_validation", True)
+    if not isinstance(auto_lock_forward_validation, bool):
+        raise HTTPException(status_code=400, detail="auto_lock_forward_validation_must_be_boolean")
     supplied_run_id = str(payload.get("run_id") or "").strip()
     safe_run_id = supplied_run_id and len(supplied_run_id) <= 100 and all(char in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in supplied_run_id)
     if apply_changes and not safe_run_id:
@@ -6211,6 +6540,8 @@ def run_learning_cycle(
                     "analysis_node": get_nested(freeze_payload, ["analysis", "analysis_node"]),
                     "reason": candidate.get("analysis_due_reason"),
                     "decision": get_nested(freeze_payload, ["decision", "decision"]),
+                    "probability_replay_status": get_nested(freeze_payload, ["analysis", "probability_replay_audit", "status"]),
+                    "probability_replay_decision_eligible": get_nested(freeze_payload, ["analysis", "probability_replay_audit", "decision_eligible"]) is True,
                 })
                 continue
             record = freeze_learning_sample(freeze_payload, now_ts=now_ts)
@@ -6219,10 +6550,45 @@ def run_learning_cycle(
                 "analysis_node": get_nested(record, ["analysis", "analysis_node"]),
                 "reason": candidate.get("analysis_due_reason"),
                 "decision": get_nested(record, ["decision", "decision"]),
+                "probability_replay_status": get_nested(record, ["analysis", "probability_replay_audit", "status"]),
+                "probability_replay_decision_eligible": get_nested(record, ["analysis", "probability_replay_audit", "decision_eligible"]) is True,
+                "probability_replay_hash": get_nested(record, ["analysis", "probability_replay", "replay_hash"]),
             })
         except HTTPException as exc:
             freeze_results.append({"fixture": fixture, "action": "rejected", "status_code": exc.status_code, "reason": exc.detail})
-    forward_validation_queue = learning_forward_validation_queue(now_ts=now_ts)
+    forward_validation_queue_before_lock = learning_forward_validation_queue(now_ts=now_ts)
+    shadow_lock_results = []
+    if auto_lock_forward_validation:
+        active_shadow_runner = shadow_model_runner or LEARNING_SHADOW_MODEL_RUNNER
+        for item in forward_validation_queue_before_lock.get("items") or []:
+            if not callable(active_shadow_runner):
+                shadow_lock_results.append({
+                    "hypothesis_id": item.get("hypothesis_id"), "freeze_id": item.get("freeze_id"),
+                    "action": "blocked", "reason": "internal_shadow_model_runner_not_configured",
+                })
+                continue
+            if not apply_changes:
+                shadow_lock_results.append({
+                    "hypothesis_id": item.get("hypothesis_id"), "freeze_id": item.get("freeze_id"),
+                    "action": "would_compute_and_lock",
+                })
+                continue
+            try:
+                locked = generate_internal_shadow_lock(
+                    item.get("hypothesis_id"), item.get("freeze_id"),
+                    model_runner=active_shadow_runner, now_ts=now_ts,
+                )
+                shadow_lock_results.append({
+                    "hypothesis_id": item.get("hypothesis_id"), "freeze_id": item.get("freeze_id"),
+                    "action": locked.get("action"), "lock_hash": locked.get("lock_hash"),
+                    "calculator_provenance": locked.get("calculator_provenance"),
+                })
+            except HTTPException as exc:
+                shadow_lock_results.append({
+                    "hypothesis_id": item.get("hypothesis_id"), "freeze_id": item.get("freeze_id"),
+                    "action": "rejected", "status_code": exc.status_code, "reason": exc.detail,
+                })
+    forward_validation_queue = learning_forward_validation_queue(now_ts=now_ts) if apply_changes else forward_validation_queue_before_lock
     immutable_summary = {
         "run_id": supplied_run_id or None,
         "mode": "apply" if apply_changes else "dry_run",
@@ -6237,6 +6603,7 @@ def run_learning_cycle(
         "quality_card_results": quality_card_results,
         "research_proposal_results": research_proposal_results,
         "freeze_results": freeze_results,
+        "shadow_lock_results": shadow_lock_results,
         "forward_validation_queue": forward_validation_queue,
         "automatic_hypothesis_registration": False,
         "automatic_champion_change": False,
@@ -6246,10 +6613,13 @@ def run_learning_cycle(
         **immutable_summary,
         "settled_count": sum(row.get("action") == "settled" for row in settlement_results + review_completion_results),
         "frozen_count": sum(row.get("action") == "frozen" for row in freeze_results),
+        "probability_replay_ready_count": sum(row.get("probability_replay_status") == "ready" for row in freeze_results),
+        "probability_replay_missing_count": sum(row.get("probability_replay_status") == "data_missing" for row in freeze_results),
         "review_draft_count": sum(row.get("action") == "drafted" for row in draft_results),
         "quality_card_created_count": sum(row.get("action") == "created" for row in quality_card_results),
+        "shadow_lock_created_count": sum(row.get("action") == "locked" for row in shadow_lock_results),
         "research_proposal_version_count": sum(row.get("action") == "proposed" for row in research_proposal_results),
-        "rejected_count": sum(row.get("action") in {"rejected", "would_reject"} for row in settlement_results + fact_results + draft_results + review_completion_results + freeze_results),
+        "rejected_count": sum(row.get("action") in {"rejected", "would_reject"} for row in settlement_results + fact_results + draft_results + review_completion_results + freeze_results + shadow_lock_results),
         "action": "completed" if apply_changes else "previewed",
     }
     if apply_changes:
@@ -6559,6 +6929,11 @@ def register_learning_hypothesis(payload: Dict[str, Any]) -> Dict[str, Any]:
         **validation_plan,
         "structured_scope": {"competition_ids": competition_ids, "markets": markets},
         "ablation_plan": normalized_ablation_plan,
+        "calculator_policy": {
+            "required_origin": "internal_shadow_runner",
+            "runner_schema": "learning_shadow_model_run_v1",
+            "external_submitted_outputs_promotion_eligible": False,
+        },
     }
     with SNAPSHOT_STORE_LOCK:
         store = load_snapshot_store()
@@ -6722,7 +7097,12 @@ def _brier_1x2(probabilities: Dict[str, float], result: Dict[str, Any]) -> float
     return round(sum((probabilities[key] - (1.0 if key == actual else 0.0)) ** 2 for key in ("home", "draw", "away")) / 3.0, 8)
 
 
-def lock_hypothesis_shadow_prediction(hypothesis_id: Any, payload: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
+def lock_hypothesis_shadow_prediction(
+    hypothesis_id: Any,
+    payload: Dict[str, Any],
+    now_ts: Optional[int] = None,
+    calculator_provenance: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Lock Champion, Challenger and ablation outputs before kickoff for later OOS scoring."""
     hypothesis_id = str(hypothesis_id or "").strip()
     payload = payload if isinstance(payload, dict) else {}
@@ -6795,6 +7175,38 @@ def lock_hypothesis_shadow_prediction(hypothesis_id: Any, payload: Dict[str, Any
                 "computed_at": computed_at, "freeze_hash": freeze.get("content_hash"),
             }
             module_ablations[module] = {**module_content, "output_hash": _content_hash(module_content)}
+        expected_calculator_input_hash = _content_hash({
+            "freeze_hash": freeze.get("content_hash"),
+            "hypothesis_hash": hypothesis.get("content_hash"),
+            "ablation_plan_hash": _content_hash(ablation_plan),
+        })
+        if calculator_provenance is None:
+            normalized_calculator_provenance = {
+                "origin": "external_submitted",
+                "promotion_eligible": False,
+                "reason": "not_generated_by_internal_shadow_runner",
+            }
+        else:
+            calculator_provenance = calculator_provenance if isinstance(calculator_provenance, dict) else {}
+            generated_at = _parse_timestamp(calculator_provenance.get("generated_at"))
+            runner_id = str(calculator_provenance.get("runner_id") or "").strip()
+            runner_version = str(calculator_provenance.get("runner_version") or "").strip()
+            run_hash = str(calculator_provenance.get("run_hash") or "").strip()
+            if (
+                calculator_provenance.get("schema") != "learning_shadow_model_run_v1"
+                or not runner_id or not runner_version or len(run_hash) != 64
+                or calculator_provenance.get("input_hash") != expected_calculator_input_hash
+                or generated_at is None
+                or not int(freeze.get("captured_at") or 0) <= generated_at <= locked_at
+            ):
+                raise HTTPException(status_code=422, detail="invalid_internal_shadow_runner_provenance")
+            normalized_calculator_provenance = {
+                "origin": "internal_shadow_runner", "promotion_eligible": True,
+                "schema": "learning_shadow_model_run_v1",
+                "runner_id": runner_id, "runner_version": runner_version,
+                "generated_at": generated_at, "input_hash": expected_calculator_input_hash,
+                "run_hash": run_hash,
+            }
         content = {
             "hypothesis_id": hypothesis_id,
             "hypothesis_hash": hypothesis.get("content_hash"),
@@ -6805,6 +7217,7 @@ def lock_hypothesis_shadow_prediction(hypothesis_id: Any, payload: Dict[str, Any
             "challenger_probabilities": challenger_probabilities,
             "ablation_plan_hash": _content_hash(ablation_plan),
             "module_ablations": module_ablations,
+            "calculator_provenance": normalized_calculator_provenance,
             "selected_expression": {
                 "market": market, "selection": selection,
                 "line": selected_expression.get("line"), "entry_decimal_price": entry_decimal_price,
@@ -6838,6 +7251,101 @@ def lock_hypothesis_shadow_prediction(hypothesis_id: Any, payload: Dict[str, Any
         store["version"] = VERSION
         write_snapshot_store(store)
         return record
+
+
+def generate_internal_shadow_lock(
+    hypothesis_id: Any,
+    freeze_id: Any,
+    model_runner: Optional[Any] = None,
+    now_ts: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Run a trusted in-process PIT calculator and lock its outputs; never synthesize missing variants."""
+    hypothesis_id = str(hypothesis_id or "").strip()
+    freeze_id = str(freeze_id or "").strip()
+    runner = model_runner or LEARNING_SHADOW_MODEL_RUNNER
+    if not callable(runner):
+        raise HTTPException(status_code=503, detail="internal_shadow_model_runner_not_configured")
+    now_ts = int(now_ts or time.time())
+    store = load_snapshot_store()
+    hypothesis = (store.get("learning_hypotheses") or {}).get(hypothesis_id)
+    freeze = _learning_freeze_by_id(store, freeze_id)
+    if not hypothesis:
+        raise HTTPException(status_code=404, detail="hypothesis_not_found")
+    if not freeze:
+        raise HTTPException(status_code=404, detail="frozen_learning_sample_not_found")
+    ablation_plan = get_nested(hypothesis, ["pre_registered_validation_plan", "ablation_plan"], {}) or {}
+    input_hash = _content_hash({
+        "freeze_hash": freeze.get("content_hash"),
+        "hypothesis_hash": hypothesis.get("content_hash"),
+        "ablation_plan_hash": _content_hash(ablation_plan),
+    })
+    request_content = {
+        "schema": "learning_shadow_model_request_v1",
+        "requested_at": now_ts,
+        "input_hash": input_hash,
+        "freeze": freeze,
+        "hypothesis": {
+            "hypothesis_id": hypothesis_id,
+            "hypothesis_hash": hypothesis.get("content_hash"),
+            "definition": hypothesis.get("definition"),
+            "expected_direction": hypothesis.get("expected_direction"),
+            "structured_scope": get_nested(hypothesis, ["pre_registered_validation_plan", "structured_scope"], {}),
+            "ablation_plan": ablation_plan,
+        },
+    }
+    try:
+        result = runner(request_content)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail={"error": "internal_shadow_model_runner_failed", "error_type": type(exc).__name__}) from exc
+    result = result if isinstance(result, dict) else {}
+    supplied_run_hash = str(result.get("run_hash") or "").strip()
+    run_content = {key: value for key, value in result.items() if key != "run_hash"}
+    if supplied_run_hash != _content_hash(run_content):
+        raise HTTPException(status_code=422, detail="internal_shadow_model_run_hash_mismatch")
+    generated_at = _parse_timestamp(result.get("generated_at"))
+    if (
+        result.get("schema") != "learning_shadow_model_run_v1"
+        or result.get("input_hash") != input_hash
+        or result.get("freeze_hash") != freeze.get("content_hash")
+        or result.get("hypothesis_hash") != hypothesis.get("content_hash")
+        or generated_at is None
+        or not int(freeze.get("captured_at") or 0) <= generated_at <= now_ts
+        or now_ts >= int(freeze.get("kickoff_at") or 0)
+    ):
+        raise HTTPException(status_code=422, detail="internal_shadow_model_run_identity_or_pit_invalid")
+    runner_id = str(result.get("runner_id") or "").strip()
+    runner_version = str(result.get("runner_version") or "").strip()
+    if not runner_id or not runner_version:
+        raise HTTPException(status_code=422, detail="internal_shadow_model_runner_identity_required")
+    required_modules = list(ablation_plan.get("required_modules") or [])
+    raw_modules = result.get("module_ablations") if isinstance(result.get("module_ablations"), dict) else {}
+    if set(raw_modules) != set(required_modules):
+        raise HTTPException(status_code=422, detail="internal_shadow_model_run_module_set_mismatch")
+    module_outputs = {}
+    for module in required_modules:
+        row = raw_modules.get(module) if isinstance(raw_modules.get(module), dict) else {}
+        module_outputs[module] = {
+            "probabilities": row.get("probabilities"),
+            "computed_at": generated_at,
+            "output_reference": f"internal-run:{supplied_run_hash}:{module}",
+        }
+    payload = {
+        "freeze_id": freeze_id,
+        "champion_probabilities": result.get("champion_probabilities"),
+        "challenger_probabilities": result.get("challenger_probabilities"),
+        "module_ablation_outputs": module_outputs,
+        "selected_expression": result.get("selected_expression"),
+        "risk": result.get("risk"),
+    }
+    provenance = {
+        "schema": "learning_shadow_model_run_v1",
+        "runner_id": runner_id, "runner_version": runner_version,
+        "generated_at": generated_at, "input_hash": input_hash,
+        "run_hash": supplied_run_hash,
+    }
+    return lock_hypothesis_shadow_prediction(
+        hypothesis_id, payload, now_ts=now_ts, calculator_provenance=provenance,
+    )
 
 
 def record_hypothesis_validation(hypothesis_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -6992,6 +7500,8 @@ def promotion_evidence_report(hypothesis_id: Any, store_override: Optional[Dict[
     preregistered = bool(plan) and bool(evidence) and all(
         (locks.get(row.get("freeze_id")) or {}).get("lock_hash") == row.get("shadow_lock_hash")
         and int((locks.get(row.get("freeze_id")) or {}).get("locked_at") or 0) >= int(hypothesis.get("registered_at") or 0)
+        and get_nested(locks.get(row.get("freeze_id")) or {}, ["calculator_provenance", "origin"]) == "internal_shadow_runner"
+        and get_nested(locks.get(row.get("freeze_id")) or {}, ["calculator_provenance", "promotion_eligible"]) is True
         for row in evidence
     )
     pit_passed = enough and all(get_nested(row, ["pit_audit", "status"]) == "passed" for row in evidence)
@@ -7037,7 +7547,12 @@ def promotion_evidence_report(hypothesis_id: Any, store_override: Optional[Dict[
     )
     sample_status = "passed" if enough and not counterexamples else ("failed" if counterexamples else "missing")
     gates = {
-        "pre_registration": gate("passed" if preregistered and enough else "missing", all_hashes, registered_at=hypothesis.get("registered_at")),
+        "pre_registration": gate(
+            "passed" if preregistered and enough else "missing",
+            all_hashes,
+            registered_at=hypothesis.get("registered_at"),
+            required_calculator_origin="internal_shadow_runner",
+        ),
         "pit_integrity": gate("passed" if pit_passed else ("failed" if enough else "missing"), all_hashes),
         "event_pollution_audit": gate("passed" if event_passed else ("failed" if enough else "missing"), all_hashes),
         "out_of_sample_shadow": gate(sample_status, all_hashes, support_count=support_count, required_support_count=required, counterexample_count=len(counterexamples)),
@@ -8681,6 +9196,12 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
         })
     available_history = [row for row in complete_timeline if row.get("timeline_status") == "available"]
     latest = latest_prematch_snapshot(available_history)
+    available_timeline_rows = [row for row in timeline if row.get("status") == "available"]
+    latest_timeline_row = max(
+        available_timeline_rows,
+        key=lambda row: (PREMATCH_STAGE_ORDER.index(row.get("stage")), int(row.get("snapshot_at") or 0)),
+        default=None,
+    )
     first = min(available_history, key=lambda row: PREMATCH_STAGE_ORDER.index(row.get("stage")), default=None)
     first_ah = line_from_primary(get_nested(first or {}, ["market_snapshot", "primary", "asian_handicap"]))
     latest_ah = line_from_primary(get_nested(latest or {}, ["market_snapshot", "primary", "asian_handicap"]))
@@ -8688,14 +9209,45 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
     si = data.get("structured_inputs") or {}
     script = pure_fundamental_script(data)
     versions = get_fundamental_versions(fixture)
-    decision = decision_layer(si.get("odds_market_snapshot") or empty_market_snapshot())
+    generated_at = int(data.get("generated_at") or time.time())
+    probability_replay = build_learning_probability_replay(
+        fixture, si.get("independent_model_inputs"), generated_at=generated_at,
+    )
+    replay_model = probability_replay.get("model") if isinstance(probability_replay.get("model"), dict) else {}
+    replay_inputs = probability_replay.get("inputs") if isinstance(probability_replay.get("inputs"), dict) else {}
+    # Only a persisted, timing-audited snapshot may drive the frozen market decision.
+    # The just-fetched current quote remains observable upstream but cannot silently
+    # masquerade as Opening/T-12h/T-6h/T-1h evidence.
+    decision_market = (latest or {}).get("market_snapshot") or empty_market_snapshot()
+    decision = decision_layer(
+        decision_market,
+        replay_model.get("probabilities") if replay_model.get("ok") is True else None,
+        None,
+        None,
+        as_float(replay_inputs.get("lineup_confidence")),
+        None,
+    )
     decision = apply_line_movement_gate(decision, history)
+    chain_audit = audit_fundamental_chain(script, now_ts=generated_at)
+    decision["fundamental_chain_audit"] = chain_audit
+    decision["probability_replay_hash"] = probability_replay.get("replay_hash")
+    decision["market_evidence_binding"] = {
+        "source": "persisted_timing_audited_snapshot" if latest_timeline_row else "data_missing",
+        "stage": (latest_timeline_row or {}).get("stage"),
+        "snapshot_at": (latest_timeline_row or {}).get("snapshot_at"),
+        "source_content_hash": (latest_timeline_row or {}).get("source_content_hash"),
+        "current_unpersisted_quote_used": False,
+    }
+    if probability_replay.get("decision_eligible") is not True:
+        force_pass_decision(decision, "learning_probability_replay_inputs_missing")
+    if chain_audit.get("decision_eligible") is not True:
+        force_pass_decision(decision, "fundamental_chain_insufficient")
     upstream_ok = bool(data.get("ok")) and bool(data.get("fixture"))
     return {
         "ok": upstream_ok,
         "status": "ready" if upstream_ok else "upstream_unavailable_or_data_missing",
         "version": VERSION,
-        "generated_at": int(time.time()),
+        "generated_at": generated_at,
         "fixture": data.get("fixture"),
         "data_quality": data.get("data_quality"),
         "coverage": data.get("coverage"),
@@ -8705,8 +9257,10 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
             "season_stats": si.get("season_stats"),
             "injuries": si.get("injuries"),
             "lineups_available": si.get("lineups_available"),
-            "prediction": si.get("prediction")
+            "prediction": si.get("prediction"),
+            "independent_model_inputs": si.get("independent_model_inputs"),
         },
+        "probability_replay": probability_replay,
         "pure_fundamental_script": script,
         "fundamental_versions": versions,
         "market": {
@@ -8725,7 +9279,9 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
             "order": ["pure_fundamental_script", *FUNDAMENTAL_CHAIN, "market_timeline", "fundamental_revalidation", "model_probability_vs_market_no_vig_probability", "edge", "ev", "script_coverage", "crowding", "capital_pressure_proxy", "line_response", "market_acceptance", "expression_optimizer", "lineup_confidence", "death_path", "bet_wait_or_pass"],
             "missing_data_rule": "Any unavailable injuries, lineups, odds, standings or other inputs must be marked 数据缺失; never infer missing facts.",
             "prematch_only": True,
-            "line_move_is_not_edge": True
+            "line_move_is_not_edge": True,
+            "probability_source_rule": "builtin odds-independent venue-split standings calculator; full inputs and hashes must replay exactly",
+            "market_binding_rule": "only persisted timing-audited snapshots may drive a frozen learning decision",
         },
         "market_move_classes": MOVE_CLASSES,
         "decision_layer": decision,
@@ -8826,6 +9382,8 @@ def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[st
         return {
             "status": "already_completed", "at": now_ts, "run_id": run_id,
             "frozen_count": existing.get("frozen_count"),
+            "probability_replay_ready_count": existing.get("probability_replay_ready_count"),
+            "probability_replay_missing_count": existing.get("probability_replay_missing_count"),
             "review_draft_count": existing.get("review_draft_count"),
             "research_proposal_version_count": existing.get("research_proposal_version_count"),
         }
@@ -8845,15 +9403,20 @@ def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[st
             "status": "completed", "at": now_ts, "run_id": run_id,
             "execution_order": result.get("execution_order"),
             "frozen_count": result.get("frozen_count"),
+            "probability_replay_ready_count": result.get("probability_replay_ready_count"),
+            "probability_replay_missing_count": result.get("probability_replay_missing_count"),
             "review_draft_count": result.get("review_draft_count"),
             "quality_card_created_count": result.get("quality_card_created_count"),
+            "shadow_lock_created_count": result.get("shadow_lock_created_count"),
             "research_proposal_version_count": result.get("research_proposal_version_count"),
             "settled_count": result.get("settled_count"),
             "rejected_count": result.get("rejected_count"),
             "postmatch_fact_results": result.get("postmatch_fact_results"),
+            "freeze_results": result.get("freeze_results"),
             "postmatch_review_draft_results": result.get("postmatch_review_draft_results"),
             "review_completion_results": result.get("review_completion_results"),
             "quality_card_results": result.get("quality_card_results"),
+            "shadow_lock_results": result.get("shadow_lock_results"),
             "research_proposal_results": result.get("research_proposal_results"),
             "forward_validation_queue": result.get("forward_validation_queue"),
             "automatic_hypothesis_registration": False,

@@ -129,6 +129,7 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 - v1.96 增加独立`real_money_v1`输入契约。真实Money%/Bet%/成交额必须绑定同一比赛、受控来源注册表、可定位HTTP证据、已核实方法、赛前观测时间、具体盘口档位和闭合百分比；缺失、过期、跨比赛、未注册域名或自称A级的来源一律拒绝。合格资金证据标为A级并带不可变`evidence_hash`，只替代压力证据，不替代独立盘口响应；未配置来源注册表时继续安全使用Capital Pressure Proxy。
 - v1.97 增加不可变 Learning Card 与内部过程校准。每张卡绑定赛前冻结、赛后事实和复盘哈希；`PriorityQuality`来自场次选择审计，`SelectionQuality`来自表达与价格执行审计。最终比分不复制进卡片，缺失的赛前评级不补造，同场只以最新结算冻结版本参与校准；报告不自动调权、登记理论或修改Champion。
 - v1.98 将匿名消融升级为预登记模块级消融。Hypothesis必须先锁定结构化联赛/市场范围和`MSCB/STATE_TREE/IEH/TAC/TDD/LET/LPS/OCR`中的目标模块；每个前向样本必须在开赛前精确锁定全部模块的消融概率、计算时间和证据引用。系统逐模块派生Brier增益，并自动判定`support/counterexample`，调用方自报结论不生效。
+- v1.99 为自动学习赛前包增加可重放的独立概率契约。服务端只使用同一PIT积分榜中的主客场分项建立联赛基准及双方攻防率，经内置`fundamental_relative_strength_xg_v1`与`independent_poisson_v1`生成概率；完整输入、来源内容哈希、估计器哈希、模型哈希及重放哈希一并冻结。冻结前会在服务端重算，任何概率、输入、来源或哈希篡改均拒绝。未先保存为合规时间节点的即时赔率不得参与冻结决策；独立概率数据缺失时明确保留`PASS/data_missing`，不得从盘口或供应商预测反推。
 
 真实资金包通过`/shadow/model/prematch-evaluate`或`/shadow/evaluate`请求体中的`real_money_data`提交。示例结构：
 
