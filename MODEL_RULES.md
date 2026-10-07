@@ -155,6 +155,8 @@ A级真实资金包固定使用`real_money_v1`：必须绑定比赛ID、注册�
 - `support/counterexample` 只能由锁定后的前向 Brier 增益、模块消融增益和风险阈值派生；调用方提交的结论一律不参与验证标签。
 - 前向 Brier 必须绑定赛前已冻结的实际`market + selection + line`：1X2使用`home/draw/away`，BTTS使用`yes/no`，AH、O/U、主队总进球和客队总进球使用`full_win/half_win/push/half_loss/full_loss`结算分布；四分之一盘必须保留半赢/半输，不得把非1X2市场借用胜平负概率或胜平负赛果评分。
 - Champion市场分布必须由冻结的独立Poisson重放投影得出；Challenger和每个预登记模块消融必须在完全相同的市场、选择、盘口档位与类别空间内比较。旧版`legacy_1x2_brier`只可审计，不具备Champion晋级资格。
+- Hypothesis必须包含可执行的`poisson_log_rate_adjustment_v1` Challenger规格。每个预登记消融模块必须且只能对应一个赔率无关的主/客队对数进球率贡献；全量Challenger为模块贡献之和，单项消融只移除该模块。单模块绝对增量不得超过0.25，组合绝对增量不得超过0.40，且任何模块不得为零贡献。
+- 正式前向证据仅接受内置`builtin_preregistered_poisson_challenger@1`。运行器身份、规格哈希、冻结概率重放哈希、Hypothesis哈希、模块集合或计算时间任一不一致即拒绝；外部提交结果不得获得Promotion资格。
 - 晋级的消融门禁必须逐模块达到预登记最低增益；匿名的单一 Ablation 向量不能证明具体模块有独立贡献。
 - 检查特征重复，防止同一事实被 Recent Process、Matchup、State Tree 和 Fair Pricing 重复加权。
 - 快层可按比赛更新；中层至少按 20 至 50 个有效样本更新；慢层至少按 100 个有效样本调整。

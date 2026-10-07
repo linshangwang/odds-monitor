@@ -3527,11 +3527,22 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "minimum_challenger_brier_gain_over_champion": 0.0,
         }
 
+    def learning_challenger_spec(self, modules=("MSCB",)):
+        return {
+            "schema_version": "poisson_log_rate_adjustment_v1",
+            "uses_market_odds": False,
+            "module_log_rate_deltas": {
+                module: {"home": 0.02 + index * 0.005, "away": -0.01 - index * 0.005}
+                for index, module in enumerate(modules)
+            },
+        }
+
     def learning_validation_plan(self, minimum_samples=2, modules=("MSCB",), markets=("1x2",)):
         return {
             "minimum_samples": minimum_samples,
             "structured_scope": {"competition_ids": [39], "markets": list(markets)},
             "ablation_plan": self.learning_ablation_plan(modules),
+            "challenger_spec": self.learning_challenger_spec(modules),
         }
 
     def module_ablation_outputs(self, computed_at, modules=("MSCB",), probabilities=None):
@@ -3557,7 +3568,8 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             modules = request["hypothesis"]["ablation_plan"]["required_modules"]
             content = {
                 "schema": "learning_shadow_model_run_v1",
-                "runner_id": "test-pit-runner", "runner_version": "1.0",
+                "runner_id": "builtin_preregistered_poisson_challenger", "runner_version": "1",
+                "challenger_spec_hash": request["hypothesis"]["challenger_spec"]["spec_hash"],
                 "generated_at": generated_at, "input_hash": request["input_hash"],
                 "freeze_hash": request["freeze"]["content_hash"],
                 "hypothesis_hash": request["hypothesis"]["hypothesis_hash"],
@@ -3906,6 +3918,29 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             })
         self.assertEqual(unsupported.exception.detail["error"], "unsupported_ablation_module")
 
+        with self.assertRaises(main.HTTPException) as missing_challenger:
+            main.register_learning_hypothesis({
+                **base,
+                "validation_plan": {
+                    "minimum_samples": 2,
+                    "structured_scope": {"competition_ids": [39], "markets": ["1x2"]},
+                    "ablation_plan": self.learning_ablation_plan(),
+                },
+            })
+        self.assertEqual(missing_challenger.exception.detail, "executable_challenger_spec_required")
+
+        invalid_challenger = self.learning_validation_plan()
+        invalid_challenger["challenger_spec"]["module_log_rate_deltas"]["MSCB"] = {"home": 0.26, "away": 0.0}
+        with self.assertRaises(main.HTTPException) as unbounded_challenger:
+            main.register_learning_hypothesis({**base, "validation_plan": invalid_challenger})
+        self.assertEqual(unbounded_challenger.exception.detail["error"], "challenger_module_log_rate_delta_out_of_range")
+
+        zero_challenger = self.learning_validation_plan()
+        zero_challenger["challenger_spec"]["module_log_rate_deltas"]["MSCB"] = {"home": 0.0, "away": 0.0}
+        with self.assertRaises(main.HTTPException) as zero_intervention:
+            main.register_learning_hypothesis({**base, "validation_plan": zero_challenger})
+        self.assertEqual(zero_intervention.exception.detail["error"], "challenger_module_intervention_cannot_be_zero")
+
         invalid_scope = self.learning_validation_plan()
         invalid_scope["structured_scope"]["markets"] = ["invented_market"]
         with self.assertRaises(main.HTTPException) as unsupported_market:
@@ -4143,6 +4178,32 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIsNone(metrics["champion_brier_1x2"])
         self.assertIsNotNone(metrics["champion_brier"])
 
+    def test_daily_cycle_uses_builtin_preregistered_challenger_without_injection(self):
+        discovery, _ = self.settle_learning_fixture("builtin-runner-discovery", 900, 1000)
+        with patch.object(main.time, "time", return_value=8300):
+            hypothesis = main.register_learning_hypothesis({
+                "hypothesis_id": "builtin-runner-hyp", "type": "HYPOTHESIS_ONLY",
+                "title": "Built-in executable challenger",
+                "definition": "Apply only the preregistered bounded log-rate intervention.",
+                "applicable_scope": "men top flights", "expected_direction": "lower forward market Brier",
+                "failure_conditions": "no forward gain", "falsification_criteria": "any unresolved counterexample",
+                "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": self.learning_validation_plan(),
+            })
+        payload = self.learning_payload_with_probability_replay("builtin-runner-validation", 8400, 10000)
+        frozen = main.freeze_learning_sample(payload, now_ts=8400)
+        result = main.run_learning_cycle(
+            {"apply": True, "run_id": "builtin-runner-cycle", "auto_prepare_prematch": False},
+            now_ts=8500, fixture_rows=[],
+        )
+        self.assertEqual(result["shadow_lock_created_count"], 1)
+        lock = main.load_snapshot_store()["learning_shadow_locks"]["builtin-runner-hyp"][frozen["freeze_id"]]
+        self.assertEqual(lock["calculator_provenance"]["runner_id"], "builtin_preregistered_poisson_challenger")
+        self.assertEqual(lock["challenger_spec_hash"], hypothesis["pre_registered_validation_plan"]["challenger_spec"]["spec_hash"])
+        self.assertNotEqual(lock["challenger_probabilities"], lock["champion_probabilities"])
+        self.assertEqual(lock["module_ablations"]["MSCB"]["probabilities"], lock["champion_probabilities"])
+        self.assertEqual(lock["scoring_contract"], "learning_market_forecast_v1")
+
     def test_learning_cycle_reports_runner_blocker_without_accepting_external_outputs(self):
         discovery, _ = self.settle_learning_fixture("cycle-no-runner-discovery", 900, 1000)
         with patch.object(main.time, "time", return_value=8300):
@@ -4159,10 +4220,11 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "decision": "BET", "selected_expression": {"market": "1x2", "selection": "draw", "price": 3.0},
         }
         frozen = main.freeze_learning_sample(payload, now_ts=8400)
-        result = main.run_learning_cycle(
-            {"apply": True, "run_id": "missing-runner-cycle", "auto_prepare_prematch": False},
-            now_ts=8500, fixture_rows=[],
-        )
+        with patch.object(main, "LEARNING_SHADOW_MODEL_RUNNER", None):
+            result = main.run_learning_cycle(
+                {"apply": True, "run_id": "missing-runner-cycle", "auto_prepare_prematch": False},
+                now_ts=8500, fixture_rows=[],
+            )
         self.assertEqual(result["shadow_lock_created_count"], 0)
         self.assertEqual(result["shadow_lock_results"][0]["action"], "blocked")
         self.assertEqual(result["shadow_lock_results"][0]["reason"], "internal_shadow_model_runner_not_configured")
@@ -5205,6 +5267,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
                 "minimum_samples": main.LEARNING_MIN_VALIDATION_SAMPLES,
                 "structured_scope": {"competition_ids": [39], "markets": ["over_under"]},
                 "ablation_plan": self.learning_ablation_plan(),
+                "challenger_spec": self.learning_challenger_spec(),
             },
         }
         stale = {**base, "source_proposal_hash": "stale"}
@@ -5241,6 +5304,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
                     "minimum_samples": main.LEARNING_MIN_VALIDATION_SAMPLES,
                     "structured_scope": {"competition_ids": [39], "markets": ["over_under"]},
                     "ablation_plan": self.learning_ablation_plan(),
+                    "challenger_spec": self.learning_challenger_spec(),
                 },
             })
 
@@ -5253,7 +5317,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         queue = main.learning_forward_validation_queue(now_ts=8700)
         self.assertEqual(queue["queue_count"], 1)
         self.assertEqual(queue["items"][0]["freeze_id"], frozen["freeze_id"])
-        self.assertFalse(queue["items"][0]["automatic_shadow_lock"])
+        self.assertTrue(queue["items"][0]["automatic_shadow_lock"])
 
         lock_payload = {
             "freeze_id": frozen["freeze_id"],
