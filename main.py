@@ -24,7 +24,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "1.94.0"
+VERSION = "1.95.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -166,7 +166,7 @@ LEARNING_TOP_FLIGHT_LEAGUES: Dict[int, Dict[str, str]] = {
 }
 LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
 LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
-LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08").strip() or "MODEL_RULES.md@2026-10-08"
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v1.95").strip() or "MODEL_RULES.md@2026-10-08-v1.95"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -1507,6 +1507,7 @@ def force_pass_decision(decision: Dict[str, Any], reasons: Any) -> Dict[str, Any
     decision.setdefault("pass_reasons", []).extend(str(reason) for reason in additions if reason)
     decision["pass_reasons"] = list(dict.fromkeys(decision["pass_reasons"]))
     decision["decision"] = "PASS"
+    decision["execution_action"] = "PASS"
     decision["best_market"] = None
     decision["edge"] = None
     decision["ev"] = None
@@ -1514,6 +1515,261 @@ def force_pass_decision(decision: Dict[str, Any], reasons: Any) -> Dict[str, Any
     if isinstance(tiers, dict):
         for key in ("first_choice_high_consistency", "second_choice_higher_return", "high_variance_single"):
             tiers[key] = None
+    optimizer = decision.get("expression_optimizer") if isinstance(decision.get("expression_optimizer"), dict) else {}
+    decision["expression_optimizer"] = {
+        **optimizer,
+        "action": "PASS", "selected_expression": None,
+        "reason": "mandatory_gate_failed",
+        "automatic_direction_reversal": False,
+    }
+    return decision
+
+
+def _movement_probability_delta(dynamics: Dict[str, Any], market: str, selection: str) -> Optional[float]:
+    detail = (dynamics.get("no_vig_probability_movements") or {}).get(market) or {}
+    if detail.get("status") != "compared":
+        return None
+    return as_float((detail.get("deltas") or {}).get(selection))
+
+
+def _market_axis_for_candidate(candidate: Dict[str, Any]) -> str:
+    market, selection = candidate.get("market"), candidate.get("selection")
+    if market in ("1x2", "asian_handicap") and selection in ("home", "away"):
+        return str(selection).title()
+    if market == "over_under" and selection in ("over", "under"):
+        return str(selection).title()
+    if market == "btts" and selection in ("yes", "no"):
+        return "BTTS Yes" if selection == "yes" else "BTTS No"
+    if market in ("home_team_total", "away_team_total") and selection in ("over", "under"):
+        side = "Home TT" if market == "home_team_total" else "Away TT"
+        return f"{side} {str(selection).title()}"
+    return f"{market}:{selection}"
+
+
+def _candidate_pressure_signal(candidate: Dict[str, Any], dynamics: Dict[str, Any]) -> Tuple[Optional[float], str]:
+    """Return signed proxy pressure toward this selection, never a claim about actual money flow."""
+    market, selection = candidate.get("market"), candidate.get("selection")
+    direct = _movement_probability_delta(dynamics, str(market), str(selection))
+    if direct is not None:
+        return direct, f"{market}_same_line_no_vig_probability_delta"
+    if market == "asian_handicap" and selection in ("home", "away"):
+        companion = _movement_probability_delta(dynamics, "1x2", str(selection))
+        if companion is not None:
+            return companion, "1x2_no_vig_probability_companion"
+    if market == "over_under" and selection in ("over", "under"):
+        btts_yes = _movement_probability_delta(dynamics, "btts", "yes")
+        if btts_yes is not None:
+            return btts_yes if selection == "over" else -btts_yes, "btts_no_vig_probability_companion"
+    return None, "data_missing"
+
+
+def _candidate_line_response(candidate: Dict[str, Any], dynamics: Dict[str, Any], pressure: Optional[float]) -> Dict[str, Any]:
+    market, selection = candidate.get("market"), candidate.get("selection")
+    movements = dynamics.get("market_movements") or {}
+    structural_market = market
+    structural_selection = selection
+    if market == "1x2" and selection in ("home", "away"):
+        structural_market = "asian_handicap"
+    line_delta = as_float((movements.get(structural_market) or {}).get("line"))
+    signed_response = None
+    if line_delta is not None:
+        if structural_market == "asian_handicap" and structural_selection in ("home", "away"):
+            signed_response = -line_delta if structural_selection == "home" else line_delta
+        elif structural_selection in ("over", "under"):
+            signed_response = line_delta if structural_selection == "over" else -line_delta
+    if signed_response is not None:
+        response = "upgrade" if signed_response >= 0.249 else ("downgrade" if signed_response <= -0.249 else "static")
+        return {
+            "status": "available", "response": response, "signed_line_response": round(signed_response, 6),
+            "raw_line_delta": line_delta, "structural_market": structural_market,
+            "basis": "main_line_change_toward_candidate",
+        }
+    if pressure is not None and market in ("1x2", "btts"):
+        return {
+            "status": "partial", "response": "price_only", "signed_line_response": None,
+            "raw_line_delta": None, "structural_market": market,
+            "basis": "line_free_market_price_confirmation_only",
+        }
+    return {
+        "status": "data_missing", "response": "data_missing", "signed_line_response": None,
+        "raw_line_delta": line_delta, "structural_market": structural_market,
+        "basis": "structural_line_response_unavailable",
+    }
+
+
+def _pressure_strength(value: Optional[float]) -> str:
+    if value is None:
+        return "data_missing"
+    magnitude = abs(value)
+    if magnitude >= 0.03:
+        return "strong"
+    if magnitude >= 0.015:
+        return "medium"
+    if magnitude >= 0.005:
+        return "weak"
+    return "neutral"
+
+
+def market_language_for_candidate(candidate: Dict[str, Any], dynamics: Dict[str, Any], timeline_audit: Dict[str, Any]) -> Dict[str, Any]:
+    axis = _market_axis_for_candidate(candidate)
+    if not timeline_audit.get("decision_eligible") or dynamics.get("comparison_status") != "compared":
+        return {
+            "axis": axis, "capital_pressure": {"status": "data_missing", "evidence_grade": "C_or_missing", "is_real_money": False},
+            "line_response": {"status": "data_missing", "response": "data_missing"},
+            "market_acceptance": "data_missing", "diagnostic": "insufficient_comparable_timeline",
+            "expression_risk": "unknown",
+        }
+    pressure, basis = _candidate_pressure_signal(candidate, dynamics)
+    response = _candidate_line_response(candidate, dynamics, pressure)
+    strength = _pressure_strength(pressure)
+    if pressure is None:
+        acceptance, diagnostic, risk = "data_missing", "capital_pressure_proxy_unavailable", "unknown"
+    elif pressure <= -0.005:
+        acceptance, diagnostic, risk = "Rejected", "Opposing Capital Pressure Proxy", "high"
+    elif strength == "neutral":
+        acceptance, diagnostic, risk = "Partial", "No Material Capital Pressure Proxy", "medium"
+    elif response["response"] == "upgrade":
+        acceptance, diagnostic, risk = "Accepted", "Accepted Repricing", "low"
+    elif response["response"] == "static":
+        acceptance, diagnostic, risk = "Resistance", "Market Resistance", "high"
+    elif response["response"] == "downgrade":
+        acceptance, diagnostic, risk = "Rejected", "Strong Resistance / Divergence", "very_high"
+    elif response["response"] == "price_only":
+        acceptance, diagnostic, risk = "Partial", "Price Confirmation Without Structural Line", "medium_low"
+    else:
+        acceptance, diagnostic, risk = "data_missing", "line_response_unavailable", "unknown"
+    opposite = None
+    if axis == "Home": opposite = "Away"
+    elif axis == "Away": opposite = "Home"
+    elif axis == "Over": opposite = "Under"
+    elif axis == "Under": opposite = "Over"
+    elif axis == "BTTS Yes": opposite = "BTTS No"
+    elif axis == "BTTS No": opposite = "BTTS Yes"
+    elif axis.endswith(" Over"): opposite = axis[:-5] + " Under"
+    elif axis.endswith(" Under"): opposite = axis[:-6] + " Over"
+    return {
+        "axis": axis,
+        "capital_pressure": {
+            "status": "proxy_available" if pressure is not None else "data_missing",
+            "label": "Capital Pressure Proxy" if pressure is not None else "data_missing",
+            "signed_toward_candidate": round(pressure, 6) if pressure is not None else None,
+            "direction": axis if pressure is not None and pressure >= 0.005 else (opposite if pressure is not None and pressure <= -0.005 else "neutral"),
+            "strength": strength, "basis": basis, "evidence_grade": "B" if pressure is not None else "C_or_missing",
+            "is_real_money": False, "money_percent": None, "bet_percent": None, "turnover": None,
+        },
+        "line_response": response,
+        "market_acceptance": acceptance,
+        "diagnostic": diagnostic,
+        "expression_risk": risk,
+    }
+
+
+def _expression_family(candidate: Dict[str, Any]) -> str:
+    market, selection = candidate.get("market"), candidate.get("selection")
+    if market in ("1x2", "asian_handicap") and selection in ("home", "away"):
+        return f"team_result_{selection}"
+    if market in ("over_under", "btts"):
+        if (market == "over_under" and selection == "over") or (market == "btts" and selection == "yes"):
+            return "open_goal_script"
+        if (market == "over_under" and selection == "under") or (market == "btts" and selection == "no"):
+            return "closed_goal_script"
+    return f"{market}_{selection}"
+
+
+def _candidate_is_qualified(candidate: Dict[str, Any]) -> bool:
+    coverage = as_float(candidate.get("script_coverage"))
+    return bool(
+        candidate.get("market_coverage_eligible", True)
+        and candidate.get("consensus_source_eligible", True)
+        and candidate.get("dispersion_eligible", True)
+        and as_float(candidate.get("edge")) is not None and as_float(candidate.get("edge")) >= MIN_EDGE
+        and as_float(candidate.get("ev")) is not None and as_float(candidate.get("ev")) >= MIN_EV
+        and coverage is not None and MIN_SCRIPT_COVERAGE <= coverage <= 1.0
+    )
+
+
+def apply_market_language_and_expression_optimizer(decision: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    audit = decision.get("line_movement_audit") or audit_line_movement_timeline(history)
+    latest = latest_prematch_snapshot(history)
+    dynamics = (latest or {}).get("market_dynamics") if isinstance((latest or {}).get("market_dynamics"), dict) else {}
+    axis_language = {
+        "Home": market_language_for_candidate({"market": "asian_handicap", "selection": "home"}, dynamics, audit),
+        "Away": market_language_for_candidate({"market": "asian_handicap", "selection": "away"}, dynamics, audit),
+        "Over": market_language_for_candidate({"market": "over_under", "selection": "over"}, dynamics, audit),
+        "Under": market_language_for_candidate({"market": "over_under", "selection": "under"}, dynamics, audit),
+    }
+    real_money_data = {
+        "status": "data_missing", "money_percent": None, "bet_percent": None, "turnover": None,
+        "policy": "real funds require an independently sourced and timestamped A-grade feed",
+    }
+    candidates = []
+    for raw in decision.get("candidates") or []:
+        candidate = dict(raw)
+        candidate["market_language"] = market_language_for_candidate(candidate, dynamics, audit)
+        candidate["expression_family"] = _expression_family(candidate)
+        candidate["expression_qualified"] = _candidate_is_qualified(candidate)
+        candidates.append(candidate)
+    decision["candidates"] = candidates
+    candidate_map = {(row.get("market"), row.get("selection"), row.get("line")): row for row in candidates}
+    original_raw = decision.get("best_market") if isinstance(decision.get("best_market"), dict) else None
+    original = candidate_map.get(((original_raw or {}).get("market"), (original_raw or {}).get("selection"), (original_raw or {}).get("line"))) if original_raw else None
+    if decision.get("decision") == "PASS" or original is None:
+        decision["execution_action"] = "PASS"
+        decision["market_language"] = {
+            "status": "data_missing" if not audit.get("decision_eligible") else "available_no_eligible_expression",
+            "axes": axis_language, "real_money_data": real_money_data, "capital_pressure_is_proxy_only": True,
+        }
+        decision["expression_optimizer"] = {"action": "PASS", "original_expression": original, "selected_expression": None, "switch_type": None, "reason": "mandatory_gate_failed_or_no_eligible_expression", "automatic_direction_reversal": False}
+        return decision
+    original_language = original["market_language"]
+    acceptance_rank = {"Accepted": 4, "Partial": 3, "data_missing": 2, "Resistance": 1, "Rejected": 0}
+    original_acceptance = original_language.get("market_acceptance", "data_missing")
+    same_family = [
+        row for row in candidates
+        if row.get("expression_qualified") and row.get("expression_family") == original.get("expression_family")
+        and (row.get("market"), row.get("selection"), row.get("line")) != (original.get("market"), original.get("selection"), original.get("line"))
+        and acceptance_rank.get(get_nested(row, ["market_language", "market_acceptance"]), -1) > acceptance_rank.get(original_acceptance, -1)
+        and get_nested(row, ["market_language", "market_acceptance"]) in ("Accepted", "Partial")
+    ]
+    selected = max(same_family, key=lambda row: (acceptance_rank.get(get_nested(row, ["market_language", "market_acceptance"]), -1), as_float(row.get("script_coverage")) or -1, as_float(row.get("ev")) or -999), default=None)
+    switched = selected is not None
+    selected = selected or original
+    if original_acceptance in ("Accepted", "Partial") or switched:
+        action = "BET"
+        reason = "current_expression_market_accepted" if not switched else "same_script_lower_resistance_expression_selected"
+    else:
+        action = "WAIT"
+        reason = "market_resistance_requires_better_expression_or_new_evidence"
+    if switched:
+        decision["best_market"] = selected
+        decision["edge"], decision["ev"] = selected.get("edge"), selected.get("ev")
+        decision["decision"] = selected.get("selection") if selected.get("market") == "1x2" else f"{selected.get('market')}:{selected.get('selection')}"
+    tiers = decision.get("recommendation_tiers") if isinstance(decision.get("recommendation_tiers"), dict) else {}
+    for tier_name in ("first_choice_high_consistency", "second_choice_higher_return", "high_variance_single"):
+        tier_raw = tiers.get(tier_name)
+        tier = candidate_map.get(((tier_raw or {}).get("market"), (tier_raw or {}).get("selection"), (tier_raw or {}).get("line"))) if isinstance(tier_raw, dict) else None
+        if tier and get_nested(tier, ["market_language", "market_acceptance"]) in ("Accepted", "Partial"):
+            tiers[tier_name] = tier
+        else:
+            tiers[tier_name] = None
+    if action == "BET":
+        tiers["first_choice_high_consistency"] = selected
+    decision["recommendation_tiers"] = tiers
+    decision["execution_action"] = action
+    decision["market_language"] = {
+        "status": "available", "axes": axis_language,
+        "real_money_data": real_money_data, "capital_pressure_is_proxy_only": True,
+        "selected_axis": get_nested(selected, ["market_language", "axis"]),
+        "selected_acceptance": get_nested(selected, ["market_language", "market_acceptance"]),
+        "selected_diagnostic": get_nested(selected, ["market_language", "diagnostic"]),
+        "policy": "odds path is Capital Pressure Proxy; only explicit Money%/Bet%/turnover data may be called real funds",
+    }
+    decision["expression_optimizer"] = {
+        "action": action, "original_expression": original, "selected_expression": selected,
+        "switch_type": "cross_market_same_script" if switched else "original_expression",
+        "reason": reason, "automatic_direction_reversal": False,
+        "wait_conditions": ["structural_line_accepts_pressure", "lower_resistance_same_script_expression_appears", "new_verified_fundamental_evidence"] if action == "WAIT" else [],
+    }
     return decision
 
 
@@ -1524,7 +1780,7 @@ def apply_line_movement_gate(decision: Dict[str, Any], history: List[Dict[str, A
     decision["line_movement_audit"] = audit
     if not audit.get("decision_eligible"):
         force_pass_decision(decision, audit.get("reason") or "line_movement_insufficient")
-    return decision
+    return apply_market_language_and_expression_optimizer(decision, history)
 
 
 def snapshot_stage_usable(row: Dict[str, Any]) -> bool:
@@ -1813,6 +2069,15 @@ def _parse_timestamp(value: Any) -> Optional[int]:
         return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp())
     except (TypeError, ValueError):
         return None
+
+
+def version_at_least(value: Any, minimum: Tuple[int, int, int]) -> bool:
+    parts = str(value or "").split(".")
+    try:
+        parsed = tuple(int("".join(char for char in part if char.isdigit()) or "0") for part in parts[:3])
+    except (TypeError, ValueError):
+        return False
+    return (parsed + (0, 0, 0))[:3] >= minimum
 
 
 def _import_consensus(source: Dict[str, Any]) -> Dict[str, Any]:
@@ -3221,7 +3486,8 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
             high_variance = None
     decision = "PASS" if pass_reasons or not first_choice else (first_choice["selection"] if first_choice["market"] == "1x2" else f"{first_choice['market']}:{first_choice['selection']}")
     return {
-        "decision": decision, "best_market": first_choice, "candidates": candidates,
+        "decision": decision, "execution_action": "PASS" if decision == "PASS" else "PENDING_MARKET_LANGUAGE",
+        "best_market": first_choice, "candidates": candidates,
         "recommendation_tiers": {
             "first_choice_high_consistency": first_choice,
             "second_choice_higher_return": second_choice,
@@ -3438,10 +3704,11 @@ def audit_fundamental_chain(script: Dict[str, Any], now_ts: Optional[int] = None
 
 def build_decision_summary(decision: Dict[str, Any], chain_audit: Dict[str, Any], model: Dict[str, Any]) -> Dict[str, Any]:
     best = decision.get("best_market") or {}
-    passed = decision.get("decision") == "PASS"
+    execution_action = decision.get("execution_action") or ("PASS" if decision.get("decision") == "PASS" else "BET")
+    passed = execution_action == "PASS"
     return {
-        "decision": decision.get("decision"),
-        "status": "pass" if passed else "actionable",
+        "decision": decision.get("decision"), "execution_action": execution_action,
+        "status": "pass" if passed else ("wait" if execution_action == "WAIT" else "actionable"),
         "recommended_market": None if passed else best.get("market"),
         "recommended_selection": None if passed else best.get("selection"),
         "line": None if passed else best.get("line"),
@@ -3452,8 +3719,9 @@ def build_decision_summary(decision: Dict[str, Any], chain_audit: Dict[str, Any]
         "model_status": model.get("status"),
         "fundamental_chain_status": chain_audit.get("status"),
         "market_move_classification": decision.get("market_move_classification"),
+        "market_acceptance": get_nested(decision, ["market_language", "selected_acceptance"]),
         "pass_reasons": decision.get("pass_reasons") or [],
-        "explanation": "No bet: one or more mandatory gates failed." if passed else "Selection passed model, price, script and risk gates.",
+        "explanation": "No bet: one or more mandatory gates failed." if passed else ("Wait: model direction is retained but the market has not accepted this expression." if execution_action == "WAIT" else "Selection passed model, price, script, market-language and risk gates."),
     }
 
 
@@ -3465,8 +3733,24 @@ def audit_decision_output(decision: Dict[str, Any]) -> Dict[str, Any]:
     )
     missing_fields = [field for field in required_fields if field not in decision]
     decision_name = decision.get("decision")
-    pass_mode = decision_name == "PASS"
+    execution_action = decision.get("execution_action") or ("PASS" if decision_name == "PASS" else "BET")
+    pass_mode = execution_action == "PASS" or decision_name == "PASS"
     consistency_issues = []
+    if "line_movement_audit" in decision:
+        if not isinstance(decision.get("market_language"), dict):
+            consistency_issues.append("terminal_decision_requires_market_language")
+        if not isinstance(decision.get("expression_optimizer"), dict):
+            consistency_issues.append("terminal_decision_requires_expression_optimizer")
+        axes = get_nested(decision, ["market_language", "axes"])
+        if not isinstance(axes, dict) or any(axis not in axes for axis in ("Home", "Away", "Over", "Under")):
+            consistency_issues.append("terminal_market_language_requires_four_axes")
+        if get_nested(decision, ["market_language", "capital_pressure_is_proxy_only"]) is not True:
+            consistency_issues.append("odds_path_must_be_labeled_capital_pressure_proxy")
+        if get_nested(decision, ["expression_optimizer", "automatic_direction_reversal"]) is not False:
+            consistency_issues.append("expression_optimizer_must_forbid_automatic_direction_reversal")
+        optimizer_action = get_nested(decision, ["expression_optimizer", "action"])
+        if optimizer_action != execution_action:
+            consistency_issues.append("expression_optimizer_action_mismatch")
     if pass_mode:
         if decision.get("best_market") is not None:
             consistency_issues.append("pass_must_not_have_best_market")
@@ -3481,6 +3765,10 @@ def audit_decision_output(decision: Dict[str, Any]) -> Dict[str, Any]:
                 consistency_issues.append(f"actionable_best_market_missing_{field}")
         if decision.get("pass_reasons"):
             consistency_issues.append("actionable_decision_must_not_have_pass_reasons")
+        if execution_action not in ("BET", "WAIT", "PENDING_MARKET_LANGUAGE"):
+            consistency_issues.append("actionable_execution_action_must_be_bet_or_wait")
+        if execution_action == "BET" and isinstance(decision.get("market_language"), dict) and decision["market_language"].get("status") == "available" and get_nested(decision, ["market_language", "selected_acceptance"]) not in ("Accepted", "Partial"):
+            consistency_issues.append("bet_requires_accepted_or_partial_market_expression")
     eligible = not missing_fields and not consistency_issues
     return {
         "status": "complete" if eligible else "incomplete",
@@ -3628,6 +3916,12 @@ def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int,
         as_float(get_nested(row, ["evaluation", "decision_layer", "recommendation_tiers", tier, "ev"])) or -999,
     ), reverse=True)
     for row in ordered:
+        execution_action = get_nested(row, ["evaluation", "decision_layer", "execution_action"])
+        if execution_action is None:
+            execution_action = "BET"
+        if execution_action != "BET":
+            excluded.append({"fixture": row.get("fixture"), "reason": "execution_action_not_bet", "execution_action": execution_action or "data_missing", "requested_tier": tier})
+            continue
         tiers = get_nested(row, ["evaluation", "decision_layer", "recommendation_tiers"]) or {}
         candidate = tiers.get(tier)
         source_tier = tier
@@ -4859,7 +5153,8 @@ def build_learning_freeze_payload(candidate: Dict[str, Any], packet: Dict[str, A
         "fundamental_chain": packet.get("pure_fundamental_script") or packet.get("fundamentals") or {"status": "data_missing"},
         "state_tree": get_nested(packet, ["pure_fundamental_script", "chain", "game_state_elasticity"], {"status": "data_missing"}),
         "market_timeline": packet.get("market") or {"status": "data_missing"},
-        "market_language": get_nested(packet, ["market", "latest_dynamics"], {"status": "data_missing"}),
+        "market_language": decision.get("market_language") or get_nested(packet, ["market", "latest_dynamics"], {"status": "data_missing"}),
+        "expression_optimizer": decision.get("expression_optimizer") or {"action": "PASS", "reason": "data_missing"},
         "analysis_rules": packet.get("analysis_rules") or {},
         "missing_data_policy": "preserve_data_missing; never backfill from post-kickoff information",
     }
@@ -5146,8 +5441,15 @@ def build_learning_postmatch_review_draft(freeze_id: Any, now_ts: Optional[int] 
     available_stage_count = int(market.get("available_prematch_stage_count") or 0)
     latest_dynamics = market.get("latest_dynamics") if isinstance(market.get("latest_dynamics"), dict) else {}
     line_path_ready = available_stage_count >= 2 and latest_dynamics.get("comparison_status") == "compared"
-    if line_path_ready:
-        market_status, market_reason = "passed", "frozen_market_path_had_two_or_more_comparable_nodes"
+    frozen_market_language = analysis.get("market_language") if isinstance(analysis.get("market_language"), dict) else {}
+    proxy_labeled = frozen_market_language.get("capital_pressure_is_proxy_only") is True
+    real_money_missing = get_nested(frozen_market_language, ["real_money_data", "status"]) == "data_missing"
+    four_axes_present = all(axis in (frozen_market_language.get("axes") or {}) for axis in ("Home", "Away", "Over", "Under"))
+    market_language_ready = proxy_labeled and real_money_missing and four_axes_present
+    market_language_contract_applicable = version_at_least(get_nested(freeze, ["versions", "service"]), (1, 95, 0))
+    if line_path_ready and (market_language_ready or not market_language_contract_applicable):
+        market_status = "passed"
+        market_reason = "frozen_market_path_and_v1_95_language_contract_were_complete" if market_language_contract_applicable else "legacy_freeze_market_path_was_complete; v1_95_contract_not_applied_retroactively"
     elif is_pass:
         market_status, market_reason = "passed", "insufficient_market_path_was_preserved_as_safe_pass"
     else:
@@ -5192,6 +5494,11 @@ def build_learning_postmatch_review_draft(freeze_id: Any, now_ts: Optional[int] 
             "available_stage_count": available_stage_count,
             "latest_comparison_status": latest_dynamics.get("comparison_status"),
             "frozen_market_classification": latest_dynamics.get("classification"),
+            "capital_pressure_proxy_only": proxy_labeled,
+            "real_money_data_status": get_nested(frozen_market_language, ["real_money_data", "status"]) or "data_missing",
+            "four_axis_language_present": four_axes_present,
+            "selected_acceptance": frozen_market_language.get("selected_acceptance"),
+            "v1_95_contract_applicable": market_language_contract_applicable,
         },
         "expression_audit": {
             "status": expression_status, "reason": expression_reason,
@@ -5254,7 +5561,16 @@ def build_learning_postmatch_review_draft(freeze_id: Any, now_ts: Optional[int] 
 
 def _derive_frozen_selection_outcome(freeze: Dict[str, Any], facts: Dict[str, Any]) -> Dict[str, Any]:
     """Derive only unambiguous settlement outcomes after process quality has been graded."""
-    expression = _learning_selected_expression(freeze.get("decision"))
+    frozen_decision = freeze.get("decision") if isinstance(freeze.get("decision"), dict) else {}
+    execution_action = str(frozen_decision.get("execution_action") or ("PASS" if str(frozen_decision.get("decision") or "").upper() == "PASS" else "BET")).upper()
+    if execution_action in {"WAIT", "PASS"}:
+        return {
+            "status": "not_executed", "outcome": None,
+            "reason": "frozen_execution_action_was_not_bet",
+            "execution_action": execution_action,
+            "result_used_only_after_process_grade": True,
+        }
+    expression = _learning_selected_expression(frozen_decision)
     market = str(expression.get("market") or "").strip().casefold()
     selection = str(expression.get("selection") or "").strip().casefold()
     line = as_float(expression.get("line"))
@@ -7457,7 +7773,7 @@ def build_imported_ai_packet(fixture: str, include_companies: bool = False, incl
             "timeline": timeline, "latest_dynamics": (latest or {}).get("market_dynamics"),
         },
         "analysis_rules": {
-            "order": ["pure_fundamental_script", *FUNDAMENTAL_CHAIN, "market_timeline", "fundamental_revalidation", "model_probability_vs_market_no_vig_probability", "edge", "ev", "script_coverage", "crowding", "line_movement", "lineup_confidence", "death_path", "bet_or_pass"],
+            "order": ["pure_fundamental_script", *FUNDAMENTAL_CHAIN, "market_timeline", "fundamental_revalidation", "model_probability_vs_market_no_vig_probability", "edge", "ev", "script_coverage", "crowding", "capital_pressure_proxy", "line_response", "market_acceptance", "expression_optimizer", "lineup_confidence", "death_path", "bet_wait_or_pass"],
             "missing_data_rule": "Missing historical checkpoints and facts remain data_missing; never backfill them from current odds.",
             "prematch_only": True, "line_move_is_not_edge": True,
         },
@@ -7747,7 +8063,7 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
             "latest_saturation": get_nested(latest or {}, ["market_dynamics", "market_saturation"])
         },
         "analysis_rules": {
-            "order": ["pure_fundamental_script", *FUNDAMENTAL_CHAIN, "market_timeline", "fundamental_revalidation", "model_probability_vs_market_no_vig_probability", "edge", "ev", "script_coverage", "crowding", "line_movement", "lineup_confidence", "death_path", "bet_or_pass"],
+            "order": ["pure_fundamental_script", *FUNDAMENTAL_CHAIN, "market_timeline", "fundamental_revalidation", "model_probability_vs_market_no_vig_probability", "edge", "ev", "script_coverage", "crowding", "capital_pressure_proxy", "line_response", "market_acceptance", "expression_optimizer", "lineup_confidence", "death_path", "bet_wait_or_pass"],
             "missing_data_rule": "Any unavailable injuries, lineups, odds, standings or other inputs must be marked 数据缺失; never infer missing facts.",
             "prematch_only": True,
             "line_move_is_not_edge": True
