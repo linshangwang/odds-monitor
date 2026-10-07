@@ -4536,7 +4536,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(rejected.exception.status_code, 409)
         self.assertEqual(rejected.exception.detail, "verified_opening_snapshot_required_for_learning_node")
 
-    def test_auto_learning_cycle_runs_only_in_daily_1430_window(self):
+    def test_auto_learning_cycle_runs_once_after_daily_1430_due_time(self):
         before_due = datetime(2026, 10, 8, 6, 29, tzinfo=timezone.utc)
         due = datetime(2026, 10, 8, 6, 30, tzinfo=timezone.utc)
         cycle_result = {
@@ -4552,10 +4552,26 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(idle["status"], "not_due")
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["run_id"], "daily-20261008-1430")
+        self.assertEqual(result["trigger_delay_seconds"], 0)
         self.assertEqual(result["execution_order"], ["past_36h_postmatch", "future_24h_prematch"])
         self.assertEqual(result["postmatch_fact_results"][0]["action"], "facts_collected")
         self.assertFalse(result["automatic_hypothesis_registration"])
         self.assertFalse(result["automatic_champion_change"])
+        runner.assert_called_once()
+
+    def test_auto_learning_cycle_catches_up_after_original_ten_minute_window(self):
+        late = datetime(2026, 10, 8, 11, 45, tzinfo=timezone.utc)
+        cycle_result = {
+            "frozen_count": 0, "settled_count": 0, "rejected_count": 0,
+            "review_draft_count": 0,
+            "execution_order": ["past_36h_postmatch", "future_24h_prematch"],
+        }
+        with patch.object(main, "run_learning_cycle", return_value=cycle_result) as runner:
+            result = main.auto_learning_daily_cycle(late, [])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["run_id"], "daily-20261008-1430")
+        self.assertEqual(result["scheduled_at"], int(datetime(2026, 10, 8, 6, 30, tzinfo=timezone.utc).timestamp()))
+        self.assertEqual(result["trigger_delay_seconds"], 5 * 3600 + 15 * 60)
         runner.assert_called_once()
 
     def test_snapshot_worker_enters_daily_learning_before_future_fixture_collection(self):

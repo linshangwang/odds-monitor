@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.04.0"
+VERSION = "2.05.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -198,7 +198,7 @@ LEARNING_TOP_FLIGHT_LEAGUES: Dict[int, Dict[str, str]] = {
 }
 LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
 LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
-LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.04").strip() or "MODEL_RULES.md@2026-10-08-v2.04"
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.05").strip() or "MODEL_RULES.md@2026-10-08-v2.05"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -10373,20 +10373,25 @@ def completed_auto_snapshot_stages(history: List[Dict[str, Any]]) -> set:
 
 
 def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    """Run the learning loop once near 14:30 Asia/Shanghai with a deterministic daily id."""
+    """Run once after 14:30 Asia/Shanghai; a late worker poll catches up the same day."""
     now = now.astimezone(timezone.utc)
     local_now = now.astimezone(ZoneInfo("Asia/Shanghai"))
     now_ts = int(now.timestamp())
-    if local_now.hour != 14 or not 30 <= local_now.minute <= 39:
+    scheduled_local = local_now.replace(hour=14, minute=30, second=0, microsecond=0)
+    scheduled_at = int(scheduled_local.astimezone(timezone.utc).timestamp())
+    trigger_delay_seconds = max(0, now_ts - scheduled_at)
+    if local_now < scheduled_local:
         return {
             "status": "not_due", "at": now_ts,
             "schedule_timezone": "Asia/Shanghai", "scheduled_local_time": "14:30",
+            "scheduled_at": scheduled_at,
         }
     run_id = f"daily-{local_now.date().strftime('%Y%m%d')}-1430"
     existing = (load_snapshot_store().get("learning_runs") or {}).get(run_id)
     if existing:
         return {
             "status": "already_completed", "at": now_ts, "run_id": run_id,
+            "scheduled_at": scheduled_at, "trigger_delay_seconds": trigger_delay_seconds,
             "frozen_count": existing.get("frozen_count"),
             "probability_replay_ready_count": existing.get("probability_replay_ready_count"),
             "probability_replay_missing_count": existing.get("probability_replay_missing_count"),
@@ -10407,6 +10412,7 @@ def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[st
         )
         return {
             "status": "completed", "at": now_ts, "run_id": run_id,
+            "scheduled_at": scheduled_at, "trigger_delay_seconds": trigger_delay_seconds,
             "execution_order": result.get("execution_order"),
             "frozen_count": result.get("frozen_count"),
             "probability_replay_ready_count": result.get("probability_replay_ready_count"),
@@ -10430,7 +10436,11 @@ def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[st
         }
     except Exception as exc:
         print("[AUTO_LEARNING] daily cycle failed: " + str(exc))
-        return {"status": "error", "at": now_ts, "run_id": run_id, "error_type": type(exc).__name__}
+        return {
+            "status": "error", "at": now_ts, "run_id": run_id,
+            "scheduled_at": scheduled_at, "trigger_delay_seconds": trigger_delay_seconds,
+            "error_type": type(exc).__name__,
+        }
 
 
 def auto_snapshot_cycle(now: Optional[datetime] = None) -> Dict[str, Any]:
