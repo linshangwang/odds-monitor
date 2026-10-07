@@ -458,6 +458,7 @@ GET  /shadow/learning/hypotheses/{HYPOTHESIS_ID}/promotion-evidence
 POST /shadow/learning/hypotheses/{HYPOTHESIS_ID}/promotion-candidate
 POST /shadow/learning/league-dna
 POST /shadow/learning/league-dna/{TAG_ID}/activation-candidate
+POST /shadow/learning/league-dna/{TAG_ID}/confirm
 GET  /shadow/learning/league-dna/status
 GET  /shadow/learning/selection-quality
 GET  /shadow/learning/status
