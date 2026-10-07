@@ -76,6 +76,8 @@
 - Match Rating和逐市场Market Rating。
 - 综合过关首选/次选、单关首选/次选及BET/WAIT/PASS。
 - 可接受HK赔率区间和导致降级/放弃的条件。
+- Home、Away、Over、Under四轴`Capital Pressure Proxy`、盘口响应、市场接受度和Expression Optimizer结果；真实资金缺失必须明确为`data_missing`。
+- 最终`execution_action`必须是`BET/WAIT/PASS`；只有`BET`可进入组合，`WAIT/PASS`仅保留过程复盘，不按已执行投注结算。
 - 当时已经存在的假设和不确定性，禁止赛后补写。
 
 冻结记录写入`SNAPSHOT_STORE_PATH`内的`learning_frozen`持久化命名空间，保存后不得覆写；后续节点更新必须生成新版本。仓库中的`learning/frozen/`仅表示导出目录约定，不是线上运行时的第二份事实源。

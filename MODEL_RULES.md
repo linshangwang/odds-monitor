@@ -75,6 +75,10 @@ League DNA 是统一模型中的正式先验层，不是独立预测模型：
 - 资金同向但盘口反向退档：`Strong Resistance / Divergence`。
 - 低水或降水本身不得写成真实资金流入。
 
+机器输出必须把赔率路径字段固定标为`Capital Pressure Proxy`并设置`is_real_money=false`。真实资金字段使用独立的`real_money_data`对象；没有带来源、时间戳和字段定义的A级数据时，Money%、Bet%和成交额全部保持`data_missing/null`，不得从赔率变化补算。
+
+最终决策必须保存Home、Away、Over、Under四个方向的压力代理、盘口响应、接受度和证据依据。`Resistance`或`Rejected`不能覆盖Core并自动反向；系统只能在相同赛前剧本内切换到通过正EV、Script Coverage和风险门禁的更低阻力表达，否则输出`WAIT`或`PASS`。只有`BET`可以进入组合，`WAIT/PASS`在赛后不得按实际下注结算输赢。
+
 重点拥堵风险结构：
 
 `Crowding + Price Compression + Line Resistance + Cross Market Divergence`

@@ -13,9 +13,9 @@
 - 仓库：`linshangwang/odds-monitor`
 - 分支：`main`
 - 接管基线提交：`b7feddc`
-- 本地候选版本：`1.94.0`（线上为 `1.87.0`，本版本尚未部署）
-- 测试基线：345 项通过
-- GitHub发布候选：草稿PR `#1`，分支`codex/auto-learning-v1.89`；Railway仍只跟踪`main`，因此草稿PR不会触发生产部署。分支名称保留历史版本标识，PR内容以当前`1.94.0`为准。
+- 本地候选版本：`1.95.0`（线上为 `1.87.0`，本版本尚未部署）
+- 测试基线：351 项通过
+- GitHub发布候选：草稿PR `#1`，分支`codex/auto-learning-v1.89`；Railway仍只跟踪`main`，因此草稿PR不会触发生产部署。分支名称保留历史版本标识，PR内容以当前`1.95.0`为准。
 - 正式赛前时间轴：Opening、T-24h、T-12h、T-6h、T-3h、T-1h、T-30m、Closing
 - 自动学习时间轴：Opening、T-12h、T-6h、T-1h。该精简只适用于学习任务，不改写普通赛前分析时间轴。
 - 旧 T-15m 数据保留，但不得替代 T-30m。
@@ -52,6 +52,7 @@
 - 证据驱动自动复盘已实现：`complete-review`不接受调用方Process分类，所有确定性审计必须绑定冻结/事实哈希。系统先从六项过程审计派生Process等级，再单独计算冻结选择的赛果；事件污染、数据不足、事件路径未核实、走盘或不支持的复杂结算会安全进入`DATA_INSUFFICIENT`。
 - 双源核验已加固为来源、证据定位和域名三重独立性检查；同一链接重复提交或同一网站换来源名称不能伪装成两个独立结果/事件来源。
 - League DNA完成全部验证后已有显式用户确认入口：确认必须绑定最新激活哈希、确认人、可追溯凭据和精确确认语句；只有确认成功的100分`VERIFIED_ACTIVE`版本能进入赛前先验，定时任务不能调用，且相同确认幂等、不同确认不可覆写。
+- 盘口语言与Expression Optimizer已进入最终决策契约：四轴分别记录Capital Pressure Proxy、盘口响应和Accepted/Partial/Resistance/Rejected，真实资金字段保持独立且缺失不补猜。阻力表达只能在同剧本内切换，不能自动反向；无更低阻力表达时进入WAIT，组合只接纳BET，WAIT/PASS赛后不按已执行投注结算。
 
 ## 当前真实阻塞
 
@@ -63,13 +64,12 @@
 ## 下一批工程任务
 
 1. 为真实资金字段建立独立 schema、来源等级和时间戳审计，严格区分真实资金与 Capital Pressure Proxy。
-2. 将资金压力、盘口响应、市场接受度和 Expression Switch 固化进最终决策输出。
-3. 为 `PriorityQuality`、`SelectionQuality` 和 Learning Card 增加内部校准记录；不得把赛后模块扩展成赛后推荐产品。
-4. 建立欧国联八场冻结样本集，保存当时版本、盘口路径、最终选择与优先级，作为不可回填的回归测试夹具。
-5. 对 MSCB、State Tree、IEH、TAC、TDD、LET、LPS 和 OCR 做 Champion 与 Challenger 消融框架。
-6. 数据源恢复后先进行 Shadow 验收；满足新鲜度、完整公司数组、基本面链和阵容置信门槛后，才允许生成非 PASS 建议。
-7. 为MLS、巴西甲、阿根廷甲和挪威顶级联赛积累合格冻结发现样本后，按新League DNA存储登记候选并启动独立验证；在此之前不影响任何正式分析。
-8. 部署并验收本地`1.94.0`自动学习执行器、证据账本、研究提案/前向验证队列、14:30固定周期、四节点复算链和显式用户确认门禁；Railway当前未配置`SHADOW_ACCESS_TOKEN`，在明确发布前必须先安全配置。即使误先部署，受保护学习与付费赔率接口也会保持fail-closed。
+2. 为 `PriorityQuality`、`SelectionQuality` 和 Learning Card 增加内部校准记录；不得把赛后模块扩展成赛后推荐产品。
+3. 建立欧国联八场冻结样本集，保存当时版本、盘口路径、最终选择与优先级，作为不可回填的回归测试夹具。
+4. 对 MSCB、State Tree、IEH、TAC、TDD、LET、LPS 和 OCR 做 Champion 与 Challenger 消融框架。
+5. 数据源恢复后先进行 Shadow 验收；满足新鲜度、完整公司数组、基本面链和阵容置信门槛后，才允许生成非 PASS 建议。
+6. 为MLS、巴西甲、阿根廷甲和挪威顶级联赛积累合格冻结发现样本后，按新League DNA存储登记候选并启动独立验证；在此之前不影响任何正式分析。
+7. 部署并验收本地`1.95.0`自动学习执行器、证据账本、盘口语言/Expression Optimizer、研究提案/前向验证队列、14:30固定周期、四节点复算链和显式用户确认门禁；Railway当前未配置`SHADOW_ACCESS_TOKEN`，在明确发布前必须先安全配置。即使误先部署，受保护学习与付费赔率接口也会保持fail-closed。
 
 ## 接管原则
 

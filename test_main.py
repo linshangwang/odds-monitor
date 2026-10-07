@@ -806,6 +806,142 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(gated["decision"], "home")
         self.assertTrue(gated["line_movement_audit"]["decision_eligible"])
 
+    def test_market_language_separates_pressure_proxy_from_line_response(self):
+        audit = {"decision_eligible": True}
+        base = {
+            "comparison_status": "compared",
+            "no_vig_probability_movements": {"1x2": {"status": "compared", "deltas": {"home": .04, "away": -.03}}},
+            "market_movements": {"asian_handicap": {"line": -.25}},
+        }
+        accepted = main.market_language_for_candidate({"market": "asian_handicap", "selection": "home"}, base, audit)
+        self.assertEqual(accepted["capital_pressure"]["label"], "Capital Pressure Proxy")
+        self.assertEqual(accepted["capital_pressure"]["evidence_grade"], "B")
+        self.assertFalse(accepted["capital_pressure"]["is_real_money"])
+        self.assertIsNone(accepted["capital_pressure"]["money_percent"])
+        self.assertEqual(accepted["line_response"]["response"], "upgrade")
+        self.assertEqual(accepted["market_acceptance"], "Accepted")
+        self.assertEqual(accepted["diagnostic"], "Accepted Repricing")
+
+        resistance = main.market_language_for_candidate(
+            {"market": "asian_handicap", "selection": "home"},
+            {**base, "market_movements": {"asian_handicap": {"line": 0.0}}}, audit,
+        )
+        self.assertEqual(resistance["line_response"]["response"], "static")
+        self.assertEqual(resistance["market_acceptance"], "Resistance")
+
+        rejected = main.market_language_for_candidate(
+            {"market": "asian_handicap", "selection": "home"},
+            {**base, "market_movements": {"asian_handicap": {"line": .25}}}, audit,
+        )
+        self.assertEqual(rejected["line_response"]["response"], "downgrade")
+        self.assertEqual(rejected["market_acceptance"], "Rejected")
+        self.assertEqual(rejected["diagnostic"], "Strong Resistance / Divergence")
+
+    def test_market_language_missing_timeline_never_invents_funds(self):
+        result = main.market_language_for_candidate(
+            {"market": "over_under", "selection": "over"},
+            {"comparison_status": "data_missing"}, {"decision_eligible": False},
+        )
+        self.assertEqual(result["capital_pressure"]["status"], "data_missing")
+        self.assertFalse(result["capital_pressure"]["is_real_money"])
+        self.assertEqual(result["market_acceptance"], "data_missing")
+
+    def test_expression_optimizer_switches_same_script_not_direction(self):
+        over = {
+            "market": "over_under", "selection": "over", "line": 2.5, "price": 1.9,
+            "model_probability": .57, "market_no_vig_probability": .52, "edge": .05, "ev": .083,
+            "script_coverage": .82, "market_coverage_eligible": True,
+            "consensus_source_eligible": True, "dispersion_eligible": True,
+        }
+        btts = {
+            "market": "btts", "selection": "yes", "line": None, "price": 1.85,
+            "model_probability": .58, "market_no_vig_probability": .53, "edge": .05, "ev": .073,
+            "script_coverage": .78, "market_coverage_eligible": True,
+            "consensus_source_eligible": True, "dispersion_eligible": True,
+        }
+        dynamics = {
+            "comparison_status": "compared",
+            "no_vig_probability_movements": {
+                "over_under": {"status": "compared", "deltas": {"over": .04, "under": -.04}},
+                "btts": {"status": "compared", "deltas": {"yes": .03, "no": -.03}},
+            },
+            "market_movements": {"over_under": {"line": 0.0}, "btts": {"yes": -.08, "no": .08}},
+        }
+        decision = {
+            "decision": "over_under:over", "best_market": over, "candidates": [over, btts],
+            "edge": over["edge"], "ev": over["ev"], "pass_reasons": [],
+            "line_movement_audit": {"decision_eligible": True},
+            "recommendation_tiers": {"first_choice_high_consistency": over, "second_choice_higher_return": btts, "high_variance_single": None},
+        }
+        history = [{"stage": "T-1h", "snapshot_at": 200, "market_dynamics": dynamics}]
+        optimized = main.apply_market_language_and_expression_optimizer(decision, history)
+        self.assertEqual(optimized["execution_action"], "BET")
+        self.assertEqual(optimized["best_market"]["market"], "btts")
+        self.assertEqual(optimized["best_market"]["selection"], "yes")
+        self.assertEqual(optimized["expression_optimizer"]["switch_type"], "cross_market_same_script")
+        self.assertFalse(optimized["expression_optimizer"]["automatic_direction_reversal"])
+        self.assertEqual(optimized["market_language"]["selected_acceptance"], "Partial")
+        self.assertEqual(set(optimized["market_language"]["axes"]), {"Home", "Away", "Over", "Under"})
+        self.assertEqual(optimized["market_language"]["real_money_data"]["status"], "data_missing")
+
+    def test_expression_optimizer_waits_when_pressure_meets_line_retreat(self):
+        home = {
+            "market": "asian_handicap", "selection": "home", "line": -.5, "price": 1.91,
+            "model_probability": .57, "market_no_vig_probability": .52, "edge": .05, "ev": .089,
+            "script_coverage": .82, "market_coverage_eligible": True,
+            "consensus_source_eligible": True, "dispersion_eligible": True,
+        }
+        dynamics = {
+            "comparison_status": "compared",
+            "no_vig_probability_movements": {"1x2": {"status": "compared", "deltas": {"home": .04, "draw": -.01, "away": -.03}}},
+            "market_movements": {"asian_handicap": {"line": .25}},
+        }
+        decision = {
+            "decision": "asian_handicap:home", "best_market": home, "candidates": [home],
+            "edge": home["edge"], "ev": home["ev"], "pass_reasons": [],
+            "line_movement_audit": {"decision_eligible": True},
+            "recommendation_tiers": {"first_choice_high_consistency": home, "second_choice_higher_return": None, "high_variance_single": None},
+        }
+        optimized = main.apply_market_language_and_expression_optimizer(decision, [{"stage": "T-1h", "snapshot_at": 200, "market_dynamics": dynamics}])
+        self.assertEqual(optimized["execution_action"], "WAIT")
+        self.assertEqual(optimized["market_language"]["selected_acceptance"], "Rejected")
+        self.assertEqual(optimized["market_language"]["selected_diagnostic"], "Strong Resistance / Divergence")
+        self.assertIsNone(optimized["recommendation_tiers"]["first_choice_high_consistency"])
+        self.assertEqual(optimized["best_market"]["selection"], "home")
+        self.assertFalse(optimized["expression_optimizer"]["automatic_direction_reversal"])
+
+    def test_portfolio_excludes_wait_expression_even_when_candidate_exists(self):
+        candidate = {
+            "market": "1x2", "selection": "home", "line": None, "price": 1.8,
+            "model_probability": .62, "market_no_vig_probability": .56,
+            "edge": .06, "ev": .116, "script_coverage": .8,
+        }
+        rows = []
+        for fixture, action in (("wait-leg", "WAIT"), ("bet-leg-1", "BET"), ("bet-leg-2", "BET")):
+            rows.append({
+                "fixture": fixture, "correlation_group": fixture,
+                "evaluation": {"decision_layer": {
+                    "execution_action": action, "lineup_confidence": .9, "crowding": .3,
+                    "line_movement": {"comparison_status": "compared"}, "death_path": [],
+                    "recommendation_tiers": {"first_choice_high_consistency": candidate},
+                }},
+            })
+        combination = main._combination_from_rows(rows, "first_choice_high_consistency", 3)
+        self.assertEqual(combination["decision"], "COMBINE")
+        self.assertEqual({leg["fixture"] for leg in combination["legs"]}, {"bet-leg-1", "bet-leg-2"})
+        excluded = {row["fixture"]: row for row in combination["selection_audit"]["excluded"]}
+        self.assertEqual(excluded["wait-leg"]["reason"], "execution_action_not_bet")
+
+    def test_wait_expression_is_not_retroactively_settled_as_a_bet(self):
+        freeze = {"decision": {
+            "decision": "asian_handicap:home", "execution_action": "WAIT",
+            "best_market": {"market": "asian_handicap", "selection": "home", "line": -.5, "price": 1.91},
+        }}
+        outcome = main._derive_frozen_selection_outcome(freeze, {"result": {"home_goals": 3, "away_goals": 0}})
+        self.assertEqual(outcome["status"], "not_executed")
+        self.assertIsNone(outcome["outcome"])
+        self.assertEqual(outcome["execution_action"], "WAIT")
+
     def test_line_movement_gate_rejects_duplicate_observation_times(self):
         history = [
             {"stage": "T-24h", "snapshot_at": 100, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "data_missing"}},
