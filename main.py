@@ -23,7 +23,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "1.89.0"
+VERSION = "1.91.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -67,6 +67,7 @@ AUTO_SNAPSHOT_THREAD: Optional[threading.Thread] = None
 AUTO_SNAPSHOT_LAST_CYCLE_AT: Optional[int] = None
 AUTO_SNAPSHOT_LAST_ERROR: Optional[str] = None
 AUTO_RECONCILIATION_LAST_RESULT: Optional[Dict[str, Any]] = None
+AUTO_LEARNING_LAST_RESULT: Optional[Dict[str, Any]] = None
 NAMI_ODDS_STARTUP_PROBE: Dict[str, Any] = {"status": "pending", "decision_use": False}
 NAMI_ODDS_STARTUP_PROBE_STARTED = False
 NAMI_ODDS_PROBE_TTL_SECONDS = max(3600, int(os.getenv("NAMI_ODDS_PROBE_TTL_SECONDS", str(7 * 24 * 3600))))
@@ -162,6 +163,7 @@ LEARNING_TOP_FLIGHT_LEAGUES: Dict[int, Dict[str, str]] = {
 LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
 LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
 LEARNING_DAILY_FREEZE_CAP = max(1, min(int(os.getenv("LEARNING_DAILY_FREEZE_CAP", "8")), 50))
+LEARNING_DAILY_REANALYSIS_CAP = max(1, min(int(os.getenv("LEARNING_DAILY_REANALYSIS_CAP", "50")), 200))
 LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08").strip() or "MODEL_RULES.md@2026-10-08"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
@@ -3915,7 +3917,7 @@ def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6, ri
 
 @app.get("/")
 def root():
-    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}", "/shadow/learning/cycle-plan", "/shadow/learning/run", "/shadow/learning/review-queue", "/shadow/learning/freeze", "/shadow/learning/settle", "/shadow/learning/hypotheses", "/shadow/learning/league-dna", "/shadow/learning/selection-quality", "/shadow/learning/status"]}
+    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}", "/shadow/learning/cycle-plan", "/shadow/learning/run", "/shadow/learning/review-queue", "/shadow/learning/freeze", "/shadow/learning/settle", "/shadow/learning/hypotheses", "/shadow/learning/hypotheses/{id}/shadow-lock", "/shadow/learning/hypotheses/{id}/promotion-evidence", "/shadow/learning/league-dna", "/shadow/learning/selection-quality", "/shadow/learning/status"]}
 
 
 @app.get("/health")
@@ -4540,7 +4542,7 @@ def discover_learning_fixtures(now_ts: Optional[int] = None, fixture_rows: Optio
     candidates, excluded = [], []
     seen = set()
     for row in rows:
-        summary = fixture_summary(row)
+        summary = dict(row) if row.get("fixture_id") is not None else fixture_summary(row)
         fixture_id = summary.get("fixture_id")
         league_id = summary.get("league_id")
         kickoff = fixture_datetime_utc(summary)
@@ -4585,6 +4587,122 @@ def discover_learning_fixtures(now_ts: Optional[int] = None, fixture_rows: Optio
     }
 
 
+def scheduled_learning_analysis_node(now_ts: int, kickoff_at: int) -> Optional[str]:
+    """Return the latest clock node that is genuinely due; never synthesize Closing."""
+    seconds_before = int(kickoff_at) - int(now_ts)
+    if seconds_before <= 0 or seconds_before > LEARNING_DISCOVERY_HORIZON_HOURS * 3600:
+        return None
+    if seconds_before <= 30 * 60:
+        return "T-30m"
+    if seconds_before <= 3600:
+        return "T-1h"
+    if seconds_before <= 3 * 3600:
+        return "T-3h"
+    if seconds_before <= 6 * 3600:
+        return "T-6h"
+    if seconds_before <= 12 * 3600:
+        return "T-12h"
+    return "T-24h"
+
+
+def _learning_snapshot_marker(store: Dict[str, Any], fixture: str, now_ts: int) -> Optional[Dict[str, Any]]:
+    rows = (store.get("fixtures") or {}).get(str(fixture), []) or []
+    available = [
+        row for row in complete_prematch_timeline(rows)
+        if row.get("timeline_status") == "available"
+        and int(row.get("snapshot_at") or 0) <= int(now_ts)
+    ]
+    latest = latest_prematch_snapshot(available)
+    if not latest:
+        return None
+    evidence_hash = str(latest.get("source_content_hash") or "").strip() or _content_hash({
+        "stage": latest.get("stage"),
+        "snapshot_at": latest.get("snapshot_at"),
+        "market_snapshot": latest.get("market_snapshot"),
+        "market_dynamics": latest.get("market_dynamics"),
+        "team_news_snapshot": latest.get("team_news_snapshot"),
+    })
+    return {
+        "stage": latest.get("stage"),
+        "snapshot_at": int(latest.get("snapshot_at") or 0),
+        "evidence_hash": evidence_hash,
+    }
+
+
+def _learning_freeze_analysis_node(row: Dict[str, Any]) -> Optional[str]:
+    node = get_nested(row, ["analysis", "analysis_node"])
+    if node in PREMATCH_STAGE_ORDER and node != "Opening":
+        return node
+    captured_at = int(row.get("captured_at") or 0)
+    kickoff_at = int(row.get("kickoff_at") or 0)
+    return scheduled_learning_analysis_node(captured_at, kickoff_at)
+
+
+def learning_candidate_analysis_state(
+    candidate: Dict[str, Any],
+    store: Dict[str, Any],
+    now_ts: int,
+) -> Dict[str, Any]:
+    """Decide whether one new PIT analysis version is due, without fetching new facts."""
+    fixture = str(candidate.get("fixture_id") or "").strip()
+    kickoff_at = _parse_timestamp(candidate.get("timestamp"))
+    scheduled_node = scheduled_learning_analysis_node(now_ts, kickoff_at or 0)
+    rows = [row for row in ((store.get("learning_frozen") or {}).get(fixture) or []) if isinstance(row, dict)]
+    latest_freeze = max(rows, key=lambda row: int(row.get("version_number") or 0), default=None)
+    marker = _learning_snapshot_marker(store, fixture, now_ts)
+    target_node = scheduled_node
+    if marker and marker.get("stage") in PREMATCH_STAGE_ORDER:
+        marker_stage = marker["stage"]
+        if marker_stage == "Closing" or (
+            target_node in PREMATCH_STAGE_ORDER
+            and PREMATCH_STAGE_ORDER.index(marker_stage) > PREMATCH_STAGE_ORDER.index(target_node)
+        ):
+            target_node = marker_stage
+    latest_node = _learning_freeze_analysis_node(latest_freeze or {})
+    due_reason = None
+    if target_node is None:
+        due_reason = "analysis_clock_node_not_due"
+    elif latest_freeze is None:
+        due_reason = "initial_analysis_node_due"
+    elif latest_node not in PREMATCH_STAGE_ORDER:
+        due_reason = "legacy_freeze_missing_analysis_node"
+    elif PREMATCH_STAGE_ORDER.index(target_node) > PREMATCH_STAGE_ORDER.index(latest_node):
+        due_reason = "analysis_node_advanced"
+    else:
+        last_source_hash = str(get_nested(latest_freeze, ["analysis", "source_snapshot_hash"]) or "").strip()
+        marker_hash = str((marker or {}).get("evidence_hash") or "").strip()
+        marker_stage = (marker or {}).get("stage")
+        if marker_hash and marker_hash != last_source_hash and marker_stage == target_node:
+            due_reason = "new_snapshot_evidence_at_current_node"
+        else:
+            latest_capture = int(latest_freeze.get("captured_at") or 0)
+            pending = [
+                task for task in (store.get("fundamental_revalidation_queue") or {}).values()
+                if isinstance(task, dict)
+                and str(task.get("fixture") or "") == fixture
+                and task.get("status") == "pending"
+                and int(task.get("created_at") or 0) > latest_capture
+                and task.get("stage") in PREMATCH_STAGE_ORDER
+                and PREMATCH_STAGE_ORDER.index(task["stage"]) <= PREMATCH_STAGE_ORDER.index(target_node)
+            ]
+            if pending:
+                due_reason = "material_revalidation_trigger"
+    analysis_due = due_reason not in {None, "analysis_clock_node_not_due"}
+    return {
+        "already_frozen": latest_freeze is not None,
+        "latest_freeze_id": (latest_freeze or {}).get("freeze_id"),
+        "latest_freeze_version": (latest_freeze or {}).get("version_number"),
+        "latest_analysis_node": latest_node,
+        "scheduled_analysis_node": scheduled_node,
+        "target_analysis_node": target_node,
+        "source_snapshot_stage": (marker or {}).get("stage"),
+        "source_snapshot_at": (marker or {}).get("snapshot_at"),
+        "source_snapshot_hash": (marker or {}).get("evidence_hash"),
+        "analysis_due": analysis_due,
+        "analysis_due_reason": due_reason or "no_new_node_or_material_evidence",
+    }
+
+
 def learning_cycle_plan(now_ts: Optional[int] = None, fixture_rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Build a non-mutating daily work plan; never invent analysis or process classifications."""
     now_ts = int(now_ts or time.time())
@@ -4605,23 +4723,36 @@ def learning_cycle_plan(now_ts: Optional[int] = None, fixture_rows: Optional[Lis
                 "kickoff_at": kickoff_at, "hours_since_kickoff": round(age / 3600, 2),
                 "required_action": "verify_result_and_events_then_classify_process_without_result_backfit",
             })
+    existing_fact_versions = store.get("learning_postmatch_facts") or {}
+    fact_collection_due = [
+        row for row in settlement_due
+        if not (existing_fact_versions.get(str(row.get("freeze_id"))) or [])
+    ]
     local_date = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(ZoneInfo("Asia/Shanghai")).date()
     frozen_today = [
         row for versions in frozen.values() for row in versions or []
         if datetime.fromtimestamp(int(row.get("captured_at") or 0), tz=timezone.utc).astimezone(ZoneInfo("Asia/Shanghai")).date() == local_date
     ]
-    already_frozen_fixtures = set(frozen)
+    admitted_today = [row for row in frozen_today if int(row.get("version_number") or 0) == 1]
+    reanalyses_today = [row for row in frozen_today if int(row.get("version_number") or 0) > 1]
     discovery_candidates = []
     for row in discovery["candidates"]:
-        fixture_key = str(row.get("fixture_id"))
-        discovery_candidates.append({**row, "already_frozen": fixture_key in already_frozen_fixtures})
+        discovery_candidates.append({**row, **learning_candidate_analysis_state(row, store, now_ts)})
     return {
         "version": VERSION, "generated_at": now_ts,
         "settlement_due_count": len(settlement_due), "settlement_due": sorted(settlement_due, key=lambda row: row["kickoff_at"]),
+        "postmatch_fact_collection_due_count": len(fact_collection_due),
+        "postmatch_fact_collection_due": sorted(fact_collection_due, key=lambda row: row["kickoff_at"]),
         "discovery": {**discovery, "candidates": discovery_candidates},
         "daily_freeze_cap": LEARNING_DAILY_FREEZE_CAP,
+        "daily_new_fixture_cap": LEARNING_DAILY_FREEZE_CAP,
+        "daily_reanalysis_cap": LEARNING_DAILY_REANALYSIS_CAP,
         "frozen_today_count": len(frozen_today),
-        "remaining_freeze_capacity": max(0, LEARNING_DAILY_FREEZE_CAP - len(frozen_today)),
+        "admitted_today_count": len(admitted_today),
+        "reanalysis_today_count": len(reanalyses_today),
+        "remaining_freeze_capacity": max(0, LEARNING_DAILY_FREEZE_CAP - len(admitted_today)),
+        "remaining_new_fixture_capacity": max(0, LEARNING_DAILY_FREEZE_CAP - len(admitted_today)),
+        "remaining_reanalysis_capacity": max(0, LEARNING_DAILY_REANALYSIS_CAP - len(reanalyses_today)),
         "mutation_policy": "plan_only; freezing requires a complete PIT analysis and settlement requires verified facts plus an explicit process classification",
         "automatic_champion_promotion": False,
     }
@@ -4654,9 +4785,43 @@ def build_learning_freeze_payload(candidate: Dict[str, Any], packet: Dict[str, A
     decision = packet.get("decision_layer") if isinstance(packet.get("decision_layer"), dict) else {}
     if not decision:
         decision = {"decision": "PASS", "pass_reasons": ["decision_layer_data_missing"]}
+    packet_timeline = get_nested(packet, ["market", "timeline"], []) or []
+    available_packet_rows = []
+    for row in packet_timeline:
+        if not isinstance(row, dict) or row.get("status") != "available" or row.get("stage") not in PREMATCH_STAGE_ORDER:
+            continue
+        snapshot_at = _parse_timestamp(row.get("snapshot_at"))
+        if snapshot_at is None or snapshot_at > generated_at:
+            continue
+        if audit_stage_timing(row["stage"], snapshot_at, kickoff_at).get("status") == "invalid":
+            continue
+        available_packet_rows.append(row)
+    latest_packet_row = max(
+        available_packet_rows,
+        key=lambda row: (PREMATCH_STAGE_ORDER.index(row["stage"]), int(row.get("snapshot_at") or 0)),
+        default=None,
+    )
+    target_node = candidate.get("target_analysis_node")
+    if latest_packet_row and (
+        target_node not in PREMATCH_STAGE_ORDER
+        or PREMATCH_STAGE_ORDER.index(latest_packet_row["stage"]) > PREMATCH_STAGE_ORDER.index(target_node)
+    ):
+        target_node = latest_packet_row["stage"]
+    if target_node not in PREMATCH_STAGE_ORDER or target_node == "Opening":
+        target_node = scheduled_learning_analysis_node(generated_at, kickoff_at)
+    if target_node not in PREMATCH_STAGE_ORDER or target_node == "Opening":
+        raise HTTPException(status_code=409, detail="learning_analysis_node_not_due")
+    packet_source_hash = str((latest_packet_row or {}).get("source_content_hash") or "").strip()
+    if not packet_source_hash and latest_packet_row:
+        packet_source_hash = _content_hash(latest_packet_row)
     analysis = {
         "prematch_only": True,
         "packet_generated_at": generated_at,
+        "analysis_node": target_node,
+        "analysis_trigger": candidate.get("analysis_due_reason") or "explicit_prematch_packet",
+        "source_snapshot_stage": (latest_packet_row or {}).get("stage") or candidate.get("source_snapshot_stage"),
+        "source_snapshot_at": (latest_packet_row or {}).get("snapshot_at") or candidate.get("source_snapshot_at"),
+        "source_snapshot_hash": packet_source_hash or candidate.get("source_snapshot_hash"),
         "data_quality": packet.get("data_quality"),
         "coverage": packet.get("coverage"),
         "fundamental_chain": packet.get("pure_fundamental_script") or packet.get("fundamentals") or {"status": "data_missing"},
@@ -4957,15 +5122,23 @@ def run_learning_cycle(
                 })
             except HTTPException as exc:
                 fact_results.append({"freeze_id": freeze_id, "action": "rejected", "status_code": exc.status_code, "reason": exc.detail})
-    remaining = int(plan.get("remaining_freeze_capacity") or 0)
+    remaining = int(plan.get("remaining_new_fixture_capacity") or 0)
+    remaining_reanalyses = int(plan.get("remaining_reanalysis_capacity") or 0)
     freeze_results = []
     builder = prematch_packet_builder or build_shadow_ai_packet
     for candidate in plan.get("discovery", {}).get("candidates") or []:
         fixture = str(candidate.get("fixture_id") or "")
-        if candidate.get("already_frozen"):
-            freeze_results.append({"fixture": fixture, "action": "skipped", "reason": "fixture_already_frozen"})
+        if not candidate.get("analysis_due"):
+            freeze_results.append({
+                "fixture": fixture, "action": "skipped", "reason": candidate.get("analysis_due_reason") or "analysis_not_due",
+                "latest_analysis_node": candidate.get("latest_analysis_node"),
+                "target_analysis_node": candidate.get("target_analysis_node"),
+            })
             continue
-        if remaining <= 0:
+        if candidate.get("already_frozen") and remaining_reanalyses <= 0:
+            freeze_results.append({"fixture": fixture, "action": "skipped", "reason": "daily_reanalysis_cap_reached"})
+            continue
+        if not candidate.get("already_frozen") and remaining <= 0:
             freeze_results.append({"fixture": fixture, "action": "skipped", "reason": "daily_freeze_cap_reached"})
             continue
         packet = prematch_packets.get(fixture)
@@ -4981,12 +5154,25 @@ def run_learning_cycle(
         try:
             freeze_payload = build_learning_freeze_payload(candidate, packet, now_ts=now_ts)
             if not apply_changes:
-                freeze_results.append({"fixture": fixture, "action": "would_freeze", "decision": get_nested(freeze_payload, ["decision", "decision"])})
+                freeze_results.append({
+                    "fixture": fixture, "action": "would_reanalyze" if candidate.get("already_frozen") else "would_freeze",
+                    "analysis_node": get_nested(freeze_payload, ["analysis", "analysis_node"]),
+                    "reason": candidate.get("analysis_due_reason"),
+                    "decision": get_nested(freeze_payload, ["decision", "decision"]),
+                })
                 continue
             record = freeze_learning_sample(freeze_payload, now_ts=now_ts)
-            freeze_results.append({"fixture": fixture, "freeze_id": record.get("freeze_id"), "action": record.get("action"), "decision": get_nested(record, ["decision", "decision"])})
+            freeze_results.append({
+                "fixture": fixture, "freeze_id": record.get("freeze_id"), "action": record.get("action"),
+                "analysis_node": get_nested(record, ["analysis", "analysis_node"]),
+                "reason": candidate.get("analysis_due_reason"),
+                "decision": get_nested(record, ["decision", "decision"]),
+            })
             if record.get("action") == "frozen":
-                remaining -= 1
+                if candidate.get("already_frozen"):
+                    remaining_reanalyses -= 1
+                else:
+                    remaining -= 1
         except HTTPException as exc:
             freeze_results.append({"fixture": fixture, "action": "rejected", "status_code": exc.status_code, "reason": exc.detail})
     immutable_summary = {
@@ -5285,6 +5471,103 @@ def register_learning_hypothesis(payload: Dict[str, Any]) -> Dict[str, Any]:
         return record
 
 
+def _normalize_1x2_probabilities(value: Any, field_name: str) -> Dict[str, float]:
+    value = value if isinstance(value, dict) else {}
+    probabilities = {key: as_float(value.get(key)) for key in ("home", "draw", "away")}
+    if any(probability is None or not 0 <= probability <= 1 for probability in probabilities.values()):
+        raise HTTPException(status_code=422, detail=f"{field_name}_must_contain_valid_1x2_probabilities")
+    total = sum(probabilities.values())
+    if abs(total - 1.0) > 0.01:
+        raise HTTPException(status_code=422, detail=f"{field_name}_probabilities_must_sum_to_one")
+    return {key: round(probability / total, 8) for key, probability in probabilities.items()}
+
+
+def _brier_1x2(probabilities: Dict[str, float], result: Dict[str, Any]) -> float:
+    home_goals, away_goals = int(result.get("home_goals")), int(result.get("away_goals"))
+    actual = "home" if home_goals > away_goals else ("away" if home_goals < away_goals else "draw")
+    return round(sum((probabilities[key] - (1.0 if key == actual else 0.0)) ** 2 for key in ("home", "draw", "away")) / 3.0, 8)
+
+
+def lock_hypothesis_shadow_prediction(hypothesis_id: Any, payload: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Lock Champion, Challenger and ablation outputs before kickoff for later OOS scoring."""
+    hypothesis_id = str(hypothesis_id or "").strip()
+    payload = payload if isinstance(payload, dict) else {}
+    freeze_id = str(payload.get("freeze_id") or "").strip()
+    if not hypothesis_id or not freeze_id:
+        raise HTTPException(status_code=400, detail="hypothesis_id_and_freeze_id_required")
+    champion_probabilities = _normalize_1x2_probabilities(payload.get("champion_probabilities"), "champion")
+    challenger_probabilities = _normalize_1x2_probabilities(payload.get("challenger_probabilities"), "challenger")
+    ablation_probabilities = _normalize_1x2_probabilities(payload.get("ablation_probabilities"), "ablation")
+    selected_expression = payload.get("selected_expression") if isinstance(payload.get("selected_expression"), dict) else {}
+    market = str(selected_expression.get("market") or "").strip()
+    selection = str(selected_expression.get("selection") or "").strip()
+    entry_decimal_price = as_float(selected_expression.get("entry_decimal_price"))
+    entry_price_evidence_ref = str(selected_expression.get("entry_price_evidence_ref") or "").strip()
+    if not market or not selection or entry_decimal_price is None or not 1.01 <= entry_decimal_price <= 1000:
+        raise HTTPException(status_code=422, detail="valid_shadow_selected_expression_required")
+    if not entry_price_evidence_ref:
+        raise HTTPException(status_code=422, detail="entry_price_evidence_ref_required")
+    risk = payload.get("risk") if isinstance(payload.get("risk"), dict) else {}
+    champion_tail_risk = as_float(risk.get("champion_tail_risk"))
+    challenger_tail_risk = as_float(risk.get("challenger_tail_risk"))
+    if any(value is None or not 0 <= value <= 1 for value in (champion_tail_risk, challenger_tail_risk)):
+        raise HTTPException(status_code=422, detail="valid_champion_and_challenger_tail_risk_required")
+    locked_at = int(now_ts or time.time())
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        hypothesis = (store.get("learning_hypotheses") or {}).get(hypothesis_id)
+        if not hypothesis:
+            raise HTTPException(status_code=404, detail="hypothesis_not_found")
+        if freeze_id in (hypothesis.get("discovery_freeze_ids") or []):
+            raise HTTPException(status_code=409, detail="discovery_sample_cannot_be_shadow_validation_sample")
+        freeze = _learning_freeze_by_id(store, freeze_id)
+        if not freeze:
+            raise HTTPException(status_code=404, detail="frozen_learning_sample_not_found")
+        if freeze_id in (store.get("learning_postmatch") or {}):
+            raise HTTPException(status_code=409, detail="shadow_prediction_must_be_locked_before_postmatch_settlement")
+        if locked_at >= int(freeze.get("kickoff_at") or 0):
+            raise HTTPException(status_code=409, detail="shadow_prediction_must_be_locked_before_kickoff")
+        if locked_at < int(freeze.get("captured_at") or 0):
+            raise HTTPException(status_code=409, detail="shadow_prediction_cannot_precede_frozen_sample")
+        if int(freeze.get("captured_at") or 0) < int(hypothesis.get("registered_at") or 0):
+            raise HTTPException(status_code=409, detail="validation_sample_predates_hypothesis_registration")
+        content = {
+            "hypothesis_id": hypothesis_id,
+            "hypothesis_hash": hypothesis.get("content_hash"),
+            "freeze_id": freeze_id,
+            "freeze_hash": freeze.get("content_hash"),
+            "champion_decision_hash": _content_hash(freeze.get("decision") or {}),
+            "champion_probabilities": champion_probabilities,
+            "challenger_probabilities": challenger_probabilities,
+            "ablation_probabilities": ablation_probabilities,
+            "selected_expression": {
+                "market": market, "selection": selection,
+                "line": selected_expression.get("line"), "entry_decimal_price": entry_decimal_price,
+                "entry_price_evidence_ref": entry_price_evidence_ref,
+            },
+            "risk": {
+                "champion_tail_risk": champion_tail_risk,
+                "challenger_tail_risk": challenger_tail_risk,
+            },
+            "locked_at": locked_at,
+        }
+        lock_hash = _content_hash(content)
+        locks = store.setdefault("learning_shadow_locks", {}).setdefault(hypothesis_id, {})
+        existing = locks.get(freeze_id)
+        if existing:
+            if existing.get("lock_hash") == lock_hash:
+                return {**existing, "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="shadow_prediction_already_locked")
+        record = {
+            **content, "lock_hash": lock_hash, "immutable": True,
+            "champion_effect": False, "action": "locked",
+        }
+        locks[freeze_id] = record
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return record
+
+
 def record_hypothesis_validation(hypothesis_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
     hypothesis_id = str(hypothesis_id or "").strip()
     payload = payload if isinstance(payload, dict) else {}
@@ -5304,14 +5587,63 @@ def record_hypothesis_validation(hypothesis_id: Any, payload: Dict[str, Any]) ->
         freeze = _learning_freeze_by_id(store, freeze_id)
         if not freeze or freeze_id not in (store.get("learning_postmatch") or {}):
             raise HTTPException(status_code=409, detail="independent_settled_frozen_sample_required")
+        shadow_lock = ((store.get("learning_shadow_locks") or {}).get(hypothesis_id) or {}).get(freeze_id)
+        if not shadow_lock:
+            raise HTTPException(status_code=409, detail="pre_kickoff_shadow_lock_required")
+        if str(payload.get("shadow_lock_hash") or "").strip() != str(shadow_lock.get("lock_hash") or ""):
+            raise HTTPException(status_code=409, detail="matching_shadow_lock_hash_required")
+        closing_decimal_price = as_float(payload.get("closing_decimal_price"))
+        if closing_decimal_price is None or not 1.01 <= closing_decimal_price <= 1000:
+            raise HTTPException(status_code=422, detail="valid_closing_decimal_price_required")
+        closing_price_evidence_ref = str(payload.get("closing_price_evidence_ref") or "").strip()
+        if not closing_price_evidence_ref:
+            raise HTTPException(status_code=422, detail="closing_price_evidence_ref_required")
+        postmatch = store["learning_postmatch"][freeze_id]
+        final_result = postmatch.get("result") if isinstance(postmatch.get("result"), dict) else {}
+        champion_brier = _brier_1x2(shadow_lock["champion_probabilities"], final_result)
+        challenger_brier = _brier_1x2(shadow_lock["challenger_probabilities"], final_result)
+        ablation_brier = _brier_1x2(shadow_lock["ablation_probabilities"], final_result)
+        entry_decimal_price = float(get_nested(shadow_lock, ["selected_expression", "entry_decimal_price"]))
+        clv_probability_delta = round(1.0 / closing_decimal_price - 1.0 / entry_decimal_price, 8)
+        risk_delta = round(float(get_nested(shadow_lock, ["risk", "challenger_tail_risk"])) - float(get_nested(shadow_lock, ["risk", "champion_tail_risk"])), 8)
+        process_classification = str(postmatch.get("process_classification") or "")
+        process_event_clean = process_classification in {
+            "PROCESS_CORRECT_RESULT_WIN", "PROCESS_CORRECT_RESULT_LOSS",
+            "PROCESS_ERROR_RESULT_WIN", "PROCESS_ERROR_RESULT_LOSS",
+        }
         evidence_content = {
             "freeze_id": freeze_id,
             "freeze_hash": freeze.get("content_hash"),
             "postmatch_hash": store["learning_postmatch"][freeze_id].get("postmatch_hash"),
             "outcome": outcome,
             "evidence_summary": str(payload.get("evidence_summary")).strip(),
-            "pit_audit": payload.get("pit_audit") if isinstance(payload.get("pit_audit"), dict) else {},
-            "event_pollution_audit": payload.get("event_pollution_audit") if isinstance(payload.get("event_pollution_audit"), dict) else {},
+            "pit_audit": {
+                "status": "passed",
+                "derived_from_freeze": True,
+                "freeze_hash": freeze.get("content_hash"),
+                "captured_before_kickoff": int(freeze.get("captured_at") or 0) < int(freeze.get("kickoff_at") or 0),
+                "data_cutoff_before_kickoff": int(freeze.get("data_cutoff_at") or 0) < int(freeze.get("kickoff_at") or 0),
+                "caller_status_used": False,
+            },
+            "event_pollution_audit": {
+                "status": "passed" if process_event_clean else "failed",
+                "derived_from_process_classification": process_classification,
+                "postmatch_event_audit_hash": _content_hash(postmatch.get("event_audit") or {}),
+                "caller_status_used": False,
+            },
+            "shadow_lock_hash": shadow_lock.get("lock_hash"),
+            "closing_price_evidence_ref": closing_price_evidence_ref,
+            "derived_metrics": {
+                "champion_brier_1x2": champion_brier,
+                "challenger_brier_1x2": challenger_brier,
+                "ablation_brier_1x2": ablation_brier,
+                "clv_probability_delta": clv_probability_delta,
+                "champion_tail_risk": get_nested(shadow_lock, ["risk", "champion_tail_risk"]),
+                "challenger_tail_risk": get_nested(shadow_lock, ["risk", "challenger_tail_risk"]),
+                "tail_risk_delta": risk_delta,
+                "process_classification": process_classification,
+                "result_outcome_used_as_rule_label": False,
+            },
         }
         evidence_hash = _content_hash(evidence_content)
         rows = hypothesis.setdefault("validation_evidence", [])
@@ -5329,48 +5661,123 @@ def record_hypothesis_validation(hypothesis_id: Any, payload: Dict[str, Any]) ->
         return evidence
 
 
-def create_promotion_candidate(hypothesis_id: Any, gate_audit: Any) -> Dict[str, Any]:
+def promotion_evidence_report(hypothesis_id: Any, store_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     hypothesis_id = str(hypothesis_id or "").strip()
-    gate_audit = gate_audit if isinstance(gate_audit, dict) else {}
+    store = store_override if isinstance(store_override, dict) else load_snapshot_store()
+    hypothesis = (store.get("learning_hypotheses") or {}).get(hypothesis_id)
+    if not hypothesis:
+        raise HTTPException(status_code=404, detail="hypothesis_not_found")
+    evidence = hypothesis.get("validation_evidence") or []
+    plan = hypothesis.get("pre_registered_validation_plan") if isinstance(hypothesis.get("pre_registered_validation_plan"), dict) else {}
+    try:
+        planned_minimum = int(plan.get("minimum_samples") or LEARNING_MIN_VALIDATION_SAMPLES)
+    except (TypeError, ValueError):
+        planned_minimum = LEARNING_MIN_VALIDATION_SAMPLES
+    required = max(LEARNING_MIN_VALIDATION_SAMPLES, planned_minimum, 2)
+    support_count = sum(row.get("outcome") == "support" for row in evidence)
+    counterexamples = [row for row in evidence if row.get("outcome") == "counterexample"]
+    metrics = [row.get("derived_metrics") for row in evidence if isinstance(row.get("derived_metrics"), dict)]
+    locks = (store.get("learning_shadow_locks") or {}).get(hypothesis_id) or {}
+    def mean(key: str) -> Optional[float]:
+        values = [as_float(row.get(key)) for row in metrics]
+        valid = [value for value in values if value is not None]
+        return round(sum(valid) / len(valid), 8) if len(valid) == len(evidence) and valid else None
+    def gate(status: str, refs: List[str], **values: Any) -> Dict[str, Any]:
+        return {"status": status, "evidence_refs": refs, **values}
+    enough = len(evidence) >= required and support_count >= required
+    all_hashes = [str(row.get("evidence_hash")) for row in evidence if row.get("evidence_hash")]
+    preregistered = bool(plan) and bool(evidence) and all(
+        (locks.get(row.get("freeze_id")) or {}).get("lock_hash") == row.get("shadow_lock_hash")
+        and int((locks.get(row.get("freeze_id")) or {}).get("locked_at") or 0) >= int(hypothesis.get("registered_at") or 0)
+        for row in evidence
+    )
+    pit_passed = enough and all(get_nested(row, ["pit_audit", "status"]) == "passed" for row in evidence)
+    clean_process_classes = {"PROCESS_CORRECT_RESULT_WIN", "PROCESS_CORRECT_RESULT_LOSS", "PROCESS_ERROR_RESULT_WIN", "PROCESS_ERROR_RESULT_LOSS"}
+    event_passed = enough and all(
+        get_nested(row, ["event_pollution_audit", "status"]) == "passed"
+        and get_nested(row, ["derived_metrics", "process_classification"]) in clean_process_classes
+        for row in evidence
+    )
+    champion_brier = mean("champion_brier_1x2")
+    challenger_brier = mean("challenger_brier_1x2")
+    ablation_brier = mean("ablation_brier_1x2")
+    mean_clv = mean("clv_probability_delta")
+    mean_risk_delta = mean("tail_risk_delta")
+    process_eligible = [get_nested(row, ["derived_metrics", "process_classification"]) for row in evidence]
+    process_accuracy = round(sum(str(value).startswith("PROCESS_CORRECT_") for value in process_eligible) / len(process_eligible), 8) if process_eligible else None
+    max_brier = as_float(plan.get("maximum_challenger_brier"))
+    max_brier = 0.34 if max_brier is None else max_brier
+    min_clv = as_float(plan.get("minimum_mean_clv"))
+    min_clv = 0.0 if min_clv is None else min_clv
+    min_process_accuracy = as_float(plan.get("minimum_process_accuracy"))
+    min_process_accuracy = 0.6 if min_process_accuracy is None else min_process_accuracy
+    max_risk_increase = as_float(plan.get("maximum_mean_tail_risk_increase"))
+    max_risk_increase = 0.0 if max_risk_increase is None else max_risk_increase
+    min_ablation_gain = as_float(plan.get("minimum_ablation_brier_gain"))
+    min_ablation_gain = 0.0 if min_ablation_gain is None else min_ablation_gain
+    sample_status = "passed" if enough and not counterexamples else ("failed" if counterexamples else "missing")
+    gates = {
+        "pre_registration": gate("passed" if preregistered and enough else "missing", all_hashes, registered_at=hypothesis.get("registered_at")),
+        "pit_integrity": gate("passed" if pit_passed else ("failed" if enough else "missing"), all_hashes),
+        "event_pollution_audit": gate("passed" if event_passed else ("failed" if enough else "missing"), all_hashes),
+        "out_of_sample_shadow": gate(sample_status, all_hashes, support_count=support_count, required_support_count=required, counterexample_count=len(counterexamples)),
+        "ablation": gate("passed" if enough and challenger_brier is not None and ablation_brier is not None and ablation_brier - challenger_brier >= min_ablation_gain else ("failed" if enough else "missing"), all_hashes, challenger_brier=challenger_brier, ablation_brier=ablation_brier, minimum_gain=min_ablation_gain),
+        "calibration": gate("passed" if enough and challenger_brier is not None and champion_brier is not None and challenger_brier <= champion_brier and challenger_brier <= max_brier else ("failed" if enough else "missing"), all_hashes, champion_brier=champion_brier, challenger_brier=challenger_brier, maximum_challenger_brier=max_brier),
+        "clv_or_price_quality": gate("passed" if enough and mean_clv is not None and mean_clv >= min_clv else ("failed" if enough else "missing"), all_hashes, mean_clv=mean_clv, minimum_mean_clv=min_clv),
+        "process_accuracy": gate("passed" if enough and process_accuracy is not None and process_accuracy >= min_process_accuracy else ("failed" if enough else "missing"), all_hashes, process_accuracy=process_accuracy, minimum_process_accuracy=min_process_accuracy),
+        "risk_review": gate("passed" if enough and mean_risk_delta is not None and mean_risk_delta <= max_risk_increase else ("failed" if enough else "missing"), all_hashes, mean_tail_risk_delta=mean_risk_delta, maximum_mean_tail_risk_increase=max_risk_increase),
+    }
+    missing_or_failed = [name for name in LEARNING_PROMOTION_REQUIRED_GATES if gates[name]["status"] != "passed"]
+    report_content = {
+        "hypothesis_id": hypothesis_id, "hypothesis_hash": hypothesis.get("content_hash"),
+        "required_samples": required, "validation_sample_count": len(evidence), "support_count": support_count,
+        "counterexample_count": len(counterexamples), "gates": gates,
+    }
+    return {
+        **report_content, "report_hash": _content_hash(report_content),
+        "promotion_ready": not missing_or_failed,
+        "incomplete_gates": missing_or_failed,
+        "caller_supplied_gate_status_used": False,
+        "result_outcome_used_as_optimization_target": False,
+        "automatic_champion_change": False,
+    }
+
+
+def create_promotion_candidate(hypothesis_id: Any, gate_audit: Any = None) -> Dict[str, Any]:
+    hypothesis_id = str(hypothesis_id or "").strip()
+    if isinstance(gate_audit, dict) and gate_audit:
+        raise HTTPException(status_code=400, detail="caller_supplied_promotion_gate_audit_forbidden")
     with SNAPSHOT_STORE_LOCK:
         store = load_snapshot_store()
         hypothesis = (store.get("learning_hypotheses") or {}).get(hypothesis_id)
         if not hypothesis:
             raise HTTPException(status_code=404, detail="hypothesis_not_found")
         evidence = hypothesis.get("validation_evidence") or []
-        support_count = sum(row.get("outcome") == "support" for row in evidence)
-        counterexamples = [row for row in evidence if row.get("outcome") == "counterexample"]
-        missing_gates = []
-        normalized_gates = {}
-        for gate in LEARNING_PROMOTION_REQUIRED_GATES:
-            audit = gate_audit.get(gate) if isinstance(gate_audit.get(gate), dict) else {}
-            passed = audit.get("status") == "passed"
-            evidence_refs = audit.get("evidence_refs") if isinstance(audit.get("evidence_refs"), list) else []
-            normalized_gates[gate] = {"status": "passed" if passed else "missing", "evidence_refs": evidence_refs}
-            if not passed or not evidence_refs:
-                missing_gates.append(gate)
-        blockers = []
-        if support_count < LEARNING_MIN_VALIDATION_SAMPLES:
-            blockers.append("independent_support_sample_minimum_not_reached")
-        if counterexamples:
-            blockers.append("unresolved_counterexamples_present")
-        if missing_gates:
-            blockers.append("promotion_gates_incomplete")
-        if blockers:
+        evidence_report = promotion_evidence_report(hypothesis_id, store_override=store)
+        if not evidence_report["promotion_ready"]:
+            blockers = []
+            if evidence_report["support_count"] < evidence_report["required_samples"]:
+                blockers.append("independent_support_sample_minimum_not_reached")
+            if evidence_report["counterexample_count"]:
+                blockers.append("unresolved_counterexamples_present")
+            if evidence_report["incomplete_gates"]:
+                blockers.append("derived_promotion_evidence_incomplete")
             raise HTTPException(status_code=409, detail={
                 "error": "promotion_candidate_not_ready",
                 "blockers": blockers,
-                "support_count": support_count,
-                "required_support_count": LEARNING_MIN_VALIDATION_SAMPLES,
-                "counterexample_count": len(counterexamples),
-                "missing_gates": missing_gates,
+                "support_count": evidence_report["support_count"],
+                "required_support_count": evidence_report["required_samples"],
+                "counterexample_count": evidence_report["counterexample_count"],
+                "missing_gates": evidence_report["incomplete_gates"],
+                "evidence_report_hash": evidence_report["report_hash"],
             })
         candidate_content = {
             "hypothesis_id": hypothesis_id,
             "hypothesis_hash": hypothesis.get("content_hash"),
-            "support_count": support_count,
+            "support_count": evidence_report["support_count"],
             "validation_evidence_hashes": [row.get("evidence_hash") for row in evidence],
-            "gate_audit": normalized_gates,
+            "gate_audit": evidence_report["gates"],
+            "promotion_evidence_report_hash": evidence_report["report_hash"],
         }
         candidate_hash = _content_hash(candidate_content)
         promotions = store.setdefault("learning_promotions", {})
@@ -5689,6 +6096,7 @@ def learning_status_report() -> Dict[str, Any]:
     postmatch_facts = store.get("learning_postmatch_facts") or {}
     runs = store.get("learning_runs") or {}
     hypotheses = store.get("learning_hypotheses") or {}
+    shadow_locks = store.get("learning_shadow_locks") or {}
     promotions = store.get("learning_promotions") or {}
     league_dna_candidates = store.get("league_dna_candidates") or {}
     league_dna_activations = store.get("league_dna_activation_candidates") or {}
@@ -5717,6 +6125,7 @@ def learning_status_report() -> Dict[str, Any]:
         "implementation_gap_count": implementation_gap_count,
         "single_match_hypothesis_disposition_count": hypothesis_disposition_count,
         "hypothesis_count": len(hypotheses),
+        "shadow_validation_lock_count": sum(len(rows or {}) for rows in shadow_locks.values()),
         "hypothesis_status_counts": {status: sum(row.get("status") == status for row in hypotheses.values()) for status in (*LEARNING_HYPOTHESIS_TYPES, "SHADOW_VALIDATION", "PROMOTION_CANDIDATE")},
         "promotion_candidate_count": len(promotions),
         "league_dna_candidate_count": len(league_dna_candidates),
@@ -5756,6 +6165,8 @@ def operations_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         alerts.append({"severity": "warning", "code": "auto_snapshot_cycle_stale", "age_seconds": worker_cycle_age})
     if AUTO_SNAPSHOT_LAST_ERROR:
         alerts.append({"severity": "warning", "code": "auto_snapshot_last_cycle_failed", "error_type": AUTO_SNAPSHOT_LAST_ERROR})
+    if isinstance(AUTO_LEARNING_LAST_RESULT, dict) and AUTO_LEARNING_LAST_RESULT.get("status") == "error":
+        alerts.append({"severity": "warning", "code": "auto_learning_last_cycle_failed", "error_type": AUTO_LEARNING_LAST_RESULT.get("error_type")})
     if overdue:
         alerts.append({"severity": "warning", "code": "overdue_fundamental_revalidation", "count": len(overdue)})
     unhealthy_freshness = freshness_counts["stale"] + freshness_counts["invalid_timestamp"]
@@ -5769,6 +6180,7 @@ def operations_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         "version": VERSION, "generated_at": now_ts, "status": status, "alerts": alerts,
         "store": integrity,
         "auto_snapshot_worker": {"enabled": worker_expected, "started": AUTO_SNAPSHOT_THREAD_STARTED, "alive": thread_alive, "last_cycle_at": AUTO_SNAPSHOT_LAST_CYCLE_AT, "last_cycle_age_seconds": worker_cycle_age, "last_error": AUTO_SNAPSHOT_LAST_ERROR},
+        "auto_learning_cycle": AUTO_LEARNING_LAST_RESULT or {"status": "not_run"},
         "external_fixture_freshness": {"fixture_count": len(fixtures), "state_counts": freshness_counts},
         "revalidation_queue": {"pending_count": len(pending), "overdue_count": len(overdue)},
         "calibration": {"settled_count": calibration["settled_count"], "minimum_sample": CALIBRATION_MIN_SAMPLE, "sample_ready": calibration["settled_count"] >= CALIBRATION_MIN_SAMPLE, "average_brier_score": calibration["average_brier_score"], "roi": calibration["roi"]},
@@ -6252,6 +6664,19 @@ async def shadow_learning_validation(hypothesis_id: str, request: Request, token
     return JSONResponse({"ok": True, "evidence": record})
 
 
+@app.post("/shadow/learning/hypotheses/{hypothesis_id}/shadow-lock")
+async def shadow_learning_hypothesis_lock(hypothesis_id: str, request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    record = lock_hypothesis_shadow_prediction(hypothesis_id, await request.json())
+    return JSONResponse({"ok": True, "shadow_lock": record})
+
+
+@app.get("/shadow/learning/hypotheses/{hypothesis_id}/promotion-evidence")
+def shadow_learning_promotion_evidence(hypothesis_id: str, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "promotion_evidence": promotion_evidence_report(hypothesis_id)})
+
+
 @app.post("/shadow/learning/hypotheses/{hypothesis_id}/promotion-candidate")
 async def shadow_learning_promotion_candidate(hypothesis_id: str, request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
@@ -6324,6 +6749,11 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
         timeline.append({
             "stage": row.get("stage"), "status": "available",
             "snapshot_at": row.get("snapshot_at"),
+            "source_content_hash": row.get("source_content_hash") or _content_hash({
+                "stage": row.get("stage"), "snapshot_at": row.get("snapshot_at"),
+                "market_snapshot": row.get("market_snapshot"), "market_dynamics": row.get("market_dynamics"),
+                "team_news_snapshot": row.get("team_news_snapshot"),
+            }),
             "asian_handicap": primary.get("asian_handicap"),
             "over_under": primary.get("over_under"),
             "1x2": primary.get("1x2"),
@@ -6456,12 +6886,14 @@ def completed_auto_snapshot_stages(history: List[Dict[str, Any]]) -> set:
     }
 
 
-def auto_snapshot_cycle() -> None:
+def auto_snapshot_cycle() -> Dict[str, Any]:
     now = datetime.now(timezone.utc)
     dates = sorted({(now + timedelta(days=i)).astimezone(ZoneInfo(AUTO_FETCH_TIMEZONE)).date().isoformat() for i in range(AUTO_SNAPSHOT_DAYS_AHEAD + 1)})
+    learning_fixture_rows: List[Dict[str, Any]] = []
     for date_str in dates:
         try:
             fixtures = target_fixtures_for_date(date_str, AUTO_FETCH_TIMEZONE)
+            learning_fixture_rows.extend(row for row in fixtures.get("fixtures", []) if isinstance(row, dict))
             for fx in fixtures.get("fixtures", []):
                 if fx.get("status") != "NS" or not fx.get("fixture_id"):
                     continue
@@ -6512,10 +6944,45 @@ def auto_snapshot_cycle() -> None:
                             print("[AUTO_SNAPSHOT] fixture failed: " + str(exc))
         except Exception as exc:
             print("[AUTO_SNAPSHOT] date failed: " + date_str + " " + str(exc))
+    now_ts = int(now.timestamp())
+    learning_plan = learning_cycle_plan(now_ts=now_ts, fixture_rows=learning_fixture_rows)
+    prematch_due = any(
+        row.get("analysis_due") is True
+        for row in get_nested(learning_plan, ["discovery", "candidates"], [])
+    )
+    facts_due = int(learning_plan.get("postmatch_fact_collection_due_count") or 0) > 0
+    if not prematch_due and not facts_due:
+        return {
+            "status": "idle", "at": now_ts,
+            "prematch_due_count": 0, "postmatch_fact_collection_due_count": 0,
+        }
+    run_id = f"auto-learning-{now_ts // AUTO_SNAPSHOT_POLL_SECONDS}"
+    try:
+        result = run_learning_cycle(
+            {
+                "apply": True, "run_id": run_id,
+                "auto_prepare_prematch": True,
+                "auto_collect_postmatch_facts": True,
+            },
+            now_ts=now_ts,
+            fixture_rows=learning_fixture_rows,
+        )
+        return {
+            "status": "completed", "at": now_ts, "run_id": run_id,
+            "frozen_count": result.get("frozen_count"),
+            "settled_count": result.get("settled_count"),
+            "rejected_count": result.get("rejected_count"),
+            "postmatch_fact_results": result.get("postmatch_fact_results"),
+            "automatic_hypothesis_registration": False,
+            "automatic_champion_change": False,
+        }
+    except Exception as exc:
+        print("[AUTO_LEARNING] cycle failed: " + str(exc))
+        return {"status": "error", "at": now_ts, "run_id": run_id, "error_type": type(exc).__name__}
 
 
 def auto_snapshot_worker() -> None:
-    global AUTO_SNAPSHOT_LAST_CYCLE_AT, AUTO_SNAPSHOT_LAST_ERROR, AUTO_RECONCILIATION_LAST_RESULT
+    global AUTO_SNAPSHOT_LAST_CYCLE_AT, AUTO_SNAPSHOT_LAST_ERROR, AUTO_RECONCILIATION_LAST_RESULT, AUTO_LEARNING_LAST_RESULT
     while True:
         try:
             try:
@@ -6523,7 +6990,7 @@ def auto_snapshot_worker() -> None:
             except Exception as exc:
                 AUTO_RECONCILIATION_LAST_RESULT = {"status": "error", "error_type": type(exc).__name__, "at": int(time.time())}
                 print("[AUTO_RECONCILIATION] failed: " + str(exc))
-            auto_snapshot_cycle()
+            AUTO_LEARNING_LAST_RESULT = auto_snapshot_cycle()
             AUTO_SNAPSHOT_LAST_CYCLE_AT = int(time.time())
             AUTO_SNAPSHOT_LAST_ERROR = None
         except Exception as exc:

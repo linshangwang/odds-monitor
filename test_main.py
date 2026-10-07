@@ -3117,6 +3117,31 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         )
         return frozen, settled
 
+    def settle_hypothesis_validation_fixture(self, hypothesis_id, fixture, captured_at, kickoff_at):
+        frozen = main.freeze_learning_sample(self.learning_payload(fixture, captured_at, kickoff_at), now_ts=captured_at)
+        shadow_lock = main.lock_hypothesis_shadow_prediction(hypothesis_id, {
+            "freeze_id": frozen["freeze_id"],
+            "champion_probabilities": {"home": 0.45, "draw": 0.25, "away": 0.30},
+            "challenger_probabilities": {"home": 0.30, "draw": 0.45, "away": 0.25},
+            "ablation_probabilities": {"home": 0.33, "draw": 0.34, "away": 0.33},
+            "selected_expression": {"market": "1x2", "selection": "draw", "entry_decimal_price": 3.0, "entry_price_evidence_ref": f"test:entry:{fixture}"},
+            "risk": {"champion_tail_risk": 0.10, "challenger_tail_risk": 0.10},
+        }, now_ts=captured_at + 10)
+        facts = self.collect_verified_learning_facts(frozen, 1, 1, kickoff_at + 7200)
+        main.settle_learning_sample(
+            frozen["freeze_id"], {"status": "FT", "home_goals": 1, "away_goals": 1},
+            "PROCESS_CORRECT_RESULT_LOSS", {"status": "clean"}, kickoff_at + 7200,
+            self.learning_postmatch_review(), facts["fact_hash"],
+        )
+        evidence = main.record_hypothesis_validation(hypothesis_id, {
+            "freeze_id": frozen["freeze_id"], "outcome": "support",
+            "evidence_summary": f"Independent locked validation for {fixture}",
+            "pit_audit": {"status": "passed"}, "event_pollution_audit": {"status": "passed"},
+            "shadow_lock_hash": shadow_lock["lock_hash"], "closing_decimal_price": 2.8,
+            "closing_price_evidence_ref": f"test:closing:{fixture}",
+        })
+        return frozen, evidence
+
     def learning_postmatch_review(self, **disposition_overrides):
         disposition = {
             "result_backfit_used": False, "champion_change_requested": False,
@@ -3192,6 +3217,15 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(discovery["excluded_counts"]["fixture_not_not_started"], 1)
         self.assertEqual(discovery["excluded_counts"]["outside_learning_discovery_horizon"], 1)
 
+    def test_learning_discovery_accepts_canonical_fixture_summaries_from_snapshot_worker(self):
+        now_ts = 100000
+        raw = self.learning_fixture_row(6, 39, now_ts + 3600)
+        summary = main.fixture_summary(raw)
+        discovery = main.discover_learning_fixtures(now_ts=now_ts, fixture_rows=[summary])
+        self.assertEqual(discovery["candidate_count"], 1)
+        self.assertEqual(discovery["candidates"][0]["fixture_id"], 6)
+        self.assertEqual(discovery["candidates"][0]["scope"]["tier"], 1)
+
     def test_learning_cycle_plan_prioritizes_latest_unsettled_freeze_without_mutating(self):
         main.freeze_learning_sample(self.learning_payload("due", captured_at=900, kickoff_at=1000), now_ts=900)
         main.freeze_learning_sample(self.learning_payload("due", captured_at=950, kickoff_at=1000, analysis={"node": "T-30m"}), now_ts=950)
@@ -3201,7 +3235,8 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         after = main.load_snapshot_store()
         self.assertEqual(plan["settlement_due_count"], 1)
         self.assertEqual(plan["settlement_due"][0]["freeze_id"], "due:v2")
-        self.assertEqual(plan["remaining_freeze_capacity"], main.LEARNING_DAILY_FREEZE_CAP - 2)
+        self.assertEqual(plan["remaining_freeze_capacity"], main.LEARNING_DAILY_FREEZE_CAP - 1)
+        self.assertEqual(plan["reanalysis_today_count"], 1)
         self.assertEqual(plan["discovery"]["candidate_count"], 1)
         self.assertEqual(before, after)
         self.assertFalse(plan["automatic_champion_promotion"])
@@ -3277,13 +3312,14 @@ class ShadowV4UpgradeTests(unittest.TestCase):
 
     def test_single_match_hypothesis_cannot_promote_and_discovery_sample_cannot_validate(self):
         discovery, _ = self.settle_learning_fixture("discovery", 900, 1000)
-        hypothesis = main.register_learning_hypothesis({
-            "hypothesis_id": "hyp-one", "type": "HYPOTHESIS_ONLY", "title": "Candidate only",
-            "definition": "A candidate relationship", "applicable_scope": "men tier-one leagues",
-            "expected_direction": "positive", "failure_conditions": "effect disappears",
-            "falsification_criteria": "independent counterexample", "discovery_freeze_ids": [discovery["freeze_id"]],
-            "validation_plan": {"minimum_samples": 30},
-        })
+        with patch.object(main.time, "time", return_value=8300):
+            hypothesis = main.register_learning_hypothesis({
+                "hypothesis_id": "hyp-one", "type": "HYPOTHESIS_ONLY", "title": "Candidate only",
+                "definition": "A candidate relationship", "applicable_scope": "men tier-one leagues",
+                "expected_direction": "positive", "failure_conditions": "effect disappears",
+                "falsification_criteria": "independent counterexample", "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": {"minimum_samples": 30},
+            })
         self.assertFalse(hypothesis["champion_effect"])
         with self.assertRaises(main.HTTPException) as reuse:
             main.record_hypothesis_validation("hyp-one", {"freeze_id": discovery["freeze_id"], "outcome": "support", "evidence_summary": "same sample"})
@@ -3292,25 +3328,32 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             main.create_promotion_candidate("hyp-one", {})
         self.assertEqual(premature.exception.status_code, 409)
         self.assertIn("independent_support_sample_minimum_not_reached", premature.exception.detail["blockers"])
+        fake_gates = {gate: {"status": "passed", "evidence_refs": ["caller:self-attestation"]} for gate in main.LEARNING_PROMOTION_REQUIRED_GATES}
+        with self.assertRaises(main.HTTPException) as forged:
+            main.create_promotion_candidate("hyp-one", fake_gates)
+        self.assertEqual(forged.exception.status_code, 400)
+        self.assertEqual(forged.exception.detail, "caller_supplied_promotion_gate_audit_forbidden")
 
     def test_validated_hypothesis_only_creates_candidate_waiting_for_user(self):
         discovery, _ = self.settle_learning_fixture("discovery-ready", 900, 1000)
-        main.register_learning_hypothesis({
-            "hypothesis_id": "hyp-ready", "type": "LEAGUE_TAG_CANDIDATE", "title": "League candidate",
-            "definition": "A registered league prior", "applicable_scope": "one league-season-phase",
-            "expected_direction": "positive", "failure_conditions": "unstable out of sample",
-            "falsification_criteria": "any unresolved counterexample", "discovery_freeze_ids": [discovery["freeze_id"]],
-            "validation_plan": {"minimum_samples": 2},
-        })
-        for index in range(2):
-            frozen, _ = self.settle_learning_fixture(f"validation-{index}", 900 + index, 1100 + index)
-            main.record_hypothesis_validation("hyp-ready", {
-                "freeze_id": frozen["freeze_id"], "outcome": "support", "evidence_summary": f"independent sample {index}",
-                "pit_audit": {"status": "passed"}, "event_pollution_audit": {"status": "passed"},
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "hyp-ready", "type": "LEAGUE_TAG_CANDIDATE", "title": "League candidate",
+                "definition": "A registered league prior", "applicable_scope": "one league-season-phase",
+                "expected_direction": "positive", "failure_conditions": "unstable out of sample",
+                "falsification_criteria": "any unresolved counterexample", "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": {"minimum_samples": 2},
             })
-        gate_audit = {gate: {"status": "passed", "evidence_refs": [f"audit:{gate}"]} for gate in main.LEARNING_PROMOTION_REQUIRED_GATES}
+        for index in range(2):
+            self.settle_hypothesis_validation_fixture("hyp-ready", f"validation-{index}", 8400 + index, 9000 + index)
         with patch.object(main, "LEARNING_MIN_VALIDATION_SAMPLES", 2):
-            candidate = main.create_promotion_candidate("hyp-ready", gate_audit)
+            evidence_report = main.promotion_evidence_report("hyp-ready")
+            candidate = main.create_promotion_candidate("hyp-ready", None)
+        self.assertTrue(evidence_report["promotion_ready"])
+        self.assertTrue(all(row["status"] == "passed" for row in evidence_report["gates"].values()))
+        self.assertFalse(evidence_report["caller_supplied_gate_status_used"])
+        self.assertFalse(evidence_report["result_outcome_used_as_optimization_target"])
+        self.assertEqual(candidate["promotion_evidence_report_hash"], evidence_report["report_hash"])
         self.assertEqual(candidate["status"], "AWAITING_EXPLICIT_USER_CONFIRMATION")
         self.assertFalse(candidate["champion_effect"])
         self.assertFalse(candidate["automatic_promotion"])
@@ -3318,18 +3361,67 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(status["promotion_candidate_count"], 1)
         self.assertFalse(status["automatic_champion_promotion"])
 
+    def test_shadow_validation_requires_forward_locked_sample_and_is_immutable(self):
+        discovery, _ = self.settle_learning_fixture("shadow-discovery", 900, 1000)
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "shadow-lock-hyp", "type": "HYPOTHESIS_ONLY", "title": "Locked challenger",
+                "definition": "Forward locked challenger output", "applicable_scope": "men top flights",
+                "expected_direction": "lower brier", "failure_conditions": "no OOS improvement",
+                "falsification_criteria": "challenger underperforms", "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": {"minimum_samples": 2},
+            })
+        frozen = main.freeze_learning_sample(self.learning_payload("shadow-validation", 8400, 9000), now_ts=8400)
+        lock_payload = {
+            "freeze_id": frozen["freeze_id"],
+            "champion_probabilities": {"home": 0.45, "draw": 0.25, "away": 0.30},
+            "challenger_probabilities": {"home": 0.30, "draw": 0.45, "away": 0.25},
+            "ablation_probabilities": {"home": 0.33, "draw": 0.34, "away": 0.33},
+            "selected_expression": {"market": "1x2", "selection": "draw", "entry_decimal_price": 3.0, "entry_price_evidence_ref": "test:entry:shadow-validation"},
+            "risk": {"champion_tail_risk": 0.10, "challenger_tail_risk": 0.10},
+        }
+        with self.assertRaises(main.HTTPException) as late:
+            main.lock_hypothesis_shadow_prediction("shadow-lock-hyp", lock_payload, now_ts=9000)
+        self.assertEqual(late.exception.detail, "shadow_prediction_must_be_locked_before_kickoff")
+        locked = main.lock_hypothesis_shadow_prediction("shadow-lock-hyp", lock_payload, now_ts=8410)
+        changed = {**lock_payload, "challenger_probabilities": {"home": 0.20, "draw": 0.55, "away": 0.25}}
+        with self.assertRaises(main.HTTPException) as overwrite:
+            main.lock_hypothesis_shadow_prediction("shadow-lock-hyp", changed, now_ts=8420)
+        self.assertEqual(overwrite.exception.detail, "shadow_prediction_already_locked")
+        self.assertTrue(locked["immutable"])
+        self.assertFalse(locked["champion_effect"])
+
+    def test_validation_evidence_cannot_be_added_without_pre_kickoff_lock(self):
+        discovery, _ = self.settle_learning_fixture("no-lock-discovery", 900, 1000)
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "no-lock-hyp", "type": "HYPOTHESIS_ONLY", "title": "No lock rejection",
+                "definition": "Must lock before validation", "applicable_scope": "men top flights",
+                "expected_direction": "positive", "failure_conditions": "not locked",
+                "falsification_criteria": "missing lock", "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": {"minimum_samples": 2},
+            })
+        frozen, _ = self.settle_learning_fixture("no-lock-validation", 8400, 9000)
+        with self.assertRaises(main.HTTPException) as rejected:
+            main.record_hypothesis_validation("no-lock-hyp", {
+                "freeze_id": frozen["freeze_id"], "outcome": "support", "evidence_summary": "Retrospective claim",
+                "closing_decimal_price": 2.8, "closing_price_evidence_ref": "test:closing",
+            })
+        self.assertEqual(rejected.exception.detail, "pre_kickoff_shadow_lock_required")
+
     def register_league_dna_fixture(self, hypothesis_id="league-dna-hyp", tag_id="eng-goal-environment"):
         discovery, _ = self.settle_learning_fixture(f"{tag_id}-discovery", 900, 1000)
-        main.register_learning_hypothesis({
-            "hypothesis_id": hypothesis_id, "type": "LEAGUE_TAG_CANDIDATE",
-            "title": "League goal environment candidate",
-            "definition": "A preregistered league-level goal environment offset",
-            "applicable_scope": "England Premier League 2026 regular season",
-            "expected_direction": "positive", "failure_conditions": "effect decays out of sample",
-            "falsification_criteria": "unresolved independent counterexample",
-            "discovery_freeze_ids": [discovery["freeze_id"]],
-            "validation_plan": {"minimum_samples": 30},
-        })
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": hypothesis_id, "type": "LEAGUE_TAG_CANDIDATE",
+                "title": "League goal environment candidate",
+                "definition": "A preregistered league-level goal environment offset",
+                "applicable_scope": "England Premier League 2026 regular season",
+                "expected_direction": "positive", "failure_conditions": "effect decays out of sample",
+                "falsification_criteria": "unresolved independent counterexample",
+                "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": {"minimum_samples": 2},
+            })
         candidate = main.register_league_dna_candidate({
             "tag_id": tag_id, "hypothesis_id": hypothesis_id,
             "scope": self.learning_payload()["scope"],
@@ -3377,15 +3469,9 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(premature.exception.status_code, 409)
 
         for index in range(2):
-            frozen, _ = self.settle_learning_fixture(f"dna-validation-{index}", 1100 + index, 1300 + index)
-            main.record_hypothesis_validation("dna-ready-hyp", {
-                "freeze_id": frozen["freeze_id"], "outcome": "support",
-                "evidence_summary": f"independent league validation sample {index}",
-                "pit_audit": {"status": "passed"}, "event_pollution_audit": {"status": "passed"},
-            })
-        gate_audit = {gate: {"status": "passed", "evidence_refs": [f"audit:{gate}"]} for gate in main.LEARNING_PROMOTION_REQUIRED_GATES}
+            self.settle_hypothesis_validation_fixture("dna-ready-hyp", f"dna-validation-{index}", 8400 + index, 9000 + index)
         with patch.object(main, "LEARNING_MIN_VALIDATION_SAMPLES", 2):
-            main.create_promotion_candidate("dna-ready-hyp", gate_audit)
+            main.create_promotion_candidate("dna-ready-hyp", None)
             activation = main.create_league_dna_activation_candidate("dna-ready-tag")
         self.assertEqual(activation["status"], "AWAITING_EXPLICIT_USER_CONFIRMATION")
         self.assertEqual(activation["evidence_confidence"], 99)
@@ -3448,6 +3534,158 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(second["action"], "unchanged")
         self.assertEqual(builder_calls, [72])
         self.assertEqual(len(main.load_snapshot_store()["learning_frozen"]["72"]), 1)
+
+    def test_learning_cycle_creates_one_version_per_due_clock_node(self):
+        kickoff_at = 200000
+        t24_now = kickoff_at - 20 * 3600
+        t12_now = kickoff_at - 10 * 3600
+        fixture_row = self.learning_fixture_row(720, 39, kickoff_at)
+        builder_times = []
+
+        def builder(fixture_id):
+            generated_at = builder_times[-1]
+            return self.learning_prematch_packet(fixture_id, generated_at)
+
+        builder_times.append(t24_now)
+        first = main.run_learning_cycle(
+            {"apply": True, "run_id": "node-t24"}, now_ts=t24_now,
+            fixture_rows=[fixture_row], prematch_packet_builder=builder,
+        )
+        self.assertEqual(first["frozen_count"], 1)
+        self.assertEqual(first["freeze_results"][0]["analysis_node"], "T-24h")
+
+        builder_times.append(t12_now)
+        second = main.run_learning_cycle(
+            {"apply": True, "run_id": "node-t12"}, now_ts=t12_now,
+            fixture_rows=[fixture_row], prematch_packet_builder=builder,
+        )
+        self.assertEqual(second["frozen_count"], 1)
+        self.assertEqual(second["freeze_results"][0]["analysis_node"], "T-12h")
+        self.assertEqual(second["freeze_results"][0]["reason"], "analysis_node_advanced")
+
+        calls_before = len(builder_times)
+        same_node = main.run_learning_cycle(
+            {"apply": True, "run_id": "node-t12-repeat"}, now_ts=t12_now + 60,
+            fixture_rows=[fixture_row],
+            prematch_packet_builder=Mock(side_effect=AssertionError("same node must not rebuild")),
+        )
+        self.assertEqual(same_node["frozen_count"], 0)
+        self.assertEqual(same_node["freeze_results"][0]["reason"], "no_new_node_or_material_evidence")
+        self.assertEqual(len(main.load_snapshot_store()["learning_frozen"]["720"]), 2)
+        self.assertEqual(len(builder_times), calls_before)
+
+    def test_learning_cycle_reanalyzes_same_node_only_for_new_snapshot_evidence(self):
+        kickoff_at = 300000
+        now_ts = kickoff_at - 10 * 3600
+        fixture_row = self.learning_fixture_row(721, 39, kickoff_at)
+        first = main.run_learning_cycle(
+            {"apply": True, "run_id": "same-node-initial"}, now_ts=now_ts,
+            fixture_rows=[fixture_row],
+            prematch_packet_builder=lambda fixture_id: self.learning_prematch_packet(fixture_id, now_ts),
+        )
+        self.assertEqual(first["freeze_results"][0]["analysis_node"], "T-12h")
+
+        snapshot_at = now_ts + 60
+        market = main.empty_market_snapshot()
+        market["available"] = True
+        market["primary"] = {"1x2": {"home": 2.0, "draw": 3.4, "away": 4.0}}
+        store = main.load_snapshot_store()
+        store.setdefault("fixtures", {})["721"] = [{
+            "fixture": 721, "stage": "T-12h", "snapshot_at": snapshot_at,
+            "import_status": "available", "market_snapshot": market,
+            "market_dynamics": {"comparison_status": "data_missing"},
+            "stage_timing_audit": main.audit_stage_timing("T-12h", snapshot_at, kickoff_at),
+            "sequence_timing_audit": {"status": "valid"},
+        }]
+        main.write_snapshot_store(store)
+        marker = main._learning_snapshot_marker(main.load_snapshot_store(), "721", snapshot_at)
+
+        packet = self.learning_prematch_packet(721, snapshot_at)
+        packet["market"]["timeline"] = [{
+            "stage": "T-12h", "status": "available", "snapshot_at": snapshot_at,
+            "source_content_hash": marker["evidence_hash"],
+        }]
+        second = main.run_learning_cycle(
+            {"apply": True, "run_id": "same-node-new-evidence", "prematch_packets": {"721": packet}},
+            now_ts=snapshot_at, fixture_rows=[fixture_row],
+        )
+        self.assertEqual(second["frozen_count"], 1)
+        self.assertEqual(second["freeze_results"][0]["reason"], "new_snapshot_evidence_at_current_node")
+        self.assertEqual(second["freeze_results"][0]["analysis_node"], "T-12h")
+
+        repeat = main.learning_cycle_plan(now_ts=snapshot_at + 60, fixture_rows=[fixture_row])
+        candidate = repeat["discovery"]["candidates"][0]
+        self.assertFalse(candidate["analysis_due"])
+        self.assertEqual(candidate["analysis_due_reason"], "no_new_node_or_material_evidence")
+
+    def test_learning_plan_uses_closing_only_when_real_snapshot_exists(self):
+        kickoff_at = 400000
+        now_ts = kickoff_at - 5 * 60
+        fixture_row = self.learning_fixture_row(722, 39, kickoff_at)
+        without_closing = main.learning_cycle_plan(now_ts=now_ts, fixture_rows=[fixture_row])
+        self.assertEqual(without_closing["discovery"]["candidates"][0]["target_analysis_node"], "T-30m")
+
+        market = main.empty_market_snapshot()
+        market["available"] = True
+        store = main.load_snapshot_store()
+        store.setdefault("fixtures", {})["722"] = [{
+            "fixture": 722, "stage": "Closing", "snapshot_at": now_ts,
+            "import_status": "available", "market_snapshot": market,
+            "stage_timing_audit": main.audit_stage_timing("Closing", now_ts, kickoff_at),
+            "sequence_timing_audit": {"status": "valid"},
+        }]
+        main.write_snapshot_store(store)
+        with_closing = main.learning_cycle_plan(now_ts=now_ts, fixture_rows=[fixture_row])
+        self.assertEqual(with_closing["discovery"]["candidates"][0]["target_analysis_node"], "Closing")
+
+    def test_learning_freeze_payload_reaudits_caller_supplied_stage_time(self):
+        generated_at = 500000
+        kickoff_at = generated_at + 20 * 3600
+        candidate = main.discover_learning_fixtures(
+            now_ts=generated_at,
+            fixture_rows=[self.learning_fixture_row(723, 39, kickoff_at)],
+        )["candidates"][0]
+        candidate["target_analysis_node"] = "T-24h"
+        packet = self.learning_prematch_packet(723, generated_at)
+        packet["market"]["timeline"] = [{
+            "stage": "Closing", "status": "available", "snapshot_at": generated_at,
+            "source_content_hash": "caller-forged-future-closing",
+        }]
+        payload = main.build_learning_freeze_payload(candidate, packet, now_ts=generated_at)
+        self.assertEqual(payload["analysis"]["analysis_node"], "T-24h")
+        self.assertIsNone(payload["analysis"]["source_snapshot_stage"])
+        self.assertIsNone(payload["analysis"]["source_snapshot_hash"])
+
+    def test_auto_snapshot_cycle_runs_learning_only_when_plan_has_due_work(self):
+        empty_targets = {"fixtures": []}
+        due_plan = {
+            "discovery": {"candidates": []},
+            "postmatch_fact_collection_due_count": 1,
+        }
+        cycle_result = {
+            "frozen_count": 0, "settled_count": 0, "rejected_count": 0,
+            "postmatch_fact_results": [{"action": "facts_collected"}],
+        }
+        with patch.object(main, "target_fixtures_for_date", return_value=empty_targets), \
+             patch.object(main, "learning_cycle_plan", return_value=due_plan), \
+             patch.object(main, "run_learning_cycle", return_value=cycle_result) as runner:
+            result = main.auto_snapshot_cycle()
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["postmatch_fact_results"][0]["action"], "facts_collected")
+        self.assertFalse(result["automatic_hypothesis_registration"])
+        self.assertFalse(result["automatic_champion_change"])
+        runner.assert_called_once()
+
+        idle_plan = {
+            "discovery": {"candidates": [{"analysis_due": False}]},
+            "postmatch_fact_collection_due_count": 0,
+        }
+        with patch.object(main, "target_fixtures_for_date", return_value=empty_targets), \
+             patch.object(main, "learning_cycle_plan", return_value=idle_plan), \
+             patch.object(main, "run_learning_cycle") as idle_runner:
+            idle = main.auto_snapshot_cycle()
+        self.assertEqual(idle["status"], "idle")
+        idle_runner.assert_not_called()
 
     def test_learning_cycle_only_builds_packets_for_top_flight_not_started_candidates(self):
         now_ts = 100000

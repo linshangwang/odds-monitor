@@ -151,6 +151,7 @@ League DNA回答的是：
 ## 九、运行时存储与激活门禁
 
 - `league_dna_candidates`保存与`LEAGUE_TAG_CANDIDATE`假设绑定的不可覆写画像，包括联赛/赛季/阶段、类别、市场、MagnitudeScore、指标、比较基准、模型影响、防重复计权规则及训练/验证窗口。
+- 独立验证样本必须在开赛前建立Shadow锁，保存Champion、Challenger和消融输出；赛后Brier、CLV、Process Accuracy、风险差及PIT/事件污染状态由系统账本派生。调用方自报的passed门槛不具有效力。
 - 验证进行中时，EvidenceConfidence最多为90；完成全部假设晋级门槛后，`league_dna_activation_candidates`也只能达到99，并保持`champion_effect=false`。
 - 赛前模型只读取`league_dna_active`中同时满足`status=VERIFIED_ACTIVE`、`EvidenceConfidence=100`及明确用户确认记录的标签。任一条件不满足，读取结果只能是`candidate_only`或`data_missing`。
 - 自动任务和对外API没有把激活候选写入`league_dna_active`的路径。用户确认后仍须执行版本化迁移并保留确认引用、激活版本及回退条件。

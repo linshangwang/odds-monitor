@@ -120,6 +120,8 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 - v1.88 的学习结算要求结构化复盘场次选择、基本面、State Tree、盘口语言、市场表达和价格执行；必须明确声明未使用赛果倒推且未请求单场修改Champion。实现错误须引用既有规则并要求回归测试。
 - v1.89 增加幂等自动学习运行器`POST /shadow/learning/run`：默认dry-run，正式执行需要唯一run_id；自动生成计划内顶级联赛PIT赛前包、冻结原始决策并收集到期赛后事实，但没有自动理论注册或Champion写入路径。
 - v1.89 增加`GET /shadow/learning/review-queue`：单源赛果只能待核实，至少两个可定位且比分一致的独立来源才进入复盘就绪；事实与赛前冻结并列展示，Process分类仍必须基于过程审计而不是比分倒推。
+- v1.90 增加前向Shadow验证锁与派生Promotion证据：验证比赛必须在开赛前锁定Champion/Challenger/消融概率、入场价格和风险；赛后由系统计算Brier、CLV、消融、过程准确率和风险门槛。调用方提交自述的passed审计会被拒绝，所有门槛仍只生成待用户确认候选。
+- v1.91 将自动学习改为节点驱动版本链：T-24h至T-30m按时钟推进，Closing必须有真实合格快照；同节点仅在快照指纹或基本面复核证据变化时复算。后台5分钟快照线程只在存在节点更新或首次赛后事实待采时触发幂等学习周期；首次纳入上限与同场复算上限分离，Opening和错过节点均不得回填。
 - Opening 导入必须同时包含可解析的观测时间和非空公司盘口数组；缺一项即标记 `opening_source_unverified`，上游汇总值不能单独充当开盘证据。
 - 每个节点保存 1X2、亚洲让球、大小球，并在上游提供时保存 BTTS、主队进球数、客队进球数。
 - `primary` 字段继续保留以兼容旧调用方，但内容改为基于完整公司数组计算的 `consensus_main_line`，不再机械取第一家公司。
@@ -443,7 +445,9 @@ POST /shadow/learning/run
 GET  /shadow/learning/review-queue
 POST /shadow/learning/settle
 POST /shadow/learning/hypotheses
+POST /shadow/learning/hypotheses/{HYPOTHESIS_ID}/shadow-lock
 POST /shadow/learning/hypotheses/{HYPOTHESIS_ID}/validation
+GET  /shadow/learning/hypotheses/{HYPOTHESIS_ID}/promotion-evidence
 POST /shadow/learning/hypotheses/{HYPOTHESIS_ID}/promotion-candidate
 POST /shadow/learning/league-dna
 POST /shadow/learning/league-dna/{TAG_ID}/activation-candidate
