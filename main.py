@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.00.0"
+VERSION = "2.01.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -87,6 +87,8 @@ AUTO_SNAPSHOT_LAST_ERROR: Optional[str] = None
 AUTO_RECONCILIATION_LAST_RESULT: Optional[Dict[str, Any]] = None
 AUTO_LEARNING_LAST_RESULT: Optional[Dict[str, Any]] = None
 LEARNING_SHADOW_MODEL_RUNNER: Optional[Any] = None
+LEARNING_CHALLENGER_MAX_MODULE_LOG_RATE_DELTA = 0.25
+LEARNING_CHALLENGER_MAX_COMBINED_LOG_RATE_DELTA = 0.40
 NAMI_ODDS_STARTUP_PROBE: Dict[str, Any] = {"status": "pending", "decision_use": False}
 NAMI_ODDS_STARTUP_PROBE_STARTED = False
 NAMI_ODDS_PROBE_TTL_SECONDS = max(3600, int(os.getenv("NAMI_ODDS_PROBE_TTL_SECONDS", str(7 * 24 * 3600))))
@@ -193,7 +195,7 @@ LEARNING_TOP_FLIGHT_LEAGUES: Dict[int, Dict[str, str]] = {
 }
 LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
 LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
-LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.00").strip() or "MODEL_RULES.md@2026-10-08-v2.00"
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.01").strip() or "MODEL_RULES.md@2026-10-08-v2.01"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -6895,6 +6897,51 @@ def _normalize_learning_ablation_plan(value: Any) -> Dict[str, Any]:
     }
 
 
+def _normalize_learning_challenger_spec(value: Any, required_modules: List[str]) -> Dict[str, Any]:
+    """Validate a bounded, executable and entirely preregistered Poisson intervention."""
+    value = value if isinstance(value, dict) else {}
+    if value.get("schema_version") != "poisson_log_rate_adjustment_v1":
+        raise HTTPException(status_code=422, detail="executable_challenger_spec_required")
+    if value.get("uses_market_odds") is not False:
+        raise HTTPException(status_code=422, detail="challenger_spec_must_be_odds_independent")
+    raw = value.get("module_log_rate_deltas") if isinstance(value.get("module_log_rate_deltas"), dict) else {}
+    if set(raw) != set(required_modules):
+        raise HTTPException(status_code=422, detail={
+            "error": "challenger_spec_modules_must_match_ablation_plan",
+            "required_modules": required_modules,
+            "submitted_modules": sorted(str(module) for module in raw),
+        })
+    normalized = {}
+    for module in required_modules:
+        row = raw.get(module) if isinstance(raw.get(module), dict) else {}
+        home_delta, away_delta = as_float(row.get("home")), as_float(row.get("away"))
+        if any(delta is None or abs(delta) > LEARNING_CHALLENGER_MAX_MODULE_LOG_RATE_DELTA for delta in (home_delta, away_delta)):
+            raise HTTPException(status_code=422, detail={
+                "error": "challenger_module_log_rate_delta_out_of_range", "module": module,
+                "maximum_absolute_delta": LEARNING_CHALLENGER_MAX_MODULE_LOG_RATE_DELTA,
+            })
+        if abs(home_delta) < 1e-12 and abs(away_delta) < 1e-12:
+            raise HTTPException(status_code=422, detail={"error": "challenger_module_intervention_cannot_be_zero", "module": module})
+        normalized[module] = {"home": round(home_delta, 8), "away": round(away_delta, 8)}
+    combined_home = round(sum(row["home"] for row in normalized.values()), 8)
+    combined_away = round(sum(row["away"] for row in normalized.values()), 8)
+    if any(abs(delta) > LEARNING_CHALLENGER_MAX_COMBINED_LOG_RATE_DELTA for delta in (combined_home, combined_away)):
+        raise HTTPException(status_code=422, detail={
+            "error": "challenger_combined_log_rate_delta_out_of_range",
+            "maximum_absolute_delta": LEARNING_CHALLENGER_MAX_COMBINED_LOG_RATE_DELTA,
+        })
+    normalized_spec = {
+        "schema_version": "poisson_log_rate_adjustment_v1",
+        "runner_id": "builtin_preregistered_poisson_challenger",
+        "runner_version": "1",
+        "uses_market_odds": False,
+        "expression_policy": "preserve_frozen_market_selection_and_line",
+        "module_log_rate_deltas": normalized,
+        "combined_log_rate_delta": {"home": combined_home, "away": combined_away},
+    }
+    return {**normalized_spec, "spec_hash": _content_hash(normalized_spec)}
+
+
 def register_learning_hypothesis(payload: Dict[str, Any]) -> Dict[str, Any]:
     payload = payload if isinstance(payload, dict) else {}
     hypothesis_type = str(payload.get("type") or "").strip()
@@ -6925,13 +6972,19 @@ def register_learning_hypothesis(payload: Dict[str, Any]) -> Dict[str, Any]:
     invalid_markets = [market for market in markets if market not in LEAGUE_DNA_MARKETS]
     if invalid_markets:
         raise HTTPException(status_code=422, detail={"error": "unsupported_structured_scope_market", "markets": invalid_markets})
+    challenger_spec = _normalize_learning_challenger_spec(
+        validation_plan.get("challenger_spec"), normalized_ablation_plan["required_modules"],
+    )
     validation_plan = {
         **validation_plan,
         "structured_scope": {"competition_ids": competition_ids, "markets": markets},
         "ablation_plan": normalized_ablation_plan,
+        "challenger_spec": challenger_spec,
         "calculator_policy": {
             "required_origin": "internal_shadow_runner",
             "runner_schema": "learning_shadow_model_run_v1",
+            "required_runner_id": "builtin_preregistered_poisson_challenger",
+            "required_runner_version": "1",
             "external_submitted_outputs_promotion_eligible": False,
         },
     }
@@ -7024,6 +7077,7 @@ def learning_forward_validation_queue(now_ts: Optional[int] = None) -> Dict[str,
         plan = hypothesis.get("pre_registered_validation_plan") if isinstance(hypothesis.get("pre_registered_validation_plan"), dict) else {}
         structured_scope = plan.get("structured_scope") if isinstance(plan.get("structured_scope"), dict) else {}
         ablation_plan = plan.get("ablation_plan") if isinstance(plan.get("ablation_plan"), dict) else {}
+        challenger_spec = plan.get("challenger_spec") if isinstance(plan.get("challenger_spec"), dict) else {}
         competition_ids = set(structured_scope.get("competition_ids") or []) if isinstance(structured_scope.get("competition_ids"), list) else set()
         markets = {str(value) for value in (structured_scope.get("markets") or [])} if isinstance(structured_scope.get("markets"), list) else set()
         if not competition_ids or not markets:
@@ -7065,7 +7119,8 @@ def learning_forward_validation_queue(now_ts: Optional[int] = None) -> Dict[str,
                 "market": expression.get("market"),
                 "required_action": "compute_champion_challenger_and_ablation_outputs_then_lock_before_kickoff",
                 "required_ablation_modules": ablation_plan.get("required_modules") or [],
-                "automatic_shadow_lock": False,
+                "challenger_spec_hash": challenger_spec.get("spec_hash"),
+                "automatic_shadow_lock": bool(challenger_spec.get("spec_hash")) and callable(LEARNING_SHADOW_MODEL_RUNNER),
                 "champion_effect": False,
             })
     items.sort(key=lambda row: (int(row.get("kickoff_at") or 0), str(row.get("hypothesis_id")), str(row.get("fixture"))))
@@ -7074,7 +7129,7 @@ def learning_forward_validation_queue(now_ts: Optional[int] = None) -> Dict[str,
         "queue_count": len(items), "items": items,
         "blocked_hypothesis_count": len(blocked_hypotheses),
         "blocked_hypotheses": blocked_hypotheses,
-        "automatic_shadow_lock": False,
+        "automatic_shadow_lock": callable(LEARNING_SHADOW_MODEL_RUNNER),
         "automatic_champion_change": False,
         "policy": "only post-registration, non-discovery, distinct future matches enter the forward queue; model outputs must be computed and locked before kickoff",
     }
@@ -7247,6 +7302,98 @@ def _brier_1x2(probabilities: Dict[str, float], result: Dict[str, Any]) -> float
     return round(sum((probabilities[key] - (1.0 if key == actual else 0.0)) ** 2 for key in ("home", "draw", "away")) / 3.0, 8)
 
 
+def _learning_poisson_tail_risk(model: Dict[str, Any]) -> float:
+    """Use the model's high-total mass as a stable distribution-tail diagnostic."""
+    distribution = get_nested(model, ["probabilities", "settlement_distributions", "total_goals"], {}) or {}
+    risk = sum(
+        float(probability)
+        for raw_total, probability in distribution.items()
+        if as_float(raw_total) is not None and float(raw_total) >= 5 and as_float(probability) is not None
+    )
+    return round(min(1.0, max(0.0, risk)), 8)
+
+
+def _learning_adjusted_poisson_model(replay: Dict[str, Any], home_delta: float, away_delta: float) -> Dict[str, Any]:
+    base_inputs = get_nested(replay, ["model", "inputs"], {}) or {}
+    home_xg, away_xg = as_float(base_inputs.get("home_expected_goals")), as_float(base_inputs.get("away_expected_goals"))
+    confidence = as_float(base_inputs.get("input_confidence"))
+    provenance = base_inputs.get("provenance") if isinstance(base_inputs.get("provenance"), dict) else {}
+    if home_xg is None or away_xg is None or confidence is None:
+        raise HTTPException(status_code=422, detail="frozen_poisson_inputs_required_for_challenger")
+    model = poisson_probability_model(
+        home_xg * math.exp(home_delta), away_xg * math.exp(away_delta), confidence, provenance,
+    )
+    if model.get("ok") is not True:
+        raise HTTPException(status_code=422, detail={"error": "challenger_poisson_model_invalid", "reasons": model.get("errors")})
+    return model
+
+
+def builtin_preregistered_poisson_challenger(request: Dict[str, Any]) -> Dict[str, Any]:
+    """Execute only the bounded module deltas frozen in the registered hypothesis."""
+    request = request if isinstance(request, dict) else {}
+    freeze = request.get("freeze") if isinstance(request.get("freeze"), dict) else {}
+    hypothesis = request.get("hypothesis") if isinstance(request.get("hypothesis"), dict) else {}
+    replay = get_nested(freeze, ["analysis", "probability_replay"], {}) or {}
+    ablation_plan = hypothesis.get("ablation_plan") if isinstance(hypothesis.get("ablation_plan"), dict) else {}
+    required_modules = list(ablation_plan.get("required_modules") or [])
+    spec = _normalize_learning_challenger_spec(hypothesis.get("challenger_spec"), required_modules)
+    expression = request.get("frozen_selected_expression") if isinstance(request.get("frozen_selected_expression"), dict) else {}
+    generated_at = int(request.get("requested_at") or 0)
+    combined = spec["combined_log_rate_delta"]
+    challenger_model = _learning_adjusted_poisson_model(replay, combined["home"], combined["away"])
+    challenger_replay = {
+        "model": challenger_model,
+        "replay_hash": _content_hash({"base_replay_hash": replay.get("replay_hash"), "spec_hash": spec["spec_hash"]}),
+    }
+    module_ablations = {}
+    for module in required_modules:
+        contribution = spec["module_log_rate_deltas"][module]
+        ablated_model = _learning_adjusted_poisson_model(
+            replay,
+            combined["home"] - contribution["home"],
+            combined["away"] - contribution["away"],
+        )
+        ablated_replay = {
+            "model": ablated_model,
+            "replay_hash": _content_hash({
+                "base_replay_hash": replay.get("replay_hash"), "spec_hash": spec["spec_hash"], "ablated_module": module,
+            }),
+        }
+        module_ablations[module] = {
+            "probabilities": get_nested(ablated_model, ["probabilities", "1x2"]),
+            "forecast": market_forecast_from_probability_replay(ablated_replay, expression),
+        }
+    entry_price = as_float(expression.get("price"))
+    content = {
+        "schema": "learning_shadow_model_run_v1",
+        "runner_id": "builtin_preregistered_poisson_challenger",
+        "runner_version": "1",
+        "challenger_spec_hash": spec["spec_hash"],
+        "generated_at": generated_at,
+        "input_hash": request.get("input_hash"),
+        "freeze_hash": freeze.get("content_hash"),
+        "hypothesis_hash": hypothesis.get("hypothesis_hash"),
+        "champion_probabilities": request.get("frozen_champion_probabilities"),
+        "challenger_probabilities": get_nested(challenger_model, ["probabilities", "1x2"]),
+        "champion_forecast": request.get("frozen_champion_forecast"),
+        "challenger_forecast": market_forecast_from_probability_replay(challenger_replay, expression),
+        "module_ablations": module_ablations,
+        "selected_expression": {
+            "market": expression.get("market"), "selection": expression.get("selection"),
+            "line": expression.get("line"), "entry_decimal_price": entry_price,
+            "entry_price_evidence_ref": f"freeze:{freeze.get('content_hash')}:decision.selected_expression",
+        },
+        "risk": {
+            "champion_tail_risk": _learning_poisson_tail_risk(replay.get("model") or {}),
+            "challenger_tail_risk": _learning_poisson_tail_risk(challenger_model),
+        },
+    }
+    return {**content, "run_hash": _content_hash(content)}
+
+
+LEARNING_SHADOW_MODEL_RUNNER = builtin_preregistered_poisson_challenger
+
+
 def lock_hypothesis_shadow_prediction(
     hypothesis_id: Any,
     payload: Dict[str, Any],
@@ -7286,7 +7433,10 @@ def lock_hypothesis_shadow_prediction(
         hypothesis = (store.get("learning_hypotheses") or {}).get(hypothesis_id)
         if not hypothesis:
             raise HTTPException(status_code=404, detail="hypothesis_not_found")
-        ablation_plan = get_nested(hypothesis, ["pre_registered_validation_plan", "ablation_plan"], {}) or {}
+        validation_plan = hypothesis.get("pre_registered_validation_plan") if isinstance(hypothesis.get("pre_registered_validation_plan"), dict) else {}
+        ablation_plan = validation_plan.get("ablation_plan") if isinstance(validation_plan.get("ablation_plan"), dict) else {}
+        challenger_spec = validation_plan.get("challenger_spec") if isinstance(validation_plan.get("challenger_spec"), dict) else {}
+        calculator_policy = validation_plan.get("calculator_policy") if isinstance(validation_plan.get("calculator_policy"), dict) else {}
         required_modules = list(ablation_plan.get("required_modules") or [])
         submitted_ablations = payload.get("module_ablation_outputs") if isinstance(payload.get("module_ablation_outputs"), dict) else {}
         if set(submitted_ablations) != set(required_modules):
@@ -7353,10 +7503,14 @@ def lock_hypothesis_shadow_prediction(
             runner_id = str(calculator_provenance.get("runner_id") or "").strip()
             runner_version = str(calculator_provenance.get("runner_version") or "").strip()
             run_hash = str(calculator_provenance.get("run_hash") or "").strip()
+            challenger_spec_hash = str(calculator_provenance.get("challenger_spec_hash") or "").strip()
             if (
                 calculator_provenance.get("schema") != "learning_shadow_model_run_v1"
                 or not runner_id or not runner_version or len(run_hash) != 64
                 or calculator_provenance.get("input_hash") != expected_calculator_input_hash
+                or runner_id != calculator_policy.get("required_runner_id")
+                or runner_version != calculator_policy.get("required_runner_version")
+                or challenger_spec_hash != challenger_spec.get("spec_hash")
                 or generated_at is None
                 or not int(freeze.get("captured_at") or 0) <= generated_at <= locked_at
             ):
@@ -7368,7 +7522,7 @@ def lock_hypothesis_shadow_prediction(
                 "schema": "learning_shadow_model_run_v1",
                 "runner_id": runner_id, "runner_version": runner_version,
                 "generated_at": generated_at, "input_hash": expected_calculator_input_hash,
-                "run_hash": run_hash,
+                "run_hash": run_hash, "challenger_spec_hash": challenger_spec_hash,
             }
         content = {
             "hypothesis_id": hypothesis_id,
@@ -7383,6 +7537,7 @@ def lock_hypothesis_shadow_prediction(
             "champion_forecast": champion_forecast,
             "challenger_forecast": challenger_forecast,
             "ablation_plan_hash": _content_hash(ablation_plan),
+            "challenger_spec_hash": challenger_spec.get("spec_hash"),
             "module_ablations": module_ablations,
             "calculator_provenance": normalized_calculator_provenance,
             "selected_expression": {
@@ -7460,7 +7615,9 @@ def generate_internal_shadow_lock(
     if not frozen_expression.get("market") or not frozen_expression.get("selection"):
         raise HTTPException(status_code=409, detail="forward_shadow_requires_frozen_selected_expression")
     frozen_champion_forecast = market_forecast_from_probability_replay(probability_replay, frozen_expression)
-    ablation_plan = get_nested(hypothesis, ["pre_registered_validation_plan", "ablation_plan"], {}) or {}
+    validation_plan = hypothesis.get("pre_registered_validation_plan") if isinstance(hypothesis.get("pre_registered_validation_plan"), dict) else {}
+    ablation_plan = validation_plan.get("ablation_plan") if isinstance(validation_plan.get("ablation_plan"), dict) else {}
+    challenger_spec = validation_plan.get("challenger_spec") if isinstance(validation_plan.get("challenger_spec"), dict) else {}
     input_hash = _content_hash({
         "freeze_hash": freeze.get("content_hash"),
         "hypothesis_hash": hypothesis.get("content_hash"),
@@ -7483,6 +7640,7 @@ def generate_internal_shadow_lock(
             "expected_direction": hypothesis.get("expected_direction"),
             "structured_scope": get_nested(hypothesis, ["pre_registered_validation_plan", "structured_scope"], {}),
             "ablation_plan": ablation_plan,
+            "challenger_spec": challenger_spec,
         },
     }
     try:
@@ -7507,8 +7665,15 @@ def generate_internal_shadow_lock(
         raise HTTPException(status_code=422, detail="internal_shadow_model_run_identity_or_pit_invalid")
     runner_id = str(result.get("runner_id") or "").strip()
     runner_version = str(result.get("runner_version") or "").strip()
+    calculator_policy = validation_plan.get("calculator_policy") if isinstance(validation_plan.get("calculator_policy"), dict) else {}
     if not runner_id or not runner_version:
         raise HTTPException(status_code=422, detail="internal_shadow_model_runner_identity_required")
+    if (
+        runner_id != calculator_policy.get("required_runner_id")
+        or runner_version != calculator_policy.get("required_runner_version")
+        or result.get("challenger_spec_hash") != challenger_spec.get("spec_hash")
+    ):
+        raise HTTPException(status_code=422, detail="internal_shadow_model_runner_or_spec_mismatch")
     if _normalize_1x2_probabilities(result.get("champion_probabilities"), "champion") != frozen_champion_probabilities:
         raise HTTPException(status_code=422, detail="internal_shadow_champion_must_match_frozen_probability_replay")
     selected_expression = result.get("selected_expression") if isinstance(result.get("selected_expression"), dict) else {}
@@ -7556,7 +7721,7 @@ def generate_internal_shadow_lock(
         "schema": "learning_shadow_model_run_v1",
         "runner_id": runner_id, "runner_version": runner_version,
         "generated_at": generated_at, "input_hash": input_hash,
-        "run_hash": supplied_run_hash,
+        "run_hash": supplied_run_hash, "challenger_spec_hash": challenger_spec.get("spec_hash"),
     }
     return lock_hypothesis_shadow_prediction(
         hypothesis_id, payload, now_ts=now_ts, calculator_provenance=provenance,
@@ -7738,6 +7903,8 @@ def promotion_evidence_report(hypothesis_id: Any, store_override: Optional[Dict[
         and get_nested(locks.get(row.get("freeze_id")) or {}, ["calculator_provenance", "origin"]) == "internal_shadow_runner"
         and get_nested(locks.get(row.get("freeze_id")) or {}, ["calculator_provenance", "promotion_eligible"]) is True
         and (locks.get(row.get("freeze_id")) or {}).get("scoring_contract") == "learning_market_forecast_v1"
+        and get_nested(locks.get(row.get("freeze_id")) or {}, ["calculator_provenance", "runner_id"]) == "builtin_preregistered_poisson_challenger"
+        and (locks.get(row.get("freeze_id")) or {}).get("challenger_spec_hash") == get_nested(plan, ["challenger_spec", "spec_hash"])
         for row in evidence
     )
     pit_passed = enough and all(get_nested(row, ["pit_audit", "status"]) == "passed" for row in evidence)
