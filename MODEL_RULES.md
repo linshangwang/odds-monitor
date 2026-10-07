@@ -77,6 +77,8 @@ League DNA 是统一模型中的正式先验层，不是独立预测模型：
 
 机器输出必须把赔率路径字段固定标为`Capital Pressure Proxy`并设置`is_real_money=false`。真实资金字段使用独立的`real_money_data`对象；没有带来源、时间戳和字段定义的A级数据时，Money%、Bet%和成交额全部保持`data_missing/null`，不得从赔率变化补算。
 
+A级真实资金包固定使用`real_money_v1`：必须绑定比赛ID、注册来源域名及允许的来源类型、可定位HTTP证据、已核实来源权威和方法、赛前`observed_at`、市场与具体盘口档位。Money%或Bet%必须覆盖该市场全部选项、各项为0至100且总和在容差内闭合；成交额如存在必须同时带非负数值和币种。跨比赛、过期、开赛后、未来时间、盘口档位不匹配或未注册来源不得参与方向判断。合格资金证据必须保存`evidence_hash`，且只提供资金压力，盘口响应仍由独立赔率时间线决定。
+
 最终决策必须保存Home、Away、Over、Under四个方向的压力代理、盘口响应、接受度和证据依据。`Resistance`或`Rejected`不能覆盖Core并自动反向；系统只能在相同赛前剧本内切换到通过正EV、Script Coverage和风险门禁的更低阻力表达，否则输出`WAIT`或`PASS`。只有`BET`可以进入组合，`WAIT/PASS`在赛后不得按实际下注结算输赢。
 
 重点拥堵风险结构：

@@ -126,6 +126,36 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 - v1.93 增加证据驱动自动复盘、多场重复信号提案与前向验证编排。`complete-review`不采信调用方Process分类：先从六项哈希绑定的过程审计派生正确/错误，再单独结算冻结选择的输赢；数据不足、事件污染、走盘和不支持的复杂盘口安全降为`DATA_INSUFFICIENT`。双源结果与事件核验同时检查证据链接和域名，来源改名不能伪造独立性。Selection Quality按真实比赛去重，默认至少5场不同比赛、同一失败维度3次且失败率25%才生成无模型影响的`RESEARCH_PROPOSAL`。提案不是理论；转为Hypothesis必须绑定最新提案哈希、全部支持样本和结构化验证范围。验证队列只接受登记后新增、未参与发现、尚未开赛的匹配比赛，同一比赛的多个版本不得重复充当验证样本。
 - v1.94 增加League DNA显式用户确认入口。完成全部Shadow门槛仍只形成99分激活候选；只有绑定最新`activation_hash`、确认人、可追溯凭据和精确确认语句的交互式请求才能写入100分`VERIFIED_ACTIVE`。定时任务和无人值守流程禁止调用该入口。
 - v1.95 将盘口语言正式接入决策终态：Home/Away/Over/Under分别输出`Capital Pressure Proxy`、盘口响应和`Accepted/Partial/Resistance/Rejected`，真实Money%/Bet%/成交额缺失时固定为`data_missing`。Expression Optimizer只在同一赛前剧本内寻找更低阻力表达；不能自动反向。Resistance无更优表达时输出`WAIT`，组合构建器只接纳`BET`腿；赛后不会把`WAIT/PASS`的监控表达伪装成已执行投注结算。
+- v1.96 增加独立`real_money_v1`输入契约。真实Money%/Bet%/成交额必须绑定同一比赛、受控来源注册表、可定位HTTP证据、已核实方法、赛前观测时间、具体盘口档位和闭合百分比；缺失、过期、跨比赛、未注册域名或自称A级的来源一律拒绝。合格资金证据标为A级并带不可变`evidence_hash`，只替代压力证据，不替代独立盘口响应；未配置来源注册表时继续安全使用Capital Pressure Proxy。
+
+真实资金包通过`/shadow/model/prematch-evaluate`或`/shadow/evaluate`请求体中的`real_money_data`提交。示例结构：
+
+```json
+{
+  "schema": "real_money_v1",
+  "fixture": "MATCH_ID",
+  "observed_at": 1791400000,
+  "source": {
+    "name": "Verified Exchange Feed",
+    "type": "betting_exchange",
+    "evidence_ref": "https://registered.example/market/MATCH_ID",
+    "authority_verified": true,
+    "methodology_verified": true,
+    "methodology": "Matched prematch stakes aggregated by selection before kickoff."
+  },
+  "markets": {
+    "asian_handicap": {
+      "line": -0.5,
+      "money_percent": {"home": 60, "away": 40},
+      "bet_percent": {"home": 55, "away": 45},
+      "turnover": 125000,
+      "currency": "USD"
+    }
+  }
+}
+```
+
+证据域名还必须预先存在于`REAL_MONEY_SOURCE_REGISTRY_JSON`；空注册表代表不信任任何真实资金输入。该配置只建立允许名单，不会自动获取或购买资金数据。
 - Opening 导入必须同时包含可解析的观测时间和非空公司盘口数组；缺一项即标记 `opening_source_unverified`，上游汇总值不能单独充当开盘证据。
 - 每个节点保存 1X2、亚洲让球、大小球，并在上游提供时保存 BTTS、主队进球数、客队进球数。
 - `primary` 字段继续保留以兼容旧调用方，但内容改为基于完整公司数组计算的 `consensus_main_line`，不再机械取第一家公司。
