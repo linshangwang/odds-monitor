@@ -130,6 +130,7 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 - v1.97 增加不可变 Learning Card 与内部过程校准。每张卡绑定赛前冻结、赛后事实和复盘哈希；`PriorityQuality`来自场次选择审计，`SelectionQuality`来自表达与价格执行审计。最终比分不复制进卡片，缺失的赛前评级不补造，同场只以最新结算冻结版本参与校准；报告不自动调权、登记理论或修改Champion。
 - v1.98 将匿名消融升级为预登记模块级消融。Hypothesis必须先锁定结构化联赛/市场范围和`MSCB/STATE_TREE/IEH/TAC/TDD/LET/LPS/OCR`中的目标模块；每个前向样本必须在开赛前精确锁定全部模块的消融概率、计算时间和证据引用。系统逐模块派生Brier增益，并自动判定`support/counterexample`，调用方自报结论不生效。
 - v1.99 为自动学习赛前包增加可重放的独立概率契约。服务端只使用同一PIT积分榜中的主客场分项建立联赛基准及双方攻防率，经内置`fundamental_relative_strength_xg_v1`与`independent_poisson_v1`生成概率；完整输入、来源内容哈希、估计器哈希、模型哈希及重放哈希一并冻结。冻结前会在服务端重算，任何概率、输入、来源或哈希篡改均拒绝。未先保存为合规时间节点的即时赔率不得参与冻结决策；独立概率数据缺失时明确保留`PASS/data_missing`，不得从盘口或供应商预测反推。内部前向Shadow计算器也必须绑定该重放哈希，且其Champion概率必须与冻结基线完全一致，否则样本不能进入晋级证据。
+- v2.00 将前向Shadow评分绑定到赛前冻结的实际市场、选择与盘口档位，不再用1X2结果替代其他市场的验证目标。1X2按`home/draw/away`、BTTS按`yes/no`评分；AH、O/U及主客队总进球按`full_win/half_win/push/half_loss/full_loss`精确结算类别评分，四分之一盘保留半赢半输。内部运行器必须返回与冻结Poisson重放完全一致的Champion市场分布，Challenger与全部模块消融也必须使用同一结算空间。历史`legacy_1x2_brier`记录仅保留审计兼容，不能通过Promotion预登记门禁。
 
 真实资金包通过`/shadow/model/prematch-evaluate`或`/shadow/evaluate`请求体中的`real_money_data`提交。示例结构：
 

@@ -145,7 +145,7 @@
 
 自动任务可以持续收集独立多场样本并运行Shadow、样本外验证和消融测试，但只有全部门槛100%完成、没有未解决反例时，才能生成`PROMOTION_CANDIDATE`。
 
-每个验证样本必须先通过`/shadow/learning/hypotheses/{id}/shadow-lock`在开赛前锁定Champion概率、Challenger概率、选择表达、入场价格、两者尾部风险，以及预登记全部模块的消融输出。模块消融范围限定为`MSCB`、`STATE_TREE`、`IEH`、`TAC`、`TDD`、`LET`、`LPS`、`OCR`；每项必须绑定固定干预、冻结哈希、计算时间和证据定位，模块缺失、多余或开赛后计算均拒绝。冻结样本不得早于假设登记，发现样本不得充当验证样本，比赛和市场必须落在预登记结构化范围内。赛后验证必须绑定该`lock_hash`和Closing价格证据。系统从不可变冻结、结算与Shadow锁自动计算1X2 Brier、CLV概率差、逐模块消融增益、Process Accuracy及尾部风险差，并按预登记阈值派生`support/counterexample`；调用方自报的验证结论、PIT状态或事件污染状态均不采信。
+每个验证样本必须先通过`/shadow/learning/hypotheses/{id}/shadow-lock`在开赛前锁定Champion概率、Challenger概率、选择表达、入场价格、两者尾部风险，以及预登记全部模块的消融输出。模块消融范围限定为`MSCB`、`STATE_TREE`、`IEH`、`TAC`、`TDD`、`LET`、`LPS`、`OCR`；每项必须绑定固定干预、冻结哈希、计算时间和证据定位，模块缺失、多余或开赛后计算均拒绝。冻结样本不得早于假设登记，发现样本不得充当验证样本，比赛和市场必须落在预登记结构化范围内。赛后验证必须绑定该`lock_hash`和Closing价格证据。系统从不可变冻结、结算与Shadow锁自动计算冻结市场的类别Brier、CLV概率差、逐模块消融增益、Process Accuracy及尾部风险差，并按预登记阈值派生`support/counterexample`；调用方自报的验证结论、PIT状态或事件污染状态均不采信。类别空间必须与冻结表达完全一致：1X2为`home/draw/away`，BTTS为`yes/no`，AH/O-U/球队总进球为`full_win/half_win/push/half_loss/full_loss`；禁止用1X2替代其他市场评分。
 
 `GET /shadow/learning/hypotheses/{id}/promotion-evidence`输出派生门槛。`create_promotion_candidate`禁止调用方提交自定义passed状态；九项门槛必须全部由账本证据达到passed，任何缺失、失败或反例都阻止候选生成。
 

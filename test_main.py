@@ -1158,6 +1158,28 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertTrue(any(issue.startswith("unexpected_model_input_fields") for issue in rejected["issues"]))
         self.assertIn("market_derived_model_input_field_forbidden", rejected["issues"])
 
+    def test_market_forecast_projects_exact_quarter_line_settlement_space(self):
+        payload = self.learning_payload_with_probability_replay("forecast-projection", 900, 2000)
+        replay = payload["analysis"]["probability_replay"]
+        over = {"market": "over_under", "selection": "over", "line": 2.75}
+        forecast = main.market_forecast_from_probability_replay(replay, over)
+        self.assertEqual(forecast["categories"], list(main.LINE_SETTLEMENT_CATEGORIES))
+        self.assertAlmostEqual(sum(forecast["probabilities"].values()), 1.0, places=7)
+        self.assertEqual(main._learning_market_outcome_category(over, {"home_goals": 2, "away_goals": 1}), "half_win")
+        self.assertEqual(main._learning_market_outcome_category(
+            {"market": "over_under", "selection": "under", "line": 2.75},
+            {"home_goals": 2, "away_goals": 1},
+        ), "half_loss")
+        self.assertEqual(main._learning_market_outcome_category(
+            {"market": "asian_handicap", "selection": "home", "line": -.75},
+            {"home_goals": 2, "away_goals": 1},
+        ), "half_win")
+        self.assertEqual(main._learning_market_outcome_category(
+            {"market": "btts", "selection": "yes", "line": None},
+            {"home_goals": 2, "away_goals": 1},
+        ), "yes")
+        self.assertGreaterEqual(main._brier_market_forecast(forecast, over, {"home_goals": 2, "away_goals": 1}), 0.0)
+
     def test_shadow_ai_packet_binds_probability_but_not_unpersisted_current_odds(self):
         current_market = main.empty_market_snapshot()
         current_market["available"] = True
@@ -3477,6 +3499,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         payload["decision"].update({
             "model_probability": replay["model"]["probabilities"],
             "probability_replay_hash": replay["replay_hash"],
+            "selected_expression": {"market": "1x2", "selection": "draw", "line": None, "price": 3.0},
         })
         return payload
 
@@ -3528,6 +3551,8 @@ class ShadowV4UpgradeTests(unittest.TestCase):
 
         def runner(request):
             champion_output = champion or request["frozen_champion_probabilities"]
+            frozen_expression = request["frozen_selected_expression"]
+            frozen_forecast = request["frozen_champion_forecast"]
             generated_at = int(request["freeze"]["captured_at"]) + 5
             modules = request["hypothesis"]["ablation_plan"]["required_modules"]
             content = {
@@ -3538,12 +3563,17 @@ class ShadowV4UpgradeTests(unittest.TestCase):
                 "hypothesis_hash": request["hypothesis"]["hypothesis_hash"],
                 "champion_probabilities": champion_output,
                 "challenger_probabilities": challenger,
-                "module_ablations": {module: {"probabilities": ablation} for module in modules},
+                "champion_forecast": frozen_forecast,
+                "challenger_forecast": frozen_forecast,
+                "module_ablations": {
+                    module: {"probabilities": ablation, "forecast": frozen_forecast}
+                    for module in modules
+                },
                 "selected_expression": {
-                    "market": market, "selection": "draw" if market == "1x2" else "under",
-                    "line": None if market == "1x2" else 2.75,
-                    "entry_decimal_price": 3.0 if market == "1x2" else 1.91,
-                    "entry_price_evidence_ref": f"test:internal-runner:{market}",
+                    "market": frozen_expression["market"], "selection": frozen_expression["selection"],
+                    "line": frozen_expression.get("line"),
+                    "entry_decimal_price": frozen_expression.get("price") or (3.0 if frozen_expression["market"] == "1x2" else 1.91),
+                    "entry_price_evidence_ref": f"test:internal-runner:{frozen_expression['market']}",
                 },
                 "risk": {"champion_tail_risk": 0.10, "challenger_tail_risk": 0.10},
             }
@@ -4071,6 +4101,47 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         lock = main.load_snapshot_store()["learning_shadow_locks"]["cycle-runner-hyp"][frozen["freeze_id"]]
         self.assertEqual(lock["calculator_provenance"]["origin"], "internal_shadow_runner")
         self.assertTrue(lock["calculator_provenance"]["promotion_eligible"])
+
+    def test_forward_shadow_scores_the_frozen_over_under_market_not_1x2(self):
+        discovery, _ = self.settle_learning_fixture("ou-runner-discovery", 900, 1000)
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "ou-runner-hyp", "type": "HYPOTHESIS_ONLY",
+                "title": "O/U market forecast", "definition": "Validate the frozen total expression directly.",
+                "applicable_scope": "men top flights", "expected_direction": "lower market Brier",
+                "failure_conditions": "no O/U calibration gain", "falsification_criteria": "forward O/U counterexample",
+                "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": self.learning_validation_plan(markets=("over_under",)),
+            })
+        payload = self.learning_payload_with_probability_replay("ou-runner-validation", 8400, 10000)
+        payload["decision"].update({
+            "decision": "BET",
+            "selected_expression": {"market": "over_under", "selection": "over", "line": 2.75, "price": 1.91},
+        })
+        frozen = main.freeze_learning_sample(payload, now_ts=8400)
+        lock = main.generate_internal_shadow_lock(
+            "ou-runner-hyp", frozen["freeze_id"], model_runner=self.learning_shadow_runner(), now_ts=8410,
+        )
+        self.assertEqual(lock["scoring_contract"], "learning_market_forecast_v1")
+        self.assertEqual(lock["champion_forecast"]["market"], "over_under")
+        self.assertEqual(lock["champion_forecast"]["line"], 2.75)
+        facts = self.collect_verified_learning_facts(frozen, 2, 1, 17200)
+        main.settle_learning_sample(
+            frozen["freeze_id"], {"status": "FT", "home_goals": 2, "away_goals": 1},
+            "PROCESS_CORRECT_RESULT_WIN", {"status": "clean"}, 17200,
+            self.learning_postmatch_review(), facts["fact_hash"],
+        )
+        evidence = main.record_hypothesis_validation("ou-runner-hyp", {
+            "freeze_id": frozen["freeze_id"], "outcome": "support",
+            "evidence_summary": "The frozen O/U 2.75 expression is scored in its own settlement space.",
+            "shadow_lock_hash": lock["lock_hash"], "closing_decimal_price": 1.85,
+            "closing_price_evidence_ref": "test:closing:ou-runner",
+        })
+        metrics = evidence["derived_metrics"]
+        self.assertEqual(metrics["forecast_market"], "over_under")
+        self.assertEqual(metrics["realized_forecast_category"], "half_win")
+        self.assertIsNone(metrics["champion_brier_1x2"])
+        self.assertIsNotNone(metrics["champion_brier"])
 
     def test_learning_cycle_reports_runner_blocker_without_accepting_external_outputs(self):
         discovery, _ = self.settle_learning_fixture("cycle-no-runner-discovery", 900, 1000)
