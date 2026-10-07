@@ -13,8 +13,8 @@
 - 仓库：`linshangwang/odds-monitor`
 - 分支：`main`
 - 接管基线提交：`b7feddc`
-- 本地候选版本：`1.88.0`（线上为 `1.87.0`，本版本尚未部署）
-- 测试基线：306 项通过
+- 本地候选版本：`1.89.0`（线上为 `1.87.0`，本版本尚未部署）
+- 测试基线：318 项通过
 - 正式赛前时间轴：Opening、T-24h、T-12h、T-6h、T-3h、T-1h、T-30m、Closing
 - 旧 T-15m 数据保留，但不得替代 T-30m。
 
@@ -40,6 +40,8 @@
 - League DNA候选画像、训练/验证窗口、MagnitudeScore、动态EvidenceConfidence和激活候选已经持久化；完成全部验证也只能形成99分待确认包。赛前视图只接受100分、`VERIFIED_ACTIVE`且带用户确认记录的版本，候选无法伪装成正式先验。
 - Selection Quality学习卡已按联赛与市场聚合Process Accuracy、场次选择、表达和价格执行质量；事件污染与数据不足样本排除，赛果输赢不作为优化目标。样本成熟后也只产生`HYPOTHESIS_ONLY_REVIEW_ALLOWED`信号，不自动调权或登记理论。
 - The Odds API付费历史权限自检与时间线采集已经改为fail-closed；服务端未配置`SHADOW_ACCESS_TOKEN`时返回503，令牌错误返回401，避免公开消耗付费额度。
+- 自动学习单次运行器已经实现：默认dry-run，`apply=true`必须提供安全且幂等的run_id；只处理当期计划内顶级联赛，自动构建PIT赛前数据包并冻结原始PASS/WAIT/BET决策，逐项错误隔离且永不自动登记理论或修改Champion。
+- 赛后事实队列已经实现：到期样本自动采集最终比分、事件和关键统计并版本化；单一API-Football来源只能进入`single_source_pending`，至少两个带证据定位且比分一致的独立来源才可进入复盘就绪队列。结算必须提交最新已核实`fact_hash`且比分完全一致，直接结算接口也无法绕过。事实采集不自动生成Process分类，也不自动结算样本。
 
 ## 当前真实阻塞
 
@@ -57,7 +59,7 @@
 5. 对 MSCB、State Tree、IEH、TAC、TDD、LET、LPS 和 OCR 做 Champion 与 Challenger 消融框架。
 6. 数据源恢复后先进行 Shadow 验收；满足新鲜度、完整公司数组、基本面链和阵容置信门槛后，才允许生成非 PASS 建议。
 7. 为MLS、巴西甲、阿根廷甲和挪威顶级联赛积累合格冻结发现样本后，按新League DNA存储登记候选并启动独立验证；在此之前不影响任何正式分析。
-8. 部署并验收本地`1.88.0`学习治理接口；Railway当前未配置`SHADOW_ACCESS_TOKEN`，在明确发布前必须先安全配置。即使误先部署，学习与付费赔率接口也会保持fail-closed。
+8. 部署并验收本地`1.89.0`自动学习执行器与治理接口；Railway当前未配置`SHADOW_ACCESS_TOKEN`，在明确发布前必须先安全配置。即使误先部署，学习与付费赔率接口也会保持fail-closed。
 
 ## 接管原则
 

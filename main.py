@@ -23,7 +23,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "1.88.0"
+VERSION = "1.89.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -162,6 +162,7 @@ LEARNING_TOP_FLIGHT_LEAGUES: Dict[int, Dict[str, str]] = {
 LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
 LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
 LEARNING_DAILY_FREEZE_CAP = max(1, min(int(os.getenv("LEARNING_DAILY_FREEZE_CAP", "8")), 50))
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08").strip() or "MODEL_RULES.md@2026-10-08"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -3914,7 +3915,7 @@ def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6, ri
 
 @app.get("/")
 def root():
-    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}", "/shadow/learning/cycle-plan", "/shadow/learning/freeze", "/shadow/learning/settle", "/shadow/learning/hypotheses", "/shadow/learning/league-dna", "/shadow/learning/selection-quality", "/shadow/learning/status"]}
+    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}", "/shadow/learning/cycle-plan", "/shadow/learning/run", "/shadow/learning/review-queue", "/shadow/learning/freeze", "/shadow/learning/settle", "/shadow/learning/hypotheses", "/shadow/learning/league-dna", "/shadow/learning/selection-quality", "/shadow/learning/status"]}
 
 
 @app.get("/health")
@@ -4626,6 +4627,401 @@ def learning_cycle_plan(now_ts: Optional[int] = None, fixture_rows: Optional[Lis
     }
 
 
+def build_learning_freeze_payload(candidate: Dict[str, Any], packet: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Convert one PIT prematch packet into the immutable learning schema without inventing missing fields."""
+    now_ts = int(now_ts or time.time())
+    candidate = candidate if isinstance(candidate, dict) else {}
+    packet = packet if isinstance(packet, dict) else {}
+    fixture = str(candidate.get("fixture_id") or "").strip()
+    kickoff_at = _parse_timestamp(candidate.get("timestamp"))
+    if not fixture or kickoff_at is None:
+        raise HTTPException(status_code=422, detail="learning_candidate_identity_or_kickoff_missing")
+    if str(candidate.get("status") or "").upper() != "NS" or now_ts >= kickoff_at:
+        raise HTTPException(status_code=409, detail="automatic_learning_freeze_requires_not_started_fixture")
+    if packet.get("ok") is not True:
+        raise HTTPException(status_code=422, detail="prematch_packet_not_ready")
+    if get_nested(packet, ["analysis_rules", "prematch_only"]) is not True:
+        raise HTTPException(status_code=422, detail="prematch_only_packet_required")
+    packet_fixture = packet.get("fixture") if isinstance(packet.get("fixture"), dict) else {}
+    packet_fixture_id = str(packet_fixture.get("fixture_id") or packet_fixture.get("id") or packet.get("fixture_id") or "").strip()
+    if packet_fixture_id and packet_fixture_id != fixture:
+        raise HTTPException(status_code=409, detail="prematch_packet_fixture_mismatch")
+    generated_at = _parse_timestamp(packet.get("generated_at")) or now_ts
+    if generated_at > now_ts + 60:
+        raise HTTPException(status_code=409, detail="prematch_packet_timestamp_in_future")
+    if generated_at >= kickoff_at:
+        raise HTTPException(status_code=409, detail="prematch_packet_generated_after_kickoff")
+    decision = packet.get("decision_layer") if isinstance(packet.get("decision_layer"), dict) else {}
+    if not decision:
+        decision = {"decision": "PASS", "pass_reasons": ["decision_layer_data_missing"]}
+    analysis = {
+        "prematch_only": True,
+        "packet_generated_at": generated_at,
+        "data_quality": packet.get("data_quality"),
+        "coverage": packet.get("coverage"),
+        "fundamental_chain": packet.get("pure_fundamental_script") or packet.get("fundamentals") or {"status": "data_missing"},
+        "state_tree": get_nested(packet, ["pure_fundamental_script", "chain", "game_state_elasticity"], {"status": "data_missing"}),
+        "market_timeline": packet.get("market") or {"status": "data_missing"},
+        "market_language": get_nested(packet, ["market", "latest_dynamics"], {"status": "data_missing"}),
+        "analysis_rules": packet.get("analysis_rules") or {},
+        "missing_data_policy": "preserve_data_missing; never backfill from post-kickoff information",
+    }
+    scope = candidate.get("scope") if isinstance(candidate.get("scope"), dict) else {}
+    return {
+        "fixture": fixture,
+        "scope": scope,
+        "captured_at": generated_at,
+        "data_cutoff_at": generated_at,
+        "kickoff_at": kickoff_at,
+        "versions": {
+            "service": VERSION,
+            "model": str(packet.get("version") or VERSION),
+            "rules": LEARNING_RULES_VERSION,
+            "league_dna": "candidate_only" if league_dna_model_view(scope).get("candidate_tag_count") else "data_missing",
+        },
+        "analysis": analysis,
+        "decision": decision,
+        "source_refs": [
+            {"source": "api_football", "fixture_id": fixture, "captured_at": generated_at},
+            {"source": str(packet.get("source") or "shadow_ai_packet"), "packet_version": str(packet.get("version") or VERSION)},
+        ],
+    }
+
+
+def _learning_postmatch_fact_fetch(fixture_id: int) -> Dict[str, Any]:
+    """Fetch one compact postmatch fact bundle; API-Football remains only one verification source."""
+    detail = call_api_football("/fixtures", {"id": fixture_id})
+    row = response_first(detail)
+    if not row:
+        return {
+            "ok": False,
+            "error": "fixture_result_unavailable",
+            "source_audit": [{"source": "api_football", "ok": False, "status_code": detail.get("status_code")}],
+        }
+    summary = fixture_summary(row)
+    status = str(summary.get("status") or "").upper()
+    goals = summary.get("goals") if isinstance(summary.get("goals"), dict) else {}
+    if status not in {"FT", "AET", "PEN"} or goals.get("home") is None or goals.get("away") is None:
+        return {
+            "ok": False, "error": "verified_final_result_not_available", "fixture": summary,
+            "source_audit": [{"source": "api_football", "ok": bool(detail.get("ok")), "status_code": detail.get("status_code")}],
+        }
+    events_response = call_api_football("/fixtures/events", {"fixture": fixture_id})
+    statistics_response = call_api_football("/fixtures/statistics", {"fixture": fixture_id})
+    events = []
+    for event in response_list(events_response)[:200]:
+        if not isinstance(event, dict):
+            continue
+        events.append({
+            "elapsed": get_nested(event, ["time", "elapsed"]), "extra": get_nested(event, ["time", "extra"]),
+            "team_id": get_nested(event, ["team", "id"]), "team": get_nested(event, ["team", "name"]),
+            "player": get_nested(event, ["player", "name"]), "assist": get_nested(event, ["assist", "name"]),
+            "type": event.get("type"), "detail": event.get("detail"), "comments": event.get("comments"),
+        })
+    allowed_statistics = {
+        "Shots on Goal", "Shots off Goal", "Total Shots", "Blocked Shots", "Shots insidebox", "Shots outsidebox",
+        "Fouls", "Corner Kicks", "Offsides", "Ball Possession", "Yellow Cards", "Red Cards", "Goalkeeper Saves",
+        "Total passes", "Passes accurate", "Passes %", "expected_goals", "goals_prevented",
+    }
+    statistics = []
+    for team_row in response_list(statistics_response):
+        if not isinstance(team_row, dict):
+            continue
+        values = {
+            str(item.get("type")): item.get("value")
+            for item in (team_row.get("statistics") or [])
+            if isinstance(item, dict) and str(item.get("type")) in allowed_statistics
+        }
+        statistics.append({"team_id": get_nested(team_row, ["team", "id"]), "team": get_nested(team_row, ["team", "name"]), "statistics": values})
+    return {
+        "ok": True,
+        "result": {"status": status, "home_goals": int(goals["home"]), "away_goals": int(goals["away"])},
+        "fixture": summary,
+        "events": events,
+        "statistics": statistics,
+        "source_audit": [
+            {"source": "api_football", "component": "result", "ok": bool(detail.get("ok")), "status_code": detail.get("status_code"), "evidence_ref": f"api_football:/fixtures?id={fixture_id}", "home_goals": int(goals["home"]), "away_goals": int(goals["away"])},
+            {"source": "api_football", "component": "events", "ok": bool(events_response.get("ok")), "status_code": events_response.get("status_code"), "evidence_ref": f"api_football:/fixtures/events?fixture={fixture_id}"},
+            {"source": "api_football", "component": "statistics", "ok": bool(statistics_response.get("ok")), "status_code": statistics_response.get("status_code"), "evidence_ref": f"api_football:/fixtures/statistics?fixture={fixture_id}"},
+        ],
+    }
+
+
+def collect_learning_postmatch_facts(freeze_id: Any, now_ts: Optional[int] = None, fact_fetcher: Optional[Any] = None) -> Dict[str, Any]:
+    """Version postmatch facts without assigning process correctness or settling the sample."""
+    freeze_id = str(freeze_id or "").strip()
+    if not freeze_id:
+        raise HTTPException(status_code=400, detail="freeze_id_required")
+    now_ts = int(now_ts or time.time())
+    store = load_snapshot_store()
+    freeze = _learning_freeze_by_id(store, freeze_id)
+    if not freeze:
+        raise HTTPException(status_code=404, detail="frozen_learning_sample_not_found")
+    if now_ts < int(freeze.get("kickoff_at") or 0) + 2 * 3600:
+        raise HTTPException(status_code=409, detail="postmatch_fact_collection_not_due")
+    raw_fixture_id = freeze.get("fixture")
+    if fact_fetcher is None:
+        try:
+            fixture_id = int(raw_fixture_id)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="provider_fixture_id_required_for_automatic_fact_collection") from exc
+        fetched = _learning_postmatch_fact_fetch(fixture_id)
+    else:
+        fetched = fact_fetcher(raw_fixture_id)
+    if not isinstance(fetched, dict) or fetched.get("ok") is not True:
+        raise HTTPException(status_code=422, detail={"error": "postmatch_fact_fetch_incomplete", "reason": (fetched or {}).get("error") if isinstance(fetched, dict) else "invalid_fetcher_response"})
+    result = fetched.get("result") if isinstance(fetched.get("result"), dict) else {}
+    try:
+        home_goals, away_goals = int(result.get("home_goals")), int(result.get("away_goals"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="postmatch_fact_result_incomplete") from exc
+    if str(result.get("status") or "").upper() not in {"FT", "AET", "PEN"} or min(home_goals, away_goals) < 0:
+        raise HTTPException(status_code=422, detail="postmatch_fact_result_not_final")
+    verified_result_sources = []
+    for row in fetched.get("source_audit") or []:
+        if not isinstance(row, dict) or row.get("ok") is not True or str(row.get("component") or "").strip().lower() != "result":
+            continue
+        source = str(row.get("source") or "").strip().casefold()
+        evidence_ref = str(row.get("evidence_ref") or row.get("url") or row.get("id") or "").strip()
+        try:
+            source_home, source_away = int(row.get("home_goals")), int(row.get("away_goals"))
+        except (TypeError, ValueError):
+            continue
+        if source and evidence_ref and source_home == home_goals and source_away == away_goals:
+            verified_result_sources.append(source)
+    source_names = set(verified_result_sources)
+    immutable_content = {
+        "freeze_id": freeze_id,
+        "fixture": freeze.get("fixture"),
+        "freeze_hash": freeze.get("content_hash"),
+        "result": {**result, "home_goals": home_goals, "away_goals": away_goals},
+        "events": fetched.get("events") if isinstance(fetched.get("events"), list) else [],
+        "statistics": fetched.get("statistics") if isinstance(fetched.get("statistics"), list) else [],
+        "source_audit": fetched.get("source_audit") if isinstance(fetched.get("source_audit"), list) else [],
+        "verification": {
+            "independent_source_count": len(source_names),
+            "status": "verified" if len(source_names) >= 2 else "single_source_pending",
+            "settlement_eligible": len(source_names) >= 2,
+            "required_independent_sources": 2,
+        },
+        "process_classification": None,
+        "result_backfit_used": False,
+        "champion_effect": False,
+    }
+    fact_hash = _content_hash(immutable_content)
+    with SNAPSHOT_STORE_LOCK:
+        latest_store = load_snapshot_store()
+        rows = latest_store.setdefault("learning_postmatch_facts", {}).setdefault(freeze_id, [])
+        duplicate = next((row for row in rows if row.get("fact_hash") == fact_hash), None)
+        if duplicate:
+            return {**duplicate, "action": "unchanged"}
+        version_number = max([int(row.get("version_number") or 0) for row in rows] + [0]) + 1
+        record = {
+            **immutable_content, "fact_hash": fact_hash, "version_number": version_number,
+            "collected_at": now_ts, "action": "facts_collected", "immutable": True,
+        }
+        rows.append(record)
+        latest_store["version"] = VERSION
+        write_snapshot_store(latest_store)
+        return record
+
+
+def learning_review_queue() -> Dict[str, Any]:
+    """Expose frozen context plus versioned facts for evidence-led postmatch review."""
+    store = load_snapshot_store()
+    postmatches = store.get("learning_postmatch") or {}
+    rows = []
+    for freeze_id, fact_versions in (store.get("learning_postmatch_facts") or {}).items():
+        if freeze_id in postmatches or not fact_versions:
+            continue
+        freeze = _learning_freeze_by_id(store, freeze_id)
+        if not freeze:
+            continue
+        latest = max(fact_versions, key=lambda row: int(row.get("version_number") or 0))
+        verification = latest.get("verification") if isinstance(latest.get("verification"), dict) else {}
+        rows.append({
+            "freeze_id": freeze_id,
+            "fixture": freeze.get("fixture"),
+            "kickoff_at": freeze.get("kickoff_at"),
+            "freeze_hash": freeze.get("content_hash"),
+            "frozen_analysis": freeze.get("analysis"),
+            "frozen_decision": freeze.get("decision"),
+            "postmatch_facts": {
+                "fact_hash": latest.get("fact_hash"), "version_number": latest.get("version_number"),
+                "result": latest.get("result"), "events": latest.get("events"), "statistics": latest.get("statistics"),
+                "source_audit": latest.get("source_audit"), "verification": verification,
+            },
+            "review_ready": verification.get("settlement_eligible") is True,
+            "required_next_action": "compare_process_to_frozen_prematch_without_result_backfit" if verification.get("settlement_eligible") is True else "obtain_independent_result_verification",
+            "allowed_process_classes": sorted(LEARNING_PROCESS_CLASSES),
+            "automatic_champion_change": False,
+        })
+    rows.sort(key=lambda row: (not row["review_ready"], int(row.get("kickoff_at") or 0), str(row.get("fixture"))))
+    return {
+        "version": VERSION,
+        "queue_count": len(rows),
+        "review_ready_count": sum(row["review_ready"] for row in rows),
+        "waiting_for_verification_count": sum(not row["review_ready"] for row in rows),
+        "items": rows,
+        "result_backfit_allowed": False,
+        "automatic_process_classification": False,
+        "automatic_hypothesis_registration": False,
+        "automatic_champion_change": False,
+    }
+
+
+def run_learning_cycle(
+    payload: Optional[Dict[str, Any]] = None,
+    now_ts: Optional[int] = None,
+    fixture_rows: Optional[List[Dict[str, Any]]] = None,
+    prematch_packet_builder: Optional[Any] = None,
+    postmatch_fact_fetcher: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Execute one bounded learning cycle. It never creates hypotheses or changes Champion."""
+    payload = payload if isinstance(payload, dict) else {}
+    now_ts = int(now_ts or time.time())
+    apply_changes = payload.get("apply") is True
+    auto_prepare = payload.get("auto_prepare_prematch", True)
+    if not isinstance(auto_prepare, bool):
+        raise HTTPException(status_code=400, detail="auto_prepare_prematch_must_be_boolean")
+    auto_collect_facts = payload.get("auto_collect_postmatch_facts", True)
+    if not isinstance(auto_collect_facts, bool):
+        raise HTTPException(status_code=400, detail="auto_collect_postmatch_facts_must_be_boolean")
+    supplied_run_id = str(payload.get("run_id") or "").strip()
+    safe_run_id = supplied_run_id and len(supplied_run_id) <= 100 and all(char in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in supplied_run_id)
+    if apply_changes and not safe_run_id:
+        raise HTTPException(status_code=400, detail="safe_run_id_required_when_apply_is_true")
+    plan = learning_cycle_plan(now_ts=now_ts, fixture_rows=fixture_rows)
+    if apply_changes:
+        existing = (load_snapshot_store().get("learning_runs") or {}).get(supplied_run_id)
+        if existing:
+            return {**existing, "action": "unchanged"}
+    prematch_packets = payload.get("prematch_packets") if isinstance(payload.get("prematch_packets"), dict) else {}
+    postmatch_fact_packets = payload.get("postmatch_fact_packets") if isinstance(payload.get("postmatch_fact_packets"), dict) else {}
+    settlement_packets = payload.get("settlement_packets") if isinstance(payload.get("settlement_packets"), list) else []
+    if len(prematch_packets) > LEARNING_DAILY_FREEZE_CAP or len(postmatch_fact_packets) > 50 or len(settlement_packets) > 50:
+        raise HTTPException(status_code=413, detail="learning_cycle_batch_too_large")
+    due_ids = {str(row.get("freeze_id")) for row in plan.get("settlement_due") or []}
+    settlement_results = []
+    for row in settlement_packets:
+        row = row if isinstance(row, dict) else {}
+        freeze_id = str(row.get("freeze_id") or "").strip()
+        if freeze_id not in due_ids:
+            settlement_results.append({"freeze_id": freeze_id or None, "action": "skipped", "reason": "freeze_not_due_in_current_cycle"})
+            continue
+        if not apply_changes:
+            review_audit = audit_learning_postmatch_review(row.get("review"))
+            settlement_results.append({
+                "freeze_id": freeze_id, "action": "would_settle" if review_audit["eligible"] else "would_reject",
+                "review_eligible": review_audit["eligible"], "reasons": review_audit["reasons"],
+            })
+            continue
+        try:
+            record = settle_learning_sample(
+                freeze_id, row.get("result"), row.get("process_classification"), row.get("event_audit"),
+                row.get("settled_at") or now_ts, row.get("review"), row.get("fact_hash"),
+            )
+            settlement_results.append({"freeze_id": freeze_id, "action": record.get("action"), "postmatch_hash": record.get("postmatch_hash")})
+        except HTTPException as exc:
+            settlement_results.append({"freeze_id": freeze_id, "action": "rejected", "status_code": exc.status_code, "reason": exc.detail})
+    settled_or_existing = {
+        str(row.get("freeze_id")) for row in settlement_results if row.get("action") in {"settled", "unchanged"}
+    }
+    fact_results = []
+    if auto_collect_facts:
+        current_store = load_snapshot_store()
+        existing_facts = current_store.get("learning_postmatch_facts") or {}
+        existing_postmatches = current_store.get("learning_postmatch") or {}
+        for freeze_id in sorted(due_ids):
+            if freeze_id in settled_or_existing or freeze_id in existing_postmatches:
+                fact_results.append({"freeze_id": freeze_id, "action": "skipped", "reason": "postmatch_already_settled"})
+                continue
+            supplied_facts = postmatch_fact_packets.get(freeze_id)
+            versions = existing_facts.get(freeze_id) or []
+            if versions and supplied_facts is None:
+                latest = max(versions, key=lambda row: int(row.get("version_number") or 0))
+                fact_results.append({
+                    "freeze_id": freeze_id, "action": "awaiting_independent_verification",
+                    "verification": latest.get("verification"), "fact_hash": latest.get("fact_hash"),
+                })
+                continue
+            if not apply_changes:
+                fact_results.append({"freeze_id": freeze_id, "action": "would_collect_facts", "supplied_fact_packet": supplied_facts is not None})
+                continue
+            try:
+                active_fact_fetcher = (lambda fixture_id, packet=supplied_facts: packet) if supplied_facts is not None else postmatch_fact_fetcher
+                fact_record = collect_learning_postmatch_facts(freeze_id, now_ts=now_ts, fact_fetcher=active_fact_fetcher)
+                fact_results.append({
+                    "freeze_id": freeze_id, "action": fact_record.get("action"),
+                    "verification": fact_record.get("verification"), "fact_hash": fact_record.get("fact_hash"),
+                })
+            except HTTPException as exc:
+                fact_results.append({"freeze_id": freeze_id, "action": "rejected", "status_code": exc.status_code, "reason": exc.detail})
+    remaining = int(plan.get("remaining_freeze_capacity") or 0)
+    freeze_results = []
+    builder = prematch_packet_builder or build_shadow_ai_packet
+    for candidate in plan.get("discovery", {}).get("candidates") or []:
+        fixture = str(candidate.get("fixture_id") or "")
+        if candidate.get("already_frozen"):
+            freeze_results.append({"fixture": fixture, "action": "skipped", "reason": "fixture_already_frozen"})
+            continue
+        if remaining <= 0:
+            freeze_results.append({"fixture": fixture, "action": "skipped", "reason": "daily_freeze_cap_reached"})
+            continue
+        packet = prematch_packets.get(fixture)
+        if packet is None and auto_prepare and apply_changes:
+            try:
+                packet = builder(int(fixture))
+            except Exception as exc:
+                freeze_results.append({"fixture": fixture, "action": "rejected", "reason": "prematch_packet_build_failed", "error_type": type(exc).__name__})
+                continue
+        if packet is None:
+            freeze_results.append({"fixture": fixture, "action": "would_prepare" if auto_prepare else "skipped", "reason": "prematch_packet_not_supplied"})
+            continue
+        try:
+            freeze_payload = build_learning_freeze_payload(candidate, packet, now_ts=now_ts)
+            if not apply_changes:
+                freeze_results.append({"fixture": fixture, "action": "would_freeze", "decision": get_nested(freeze_payload, ["decision", "decision"])})
+                continue
+            record = freeze_learning_sample(freeze_payload, now_ts=now_ts)
+            freeze_results.append({"fixture": fixture, "freeze_id": record.get("freeze_id"), "action": record.get("action"), "decision": get_nested(record, ["decision", "decision"])})
+            if record.get("action") == "frozen":
+                remaining -= 1
+        except HTTPException as exc:
+            freeze_results.append({"fixture": fixture, "action": "rejected", "status_code": exc.status_code, "reason": exc.detail})
+    immutable_summary = {
+        "run_id": supplied_run_id or None,
+        "mode": "apply" if apply_changes else "dry_run",
+        "started_at": now_ts,
+        "plan_generated_at": plan.get("generated_at"),
+        "settlement_results": settlement_results,
+        "postmatch_fact_results": fact_results,
+        "freeze_results": freeze_results,
+        "automatic_hypothesis_registration": False,
+        "automatic_champion_change": False,
+        "result_backfit_allowed": False,
+    }
+    result = {
+        **immutable_summary,
+        "settled_count": sum(row.get("action") == "settled" for row in settlement_results),
+        "frozen_count": sum(row.get("action") == "frozen" for row in freeze_results),
+        "rejected_count": sum(row.get("action") in {"rejected", "would_reject"} for row in settlement_results + fact_results + freeze_results),
+        "action": "completed" if apply_changes else "previewed",
+    }
+    if apply_changes:
+        with SNAPSHOT_STORE_LOCK:
+            store = load_snapshot_store()
+            runs = store.setdefault("learning_runs", {})
+            if supplied_run_id in runs:
+                return {**runs[supplied_run_id], "action": "unchanged"}
+            record = {**result, "run_hash": _content_hash(immutable_summary), "immutable": True}
+            runs[supplied_run_id] = record
+            store["version"] = VERSION
+            write_snapshot_store(store)
+            result = record
+    return result
+
+
 def _learning_freeze_by_id(store: Dict[str, Any], freeze_id: str) -> Optional[Dict[str, Any]]:
     for rows in (store.get("learning_frozen") or {}).values():
         for row in rows or []:
@@ -4764,7 +5160,7 @@ def audit_learning_postmatch_review(review: Any) -> Dict[str, Any]:
     }
 
 
-def settle_learning_sample(freeze_id: Any, result: Any, process_classification: Any, event_audit: Any = None, settled_at: Any = None, review: Any = None) -> Dict[str, Any]:
+def settle_learning_sample(freeze_id: Any, result: Any, process_classification: Any, event_audit: Any = None, settled_at: Any = None, review: Any = None, fact_hash: Any = None) -> Dict[str, Any]:
     freeze_id = str(freeze_id or "").strip()
     if not freeze_id:
         raise HTTPException(status_code=400, detail="freeze_id_required")
@@ -4786,6 +5182,22 @@ def settle_learning_sample(freeze_id: Any, result: Any, process_classification: 
         review_audit = audit_learning_postmatch_review(review)
         if not review_audit["eligible"]:
             raise HTTPException(status_code=422, detail={"error": "postmatch_review_incomplete_or_backfit_risk", "reasons": review_audit["reasons"]})
+        fact_versions = (store.get("learning_postmatch_facts") or {}).get(freeze_id) or []
+        if not fact_versions:
+            raise HTTPException(status_code=409, detail="verified_postmatch_fact_packet_required")
+        verified_facts = max(fact_versions, key=lambda row: int(row.get("version_number") or 0))
+        if get_nested(verified_facts, ["verification", "settlement_eligible"]) is not True:
+            raise HTTPException(status_code=409, detail="independent_result_verification_required")
+        supplied_fact_hash = str(fact_hash or "").strip()
+        if not supplied_fact_hash or supplied_fact_hash != str(verified_facts.get("fact_hash") or ""):
+            raise HTTPException(status_code=409, detail="latest_verified_fact_hash_required")
+        verified_result = verified_facts.get("result") if isinstance(verified_facts.get("result"), dict) else {}
+        if (
+            str(verified_result.get("status") or "").upper() != str(result.get("status") or "").upper()
+            or int(verified_result.get("home_goals")) != home_goals
+            or int(verified_result.get("away_goals")) != away_goals
+        ):
+            raise HTTPException(status_code=409, detail="submitted_result_does_not_match_verified_facts")
         settled_ts = _parse_timestamp(settled_at) or int(time.time())
         if settled_ts < int(freeze.get("kickoff_at") or 0):
             raise HTTPException(status_code=409, detail="postmatch_settlement_cannot_precede_kickoff")
@@ -4793,6 +5205,8 @@ def settle_learning_sample(freeze_id: Any, result: Any, process_classification: 
             "freeze_id": freeze_id,
             "fixture": freeze.get("fixture"),
             "freeze_hash": freeze.get("content_hash"),
+            "fact_hash": verified_facts.get("fact_hash"),
+            "fact_version_number": verified_facts.get("version_number"),
             "result": {**result, "home_goals": home_goals, "away_goals": away_goals},
             "process_classification": process_classification,
             "event_audit": event_audit,
@@ -5272,6 +5686,8 @@ def learning_status_report() -> Dict[str, Any]:
     store = load_snapshot_store()
     frozen = store.get("learning_frozen") or {}
     postmatches = store.get("learning_postmatch") or {}
+    postmatch_facts = store.get("learning_postmatch_facts") or {}
+    runs = store.get("learning_runs") or {}
     hypotheses = store.get("learning_hypotheses") or {}
     promotions = store.get("learning_promotions") or {}
     league_dna_candidates = store.get("league_dna_candidates") or {}
@@ -5291,6 +5707,12 @@ def learning_status_report() -> Dict[str, Any]:
         "frozen_fixture_count": len(frozen),
         "frozen_version_count": len(frozen_rows),
         "postmatch_count": len(postmatches),
+        "postmatch_fact_queue_count": len(postmatch_facts),
+        "postmatch_fact_pending_verification_count": sum(
+            bool(rows) and max(rows, key=lambda row: int(row.get("version_number") or 0)).get("verification", {}).get("settlement_eligible") is not True
+            for rows in postmatch_facts.values()
+        ),
+        "cycle_run_count": len(runs),
         "postmatch_process_class_counts": {status: sum(row.get("process_classification") == status for row in postmatch_rows) for status in sorted(LEARNING_PROCESS_CLASSES)},
         "implementation_gap_count": implementation_gap_count,
         "single_match_hypothesis_disposition_count": hypothesis_disposition_count,
@@ -5787,11 +6209,32 @@ def shadow_learning_cycle_plan(now_ts: Optional[int] = None, token: Optional[str
     return JSONResponse({"ok": True, "plan": learning_cycle_plan(now_ts=now_ts)})
 
 
+@app.post("/shadow/learning/run")
+async def shadow_learning_run(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    body = await request.body()
+    if len(body) > 256 * 1024:
+        raise HTTPException(status_code=413, detail="request_body_too_large")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="invalid_json_body") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="json_body_must_be_an_object")
+    return JSONResponse({"ok": True, "run": run_learning_cycle(payload)})
+
+
+@app.get("/shadow/learning/review-queue")
+def shadow_learning_review_queue(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "review_queue": learning_review_queue()})
+
+
 @app.post("/shadow/learning/settle")
 async def shadow_learning_settle(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
     payload = await request.json()
-    record = settle_learning_sample(payload.get("freeze_id"), payload.get("result"), payload.get("process_classification"), payload.get("event_audit"), payload.get("settled_at"), payload.get("review"))
+    record = settle_learning_sample(payload.get("freeze_id"), payload.get("result"), payload.get("process_classification"), payload.get("event_audit"), payload.get("settled_at"), payload.get("review"), payload.get("fact_hash"))
     return JSONResponse({"ok": True, "postmatch": record})
 
 

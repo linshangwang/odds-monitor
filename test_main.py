@@ -2,7 +2,7 @@ import os
 import gzip
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import main
 
@@ -3109,10 +3109,11 @@ class ShadowV4UpgradeTests(unittest.TestCase):
 
     def settle_learning_fixture(self, fixture, captured_at, kickoff_at):
         frozen = main.freeze_learning_sample(self.learning_payload(fixture, captured_at, kickoff_at), now_ts=captured_at)
+        facts = self.collect_verified_learning_facts(frozen, 1, 1, kickoff_at + 7200)
         settled = main.settle_learning_sample(
             frozen["freeze_id"], {"status": "FT", "home_goals": 1, "away_goals": 1},
             "PROCESS_CORRECT_RESULT_LOSS", {"status": "clean", "red_cards": 0}, kickoff_at + 7200,
-            self.learning_postmatch_review(),
+            self.learning_postmatch_review(), facts["fact_hash"],
         )
         return frozen, settled
 
@@ -3236,11 +3237,11 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         unchanged = main.settle_learning_sample(
             frozen["freeze_id"], {"status": "FT", "home_goals": 1, "away_goals": 1},
             "PROCESS_CORRECT_RESULT_LOSS", {"status": "clean", "red_cards": 0}, 8200,
-            self.learning_postmatch_review(),
+            self.learning_postmatch_review(), settled["fact_hash"],
         )
         self.assertEqual(unchanged["action"], "unchanged")
         with self.assertRaises(main.HTTPException) as changed:
-            main.settle_learning_sample(frozen["freeze_id"], {"status": "FT", "home_goals": 2, "away_goals": 1}, "PROCESS_ERROR_RESULT_WIN", settled_at=8300, review=self.learning_postmatch_review())
+            main.settle_learning_sample(frozen["freeze_id"], {"status": "FT", "home_goals": 2, "away_goals": 1}, "PROCESS_ERROR_RESULT_WIN", settled_at=8300, review=self.learning_postmatch_review(), fact_hash=settled["fact_hash"])
         self.assertEqual(changed.exception.status_code, 409)
 
     def test_learning_postmatch_review_rejects_backfit_and_single_match_champion_change(self):
@@ -3396,6 +3397,263 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(report["automatic_activation"])
         self.assertEqual(main.league_dna_model_view(self.learning_payload()["scope"])["status"], "candidate_only")
 
+    def learning_prematch_packet(self, fixture_id, generated_at):
+        return {
+            "ok": True, "version": main.VERSION, "generated_at": generated_at,
+            "source": "test_pit_packet", "fixture": {"fixture_id": fixture_id},
+            "data_quality": {"status": "partial"}, "coverage": {"status": "partial"},
+            "pure_fundamental_script": {
+                "status": "partial",
+                "chain": {"game_state_elasticity": {"status": "data_missing"}},
+            },
+            "market": {"timeline": [], "latest_dynamics": {"status": "data_missing"}},
+            "analysis_rules": {"prematch_only": True},
+            "decision_layer": {"decision": "PASS", "pass_reasons": ["fundamental_chain_insufficient"]},
+        }
+
+    def test_learning_cycle_dry_run_previews_freeze_without_mutation(self):
+        now_ts = 100000
+        fixture_row = self.learning_fixture_row(71, 39, now_ts + 3600)
+        preview = main.run_learning_cycle({
+            "apply": False,
+            "prematch_packets": {"71": self.learning_prematch_packet(71, now_ts)},
+        }, now_ts=now_ts, fixture_rows=[fixture_row])
+        self.assertEqual(preview["action"], "previewed")
+        self.assertEqual(preview["freeze_results"][0]["action"], "would_freeze")
+        self.assertFalse(preview["automatic_hypothesis_registration"])
+        self.assertFalse(preview["automatic_champion_change"])
+        self.assertFalse(os.path.exists(main.SNAPSHOT_STORE_PATH))
+
+    def test_learning_cycle_apply_auto_prepares_and_is_run_idempotent(self):
+        now_ts = 100000
+        fixture_row = self.learning_fixture_row(72, 39, now_ts + 3600)
+        builder_calls = []
+
+        def builder(fixture_id):
+            builder_calls.append(fixture_id)
+            return self.learning_prematch_packet(fixture_id, now_ts)
+
+        payload = {"apply": True, "run_id": "cycle-20261008-a", "auto_prepare_prematch": True}
+        first = main.run_learning_cycle(payload, now_ts=now_ts, fixture_rows=[fixture_row], prematch_packet_builder=builder)
+        self.assertEqual(first["frozen_count"], 1)
+        self.assertEqual(first["freeze_results"][0]["decision"], "PASS")
+        self.assertEqual(builder_calls, [72])
+        store = main.load_snapshot_store()
+        self.assertIn("72", store["learning_frozen"])
+        self.assertIn("cycle-20261008-a", store["learning_runs"])
+        self.assertNotIn("learning_hypotheses", store)
+        self.assertNotIn("league_dna_active", store)
+
+        second = main.run_learning_cycle(payload, now_ts=now_ts, fixture_rows=[fixture_row], prematch_packet_builder=builder)
+        self.assertEqual(second["action"], "unchanged")
+        self.assertEqual(builder_calls, [72])
+        self.assertEqual(len(main.load_snapshot_store()["learning_frozen"]["72"]), 1)
+
+    def test_learning_cycle_only_builds_packets_for_top_flight_not_started_candidates(self):
+        now_ts = 100000
+        rows = [
+            self.learning_fixture_row(73, 39, now_ts + 3600),
+            self.learning_fixture_row(74, 2, now_ts + 3600),
+            self.learning_fixture_row(75, 39, now_ts + 3600, status="1H"),
+        ]
+        built = []
+
+        def builder(fixture_id):
+            built.append(fixture_id)
+            return self.learning_prematch_packet(fixture_id, now_ts)
+
+        result = main.run_learning_cycle(
+            {"apply": True, "run_id": "cycle-scope-gate", "auto_prepare_prematch": True},
+            now_ts=now_ts, fixture_rows=rows, prematch_packet_builder=builder,
+        )
+        self.assertEqual(result["frozen_count"], 1)
+        self.assertEqual(built, [73])
+        self.assertEqual(set(main.load_snapshot_store()["learning_frozen"]), {"73"})
+
+    def test_learning_cycle_settles_only_due_freeze_using_explicit_process_review(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("cycle-due", 900, 1000), now_ts=900)
+        facts = self.collect_verified_learning_facts(frozen, 2, 0, 9000)
+        settlement = {
+            "freeze_id": frozen["freeze_id"],
+            "fact_hash": facts["fact_hash"],
+            "result": {"status": "FT", "home_goals": 2, "away_goals": 0},
+            "process_classification": "PROCESS_ERROR_RESULT_WIN",
+            "event_audit": {"status": "clean", "source_count": 2},
+            "settled_at": 9000,
+            "review": self.learning_postmatch_review(),
+        }
+        result = main.run_learning_cycle({
+            "apply": True, "run_id": "cycle-settle-due", "auto_prepare_prematch": False,
+            "settlement_packets": [settlement],
+        }, now_ts=9000, fixture_rows=[])
+        self.assertEqual(result["settled_count"], 1)
+        saved = main.load_snapshot_store()["learning_postmatch"][frozen["freeze_id"]]
+        self.assertEqual(saved["process_classification"], "PROCESS_ERROR_RESULT_WIN")
+        self.assertFalse(saved["review"]["learning_disposition"]["result_backfit_used"])
+        self.assertNotIn("learning_hypotheses", main.load_snapshot_store())
+        self.assertFalse(result["automatic_champion_change"])
+
+    def learning_postmatch_facts(self, sources=("api_football",), home_goals=2, away_goals=1):
+        return {
+            "ok": True,
+            "result": {"status": "FT", "home_goals": home_goals, "away_goals": away_goals},
+            "events": [{"elapsed": 10, "type": "Goal", "detail": "Normal Goal"}],
+            "statistics": [{"team": "Home", "statistics": {"Total Shots": 12}}],
+            "source_audit": [
+                {"source": source, "component": "result", "ok": True, "evidence_ref": f"test:{source}:fixture",
+                 "home_goals": home_goals, "away_goals": away_goals}
+                for source in sources
+            ],
+        }
+
+    def collect_verified_learning_facts(self, frozen, home_goals, away_goals, collected_at=9000):
+        return main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=collected_at,
+            fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(
+                ("api_football", "official_league"), home_goals, away_goals,
+            ),
+        )
+
+    def test_learning_cycle_collects_single_source_facts_but_never_classifies_or_settles(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("801", 900, 1000), now_ts=900)
+        calls = []
+
+        def fetcher(fixture_id):
+            calls.append(fixture_id)
+            return self.learning_postmatch_facts()
+
+        result = main.run_learning_cycle({
+            "apply": True, "run_id": "cycle-facts-only", "auto_prepare_prematch": False,
+            "auto_collect_postmatch_facts": True,
+        }, now_ts=9000, fixture_rows=[], postmatch_fact_fetcher=fetcher)
+        self.assertEqual(calls, ["801"])
+        self.assertEqual(result["postmatch_fact_results"][0]["action"], "facts_collected")
+        self.assertFalse(result["postmatch_fact_results"][0]["verification"]["settlement_eligible"])
+        store = main.load_snapshot_store()
+        facts = store["learning_postmatch_facts"][frozen["freeze_id"]][0]
+        self.assertEqual(facts["verification"]["status"], "single_source_pending")
+        self.assertIsNone(facts["process_classification"])
+        self.assertFalse(facts["result_backfit_used"])
+        self.assertNotIn(frozen["freeze_id"], store.get("learning_postmatch", {}))
+        self.assertNotIn("learning_hypotheses", store)
+
+    def test_two_source_fact_packet_becomes_review_eligible_but_does_not_auto_settle(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("802", 900, 1000), now_ts=900)
+        facts = main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(("api_football", "official_league")),
+        )
+        self.assertTrue(facts["verification"]["settlement_eligible"])
+        self.assertEqual(facts["verification"]["independent_source_count"], 2)
+        self.assertIsNone(facts["process_classification"])
+        self.assertNotIn(frozen["freeze_id"], main.load_snapshot_store().get("learning_postmatch", {}))
+
+    def test_learning_cycle_reuses_fact_queue_without_repeating_provider_calls(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("803", 900, 1000), now_ts=900)
+        main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(),
+        )
+        fetcher = Mock(side_effect=AssertionError("provider must not be called twice"))
+        result = main.run_learning_cycle({
+            "apply": True, "run_id": "cycle-facts-reuse", "auto_prepare_prematch": False,
+        }, now_ts=9100, fixture_rows=[], postmatch_fact_fetcher=fetcher)
+        self.assertEqual(result["postmatch_fact_results"][0]["action"], "awaiting_independent_verification")
+        fetcher.assert_not_called()
+
+    def test_learning_cycle_can_version_fact_queue_with_supplied_second_source(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("804", 900, 1000), now_ts=900)
+        main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(),
+        )
+        supplied = self.learning_postmatch_facts(("api_football", "official_league"))
+        result = main.run_learning_cycle({
+            "apply": True, "run_id": "cycle-facts-verified", "auto_prepare_prematch": False,
+            "postmatch_fact_packets": {frozen["freeze_id"]: supplied},
+        }, now_ts=9100, fixture_rows=[])
+        verification = result["postmatch_fact_results"][0]["verification"]
+        self.assertTrue(verification["settlement_eligible"])
+        rows = main.load_snapshot_store()["learning_postmatch_facts"][frozen["freeze_id"]]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[-1]["verification"]["independent_source_count"], 2)
+        self.assertNotIn(frozen["freeze_id"], main.load_snapshot_store().get("learning_postmatch", {}))
+
+    def test_fact_verification_counts_only_matching_result_evidence(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("805", 900, 1000), now_ts=900)
+        supplied = self.learning_postmatch_facts(("api_football", "official_league"))
+        supplied["source_audit"][1]["away_goals"] = 0
+        facts = main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000, fact_fetcher=lambda fixture_id: supplied,
+        )
+        self.assertEqual(facts["verification"]["independent_source_count"], 1)
+        self.assertFalse(facts["verification"]["settlement_eligible"])
+
+    def test_review_queue_prioritizes_verified_facts_and_preserves_frozen_context(self):
+        waiting = main.freeze_learning_sample(self.learning_payload("806", 900, 1000), now_ts=900)
+        ready = main.freeze_learning_sample(self.learning_payload("807", 901, 1001), now_ts=901)
+        main.collect_learning_postmatch_facts(
+            waiting["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(),
+        )
+        main.collect_learning_postmatch_facts(
+            ready["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(("api_football", "official_league")),
+        )
+        queue = main.learning_review_queue()
+        self.assertEqual(queue["queue_count"], 2)
+        self.assertEqual(queue["review_ready_count"], 1)
+        self.assertEqual(queue["items"][0]["freeze_id"], ready["freeze_id"])
+        self.assertTrue(queue["items"][0]["review_ready"])
+        self.assertEqual(queue["items"][0]["freeze_hash"], ready["content_hash"])
+        self.assertEqual(queue["items"][0]["frozen_decision"]["decision"], "PASS")
+        self.assertFalse(queue["automatic_process_classification"])
+        self.assertFalse(queue["result_backfit_allowed"])
+        self.assertFalse(queue["automatic_champion_change"])
+
+    def test_settlement_cannot_bypass_latest_verified_fact_packet(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("808", 900, 1000), now_ts=900)
+        result = {"status": "FT", "home_goals": 2, "away_goals": 1}
+        with self.assertRaises(main.HTTPException) as no_facts:
+            main.settle_learning_sample(
+                frozen["freeze_id"], result, "PROCESS_CORRECT_RESULT_WIN",
+                {"status": "clean"}, 9000, self.learning_postmatch_review(), "missing-hash",
+            )
+        self.assertEqual(no_facts.exception.detail, "verified_postmatch_fact_packet_required")
+
+        single = main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(),
+        )
+        with self.assertRaises(main.HTTPException) as one_source:
+            main.settle_learning_sample(
+                frozen["freeze_id"], result, "PROCESS_CORRECT_RESULT_WIN",
+                {"status": "clean"}, 9000, self.learning_postmatch_review(), single["fact_hash"],
+            )
+        self.assertEqual(one_source.exception.detail, "independent_result_verification_required")
+
+        verified = self.collect_verified_learning_facts(frozen, 2, 1, 9001)
+        with self.assertRaises(main.HTTPException) as stale_hash:
+            main.settle_learning_sample(
+                frozen["freeze_id"], result, "PROCESS_CORRECT_RESULT_WIN",
+                {"status": "clean"}, 9001, self.learning_postmatch_review(), single["fact_hash"],
+            )
+        self.assertEqual(stale_hash.exception.detail, "latest_verified_fact_hash_required")
+        with self.assertRaises(main.HTTPException) as wrong_result:
+            main.settle_learning_sample(
+                frozen["freeze_id"], {"status": "FT", "home_goals": 3, "away_goals": 1},
+                "PROCESS_CORRECT_RESULT_WIN", {"status": "clean"}, 9001,
+                self.learning_postmatch_review(), verified["fact_hash"],
+            )
+        self.assertEqual(wrong_result.exception.detail, "submitted_result_does_not_match_verified_facts")
+
+    def test_learning_cycle_rejects_apply_without_safe_run_id(self):
+        with self.assertRaises(main.HTTPException) as missing:
+            main.run_learning_cycle({"apply": True}, now_ts=100000, fixture_rows=[])
+        self.assertEqual(missing.exception.status_code, 400)
+        with self.assertRaises(main.HTTPException):
+            main.run_learning_cycle({"apply": True, "run_id": "unsafe/id"}, now_ts=100000, fixture_rows=[])
+
     def settle_selection_quality_sample(self, fixture, process_class, expression_status="passed"):
         payload = self.learning_payload(fixture, 900, 1000)
         payload["decision"] = {
@@ -3403,13 +3661,14 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "selected_expression": {"market": "over_under", "selection": "under", "line": 2.75, "price": 1.91},
         }
         frozen = main.freeze_learning_sample(payload, now_ts=900)
+        facts = self.collect_verified_learning_facts(frozen, 3, 2, 8200)
         review = self.learning_postmatch_review()
         review["match_selection_quality"] = {"status": "passed"}
         review["expression_audit"] = {"status": expression_status}
         review["price_execution_audit"] = {"status": "passed"}
         return main.settle_learning_sample(
             frozen["freeze_id"], {"status": "FT", "home_goals": 3, "away_goals": 2},
-            process_class, {"status": "clean"}, 8200, review,
+            process_class, {"status": "clean"}, 8200, review, facts["fact_hash"],
         )
 
     def test_selection_quality_cards_use_process_not_result_and_never_auto_optimize(self):

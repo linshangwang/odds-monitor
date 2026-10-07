@@ -29,7 +29,11 @@
 
 先完成赛后复盘，再创建新的赛前样本，避免未结算样本无限累积。
 
-`GET /shadow/learning/cycle-plan`生成当日只读执行计划：列出未来24小时合格候选、每日冻结余量，以及开赛至少2小时且仍在36小时窗口内的最新未结算冻结版本。该接口不会自动补写赛前分析，也不会仅凭赛果生成过程分类。
+`GET /shadow/learning/cycle-plan`生成当日只读执行计划：列出未来24小时合格候选、每日冻结余量，以及开赛至少2小时且仍在36小时窗口内的最新未结算冻结版本。
+
+`POST /shadow/learning/run`执行一次有界周期。默认只预览；`apply=true`时必须携带唯一安全`run_id`，重复运行返回原记录。执行器先处理已提交的合格赛后复盘，再为未结算样本收集赛后事实，最后为计划内未开赛赛事自动构建PIT数据包并冻结。单场失败只记录为rejected，不得污染其他场次。
+
+赛后自动采集只建立`learning_postmatch_facts`版本：单一来源保持`single_source_pending`，两个带证据定位且比分一致的独立来源才标记`settlement_eligible`。`GET /shadow/learning/review-queue`把已核实事实与原始赛前冻结并列提供给复盘任务。最终结算必须引用最新已核实`fact_hash`，提交比分必须与该版本完全一致。系统禁止仅凭赛果自动产生Process分类、理论或Champion变更。
 
 ## 四、赛前阶段
 
