@@ -128,6 +128,7 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 - v1.95 将盘口语言正式接入决策终态：Home/Away/Over/Under分别输出`Capital Pressure Proxy`、盘口响应和`Accepted/Partial/Resistance/Rejected`，真实Money%/Bet%/成交额缺失时固定为`data_missing`。Expression Optimizer只在同一赛前剧本内寻找更低阻力表达；不能自动反向。Resistance无更优表达时输出`WAIT`，组合构建器只接纳`BET`腿；赛后不会把`WAIT/PASS`的监控表达伪装成已执行投注结算。
 - v1.96 增加独立`real_money_v1`输入契约。真实Money%/Bet%/成交额必须绑定同一比赛、受控来源注册表、可定位HTTP证据、已核实方法、赛前观测时间、具体盘口档位和闭合百分比；缺失、过期、跨比赛、未注册域名或自称A级的来源一律拒绝。合格资金证据标为A级并带不可变`evidence_hash`，只替代压力证据，不替代独立盘口响应；未配置来源注册表时继续安全使用Capital Pressure Proxy。
 - v1.97 增加不可变 Learning Card 与内部过程校准。每张卡绑定赛前冻结、赛后事实和复盘哈希；`PriorityQuality`来自场次选择审计，`SelectionQuality`来自表达与价格执行审计。最终比分不复制进卡片，缺失的赛前评级不补造，同场只以最新结算冻结版本参与校准；报告不自动调权、登记理论或修改Champion。
+- v1.98 将匿名消融升级为预登记模块级消融。Hypothesis必须先锁定结构化联赛/市场范围和`MSCB/STATE_TREE/IEH/TAC/TDD/LET/LPS/OCR`中的目标模块；每个前向样本必须在开赛前精确锁定全部模块的消融概率、计算时间和证据引用。系统逐模块派生Brier增益，并自动判定`support/counterexample`，调用方自报结论不生效。
 
 真实资金包通过`/shadow/model/prematch-evaluate`或`/shadow/evaluate`请求体中的`real_money_data`提交。示例结构：
 
@@ -498,6 +499,25 @@ GET  /shadow/learning/league-dna/status
 GET  /shadow/learning/selection-quality
 GET  /shadow/learning/status
 ```
+
+模块级Shadow锁的核心字段示例：
+
+```json
+{
+  "freeze_id": "fixture:v2",
+  "champion_probabilities": {"home": 0.45, "draw": 0.25, "away": 0.30},
+  "challenger_probabilities": {"home": 0.30, "draw": 0.45, "away": 0.25},
+  "module_ablation_outputs": {
+    "MSCB": {
+      "probabilities": {"home": 0.33, "draw": 0.34, "away": 0.33},
+      "computed_at": 1791400000,
+      "output_reference": "model-run:mscb-ablation-001"
+    }
+  }
+}
+```
+
+锁定模块必须与Hypothesis预登记的`ablation_plan.required_modules`完全一致。`computed_at`必须位于赛前冻结之后、Shadow锁之前；验证结论由系统根据前向指标产生。
 
 以上请求推荐通过 Header 携带令牌，不在 URL 中传递。
 

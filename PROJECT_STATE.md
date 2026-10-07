@@ -13,9 +13,9 @@
 - 仓库：`linshangwang/odds-monitor`
 - 分支：`main`
 - 接管基线提交：`b7feddc`
-- 本地候选版本：`1.97.0`（线上为 `1.87.0`，本版本尚未部署）
-- 测试基线：359 项通过
-- GitHub发布候选：草稿PR `#1`，分支`codex/auto-learning-v1.89`；Railway仍只跟踪`main`，因此草稿PR不会触发生产部署。分支名称保留历史版本标识，PR内容以当前`1.97.0`为准。
+- 本地候选版本：`1.98.0`（线上为 `1.87.0`，本版本尚未部署）
+- 测试基线：363 项通过
+- GitHub发布候选：草稿PR `#1`，分支`codex/auto-learning-v1.89`；Railway仍只跟踪`main`，因此草稿PR不会触发生产部署。分支名称保留历史版本标识，PR内容以当前`1.98.0`为准。
 - 正式赛前时间轴：Opening、T-24h、T-12h、T-6h、T-3h、T-1h、T-30m、Closing
 - 自动学习时间轴：Opening、T-12h、T-6h、T-1h。该精简只适用于学习任务，不改写普通赛前分析时间轴。
 - 旧 T-15m 数据保留，但不得替代 T-30m。
@@ -55,6 +55,7 @@
 - 盘口语言与Expression Optimizer已进入最终决策契约：四轴分别记录Capital Pressure Proxy、盘口响应和Accepted/Partial/Resistance/Rejected，真实资金字段保持独立且缺失不补猜。阻力表达只能在同剧本内切换，不能自动反向；无更低阻力表达时进入WAIT，组合只接纳BET，WAIT/PASS赛后不按已执行投注结算。
 - A级真实资金已有独立`real_money_v1`契约和受控来源注册表：比赛、域名/类型、可定位证据、权威与方法核验、赛前时间、盘口档位、百分比闭合及成交额币种均为硬门槛。合格记录保存证据哈希并可作为压力证据；盘口响应继续由赔率时间线独立产生。未配置注册表时任何自称Money%/Bet%的输入都不会被采信。
 - PriorityQuality、SelectionQuality 与逐场 Learning Card 已形成内部校准账本：卡片不可变地绑定冻结/事实/复盘哈希，质量标签只来自过程审计，赛果隔离；同场只用最新结算版本，缺失的冻结评级不补造，样本成熟也不会自动调权或影响Champion。
+- Champion/Challenger验证已升级为模块级消融契约：Hypothesis必须预登记结构化联赛/市场和目标模块，每个样本在开赛前锁定全部模块的固定干预、概率、时间与证据引用；系统逐模块派生Brier增益并自动产生support/counterexample，调用方不能自报支持结论。晋级门禁逐项检查MSCB、State Tree及已选状态参数的独立贡献。
 
 ## 当前真实阻塞
 
@@ -67,10 +68,10 @@
 
 1. 接入一个经过授权的真实资金供应商后，将其证据域名和类型加入`REAL_MONEY_SOURCE_REGISTRY_JSON`，在此之前不得用模拟或赔率推导数据填充A级字段。
 2. 建立欧国联八场冻结样本集，保存当时版本、盘口路径、最终选择与优先级，作为不可回填的回归测试夹具。
-3. 对 MSCB、State Tree、IEH、TAC、TDD、LET、LPS 和 OCR 做 Champion 与 Challenger 消融框架。
+3. 为模块级消融接入真实Champion/Challenger计算器，使`module_ablation_outputs`由同一PIT输入自动生成，而不是由API调用方手工提交。
 4. 数据源恢复后先进行 Shadow 验收；满足新鲜度、完整公司数组、基本面链和阵容置信门槛后，才允许生成非 PASS 建议。
 5. 为MLS、巴西甲、阿根廷甲和挪威顶级联赛积累合格冻结发现样本后，按新League DNA存储登记候选并启动独立验证；在此之前不影响任何正式分析。
-6. 部署并验收本地`1.97.0`自动学习执行器、证据账本、真实资金审计、盘口语言/Expression Optimizer、过程质量校准、研究提案/前向验证队列、14:30固定周期、四节点复算链和显式用户确认门禁；Railway当前未配置`SHADOW_ACCESS_TOKEN`，在明确发布前必须先安全配置。即使误先部署，受保护学习与付费赔率接口也会保持fail-closed。
+6. 部署并验收本地`1.98.0`自动学习执行器、证据账本、真实资金审计、盘口语言/Expression Optimizer、过程质量校准、模块级消融、研究提案/前向验证队列、14:30固定周期、四节点复算链和显式用户确认门禁；Railway当前未配置`SHADOW_ACCESS_TOKEN`，在明确发布前必须先安全配置。即使误先部署，受保护学习与付费赔率接口也会保持fail-closed。
 
 ## 接管原则
 

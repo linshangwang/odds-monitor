@@ -24,7 +24,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "1.97.0"
+VERSION = "1.98.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -99,7 +99,6 @@ LEARNING_PROCESS_CLASSES = {
     "EVENT_CONTAMINATED", "DATA_INSUFFICIENT",
 }
 LEARNING_HYPOTHESIS_TYPES = {"HYPOTHESIS_ONLY", "LEAGUE_TAG_CANDIDATE"}
-LEARNING_VALIDATION_OUTCOMES = {"support", "counterexample", "inconclusive"}
 LEARNING_REVIEW_STATUSES = {"passed", "failed", "inconclusive", "data_missing", "not_applicable"}
 LEARNING_REVIEW_SECTIONS = (
     "match_selection_quality", "fundamental_chain_audit", "state_tree_coverage",
@@ -119,6 +118,16 @@ LEARNING_PROMOTION_REQUIRED_GATES = (
     "out_of_sample_shadow", "ablation", "calibration",
     "clv_or_price_quality", "process_accuracy", "risk_review",
 )
+LEARNING_ABLATION_INTERVENTIONS = {
+    "MSCB": "remove_mscb_adjustment",
+    "STATE_TREE": "remove_state_tree_layer",
+    "IEH": "neutralize_ieh_state_parameter",
+    "TAC": "neutralize_tac_state_parameter",
+    "TDD": "neutralize_tdd_state_parameter",
+    "LET": "neutralize_let_state_parameter",
+    "LPS": "neutralize_lps_state_parameter",
+    "OCR": "neutralize_ocr_state_parameter",
+}
 API_FOOTBALL_RATE_LIMIT_UNTIL = 0
 SNAPSHOT_STORE_LOCK = threading.RLock()
 
@@ -182,7 +191,7 @@ LEARNING_TOP_FLIGHT_LEAGUES: Dict[int, Dict[str, str]] = {
 }
 LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
 LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
-LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v1.97").strip() or "MODEL_RULES.md@2026-10-08-v1.97"
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v1.98").strip() or "MODEL_RULES.md@2026-10-08-v1.98"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -6473,6 +6482,49 @@ def settle_learning_sample(freeze_id: Any, result: Any, process_classification: 
         return record
 
 
+def _normalize_learning_ablation_plan(value: Any) -> Dict[str, Any]:
+    value = value if isinstance(value, dict) else {}
+    primary_module = str(value.get("primary_module") or "").strip().upper()
+    raw_modules = value.get("required_modules") if isinstance(value.get("required_modules"), list) else []
+    required_modules = list(dict.fromkeys(str(module).strip().upper() for module in raw_modules if str(module).strip()))
+    if not required_modules:
+        raise HTTPException(status_code=422, detail="ablation_plan_required_modules_required")
+    invalid = [module for module in required_modules if module not in LEARNING_ABLATION_INTERVENTIONS]
+    if invalid:
+        raise HTTPException(status_code=422, detail={"error": "unsupported_ablation_module", "modules": invalid})
+    if primary_module not in required_modules:
+        raise HTTPException(status_code=422, detail="ablation_primary_module_must_be_required")
+    raw_interventions = value.get("module_interventions") if isinstance(value.get("module_interventions"), dict) else {}
+    module_interventions = {}
+    for module in required_modules:
+        row = raw_interventions.get(module) if isinstance(raw_interventions.get(module), dict) else {}
+        expected = LEARNING_ABLATION_INTERVENTIONS[module]
+        if str(row.get("intervention") or "").strip() != expected:
+            raise HTTPException(status_code=422, detail={
+                "error": "exact_module_ablation_intervention_required",
+                "module": module, "required_intervention": expected,
+            })
+        minimum_gain = as_float(row.get("minimum_brier_gain"))
+        if minimum_gain is None or not 0 <= minimum_gain <= 1:
+            raise HTTPException(status_code=422, detail={"error": "valid_module_minimum_brier_gain_required", "module": module})
+        module_interventions[module] = {
+            "intervention": expected,
+            "minimum_brier_gain": minimum_gain,
+            "expected_direction": "challenger_brier_lower_than_module_ablated_brier",
+        }
+    minimum_champion_gain = as_float(value.get("minimum_challenger_brier_gain_over_champion"))
+    if minimum_champion_gain is None or not 0 <= minimum_champion_gain <= 1:
+        raise HTTPException(status_code=422, detail="valid_minimum_challenger_brier_gain_over_champion_required")
+    return {
+        "schema_version": "module_ablation_v1",
+        "primary_module": primary_module,
+        "required_modules": required_modules,
+        "module_interventions": module_interventions,
+        "minimum_challenger_brier_gain_over_champion": minimum_champion_gain,
+        "caller_supplied_validation_outcome_allowed": False,
+    }
+
+
 def register_learning_hypothesis(payload: Dict[str, Any]) -> Dict[str, Any]:
     payload = payload if isinstance(payload, dict) else {}
     hypothesis_type = str(payload.get("type") or "").strip()
@@ -6490,6 +6542,24 @@ def register_learning_hypothesis(payload: Dict[str, Any]) -> Dict[str, Any]:
     source_proposal_id = str(payload.get("source_proposal_id") or "").strip()
     source_proposal_hash = str(payload.get("source_proposal_hash") or "").strip()
     validation_plan = payload.get("validation_plan") if isinstance(payload.get("validation_plan"), dict) else {}
+    normalized_ablation_plan = _normalize_learning_ablation_plan(validation_plan.get("ablation_plan"))
+    structured_scope = validation_plan.get("structured_scope") if isinstance(validation_plan.get("structured_scope"), dict) else {}
+    raw_competition_ids = structured_scope.get("competition_ids") if isinstance(structured_scope.get("competition_ids"), list) else []
+    try:
+        competition_ids = sorted(set(int(value) for value in raw_competition_ids if not isinstance(value, bool)))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="structured_scope_competition_ids_invalid") from exc
+    markets = sorted(set(str(value).strip() for value in (structured_scope.get("markets") or []) if str(value).strip())) if isinstance(structured_scope.get("markets"), list) else []
+    if not competition_ids or not markets:
+        raise HTTPException(status_code=422, detail="structured_validation_scope_required")
+    invalid_markets = [market for market in markets if market not in LEAGUE_DNA_MARKETS]
+    if invalid_markets:
+        raise HTTPException(status_code=422, detail={"error": "unsupported_structured_scope_market", "markets": invalid_markets})
+    validation_plan = {
+        **validation_plan,
+        "structured_scope": {"competition_ids": competition_ids, "markets": markets},
+        "ablation_plan": normalized_ablation_plan,
+    }
     with SNAPSHOT_STORE_LOCK:
         store = load_snapshot_store()
         unknown = [freeze_id for freeze_id in discovery if not _learning_freeze_by_id(store, freeze_id)]
@@ -6578,6 +6648,7 @@ def learning_forward_validation_queue(now_ts: Optional[int] = None) -> Dict[str,
             continue
         plan = hypothesis.get("pre_registered_validation_plan") if isinstance(hypothesis.get("pre_registered_validation_plan"), dict) else {}
         structured_scope = plan.get("structured_scope") if isinstance(plan.get("structured_scope"), dict) else {}
+        ablation_plan = plan.get("ablation_plan") if isinstance(plan.get("ablation_plan"), dict) else {}
         competition_ids = set(structured_scope.get("competition_ids") or []) if isinstance(structured_scope.get("competition_ids"), list) else set()
         markets = {str(value) for value in (structured_scope.get("markets") or [])} if isinstance(structured_scope.get("markets"), list) else set()
         if not competition_ids or not markets:
@@ -6618,6 +6689,7 @@ def learning_forward_validation_queue(now_ts: Optional[int] = None) -> Dict[str,
                 "competition_id": competition_id,
                 "market": expression.get("market"),
                 "required_action": "compute_champion_challenger_and_ablation_outputs_then_lock_before_kickoff",
+                "required_ablation_modules": ablation_plan.get("required_modules") or [],
                 "automatic_shadow_lock": False,
                 "champion_effect": False,
             })
@@ -6659,7 +6731,6 @@ def lock_hypothesis_shadow_prediction(hypothesis_id: Any, payload: Dict[str, Any
         raise HTTPException(status_code=400, detail="hypothesis_id_and_freeze_id_required")
     champion_probabilities = _normalize_1x2_probabilities(payload.get("champion_probabilities"), "champion")
     challenger_probabilities = _normalize_1x2_probabilities(payload.get("challenger_probabilities"), "challenger")
-    ablation_probabilities = _normalize_1x2_probabilities(payload.get("ablation_probabilities"), "ablation")
     selected_expression = payload.get("selected_expression") if isinstance(payload.get("selected_expression"), dict) else {}
     market = str(selected_expression.get("market") or "").strip()
     selection = str(selected_expression.get("selection") or "").strip()
@@ -6680,6 +6751,15 @@ def lock_hypothesis_shadow_prediction(hypothesis_id: Any, payload: Dict[str, Any
         hypothesis = (store.get("learning_hypotheses") or {}).get(hypothesis_id)
         if not hypothesis:
             raise HTTPException(status_code=404, detail="hypothesis_not_found")
+        ablation_plan = get_nested(hypothesis, ["pre_registered_validation_plan", "ablation_plan"], {}) or {}
+        required_modules = list(ablation_plan.get("required_modules") or [])
+        submitted_ablations = payload.get("module_ablation_outputs") if isinstance(payload.get("module_ablation_outputs"), dict) else {}
+        if set(submitted_ablations) != set(required_modules):
+            raise HTTPException(status_code=422, detail={
+                "error": "exact_preregistered_module_ablation_outputs_required",
+                "required_modules": required_modules,
+                "submitted_modules": sorted(submitted_ablations),
+            })
         if freeze_id in (hypothesis.get("discovery_freeze_ids") or []):
             raise HTTPException(status_code=409, detail="discovery_sample_cannot_be_shadow_validation_sample")
         freeze = _learning_freeze_by_id(store, freeze_id)
@@ -6693,6 +6773,28 @@ def lock_hypothesis_shadow_prediction(hypothesis_id: Any, payload: Dict[str, Any
             raise HTTPException(status_code=409, detail="shadow_prediction_cannot_precede_frozen_sample")
         if int(freeze.get("captured_at") or 0) < int(hypothesis.get("registered_at") or 0):
             raise HTTPException(status_code=409, detail="validation_sample_predates_hypothesis_registration")
+        structured_scope = get_nested(hypothesis, ["pre_registered_validation_plan", "structured_scope"], {}) or {}
+        if get_nested(freeze, ["scope", "competition_id"]) not in set(structured_scope.get("competition_ids") or []):
+            raise HTTPException(status_code=409, detail="validation_fixture_outside_preregistered_competition_scope")
+        if market not in set(structured_scope.get("markets") or []):
+            raise HTTPException(status_code=409, detail="validation_market_outside_preregistered_scope")
+        module_ablations = {}
+        for module in required_modules:
+            row = submitted_ablations.get(module) if isinstance(submitted_ablations.get(module), dict) else {}
+            probabilities = _normalize_1x2_probabilities(row.get("probabilities"), f"ablation_{module.lower()}")
+            output_reference = str(row.get("output_reference") or "").strip()
+            computed_at = _parse_timestamp(row.get("computed_at"))
+            if not output_reference:
+                raise HTTPException(status_code=422, detail={"error": "module_ablation_output_reference_required", "module": module})
+            if computed_at is None or not int(freeze.get("captured_at") or 0) <= computed_at <= locked_at:
+                raise HTTPException(status_code=422, detail={"error": "module_ablation_computed_at_must_be_pit", "module": module})
+            intervention = get_nested(ablation_plan, ["module_interventions", module, "intervention"])
+            module_content = {
+                "module": module, "intervention": intervention,
+                "probabilities": probabilities, "output_reference": output_reference,
+                "computed_at": computed_at, "freeze_hash": freeze.get("content_hash"),
+            }
+            module_ablations[module] = {**module_content, "output_hash": _content_hash(module_content)}
         content = {
             "hypothesis_id": hypothesis_id,
             "hypothesis_hash": hypothesis.get("content_hash"),
@@ -6701,7 +6803,8 @@ def lock_hypothesis_shadow_prediction(hypothesis_id: Any, payload: Dict[str, Any
             "champion_decision_hash": _content_hash(freeze.get("decision") or {}),
             "champion_probabilities": champion_probabilities,
             "challenger_probabilities": challenger_probabilities,
-            "ablation_probabilities": ablation_probabilities,
+            "ablation_plan_hash": _content_hash(ablation_plan),
+            "module_ablations": module_ablations,
             "selected_expression": {
                 "market": market, "selection": selection,
                 "line": selected_expression.get("line"), "entry_decimal_price": entry_decimal_price,
@@ -6741,9 +6844,8 @@ def record_hypothesis_validation(hypothesis_id: Any, payload: Dict[str, Any]) ->
     hypothesis_id = str(hypothesis_id or "").strip()
     payload = payload if isinstance(payload, dict) else {}
     freeze_id = str(payload.get("freeze_id") or "").strip()
-    outcome = str(payload.get("outcome") or "").strip().lower()
-    if not freeze_id or outcome not in LEARNING_VALIDATION_OUTCOMES:
-        raise HTTPException(status_code=400, detail="valid_freeze_id_and_validation_outcome_required")
+    if not freeze_id:
+        raise HTTPException(status_code=400, detail="valid_freeze_id_required")
     if not str(payload.get("evidence_summary") or "").strip():
         raise HTTPException(status_code=400, detail="evidence_summary_required")
     with SNAPSHOT_STORE_LOCK:
@@ -6771,10 +6873,34 @@ def record_hypothesis_validation(hypothesis_id: Any, payload: Dict[str, Any]) ->
         final_result = postmatch.get("result") if isinstance(postmatch.get("result"), dict) else {}
         champion_brier = _brier_1x2(shadow_lock["champion_probabilities"], final_result)
         challenger_brier = _brier_1x2(shadow_lock["challenger_probabilities"], final_result)
-        ablation_brier = _brier_1x2(shadow_lock["ablation_probabilities"], final_result)
+        ablation_plan = get_nested(hypothesis, ["pre_registered_validation_plan", "ablation_plan"], {}) or {}
+        module_briers = {
+            module: _brier_1x2(row["probabilities"], final_result)
+            for module, row in (shadow_lock.get("module_ablations") or {}).items()
+        }
+        module_brier_gains = {
+            module: round(value - challenger_brier, 8) for module, value in module_briers.items()
+        }
         entry_decimal_price = float(get_nested(shadow_lock, ["selected_expression", "entry_decimal_price"]))
         clv_probability_delta = round(1.0 / closing_decimal_price - 1.0 / entry_decimal_price, 8)
         risk_delta = round(float(get_nested(shadow_lock, ["risk", "challenger_tail_risk"])) - float(get_nested(shadow_lock, ["risk", "champion_tail_risk"])), 8)
+        champion_brier_gain = round(champion_brier - challenger_brier, 8)
+        minimum_champion_gain = float(ablation_plan.get("minimum_challenger_brier_gain_over_champion") or 0.0)
+        maximum_risk_increase = as_float(get_nested(hypothesis, ["pre_registered_validation_plan", "maximum_mean_tail_risk_increase"]))
+        maximum_risk_increase = 0.0 if maximum_risk_increase is None else maximum_risk_increase
+        module_thresholds = {
+            module: float(get_nested(ablation_plan, ["module_interventions", module, "minimum_brier_gain"], 0.0) or 0.0)
+            for module in ablation_plan.get("required_modules") or []
+        }
+        metric_failures = []
+        if champion_brier_gain < minimum_champion_gain:
+            metric_failures.append("challenger_brier_gain_below_preregistered_minimum")
+        for module, threshold in module_thresholds.items():
+            if module not in module_brier_gains or module_brier_gains[module] < threshold:
+                metric_failures.append(f"{module}_ablation_gain_below_preregistered_minimum")
+        if risk_delta > maximum_risk_increase:
+            metric_failures.append("tail_risk_increase_above_preregistered_maximum")
+        outcome = "support" if not metric_failures else "counterexample"
         process_classification = str(postmatch.get("process_classification") or "")
         process_event_clean = process_classification in {
             "PROCESS_CORRECT_RESULT_WIN", "PROCESS_CORRECT_RESULT_LOSS",
@@ -6785,6 +6911,12 @@ def record_hypothesis_validation(hypothesis_id: Any, payload: Dict[str, Any]) ->
             "freeze_hash": freeze.get("content_hash"),
             "postmatch_hash": store["learning_postmatch"][freeze_id].get("postmatch_hash"),
             "outcome": outcome,
+            "outcome_derivation": {
+                "method": "preregistered_forward_metric_thresholds_v1",
+                "metric_failures": metric_failures,
+                "caller_supplied_outcome": payload.get("outcome"),
+                "caller_supplied_outcome_used": False,
+            },
             "evidence_summary": str(payload.get("evidence_summary")).strip(),
             "pit_audit": {
                 "status": "passed",
@@ -6805,7 +6937,9 @@ def record_hypothesis_validation(hypothesis_id: Any, payload: Dict[str, Any]) ->
             "derived_metrics": {
                 "champion_brier_1x2": champion_brier,
                 "challenger_brier_1x2": challenger_brier,
-                "ablation_brier_1x2": ablation_brier,
+                "challenger_brier_gain_over_champion": champion_brier_gain,
+                "module_ablation_brier_1x2": module_briers,
+                "module_ablation_brier_gain": module_brier_gains,
                 "clv_probability_delta": clv_probability_delta,
                 "champion_tail_risk": get_nested(shadow_lock, ["risk", "champion_tail_risk"]),
                 "challenger_tail_risk": get_nested(shadow_lock, ["risk", "challenger_tail_risk"]),
@@ -6869,7 +7003,19 @@ def promotion_evidence_report(hypothesis_id: Any, store_override: Optional[Dict[
     )
     champion_brier = mean("champion_brier_1x2")
     challenger_brier = mean("challenger_brier_1x2")
-    ablation_brier = mean("ablation_brier_1x2")
+    ablation_plan = plan.get("ablation_plan") if isinstance(plan.get("ablation_plan"), dict) else {}
+    required_ablation_modules = list(ablation_plan.get("required_modules") or [])
+    module_ablation_metrics = {}
+    for module in required_ablation_modules:
+        brier_values = [as_float(get_nested(row, ["module_ablation_brier_1x2", module])) for row in metrics]
+        gain_values = [as_float(get_nested(row, ["module_ablation_brier_gain", module])) for row in metrics]
+        complete = bool(evidence) and len(brier_values) == len(evidence) and all(value is not None for value in brier_values + gain_values)
+        module_ablation_metrics[module] = {
+            "sample_count": len(gain_values) if complete else 0,
+            "mean_ablated_brier": round(sum(brier_values) / len(brier_values), 8) if complete else None,
+            "mean_challenger_gain_over_ablation": round(sum(gain_values) / len(gain_values), 8) if complete else None,
+            "minimum_required_gain": as_float(get_nested(ablation_plan, ["module_interventions", module, "minimum_brier_gain"])),
+        }
     mean_clv = mean("clv_probability_delta")
     mean_risk_delta = mean("tail_risk_delta")
     process_eligible = [get_nested(row, ["derived_metrics", "process_classification"]) for row in evidence]
@@ -6882,15 +7028,26 @@ def promotion_evidence_report(hypothesis_id: Any, store_override: Optional[Dict[
     min_process_accuracy = 0.6 if min_process_accuracy is None else min_process_accuracy
     max_risk_increase = as_float(plan.get("maximum_mean_tail_risk_increase"))
     max_risk_increase = 0.0 if max_risk_increase is None else max_risk_increase
-    min_ablation_gain = as_float(plan.get("minimum_ablation_brier_gain"))
-    min_ablation_gain = 0.0 if min_ablation_gain is None else min_ablation_gain
+    module_ablation_passed = bool(required_ablation_modules) and all(
+        row["sample_count"] == len(evidence)
+        and row["mean_challenger_gain_over_ablation"] is not None
+        and row["minimum_required_gain"] is not None
+        and row["mean_challenger_gain_over_ablation"] >= row["minimum_required_gain"]
+        for row in module_ablation_metrics.values()
+    )
     sample_status = "passed" if enough and not counterexamples else ("failed" if counterexamples else "missing")
     gates = {
         "pre_registration": gate("passed" if preregistered and enough else "missing", all_hashes, registered_at=hypothesis.get("registered_at")),
         "pit_integrity": gate("passed" if pit_passed else ("failed" if enough else "missing"), all_hashes),
         "event_pollution_audit": gate("passed" if event_passed else ("failed" if enough else "missing"), all_hashes),
         "out_of_sample_shadow": gate(sample_status, all_hashes, support_count=support_count, required_support_count=required, counterexample_count=len(counterexamples)),
-        "ablation": gate("passed" if enough and challenger_brier is not None and ablation_brier is not None and ablation_brier - challenger_brier >= min_ablation_gain else ("failed" if enough else "missing"), all_hashes, challenger_brier=challenger_brier, ablation_brier=ablation_brier, minimum_gain=min_ablation_gain),
+        "ablation": gate(
+            "passed" if enough and module_ablation_passed else ("failed" if enough else "missing"),
+            all_hashes,
+            schema_version=ablation_plan.get("schema_version"),
+            required_modules=required_ablation_modules,
+            module_metrics=module_ablation_metrics,
+        ),
         "calibration": gate("passed" if enough and challenger_brier is not None and champion_brier is not None and challenger_brier <= champion_brier and challenger_brier <= max_brier else ("failed" if enough else "missing"), all_hashes, champion_brier=champion_brier, challenger_brier=challenger_brier, maximum_challenger_brier=max_brier),
         "clv_or_price_quality": gate("passed" if enough and mean_clv is not None and mean_clv >= min_clv else ("failed" if enough else "missing"), all_hashes, mean_clv=mean_clv, minimum_mean_clv=min_clv),
         "process_accuracy": gate("passed" if enough and process_accuracy is not None and process_accuracy >= min_process_accuracy else ("failed" if enough else "missing"), all_hashes, process_accuracy=process_accuracy, minimum_process_accuracy=min_process_accuracy),
@@ -6899,6 +7056,7 @@ def promotion_evidence_report(hypothesis_id: Any, store_override: Optional[Dict[
     missing_or_failed = [name for name in LEARNING_PROMOTION_REQUIRED_GATES if gates[name]["status"] != "passed"]
     report_content = {
         "hypothesis_id": hypothesis_id, "hypothesis_hash": hypothesis.get("content_hash"),
+        "ablation_plan_hash": _content_hash(ablation_plan),
         "required_samples": required, "validation_sample_count": len(evidence), "support_count": support_count,
         "counterexample_count": len(counterexamples), "gates": gates,
     }
@@ -6907,6 +7065,7 @@ def promotion_evidence_report(hypothesis_id: Any, store_override: Optional[Dict[
         "promotion_ready": not missing_or_failed,
         "incomplete_gates": missing_or_failed,
         "caller_supplied_gate_status_used": False,
+        "caller_supplied_validation_outcome_used": False,
         "result_outcome_used_as_optimization_target": False,
         "automatic_champion_change": False,
     }
@@ -7678,6 +7837,8 @@ def learning_research_proposal_candidates(minimum_matches: Optional[int] = None)
                     "pre_registration_required": True,
                     "pre_kickoff_shadow_lock_required": True,
                     "required_comparators": ["Champion", "Challenger", "Ablation"],
+                    "allowed_ablation_modules": sorted(LEARNING_ABLATION_INTERVENTIONS),
+                    "module_ablation_plan_must_be_preregistered": True,
                     "required_metrics": ["Brier", "CLV", "Process Accuracy", "Tail Risk"],
                     "unresolved_counterexample_blocks_promotion": True,
                     "explicit_user_confirmation_required_for_champion": True,
