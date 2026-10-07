@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.01.0"
+VERSION = "2.02.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -195,7 +195,7 @@ LEARNING_TOP_FLIGHT_LEAGUES: Dict[int, Dict[str, str]] = {
 }
 LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
 LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
-LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.01").strip() or "MODEL_RULES.md@2026-10-08-v2.01"
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.02").strip() or "MODEL_RULES.md@2026-10-08-v2.02"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -5719,6 +5719,28 @@ def build_learning_freeze_payload(candidate: Dict[str, Any], packet: Dict[str, A
         "missing_data_policy": "preserve_data_missing; never backfill from post-kickoff information",
     }
     scope = candidate.get("scope") if isinstance(candidate.get("scope"), dict) else {}
+    provider_identity = packet.get("provider_identity") if isinstance(packet.get("provider_identity"), dict) else {}
+    frozen_source_refs = [
+        {"source": "api_football", "fixture_id": fixture, "captured_at": generated_at},
+        {"source": str(packet.get("source") or "shadow_ai_packet"), "packet_version": str(packet.get("version") or VERSION)},
+    ]
+    canonical_provider_identity = {
+        "source": "the_odds_api",
+        "sport_key": str(provider_identity.get("sport_key") or "").strip().lower(),
+        "event_id": str(provider_identity.get("event_id") or "").strip().lower(),
+        "home_team": str(provider_identity.get("home_team") or "").strip(),
+        "away_team": str(provider_identity.get("away_team") or "").strip(),
+    }
+    if (
+        provider_identity.get("source") == "the_odds_api"
+        and all(canonical_provider_identity[key] for key in ("sport_key", "event_id", "home_team", "away_team"))
+        and provider_identity.get("source_hash") == _content_hash(canonical_provider_identity)
+    ):
+        frozen_source_refs.append({
+            **canonical_provider_identity,
+            "identity_bound_at": generated_at,
+            "identity_source_hash": provider_identity["source_hash"],
+        })
     return {
         "fixture": fixture,
         "scope": scope,
@@ -5733,15 +5755,91 @@ def build_learning_freeze_payload(candidate: Dict[str, Any], packet: Dict[str, A
         },
         "analysis": analysis,
         "decision": decision,
-        "source_refs": [
-            {"source": "api_football", "fixture_id": fixture, "captured_at": generated_at},
-            {"source": str(packet.get("source") or "shadow_ai_packet"), "packet_version": str(packet.get("version") or VERSION)},
-        ],
+        "source_refs": frozen_source_refs,
     }
 
 
-def _learning_postmatch_fact_fetch(fixture_id: int) -> Dict[str, Any]:
-    """Fetch one compact postmatch fact bundle; API-Football remains only one verification source."""
+def _the_odds_api_frozen_result_evidence(freeze: Dict[str, Any]) -> Dict[str, Any]:
+    """Corroborate a result only through a The Odds API identity frozen before kickoff."""
+    identity = next((
+        row for row in (freeze.get("source_refs") or [])
+        if isinstance(row, dict) and row.get("source") == "the_odds_api"
+    ), None)
+    if not identity:
+        return {"ok": False, "error": "frozen_the_odds_api_identity_missing"}
+    sport_key = str(identity.get("sport_key") or "").strip().lower()
+    event_id = str(identity.get("event_id") or "").strip().lower()
+    home_team = str(identity.get("home_team") or "").strip()
+    away_team = str(identity.get("away_team") or "").strip()
+    bound_at = _parse_timestamp(identity.get("identity_bound_at"))
+    identity_content = {
+        "source": "the_odds_api", "sport_key": sport_key, "event_id": event_id,
+        "home_team": home_team, "away_team": away_team,
+    }
+    if (
+        not sport_key or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789_" for char in sport_key)
+        or len(event_id) != 32 or any(char not in "0123456789abcdef" for char in event_id)
+        or not home_team or not away_team
+        or bound_at is None or bound_at >= int(freeze.get("kickoff_at") or 0)
+        or identity.get("identity_source_hash") != _content_hash(identity_content)
+    ):
+        return {"ok": False, "error": "frozen_the_odds_api_identity_invalid"}
+    response = call_the_odds_api(
+        f"/sports/{sport_key}/scores", {"daysFrom": 3, "dateFormat": "iso", "eventIds": event_id},
+    )
+    if response.get("ok") is not True:
+        return {
+            "ok": False, "error": "the_odds_api_score_request_failed",
+            "status_code": response.get("status_code"),
+        }
+    rows = response.get("data") if isinstance(response.get("data"), list) else []
+    matches = [row for row in rows if isinstance(row, dict) and str(row.get("id") or "").strip().lower() == event_id]
+    if len(matches) != 1:
+        return {"ok": False, "error": "the_odds_api_bound_event_score_missing", "status_code": response.get("status_code")}
+    event = matches[0]
+    if event.get("completed") is not True:
+        return {"ok": False, "error": "the_odds_api_bound_event_not_completed", "status_code": response.get("status_code")}
+    if str(event.get("sport_key") or "").strip().lower() != sport_key:
+        return {"ok": False, "error": "the_odds_api_bound_event_sport_mismatch", "status_code": response.get("status_code")}
+    if (
+        normalize_fixture_identity_name(event.get("home_team")) != normalize_fixture_identity_name(home_team)
+        or normalize_fixture_identity_name(event.get("away_team")) != normalize_fixture_identity_name(away_team)
+    ):
+        return {"ok": False, "error": "the_odds_api_bound_event_team_mismatch", "status_code": response.get("status_code")}
+    scores = event.get("scores") if isinstance(event.get("scores"), list) else []
+    normalized_score_rows = [
+        (normalize_fixture_identity_name(row.get("name")), row.get("score"))
+        for row in scores if isinstance(row, dict) and str(row.get("name") or "").strip()
+    ]
+    expected_score_names = {
+        normalize_fixture_identity_name(home_team), normalize_fixture_identity_name(away_team),
+    }
+    if (
+        len(normalized_score_rows) != 2
+        or len({name for name, _ in normalized_score_rows}) != 2
+        or {name for name, _ in normalized_score_rows} != expected_score_names
+    ):
+        return {"ok": False, "error": "the_odds_api_bound_event_score_incomplete", "status_code": response.get("status_code")}
+    score_by_team = dict(normalized_score_rows)
+    try:
+        home_goals = int(score_by_team[normalize_fixture_identity_name(home_team)])
+        away_goals = int(score_by_team[normalize_fixture_identity_name(away_team)])
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "error": "the_odds_api_bound_event_score_incomplete", "status_code": response.get("status_code")}
+    if min(home_goals, away_goals) < 0:
+        return {"ok": False, "error": "the_odds_api_bound_event_score_invalid", "status_code": response.get("status_code")}
+    return {
+        "ok": True, "source": "the_odds_api", "component": "result",
+        "home_goals": home_goals, "away_goals": away_goals,
+        "evidence_ref": f"https://api.the-odds-api.com/v4/sports/{sport_key}/scores?eventIds={event_id}",
+        "status_code": response.get("status_code"), "event_id": event_id,
+        "identity_source_hash": identity.get("identity_source_hash"),
+    }
+
+
+def _learning_postmatch_fact_fetch(freeze: Dict[str, Any]) -> Dict[str, Any]:
+    """Fetch API-Football facts and independently corroborate the frozen result when possible."""
+    fixture_id = int(freeze.get("fixture"))
     detail = call_api_football("/fixtures", {"id": fixture_id})
     row = response_first(detail)
     if not row:
@@ -5785,17 +5883,23 @@ def _learning_postmatch_fact_fetch(fixture_id: int) -> Dict[str, Any]:
             if isinstance(item, dict) and str(item.get("type")) in allowed_statistics
         }
         statistics.append({"team_id": get_nested(team_row, ["team", "id"]), "team": get_nested(team_row, ["team", "name"]), "statistics": values})
+    source_audit = [
+        {"source": "api_football", "component": "result", "ok": bool(detail.get("ok")), "status_code": detail.get("status_code"), "evidence_ref": f"api_football:/fixtures?id={fixture_id}", "home_goals": int(goals["home"]), "away_goals": int(goals["away"])},
+        {"source": "api_football", "component": "events", "ok": bool(events_response.get("ok")), "status_code": events_response.get("status_code"), "evidence_ref": f"api_football:/fixtures/events?fixture={fixture_id}"},
+        {"source": "api_football", "component": "statistics", "ok": bool(statistics_response.get("ok")), "status_code": statistics_response.get("status_code"), "evidence_ref": f"api_football:/fixtures/statistics?fixture={fixture_id}"},
+    ]
+    odds_result = _the_odds_api_frozen_result_evidence(freeze)
+    source_audit.append(odds_result if odds_result.get("ok") else {
+        "source": "the_odds_api", "component": "result", "ok": False,
+        "error": odds_result.get("error"), "status_code": odds_result.get("status_code"),
+    })
     return {
         "ok": True,
         "result": {"status": status, "home_goals": int(goals["home"]), "away_goals": int(goals["away"])},
         "fixture": summary,
         "events": events,
         "statistics": statistics,
-        "source_audit": [
-            {"source": "api_football", "component": "result", "ok": bool(detail.get("ok")), "status_code": detail.get("status_code"), "evidence_ref": f"api_football:/fixtures?id={fixture_id}", "home_goals": int(goals["home"]), "away_goals": int(goals["away"])},
-            {"source": "api_football", "component": "events", "ok": bool(events_response.get("ok")), "status_code": events_response.get("status_code"), "evidence_ref": f"api_football:/fixtures/events?fixture={fixture_id}"},
-            {"source": "api_football", "component": "statistics", "ok": bool(statistics_response.get("ok")), "status_code": statistics_response.get("status_code"), "evidence_ref": f"api_football:/fixtures/statistics?fixture={fixture_id}"},
-        ],
+        "source_audit": source_audit,
     }
 
 
@@ -5814,10 +5918,10 @@ def collect_learning_postmatch_facts(freeze_id: Any, now_ts: Optional[int] = Non
     raw_fixture_id = freeze.get("fixture")
     if fact_fetcher is None:
         try:
-            fixture_id = int(raw_fixture_id)
+            int(raw_fixture_id)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail="provider_fixture_id_required_for_automatic_fact_collection") from exc
-        fetched = _learning_postmatch_fact_fetch(fixture_id)
+        fetched = _learning_postmatch_fact_fetch(freeze)
     else:
         fetched = fact_fetcher(raw_fixture_id)
     if not isinstance(fetched, dict) or fetched.get("ok") is not True:
@@ -6253,6 +6357,10 @@ def complete_learning_postmatch_review(payload: Dict[str, Any], now_ts: Optional
         classification = "EVENT_CONTAMINATED"
         process_grade = "not_graded_event_contaminated"
         outcome_audit = {"status": "not_used", "reason": "event_contamination_precedes_process_grade"}
+    elif event_status == "data_missing":
+        classification = "DATA_INSUFFICIENT"
+        process_grade = "not_graded_event_pollution_unknown"
+        outcome_audit = {"status": "not_used", "reason": "event_pollution_could_not_be_verified"}
     elif any(status in {"inconclusive", "data_missing", None} for status in statuses):
         classification = "DATA_INSUFFICIENT"
         process_grade = "not_graded_incomplete_review"
@@ -6283,6 +6391,110 @@ def complete_learning_postmatch_review(payload: Dict[str, Any], now_ts: Optional
         freeze_id, facts.get("result"), classification, enriched_event_audit,
         payload.get("settled_at") or now_ts, review, fact_hash,
     )
+
+
+def complete_automatic_learning_postmatch_review(freeze_id: Any, now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Complete a deterministic evidence-contract review without using the realised score to grade process."""
+    freeze_id = str(freeze_id or "").strip()
+    now_ts = int(now_ts or time.time())
+    store = load_snapshot_store()
+    freeze = _learning_freeze_by_id(store, freeze_id)
+    facts = max(
+        ((store.get("learning_postmatch_facts") or {}).get(freeze_id) or []),
+        key=lambda row: int(row.get("version_number") or 0), default=None,
+    )
+    draft = max(
+        ((store.get("learning_postmatch_drafts") or {}).get(freeze_id) or []),
+        key=lambda row: int(row.get("version_number") or 0), default=None,
+    )
+    if not freeze or not facts or get_nested(facts, ["verification", "settlement_eligible"]) is not True:
+        raise HTTPException(status_code=409, detail="latest_independently_verified_facts_required")
+    if not draft or draft.get("fact_hash") != facts.get("fact_hash"):
+        raise HTTPException(status_code=409, detail="latest_matching_review_draft_hash_required")
+    freeze_ref = f"freeze:{freeze.get('content_hash')}"
+    fact_ref = f"fact:{facts.get('fact_hash')}"
+    draft_ref = f"draft:{draft.get('draft_hash')}"
+    frozen_decision = freeze.get("decision") if isinstance(freeze.get("decision"), dict) else {}
+    decision_contract = audit_decision_output(frozen_decision)
+    is_pass = str(frozen_decision.get("decision") or "").upper() == "PASS"
+    if is_pass and bool(frozen_decision.get("pass_reasons")):
+        match_status = "passed"
+        match_reason = "The frozen safe PASS has explicit reasons and is auditable without consulting the final score."
+    elif decision_contract.get("decision_eligible") is True:
+        match_status = "inconclusive"
+        match_reason = "The actionable decision contract is complete, but contract completeness alone cannot prove match-selection quality."
+    else:
+        match_status = "failed"
+        match_reason = "The frozen actionable decision did not satisfy the prematch decision contract."
+    event_evidence = draft.get("event_evidence") if isinstance(draft.get("event_evidence"), dict) else {}
+    event_verified = event_evidence.get("event_verification") == "verified"
+    populated_states = get_nested(draft, ["review", "state_tree_coverage", "populated_frozen_states"], []) or []
+    if not populated_states:
+        state_status, state_reason = "not_applicable", "No frozen state prediction was available, so state coverage is not graded."
+    elif event_verified:
+        state_status, state_reason = "inconclusive", "Frozen state predictions and independently verified events are present, but no deterministic state-path comparison proves coverage automatically."
+    else:
+        state_status, state_reason = "data_missing", "Frozen state predictions exist but the event sequence lacks independent verification."
+    review = copy.deepcopy(draft.get("review") if isinstance(draft.get("review"), dict) else {})
+    section_overrides = {
+        "match_selection_quality": {
+            "status": match_status,
+            "reason": match_reason,
+            "evidence_refs": [freeze_ref] if match_status in {"passed", "failed"} else [],
+        },
+        "state_tree_coverage": {
+            "status": state_status, "reason": state_reason,
+            "evidence_refs": [freeze_ref, fact_ref] if state_status in {"passed", "failed"} else [],
+        },
+        "price_execution_audit": {
+            "status": "not_applicable",
+            "reason": "Verified closing-price evidence is not part of the result fact packet and is not inferred.",
+            "evidence_refs": [],
+        },
+    }
+    for section in LEARNING_REVIEW_SECTIONS:
+        if section in section_overrides:
+            review[section] = section_overrides[section]
+            continue
+        row = review.get(section) if isinstance(review.get(section), dict) else {}
+        status = str(row.get("status") or "data_missing").lower()
+        reason = str(row.get("reason") or "Frozen evidence was insufficient for this process section.")
+        review[section] = {
+            **row, "status": status, "reason": reason,
+            "evidence_refs": [freeze_ref] if status in {"passed", "failed"} else [],
+        }
+    review.update({
+        "review_mode": "automatic_evidence_review",
+        "outcome_not_used_for_process_grade": True,
+        "process_reasoning": "The automatic process grade uses only the immutable prematch contract and hash-bound event evidence; the verified final score is consulted afterward solely to settle the frozen selection.",
+        "learning_disposition": {
+            "result_backfit_used": False, "champion_change_requested": False,
+            "new_theory_status": "none", "existing_rule_implementation_gap": False,
+        },
+    })
+    pollution_flags = list(event_evidence.get("pollution_flags") or [])
+    if not event_verified:
+        event_status = "data_missing"
+    elif pollution_flags:
+        event_status = "contaminated"
+    else:
+        event_status = "clean"
+    event_audit = {
+        "status": event_status,
+        "evidence_refs": [fact_ref, draft_ref] if event_status != "data_missing" else [],
+        "pollution_flags": pollution_flags,
+        "pollution_reasoning": (
+            "Independently verified event evidence contains a listed material incident."
+            if event_status == "contaminated"
+            else "Independently verified event evidence contains no listed pollution incident."
+            if event_status == "clean"
+            else "Event pollution remains unknown because the event sequence lacks two-source verification."
+        ),
+    }
+    return complete_learning_postmatch_review({
+        "freeze_id": freeze_id, "draft_hash": draft.get("draft_hash"),
+        "review": review, "event_audit": event_audit, "settled_at": now_ts,
+    }, now_ts=now_ts)
 
 
 def learning_review_queue() -> Dict[str, Any]:
@@ -6356,6 +6568,9 @@ def run_learning_cycle(
     auto_build_review_drafts = payload.get("auto_build_postmatch_review_drafts", True)
     if not isinstance(auto_build_review_drafts, bool):
         raise HTTPException(status_code=400, detail="auto_build_postmatch_review_drafts_must_be_boolean")
+    auto_complete_reviews = payload.get("auto_complete_postmatch_reviews", True)
+    if not isinstance(auto_complete_reviews, bool):
+        raise HTTPException(status_code=400, detail="auto_complete_postmatch_reviews_must_be_boolean")
     auto_refresh_research_proposals = payload.get("auto_refresh_research_proposals", True)
     if not isinstance(auto_refresh_research_proposals, bool):
         raise HTTPException(status_code=400, detail="auto_refresh_research_proposals_must_be_boolean")
@@ -6418,11 +6633,12 @@ def run_learning_cycle(
             if versions and supplied_facts is None:
                 latest = max(versions, key=lambda row: int(row.get("version_number") or 0))
                 verified = get_nested(latest, ["verification", "settlement_eligible"]) is True
-                fact_results.append({
-                    "freeze_id": freeze_id, "action": "facts_verified_awaiting_review" if verified else "awaiting_independent_verification",
-                    "verification": latest.get("verification"), "fact_hash": latest.get("fact_hash"),
-                })
-                continue
+                if verified or postmatch_fact_fetcher is not None:
+                    fact_results.append({
+                        "freeze_id": freeze_id, "action": "facts_verified_awaiting_review" if verified else "awaiting_independent_verification",
+                        "verification": latest.get("verification"), "fact_hash": latest.get("fact_hash"),
+                    })
+                    continue
             if not apply_changes:
                 fact_results.append({"freeze_id": freeze_id, "action": "would_collect_facts", "supplied_fact_packet": supplied_facts is not None})
                 continue
@@ -6461,9 +6677,12 @@ def run_learning_cycle(
             except HTTPException as exc:
                 draft_results.append({"freeze_id": freeze_id, "action": "rejected", "status_code": exc.status_code, "reason": exc.detail})
     review_completion_results = []
+    explicit_review_freeze_ids = set()
     for row in review_completion_packets:
         row = row if isinstance(row, dict) else {}
         freeze_id = str(row.get("freeze_id") or "").strip()
+        if freeze_id:
+            explicit_review_freeze_ids.add(freeze_id)
         if freeze_id not in due_ids:
             review_completion_results.append({"freeze_id": freeze_id or None, "action": "skipped", "reason": "freeze_not_due_in_current_cycle"})
             continue
@@ -6483,6 +6702,46 @@ def run_learning_cycle(
                 "freeze_id": freeze_id, "action": "rejected",
                 "status_code": exc.status_code, "reason": exc.detail,
             })
+    if auto_complete_reviews:
+        current_store = load_snapshot_store()
+        current_postmatches = current_store.get("learning_postmatch") or {}
+        for freeze_id in sorted(due_ids - explicit_review_freeze_ids):
+            if freeze_id in current_postmatches:
+                continue
+            facts = max(
+                ((current_store.get("learning_postmatch_facts") or {}).get(freeze_id) or []),
+                key=lambda row: int(row.get("version_number") or 0), default=None,
+            )
+            draft = max(
+                ((current_store.get("learning_postmatch_drafts") or {}).get(freeze_id) or []),
+                key=lambda row: int(row.get("version_number") or 0), default=None,
+            )
+            if (
+                not facts or get_nested(facts, ["verification", "settlement_eligible"]) is not True
+                or not draft or draft.get("fact_hash") != facts.get("fact_hash")
+            ):
+                continue
+            if not apply_changes:
+                review_completion_results.append({
+                    "freeze_id": freeze_id, "action": "would_complete_automatic_evidence_review",
+                    "draft_hash": draft.get("draft_hash"), "fact_hash": facts.get("fact_hash"),
+                })
+                continue
+            try:
+                completed = complete_automatic_learning_postmatch_review(freeze_id, now_ts=now_ts)
+                review_completion_results.append({
+                    "freeze_id": freeze_id, "action": completed.get("action"),
+                    "postmatch_hash": completed.get("postmatch_hash"),
+                    "process_classification": completed.get("process_classification"),
+                    "review_mode": "automatic_evidence_review",
+                    "caller_supplied_process_classification_used": False,
+                })
+            except HTTPException as exc:
+                review_completion_results.append({
+                    "freeze_id": freeze_id, "action": "rejected",
+                    "status_code": exc.status_code, "reason": exc.detail,
+                    "review_mode": "automatic_evidence_review",
+                })
     quality_card_results = []
     if auto_refresh_quality_cards:
         if apply_changes:
@@ -9569,6 +9828,20 @@ def shadow_release_acceptance(token: Optional[str] = None, authorization: Option
 def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
     """Build one AI-ready prematch packet from persisted market history + one current fundamentals fetch."""
     data = collect_prematch_data(fixture, include_raw=False)
+    external_metadata = (load_snapshot_store().get("external_prematch") or {}).get(str(fixture)) or {}
+    external_match = external_metadata.get("match") if isinstance(external_metadata.get("match"), dict) else {}
+    external_provider_ids = external_metadata.get("provider_fixture_ids") if isinstance(external_metadata.get("provider_fixture_ids"), dict) else {}
+    provider_identity = None
+    if external_metadata.get("source") == "the_odds_api" and external_provider_ids.get("the_odds_api"):
+        provider_identity_content = {
+            "source": "the_odds_api",
+            "sport_key": str(external_match.get("the_odds_api_sport_key") or "").strip().lower(),
+            "event_id": str(external_provider_ids.get("the_odds_api") or "").strip().lower(),
+            "home_team": str(external_match.get("home_team_name") or "").strip(),
+            "away_team": str(external_match.get("away_team_name") or "").strip(),
+        }
+        if all(str(provider_identity_content.get(key) or "").strip() for key in ("sport_key", "event_id", "home_team", "away_team")):
+            provider_identity = {**provider_identity_content, "source_hash": _content_hash(provider_identity_content)}
     history = get_fixture_snapshots(fixture)
     complete_timeline = complete_prematch_timeline(history)
     by_stage = {row.get("stage"): row for row in complete_timeline}
@@ -9652,6 +9925,7 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
         "version": VERSION,
         "generated_at": generated_at,
         "fixture": data.get("fixture"),
+        "provider_identity": provider_identity,
         "data_quality": data.get("data_quality"),
         "coverage": data.get("coverage"),
         "fundamentals": {
