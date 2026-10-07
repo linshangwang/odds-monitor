@@ -3367,13 +3367,45 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         )
         return frozen, settled
 
-    def settle_hypothesis_validation_fixture(self, hypothesis_id, fixture, captured_at, kickoff_at):
+    def learning_ablation_plan(self, modules=("MSCB",)):
+        return {
+            "primary_module": modules[0],
+            "required_modules": list(modules),
+            "module_interventions": {
+                module: {
+                    "intervention": main.LEARNING_ABLATION_INTERVENTIONS[module],
+                    "minimum_brier_gain": 0.0,
+                }
+                for module in modules
+            },
+            "minimum_challenger_brier_gain_over_champion": 0.0,
+        }
+
+    def learning_validation_plan(self, minimum_samples=2, modules=("MSCB",), markets=("1x2",)):
+        return {
+            "minimum_samples": minimum_samples,
+            "structured_scope": {"competition_ids": [39], "markets": list(markets)},
+            "ablation_plan": self.learning_ablation_plan(modules),
+        }
+
+    def module_ablation_outputs(self, computed_at, modules=("MSCB",), probabilities=None):
+        probabilities = probabilities or {"home": 0.33, "draw": 0.34, "away": 0.33}
+        return {
+            module: {
+                "probabilities": probabilities,
+                "output_reference": f"test:ablation:{module}:{computed_at}",
+                "computed_at": computed_at,
+            }
+            for module in modules
+        }
+
+    def settle_hypothesis_validation_fixture(self, hypothesis_id, fixture, captured_at, kickoff_at, modules=("MSCB",)):
         frozen = main.freeze_learning_sample(self.learning_payload(fixture, captured_at, kickoff_at), now_ts=captured_at)
         shadow_lock = main.lock_hypothesis_shadow_prediction(hypothesis_id, {
             "freeze_id": frozen["freeze_id"],
             "champion_probabilities": {"home": 0.45, "draw": 0.25, "away": 0.30},
             "challenger_probabilities": {"home": 0.30, "draw": 0.45, "away": 0.25},
-            "ablation_probabilities": {"home": 0.33, "draw": 0.34, "away": 0.33},
+            "module_ablation_outputs": self.module_ablation_outputs(captured_at + 5, modules=modules),
             "selected_expression": {"market": "1x2", "selection": "draw", "entry_decimal_price": 3.0, "entry_price_evidence_ref": f"test:entry:{fixture}"},
             "risk": {"champion_tail_risk": 0.10, "challenger_tail_risk": 0.10},
         }, now_ts=captured_at + 10)
@@ -3573,7 +3605,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
                 "definition": "A candidate relationship", "applicable_scope": "men tier-one leagues",
                 "expected_direction": "positive", "failure_conditions": "effect disappears",
                 "falsification_criteria": "independent counterexample", "discovery_freeze_ids": [discovery["freeze_id"]],
-                "validation_plan": {"minimum_samples": 30},
+                "validation_plan": self.learning_validation_plan(minimum_samples=30),
             })
         self.assertFalse(hypothesis["champion_effect"])
         with self.assertRaises(main.HTTPException) as reuse:
@@ -3597,7 +3629,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
                 "definition": "A registered league prior", "applicable_scope": "one league-season-phase",
                 "expected_direction": "positive", "failure_conditions": "unstable out of sample",
                 "falsification_criteria": "any unresolved counterexample", "discovery_freeze_ids": [discovery["freeze_id"]],
-                "validation_plan": {"minimum_samples": 2},
+                "validation_plan": self.learning_validation_plan(),
             })
         for index in range(2):
             self.settle_hypothesis_validation_fixture("hyp-ready", f"validation-{index}", 8400 + index, 9000 + index)
@@ -3624,14 +3656,14 @@ class ShadowV4UpgradeTests(unittest.TestCase):
                 "definition": "Forward locked challenger output", "applicable_scope": "men top flights",
                 "expected_direction": "lower brier", "failure_conditions": "no OOS improvement",
                 "falsification_criteria": "challenger underperforms", "discovery_freeze_ids": [discovery["freeze_id"]],
-                "validation_plan": {"minimum_samples": 2},
+                "validation_plan": self.learning_validation_plan(),
             })
         frozen = main.freeze_learning_sample(self.learning_payload("shadow-validation", 8400, 9000), now_ts=8400)
         lock_payload = {
             "freeze_id": frozen["freeze_id"],
             "champion_probabilities": {"home": 0.45, "draw": 0.25, "away": 0.30},
             "challenger_probabilities": {"home": 0.30, "draw": 0.45, "away": 0.25},
-            "ablation_probabilities": {"home": 0.33, "draw": 0.34, "away": 0.33},
+            "module_ablation_outputs": self.module_ablation_outputs(8405),
             "selected_expression": {"market": "1x2", "selection": "draw", "entry_decimal_price": 3.0, "entry_price_evidence_ref": "test:entry:shadow-validation"},
             "risk": {"champion_tail_risk": 0.10, "challenger_tail_risk": 0.10},
         }
@@ -3654,7 +3686,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
                 "definition": "Must lock before validation", "applicable_scope": "men top flights",
                 "expected_direction": "positive", "failure_conditions": "not locked",
                 "falsification_criteria": "missing lock", "discovery_freeze_ids": [discovery["freeze_id"]],
-                "validation_plan": {"minimum_samples": 2},
+                "validation_plan": self.learning_validation_plan(),
             })
         frozen, _ = self.settle_learning_fixture("no-lock-validation", 8400, 9000)
         with self.assertRaises(main.HTTPException) as rejected:
@@ -3663,6 +3695,158 @@ class ShadowV4UpgradeTests(unittest.TestCase):
                 "closing_decimal_price": 2.8, "closing_price_evidence_ref": "test:closing",
             })
         self.assertEqual(rejected.exception.detail, "pre_kickoff_shadow_lock_required")
+
+    def test_hypothesis_requires_exact_preregistered_module_ablation_plan(self):
+        discovery, _ = self.settle_learning_fixture("ablation-plan-discovery", 900, 1000)
+        base = {
+            "hypothesis_id": "ablation-plan-hyp", "type": "HYPOTHESIS_ONLY",
+            "title": "Module ablation required", "definition": "Test one isolated module change.",
+            "applicable_scope": "men top flights", "expected_direction": "lower forward Brier",
+            "failure_conditions": "no isolated gain", "falsification_criteria": "module removal does not degrade output",
+            "discovery_freeze_ids": [discovery["freeze_id"]],
+        }
+        with self.assertRaises(main.HTTPException) as missing:
+            main.register_learning_hypothesis({
+                **base,
+                "validation_plan": {
+                    "minimum_samples": 2,
+                    "structured_scope": {"competition_ids": [39], "markets": ["1x2"]},
+                },
+            })
+        self.assertEqual(missing.exception.detail, "ablation_plan_required_modules_required")
+
+        invalid_plan = self.learning_ablation_plan()
+        invalid_plan["required_modules"] = ["UNKNOWN"]
+        invalid_plan["primary_module"] = "UNKNOWN"
+        with self.assertRaises(main.HTTPException) as unsupported:
+            main.register_learning_hypothesis({
+                **base,
+                "validation_plan": {
+                    "minimum_samples": 2,
+                    "structured_scope": {"competition_ids": [39], "markets": ["1x2"]},
+                    "ablation_plan": invalid_plan,
+                },
+            })
+        self.assertEqual(unsupported.exception.detail["error"], "unsupported_ablation_module")
+
+        invalid_scope = self.learning_validation_plan()
+        invalid_scope["structured_scope"]["markets"] = ["invented_market"]
+        with self.assertRaises(main.HTTPException) as unsupported_market:
+            main.register_learning_hypothesis({**base, "validation_plan": invalid_scope})
+        self.assertEqual(unsupported_market.exception.detail["error"], "unsupported_structured_scope_market")
+
+    def test_shadow_lock_requires_exact_modules_and_pit_ablation_timestamp(self):
+        discovery, _ = self.settle_learning_fixture("exact-ablation-discovery", 900, 1000)
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "exact-ablation-hyp", "type": "HYPOTHESIS_ONLY",
+                "title": "Exact module lock", "definition": "Lock MSCB and State Tree removals.",
+                "applicable_scope": "men top flights", "expected_direction": "lower forward Brier",
+                "failure_conditions": "either module has no gain", "falsification_criteria": "any module counterexample",
+                "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": self.learning_validation_plan(modules=("MSCB", "STATE_TREE")),
+            })
+        frozen = main.freeze_learning_sample(self.learning_payload("exact-ablation-validation", 8400, 9000), now_ts=8400)
+        base_lock = {
+            "freeze_id": frozen["freeze_id"],
+            "champion_probabilities": {"home": 0.45, "draw": 0.25, "away": 0.30},
+            "challenger_probabilities": {"home": 0.30, "draw": 0.45, "away": 0.25},
+            "selected_expression": {"market": "1x2", "selection": "draw", "entry_decimal_price": 3.0, "entry_price_evidence_ref": "test:entry:exact"},
+            "risk": {"champion_tail_risk": 0.10, "challenger_tail_risk": 0.10},
+        }
+        with self.assertRaises(main.HTTPException) as wrong_market:
+            main.lock_hypothesis_shadow_prediction("exact-ablation-hyp", {
+                **base_lock,
+                "selected_expression": {
+                    **base_lock["selected_expression"], "market": "over_under",
+                },
+                "module_ablation_outputs": self.module_ablation_outputs(8405, modules=("MSCB", "STATE_TREE")),
+            }, now_ts=8410)
+        self.assertEqual(wrong_market.exception.detail, "validation_market_outside_preregistered_scope")
+
+        with self.assertRaises(main.HTTPException) as partial:
+            main.lock_hypothesis_shadow_prediction("exact-ablation-hyp", {
+                **base_lock, "module_ablation_outputs": self.module_ablation_outputs(8405),
+            }, now_ts=8410)
+        self.assertEqual(partial.exception.detail["error"], "exact_preregistered_module_ablation_outputs_required")
+
+        with self.assertRaises(main.HTTPException) as post_lock_time:
+            main.lock_hypothesis_shadow_prediction("exact-ablation-hyp", {
+                **base_lock,
+                "module_ablation_outputs": self.module_ablation_outputs(8420, modules=("MSCB", "STATE_TREE")),
+            }, now_ts=8410)
+        self.assertEqual(post_lock_time.exception.detail["error"], "module_ablation_computed_at_must_be_pit")
+
+        locked = main.lock_hypothesis_shadow_prediction("exact-ablation-hyp", {
+            **base_lock,
+            "module_ablation_outputs": self.module_ablation_outputs(8405, modules=("MSCB", "STATE_TREE")),
+        }, now_ts=8410)
+        self.assertEqual(set(locked["module_ablations"]), {"MSCB", "STATE_TREE"})
+        self.assertTrue(all(row["freeze_hash"] == frozen["content_hash"] for row in locked["module_ablations"].values()))
+
+    def test_validation_outcome_is_metric_derived_and_caller_support_is_ignored(self):
+        discovery, _ = self.settle_learning_fixture("derived-outcome-discovery", 900, 1000)
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "derived-outcome-hyp", "type": "HYPOTHESIS_ONLY",
+                "title": "Derived validation outcome", "definition": "Caller cannot self-attest support.",
+                "applicable_scope": "men top flights", "expected_direction": "lower forward Brier",
+                "failure_conditions": "challenger is worse", "falsification_criteria": "negative locked metric gain",
+                "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": self.learning_validation_plan(),
+            })
+        frozen = main.freeze_learning_sample(self.learning_payload("derived-outcome-validation", 8400, 9000), now_ts=8400)
+        lock = main.lock_hypothesis_shadow_prediction("derived-outcome-hyp", {
+            "freeze_id": frozen["freeze_id"],
+            "champion_probabilities": {"home": 0.25, "draw": 0.50, "away": 0.25},
+            "challenger_probabilities": {"home": 0.45, "draw": 0.10, "away": 0.45},
+            "module_ablation_outputs": self.module_ablation_outputs(8405),
+            "selected_expression": {"market": "1x2", "selection": "draw", "entry_decimal_price": 3.0, "entry_price_evidence_ref": "test:entry:derived"},
+            "risk": {"champion_tail_risk": 0.10, "challenger_tail_risk": 0.10},
+        }, now_ts=8410)
+        facts = self.collect_verified_learning_facts(frozen, 1, 1, 16200)
+        main.settle_learning_sample(
+            frozen["freeze_id"], {"status": "FT", "home_goals": 1, "away_goals": 1},
+            "PROCESS_CORRECT_RESULT_LOSS", {"status": "clean"}, 16200,
+            self.learning_postmatch_review(), facts["fact_hash"],
+        )
+        evidence = main.record_hypothesis_validation("derived-outcome-hyp", {
+            "freeze_id": frozen["freeze_id"], "outcome": "support",
+            "evidence_summary": "Caller attempts to claim support despite worse locked metrics.",
+            "shadow_lock_hash": lock["lock_hash"], "closing_decimal_price": 2.8,
+            "closing_price_evidence_ref": "test:closing:derived",
+        })
+        self.assertEqual(evidence["outcome"], "counterexample")
+        self.assertEqual(evidence["outcome_derivation"]["caller_supplied_outcome"], "support")
+        self.assertFalse(evidence["outcome_derivation"]["caller_supplied_outcome_used"])
+        report = main.promotion_evidence_report("derived-outcome-hyp")
+        self.assertEqual(report["support_count"], 0)
+        self.assertEqual(report["counterexample_count"], 1)
+        self.assertFalse(report["caller_supplied_validation_outcome_used"])
+
+    def test_multimodule_ablation_gate_reports_each_preregistered_module(self):
+        discovery, _ = self.settle_learning_fixture("multimodule-discovery", 900, 1000)
+        modules = ("MSCB", "STATE_TREE")
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "multimodule-hyp", "type": "HYPOTHESIS_ONLY",
+                "title": "Two-module ablation", "definition": "Validate two isolated module contributions.",
+                "applicable_scope": "men top flights", "expected_direction": "positive isolated gains",
+                "failure_conditions": "either module fails", "falsification_criteria": "any forward module counterexample",
+                "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": self.learning_validation_plan(modules=modules),
+            })
+        for index in range(2):
+            self.settle_hypothesis_validation_fixture(
+                "multimodule-hyp", f"multimodule-validation-{index}", 8400 + index, 9000 + index, modules=modules,
+            )
+        with patch.object(main, "LEARNING_MIN_VALIDATION_SAMPLES", 2):
+            report = main.promotion_evidence_report("multimodule-hyp")
+        gate = report["gates"]["ablation"]
+        self.assertEqual(gate["status"], "passed")
+        self.assertEqual(set(gate["required_modules"]), set(modules))
+        self.assertEqual(set(gate["module_metrics"]), set(modules))
+        self.assertTrue(all(row["sample_count"] == 2 for row in gate["module_metrics"].values()))
 
     def register_league_dna_fixture(self, hypothesis_id="league-dna-hyp", tag_id="eng-goal-environment"):
         discovery, _ = self.settle_learning_fixture(f"{tag_id}-discovery", 900, 1000)
@@ -3675,7 +3859,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
                 "expected_direction": "positive", "failure_conditions": "effect decays out of sample",
                 "falsification_criteria": "unresolved independent counterexample",
                 "discovery_freeze_ids": [discovery["freeze_id"]],
-                "validation_plan": {"minimum_samples": 2},
+                "validation_plan": self.learning_validation_plan(),
             })
         candidate = main.register_league_dna_candidate({
             "tag_id": tag_id, "hypothesis_id": hypothesis_id,
@@ -4697,6 +4881,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "validation_plan": {
                 "minimum_samples": main.LEARNING_MIN_VALIDATION_SAMPLES,
                 "structured_scope": {"competition_ids": [39], "markets": ["over_under"]},
+                "ablation_plan": self.learning_ablation_plan(),
             },
         }
         stale = {**base, "source_proposal_hash": "stale"}
@@ -4732,6 +4917,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
                 "validation_plan": {
                     "minimum_samples": main.LEARNING_MIN_VALIDATION_SAMPLES,
                     "structured_scope": {"competition_ids": [39], "markets": ["over_under"]},
+                    "ablation_plan": self.learning_ablation_plan(),
                 },
             })
 
@@ -4750,7 +4936,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "freeze_id": frozen["freeze_id"],
             "champion_probabilities": {"home": 0.45, "draw": 0.25, "away": 0.30},
             "challenger_probabilities": {"home": 0.30, "draw": 0.45, "away": 0.25},
-            "ablation_probabilities": {"home": 0.33, "draw": 0.34, "away": 0.33},
+            "module_ablation_outputs": self.module_ablation_outputs(8650),
             "selected_expression": {"market": "over_under", "selection": "under", "entry_decimal_price": 1.91, "entry_price_evidence_ref": "test:entry:forward"},
             "risk": {"champion_tail_risk": 0.10, "challenger_tail_risk": 0.10},
         }
@@ -4765,7 +4951,10 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         later = main.freeze_learning_sample(later_payload, now_ts=8800)
         with self.assertRaises(main.HTTPException) as duplicate_fixture:
             main.lock_hypothesis_shadow_prediction(
-                "forward-hyp", {**lock_payload, "freeze_id": later["freeze_id"]}, now_ts=8810,
+                "forward-hyp", {
+                    **lock_payload, "freeze_id": later["freeze_id"],
+                    "module_ablation_outputs": self.module_ablation_outputs(8805),
+                }, now_ts=8810,
             )
         self.assertEqual(duplicate_fixture.exception.detail, "validation_fixture_already_locked_for_hypothesis")
 
