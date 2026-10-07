@@ -15,6 +15,7 @@
 - 接管基线提交：`b7feddc`
 - 本地候选版本：`1.89.0`（线上为 `1.87.0`，本版本尚未部署）
 - 测试基线：318 项通过
+- GitHub发布候选：草稿PR `#1`，分支`codex/auto-learning-v1.89`；Railway仍只跟踪`main`，因此草稿PR不会触发生产部署。
 - 正式赛前时间轴：Opening、T-24h、T-12h、T-6h、T-3h、T-1h、T-30m、Closing
 - 旧 T-15m 数据保留，但不得替代 T-30m。
 
