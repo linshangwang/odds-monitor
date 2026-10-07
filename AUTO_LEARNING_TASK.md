@@ -37,7 +37,7 @@
 
 学习池不限制合格比赛数量，也暂不设置完整历史赔率样本额度上限。幂等、节点去重、时间审计和来源审计仍然生效，防止重复请求或伪造节点。
 
-赛后自动采集先建立`learning_postmatch_facts`版本：单一来源保持`single_source_pending`，两个带证据定位且比分一致的独立来源才标记`settlement_eligible`。随后生成不可变`learning_postmatch_drafts`证据草稿，绑定`freeze_hash`和`fact_hash`，整理实际状态路径、事件污染、冻结流程完整度和待复核项。草稿本身固定为`DATA_INSUFFICIENT`建议，不直接给出过程正误，不自动登记理论或修改Champion。`GET /shadow/learning/review-queue`并列提供冻结、事实和对应草稿；`POST /shadow/learning/review-draft`可幂等重建最新事实版本的草稿。
+赛后自动采集先建立`learning_postmatch_facts`版本：单一来源保持`single_source_pending`，两个带证据定位且比分一致的独立来源才标记`settlement_eligible`。独立性同时检查来源标识、证据定位和HTTP域名；相同证据链接或同一域名的不同别名只能计为一个来源。事件证据使用同一独立性规则。随后生成不可变`learning_postmatch_drafts`证据草稿，绑定`freeze_hash`和`fact_hash`，整理实际状态路径、事件污染、冻结流程完整度和待复核项。草稿本身固定为`DATA_INSUFFICIENT`建议，不直接给出过程正误，不自动登记理论或修改Champion。`GET /shadow/learning/review-queue`并列提供冻结、事实和对应草稿；`POST /shadow/learning/review-draft`可幂等重建最新事实版本的草稿。
 
 自动任务可以通过`POST /shadow/learning/complete-review`完成证据驱动的结构化复盘，但接口不接受调用方Process分类。六个复盘对象中任何`passed/failed`判断都必须包含绑定冻结或事实哈希的证据和完整理由，并明确`outcome_not_used_for_process_grade=true`。系统先从六项审计派生Process正确/错误，之后才独立结算冻结选择的win/loss；最终输赢永远不能反向改变Process等级。事件污染优先，证据不完整、事件路径未独立核实、盘口无法无歧义结算或走盘时统一进入`DATA_INSUFFICIENT`。
 

@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -4974,6 +4975,8 @@ def collect_learning_postmatch_facts(freeze_id: Any, now_ts: Optional[int] = Non
     if str(result.get("status") or "").upper() not in {"FT", "AET", "PEN"} or min(home_goals, away_goals) < 0:
         raise HTTPException(status_code=422, detail="postmatch_fact_result_not_final")
     verified_result_sources = []
+    verified_result_authorities = []
+    verified_evidence_refs = set()
     for row in fetched.get("source_audit") or []:
         if not isinstance(row, dict) or row.get("ok") is not True or str(row.get("component") or "").strip().lower() != "result":
             continue
@@ -4984,8 +4987,16 @@ def collect_learning_postmatch_facts(freeze_id: Any, now_ts: Optional[int] = Non
         except (TypeError, ValueError):
             continue
         if source and evidence_ref and source_home == home_goals and source_away == away_goals:
+            parsed = urlparse(evidence_ref)
+            authority = str(parsed.hostname or source).strip().casefold()
+            normalized_ref = evidence_ref.strip().casefold()
+            if normalized_ref in verified_evidence_refs:
+                continue
+            verified_evidence_refs.add(normalized_ref)
             verified_result_sources.append(source)
+            verified_result_authorities.append(authority)
     source_names = set(verified_result_sources)
+    independent_authorities = set(verified_result_authorities)
     immutable_content = {
         "freeze_id": freeze_id,
         "fixture": freeze.get("fixture"),
@@ -4995,9 +5006,12 @@ def collect_learning_postmatch_facts(freeze_id: Any, now_ts: Optional[int] = Non
         "statistics": fetched.get("statistics") if isinstance(fetched.get("statistics"), list) else [],
         "source_audit": fetched.get("source_audit") if isinstance(fetched.get("source_audit"), list) else [],
         "verification": {
-            "independent_source_count": len(source_names),
-            "status": "verified" if len(source_names) >= 2 else "single_source_pending",
-            "settlement_eligible": len(source_names) >= 2,
+            "independent_source_count": len(independent_authorities),
+            "verified_source_names": sorted(source_names),
+            "verified_source_authorities": sorted(independent_authorities),
+            "unique_evidence_ref_count": len(verified_evidence_refs),
+            "status": "verified" if len(independent_authorities) >= 2 else "single_source_pending",
+            "settlement_eligible": len(independent_authorities) >= 2,
             "required_independent_sources": 2,
         },
         "process_classification": None,
@@ -5043,14 +5057,24 @@ def _postmatch_event_evidence(facts: Dict[str, Any]) -> Dict[str, Any]:
             penalties.append(normalized)
         if "own goal" in detail:
             own_goals.append(normalized)
-    event_sources = sorted({
-        str(row.get("source") or "").strip().casefold()
-        for row in (facts.get("source_audit") or [])
-        if isinstance(row, dict) and row.get("ok") is True
-        and str(row.get("component") or "").strip().casefold() == "events"
-        and str(row.get("source") or "").strip()
-        and str(row.get("evidence_ref") or "").strip()
-    })
+    event_sources, event_authorities, event_evidence_refs = set(), set(), set()
+    for row in facts.get("source_audit") or []:
+        if (
+            not isinstance(row, dict) or row.get("ok") is not True
+            or str(row.get("component") or "").strip().casefold() != "events"
+        ):
+            continue
+        source = str(row.get("source") or "").strip().casefold()
+        evidence_ref = str(row.get("evidence_ref") or "").strip()
+        if not source or not evidence_ref:
+            continue
+        normalized_ref = evidence_ref.casefold()
+        if normalized_ref in event_evidence_refs:
+            continue
+        parsed = urlparse(evidence_ref)
+        event_evidence_refs.add(normalized_ref)
+        event_sources.add(source)
+        event_authorities.add(str(parsed.hostname or source).strip().casefold())
     pollution_flags = []
     if red_cards:
         pollution_flags.append("red_card")
@@ -5062,16 +5086,18 @@ def _postmatch_event_evidence(facts: Dict[str, Any]) -> Dict[str, Any]:
     result = facts.get("result") if isinstance(facts.get("result"), dict) else {}
     return {
         "event_count": len(events),
-        "event_source_count": len(event_sources),
-        "event_sources": event_sources,
-        "event_verification": "verified" if len(event_sources) >= 2 else ("single_source" if event_sources else "data_missing"),
+        "event_source_count": len(event_authorities),
+        "event_sources": sorted(event_sources),
+        "event_source_authorities": sorted(event_authorities),
+        "event_unique_evidence_ref_count": len(event_evidence_refs),
+        "event_verification": "verified" if len(event_authorities) >= 2 else ("single_source" if event_authorities else "data_missing"),
         "first_goal": first_goal,
         "goal_count_in_event_feed": len(goals),
         "red_cards": red_cards,
         "penalties": penalties,
         "own_goals": own_goals,
         "pollution_flags": pollution_flags,
-        "pollution_status": "requires_human_review" if pollution_flags else ("clean_verified" if len(event_sources) >= 2 else "clean_unverified"),
+        "pollution_status": "requires_human_review" if pollution_flags else ("clean_verified" if len(event_authorities) >= 2 else "clean_unverified"),
         "actual_state_path": {
             "first_goal_side_or_team": (first_goal or {}).get("team"),
             "first_goal_minute": (first_goal or {}).get("minute"),
