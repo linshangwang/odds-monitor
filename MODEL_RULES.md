@@ -153,6 +153,8 @@ A级真实资金包固定使用`real_money_v1`：必须绑定比赛ID、注册�
 - 新理论登记时必须预先指定结构化联赛/市场范围及模块级消融计划。允许隔离的模块标识为 `MSCB`、`STATE_TREE`、`IEH`、`TAC`、`TDD`、`LET`、`LPS`、`OCR`；必须逐项使用规则定义的固定移除/中和干预，不能在赛后改名或换口径。
 - 每个验证样本必须在开赛前同时锁定 Champion、Challenger 及预登记全部模块的消融输出、计算时间和证据定位。模块缺失、多余、开赛后计算或超出预登记联赛/市场范围时，样本无效。
 - `support/counterexample` 只能由锁定后的前向 Brier 增益、模块消融增益和风险阈值派生；调用方提交的结论一律不参与验证标签。
+- 前向 Brier 必须绑定赛前已冻结的实际`market + selection + line`：1X2使用`home/draw/away`，BTTS使用`yes/no`，AH、O/U、主队总进球和客队总进球使用`full_win/half_win/push/half_loss/full_loss`结算分布；四分之一盘必须保留半赢/半输，不得把非1X2市场借用胜平负概率或胜平负赛果评分。
+- Champion市场分布必须由冻结的独立Poisson重放投影得出；Challenger和每个预登记模块消融必须在完全相同的市场、选择、盘口档位与类别空间内比较。旧版`legacy_1x2_brier`只可审计，不具备Champion晋级资格。
 - 晋级的消融门禁必须逐模块达到预登记最低增益；匿名的单一 Ablation 向量不能证明具体模块有独立贡献。
 - 检查特征重复，防止同一事实被 Recent Process、Matchup、State Tree 和 Fair Pricing 重复加权。
 - 快层可按比赛更新；中层至少按 20 至 50 个有效样本更新；慢层至少按 100 个有效样本调整。

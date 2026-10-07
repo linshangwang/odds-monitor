@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "1.99.0"
+VERSION = "2.00.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -193,7 +193,7 @@ LEARNING_TOP_FLIGHT_LEAGUES: Dict[int, Dict[str, str]] = {
 }
 LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
 LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
-LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v1.99").strip() or "MODEL_RULES.md@2026-10-08-v1.99"
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.00").strip() or "MODEL_RULES.md@2026-10-08-v2.00"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -7091,6 +7091,156 @@ def _normalize_1x2_probabilities(value: Any, field_name: str) -> Dict[str, float
     return {key: round(probability / total, 8) for key, probability in probabilities.items()}
 
 
+LINE_SETTLEMENT_CATEGORIES = ("full_win", "half_win", "push", "half_loss", "full_loss")
+
+
+def _learning_forecast_categories(market: str) -> Tuple[str, ...]:
+    if market == "1x2":
+        return ("home", "draw", "away")
+    if market == "btts":
+        return ("yes", "no")
+    if market in {"asian_handicap", "over_under", "home_team_total", "away_team_total"}:
+        return LINE_SETTLEMENT_CATEGORIES
+    raise HTTPException(status_code=422, detail="unsupported_learning_forecast_market")
+
+
+def _line_settlement_category(outcome: float, line: float, selection: str, market: str) -> Optional[str]:
+    split = _split_asian_line(line)
+    if not split:
+        return None
+    signs = []
+    for component in split:
+        if market == "asian_handicap":
+            settled = outcome + component if selection == "home" else -outcome - component
+        else:
+            settled = outcome - component if selection == "over" else component - outcome
+        signs.append(1 if settled > 1e-9 else (-1 if settled < -1e-9 else 0))
+    if all(sign > 0 for sign in signs):
+        return "full_win"
+    if all(sign < 0 for sign in signs):
+        return "full_loss"
+    if all(sign == 0 for sign in signs):
+        return "push"
+    if all(sign >= 0 for sign in signs) and any(sign > 0 for sign in signs):
+        return "half_win"
+    if all(sign <= 0 for sign in signs) and any(sign < 0 for sign in signs):
+        return "half_loss"
+    return None
+
+
+def market_forecast_from_probability_replay(replay: Dict[str, Any], expression: Dict[str, Any]) -> Dict[str, Any]:
+    """Project the frozen Poisson output onto the exact selected market settlement space."""
+    market = str(expression.get("market") or "").strip()
+    selection = str(expression.get("selection") or "").strip()
+    line = as_float(expression.get("line"))
+    probabilities = get_nested(replay, ["model", "probabilities"], {}) or {}
+    categories = _learning_forecast_categories(market)
+    if market == "1x2":
+        raw = probabilities.get("1x2") if isinstance(probabilities.get("1x2"), dict) else {}
+    elif market == "btts":
+        raw = probabilities.get("btts") if isinstance(probabilities.get("btts"), dict) else {}
+    else:
+        if line is None or selection not in ({"home", "away"} if market == "asian_handicap" else {"over", "under"}):
+            raise HTTPException(status_code=422, detail="valid_line_market_expression_required_for_forecast")
+        distribution_name = {
+            "asian_handicap": "goal_difference",
+            "over_under": "total_goals",
+            "home_team_total": "home_goals",
+            "away_team_total": "away_goals",
+        }[market]
+        distribution = get_nested(probabilities, ["settlement_distributions", distribution_name], {}) or {}
+        raw = {category: 0.0 for category in categories}
+        for raw_outcome, raw_probability in distribution.items():
+            outcome, probability = as_float(raw_outcome), as_float(raw_probability)
+            if outcome is None or probability is None or probability < 0:
+                continue
+            category = _line_settlement_category(outcome, line, selection, market)
+            if category is None:
+                raise HTTPException(status_code=422, detail="unsupported_line_settlement_shape")
+            raw[category] += probability
+    values = {category: as_float(raw.get(category)) for category in categories}
+    if any(value is None or value < 0 for value in values.values()):
+        raise HTTPException(status_code=422, detail="frozen_replay_missing_selected_market_probabilities")
+    total = sum(values.values())
+    if total <= 0 or abs(total - 1.0) > 0.02:
+        raise HTTPException(status_code=422, detail="selected_market_probabilities_must_sum_to_one")
+    normalized = {category: round(values[category] / total, 8) for category in categories}
+    return {
+        "schema": "learning_market_forecast_v1",
+        "market": market,
+        "selection": selection,
+        "line": line,
+        "categories": list(categories),
+        "probabilities": normalized,
+        "source": "frozen_probability_replay",
+        "probability_replay_hash": replay.get("replay_hash"),
+    }
+
+
+def _normalize_learning_market_forecast(value: Any, expression: Dict[str, Any], field_name: str) -> Dict[str, Any]:
+    value = value if isinstance(value, dict) else {}
+    market = str(expression.get("market") or "").strip()
+    selection = str(expression.get("selection") or "").strip()
+    line = as_float(expression.get("line"))
+    categories = _learning_forecast_categories(market)
+    if value.get("schema") != "learning_market_forecast_v1":
+        raise HTTPException(status_code=422, detail=f"{field_name}_forecast_schema_required")
+    if str(value.get("market") or "").strip() != market or str(value.get("selection") or "").strip() != selection:
+        raise HTTPException(status_code=422, detail=f"{field_name}_forecast_expression_mismatch")
+    if market in {"asian_handicap", "over_under", "home_team_total", "away_team_total"} and as_float(value.get("line")) != line:
+        raise HTTPException(status_code=422, detail=f"{field_name}_forecast_line_mismatch")
+    supplied_categories = value.get("categories") if isinstance(value.get("categories"), list) else []
+    if supplied_categories != list(categories):
+        raise HTTPException(status_code=422, detail=f"{field_name}_forecast_categories_mismatch")
+    raw = value.get("probabilities") if isinstance(value.get("probabilities"), dict) else {}
+    if set(raw) != set(categories):
+        raise HTTPException(status_code=422, detail=f"{field_name}_forecast_probability_categories_mismatch")
+    probabilities = {category: as_float(raw.get(category)) for category in categories}
+    if any(probability is None or not 0 <= probability <= 1 for probability in probabilities.values()):
+        raise HTTPException(status_code=422, detail=f"{field_name}_forecast_probabilities_invalid")
+    total = sum(probabilities.values())
+    if abs(total - 1.0) > 0.01:
+        raise HTTPException(status_code=422, detail=f"{field_name}_forecast_probabilities_must_sum_to_one")
+    return {
+        "schema": "learning_market_forecast_v1",
+        "market": market, "selection": selection, "line": line,
+        "categories": list(categories),
+        "probabilities": {category: round(probabilities[category] / total, 8) for category in categories},
+    }
+
+
+def _learning_market_outcome_category(expression: Dict[str, Any], result: Dict[str, Any]) -> str:
+    market = str(expression.get("market") or "").strip()
+    selection = str(expression.get("selection") or "").strip()
+    home_goals, away_goals = int(result.get("home_goals")), int(result.get("away_goals"))
+    if market == "1x2":
+        return "home" if home_goals > away_goals else ("away" if home_goals < away_goals else "draw")
+    if market == "btts":
+        return "yes" if home_goals > 0 and away_goals > 0 else "no"
+    line = as_float(expression.get("line"))
+    if line is None:
+        raise HTTPException(status_code=422, detail="settlement_line_required")
+    outcome = {
+        "asian_handicap": home_goals - away_goals,
+        "over_under": home_goals + away_goals,
+        "home_team_total": home_goals,
+        "away_team_total": away_goals,
+    }.get(market)
+    if outcome is None:
+        raise HTTPException(status_code=422, detail="unsupported_learning_forecast_market")
+    category = _line_settlement_category(float(outcome), line, selection, market)
+    if category is None:
+        raise HTTPException(status_code=422, detail="unsupported_line_settlement_shape")
+    return category
+
+
+def _brier_market_forecast(forecast: Dict[str, Any], expression: Dict[str, Any], result: Dict[str, Any]) -> float:
+    normalized = _normalize_learning_market_forecast(forecast, expression, "locked")
+    actual = _learning_market_outcome_category(expression, result)
+    probabilities = normalized["probabilities"]
+    return round(sum((probabilities[key] - (1.0 if key == actual else 0.0)) ** 2 for key in normalized["categories"]) / len(normalized["categories"]), 8)
+
+
 def _brier_1x2(probabilities: Dict[str, float], result: Dict[str, Any]) -> float:
     home_goals, away_goals = int(result.get("home_goals")), int(result.get("away_goals"))
     actual = "home" if home_goals > away_goals else ("away" if home_goals < away_goals else "draw")
@@ -7120,6 +7270,11 @@ def lock_hypothesis_shadow_prediction(
         raise HTTPException(status_code=422, detail="valid_shadow_selected_expression_required")
     if not entry_price_evidence_ref:
         raise HTTPException(status_code=422, detail="entry_price_evidence_ref_required")
+    raw_champion_forecast = payload.get("champion_forecast")
+    raw_challenger_forecast = payload.get("challenger_forecast")
+    market_forecast_mode = raw_champion_forecast is not None or raw_challenger_forecast is not None
+    champion_forecast = _normalize_learning_market_forecast(raw_champion_forecast, selected_expression, "champion") if market_forecast_mode else None
+    challenger_forecast = _normalize_learning_market_forecast(raw_challenger_forecast, selected_expression, "challenger") if market_forecast_mode else None
     risk = payload.get("risk") if isinstance(payload.get("risk"), dict) else {}
     champion_tail_risk = as_float(risk.get("champion_tail_risk"))
     challenger_tail_risk = as_float(risk.get("challenger_tail_risk"))
@@ -7162,6 +7317,9 @@ def lock_hypothesis_shadow_prediction(
         for module in required_modules:
             row = submitted_ablations.get(module) if isinstance(submitted_ablations.get(module), dict) else {}
             probabilities = _normalize_1x2_probabilities(row.get("probabilities"), f"ablation_{module.lower()}")
+            module_forecast = _normalize_learning_market_forecast(
+                row.get("forecast"), selected_expression, f"ablation_{module.lower()}"
+            ) if market_forecast_mode else None
             output_reference = str(row.get("output_reference") or "").strip()
             computed_at = _parse_timestamp(row.get("computed_at"))
             if not output_reference:
@@ -7174,6 +7332,8 @@ def lock_hypothesis_shadow_prediction(
                 "probabilities": probabilities, "output_reference": output_reference,
                 "computed_at": computed_at, "freeze_hash": freeze.get("content_hash"),
             }
+            if module_forecast is not None:
+                module_content["forecast"] = module_forecast
             module_ablations[module] = {**module_content, "output_hash": _content_hash(module_content)}
         expected_calculator_input_hash = _content_hash({
             "freeze_hash": freeze.get("content_hash"),
@@ -7201,6 +7361,8 @@ def lock_hypothesis_shadow_prediction(
                 or not int(freeze.get("captured_at") or 0) <= generated_at <= locked_at
             ):
                 raise HTTPException(status_code=422, detail="invalid_internal_shadow_runner_provenance")
+            if not market_forecast_mode:
+                raise HTTPException(status_code=422, detail="internal_shadow_runner_requires_market_forecast_contract")
             normalized_calculator_provenance = {
                 "origin": "internal_shadow_runner", "promotion_eligible": True,
                 "schema": "learning_shadow_model_run_v1",
@@ -7217,6 +7379,9 @@ def lock_hypothesis_shadow_prediction(
             "probability_replay_hash": get_nested(freeze, ["analysis", "probability_replay", "replay_hash"]),
             "champion_probabilities": champion_probabilities,
             "challenger_probabilities": challenger_probabilities,
+            "scoring_contract": "learning_market_forecast_v1" if market_forecast_mode else "legacy_1x2_brier",
+            "champion_forecast": champion_forecast,
+            "challenger_forecast": challenger_forecast,
             "ablation_plan_hash": _content_hash(ablation_plan),
             "module_ablations": module_ablations,
             "calculator_provenance": normalized_calculator_provenance,
@@ -7291,6 +7456,10 @@ def generate_internal_shadow_lock(
         get_nested(probability_replay, ["model", "probabilities", "1x2"]),
         "frozen_champion",
     )
+    frozen_expression = _learning_selected_expression(freeze.get("decision"))
+    if not frozen_expression.get("market") or not frozen_expression.get("selection"):
+        raise HTTPException(status_code=409, detail="forward_shadow_requires_frozen_selected_expression")
+    frozen_champion_forecast = market_forecast_from_probability_replay(probability_replay, frozen_expression)
     ablation_plan = get_nested(hypothesis, ["pre_registered_validation_plan", "ablation_plan"], {}) or {}
     input_hash = _content_hash({
         "freeze_hash": freeze.get("content_hash"),
@@ -7304,6 +7473,8 @@ def generate_internal_shadow_lock(
         "input_hash": input_hash,
         "probability_replay_hash": probability_replay.get("replay_hash"),
         "frozen_champion_probabilities": frozen_champion_probabilities,
+        "frozen_selected_expression": frozen_expression,
+        "frozen_champion_forecast": frozen_champion_forecast,
         "freeze": freeze,
         "hypothesis": {
             "hypothesis_id": hypothesis_id,
@@ -7340,6 +7511,24 @@ def generate_internal_shadow_lock(
         raise HTTPException(status_code=422, detail="internal_shadow_model_runner_identity_required")
     if _normalize_1x2_probabilities(result.get("champion_probabilities"), "champion") != frozen_champion_probabilities:
         raise HTTPException(status_code=422, detail="internal_shadow_champion_must_match_frozen_probability_replay")
+    selected_expression = result.get("selected_expression") if isinstance(result.get("selected_expression"), dict) else {}
+    if (
+        str(selected_expression.get("market") or "") != str(frozen_expression.get("market") or "")
+        or str(selected_expression.get("selection") or "") != str(frozen_expression.get("selection") or "")
+        or as_float(selected_expression.get("line")) != as_float(frozen_expression.get("line"))
+    ):
+        raise HTTPException(status_code=422, detail="internal_shadow_expression_must_match_frozen_selection")
+    normalized_champion_forecast = _normalize_learning_market_forecast(
+        result.get("champion_forecast"), frozen_expression, "champion",
+    )
+    expected_champion_forecast = _normalize_learning_market_forecast(
+        frozen_champion_forecast, frozen_expression, "frozen_champion",
+    )
+    if normalized_champion_forecast != expected_champion_forecast:
+        raise HTTPException(status_code=422, detail="internal_shadow_champion_forecast_must_match_frozen_probability_replay")
+    normalized_challenger_forecast = _normalize_learning_market_forecast(
+        result.get("challenger_forecast"), frozen_expression, "challenger",
+    )
     required_modules = list(ablation_plan.get("required_modules") or [])
     raw_modules = result.get("module_ablations") if isinstance(result.get("module_ablations"), dict) else {}
     if set(raw_modules) != set(required_modules):
@@ -7349,6 +7538,7 @@ def generate_internal_shadow_lock(
         row = raw_modules.get(module) if isinstance(raw_modules.get(module), dict) else {}
         module_outputs[module] = {
             "probabilities": row.get("probabilities"),
+            "forecast": row.get("forecast"),
             "computed_at": generated_at,
             "output_reference": f"internal-run:{supplied_run_hash}:{module}",
         }
@@ -7356,8 +7546,10 @@ def generate_internal_shadow_lock(
         "freeze_id": freeze_id,
         "champion_probabilities": result.get("champion_probabilities"),
         "challenger_probabilities": result.get("challenger_probabilities"),
+        "champion_forecast": normalized_champion_forecast,
+        "challenger_forecast": normalized_challenger_forecast,
         "module_ablation_outputs": module_outputs,
-        "selected_expression": result.get("selected_expression"),
+        "selected_expression": selected_expression,
         "risk": result.get("risk"),
     }
     provenance = {
@@ -7402,11 +7594,23 @@ def record_hypothesis_validation(hypothesis_id: Any, payload: Dict[str, Any]) ->
             raise HTTPException(status_code=422, detail="closing_price_evidence_ref_required")
         postmatch = store["learning_postmatch"][freeze_id]
         final_result = postmatch.get("result") if isinstance(postmatch.get("result"), dict) else {}
-        champion_brier = _brier_1x2(shadow_lock["champion_probabilities"], final_result)
-        challenger_brier = _brier_1x2(shadow_lock["challenger_probabilities"], final_result)
+        locked_expression = shadow_lock.get("selected_expression") if isinstance(shadow_lock.get("selected_expression"), dict) else {}
+        market_forecast_scoring = shadow_lock.get("scoring_contract") == "learning_market_forecast_v1"
+        if market_forecast_scoring:
+            champion_brier = _brier_market_forecast(shadow_lock["champion_forecast"], locked_expression, final_result)
+            challenger_brier = _brier_market_forecast(shadow_lock["challenger_forecast"], locked_expression, final_result)
+            realized_forecast_category = _learning_market_outcome_category(locked_expression, final_result)
+        else:
+            champion_brier = _brier_1x2(shadow_lock["champion_probabilities"], final_result)
+            challenger_brier = _brier_1x2(shadow_lock["challenger_probabilities"], final_result)
+            realized_forecast_category = "legacy_1x2"
         ablation_plan = get_nested(hypothesis, ["pre_registered_validation_plan", "ablation_plan"], {}) or {}
         module_briers = {
-            module: _brier_1x2(row["probabilities"], final_result)
+            module: (
+                _brier_market_forecast(row["forecast"], locked_expression, final_result)
+                if market_forecast_scoring
+                else _brier_1x2(row["probabilities"], final_result)
+            )
             for module, row in (shadow_lock.get("module_ablations") or {}).items()
         }
         module_brier_gains = {
@@ -7466,10 +7670,18 @@ def record_hypothesis_validation(hypothesis_id: Any, payload: Dict[str, Any]) ->
             "shadow_lock_hash": shadow_lock.get("lock_hash"),
             "closing_price_evidence_ref": closing_price_evidence_ref,
             "derived_metrics": {
-                "champion_brier_1x2": champion_brier,
-                "challenger_brier_1x2": challenger_brier,
+                "scoring_contract": shadow_lock.get("scoring_contract"),
+                "forecast_market": locked_expression.get("market"),
+                "forecast_selection": locked_expression.get("selection"),
+                "forecast_line": locked_expression.get("line"),
+                "realized_forecast_category": realized_forecast_category,
+                "champion_brier": champion_brier,
+                "challenger_brier": challenger_brier,
+                "champion_brier_1x2": champion_brier if locked_expression.get("market") == "1x2" else None,
+                "challenger_brier_1x2": challenger_brier if locked_expression.get("market") == "1x2" else None,
                 "challenger_brier_gain_over_champion": champion_brier_gain,
-                "module_ablation_brier_1x2": module_briers,
+                "module_ablation_brier": module_briers,
+                "module_ablation_brier_1x2": module_briers if locked_expression.get("market") == "1x2" else None,
                 "module_ablation_brier_gain": module_brier_gains,
                 "clv_probability_delta": clv_probability_delta,
                 "champion_tail_risk": get_nested(shadow_lock, ["risk", "champion_tail_risk"]),
@@ -7525,6 +7737,7 @@ def promotion_evidence_report(hypothesis_id: Any, store_override: Optional[Dict[
         and int((locks.get(row.get("freeze_id")) or {}).get("locked_at") or 0) >= int(hypothesis.get("registered_at") or 0)
         and get_nested(locks.get(row.get("freeze_id")) or {}, ["calculator_provenance", "origin"]) == "internal_shadow_runner"
         and get_nested(locks.get(row.get("freeze_id")) or {}, ["calculator_provenance", "promotion_eligible"]) is True
+        and (locks.get(row.get("freeze_id")) or {}).get("scoring_contract") == "learning_market_forecast_v1"
         for row in evidence
     )
     pit_passed = enough and all(get_nested(row, ["pit_audit", "status"]) == "passed" for row in evidence)
@@ -7534,13 +7747,13 @@ def promotion_evidence_report(hypothesis_id: Any, store_override: Optional[Dict[
         and get_nested(row, ["derived_metrics", "process_classification"]) in clean_process_classes
         for row in evidence
     )
-    champion_brier = mean("champion_brier_1x2")
-    challenger_brier = mean("challenger_brier_1x2")
+    champion_brier = mean("champion_brier")
+    challenger_brier = mean("challenger_brier")
     ablation_plan = plan.get("ablation_plan") if isinstance(plan.get("ablation_plan"), dict) else {}
     required_ablation_modules = list(ablation_plan.get("required_modules") or [])
     module_ablation_metrics = {}
     for module in required_ablation_modules:
-        brier_values = [as_float(get_nested(row, ["module_ablation_brier_1x2", module])) for row in metrics]
+        brier_values = [as_float(get_nested(row, ["module_ablation_brier", module])) for row in metrics]
         gain_values = [as_float(get_nested(row, ["module_ablation_brier_gain", module])) for row in metrics]
         complete = bool(evidence) and len(brier_values) == len(evidence) and all(value is not None for value in brier_values + gain_values)
         module_ablation_metrics[module] = {
