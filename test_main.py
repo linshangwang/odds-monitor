@@ -3406,6 +3406,8 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "expression_audit": {"status": "inconclusive"},
             "price_execution_audit": {"status": "inconclusive"},
             "process_reasoning": "Review compares the frozen prematch process with verified events, independent of the final score.",
+            "review_mode": "manual",
+            "outcome_not_used_for_process_grade": True,
             "learning_disposition": disposition,
         }
 
@@ -4454,16 +4456,18 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         with self.assertRaises(main.HTTPException):
             main.run_learning_cycle({"apply": True, "run_id": "unsafe/id"}, now_ts=100000, fixture_rows=[])
 
-    def settle_selection_quality_sample(self, fixture, process_class, expression_status="passed"):
+    def settle_selection_quality_sample(self, fixture, process_class, expression_status="passed", market_rating=None, match_status="passed"):
         payload = self.learning_payload(fixture, 900, 1000)
         payload["decision"] = {
             "decision": "BET", "match_rating": "B",
             "selected_expression": {"market": "over_under", "selection": "under", "line": 2.75, "price": 1.91},
         }
+        if market_rating is not None:
+            payload["decision"]["market_rating"] = market_rating
         frozen = main.freeze_learning_sample(payload, now_ts=900)
         facts = self.collect_verified_learning_facts(frozen, 3, 2, 8200)
         review = self.learning_postmatch_review()
-        review["match_selection_quality"] = {"status": "passed"}
+        review["match_selection_quality"] = {"status": match_status}
         review["expression_audit"] = {"status": expression_status}
         review["price_execution_audit"] = {"status": "passed"}
         return main.settle_learning_sample(
@@ -4517,6 +4521,106 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(report["cards"][0]["eligible_sample_count"], 1)
         self.assertEqual(report["cards"][0]["fixture_ids"], ["quality-versioned"])
         self.assertEqual(report["excluded_counts"]["superseded_freeze_version"], 1)
+
+    def test_learning_quality_cards_are_hash_bound_immutable_and_result_independent(self):
+        self.settle_selection_quality_sample(
+            "card-result-win", "PROCESS_CORRECT_RESULT_WIN", expression_status="failed", market_rating="B+",
+        )
+        self.settle_selection_quality_sample(
+            "card-result-loss", "PROCESS_CORRECT_RESULT_LOSS", expression_status="failed", market_rating="B+",
+        )
+        first = main.refresh_learning_quality_cards(now_ts=9000)
+        second = main.refresh_learning_quality_cards(now_ts=9001)
+        self.assertEqual(first["created_count"], 2)
+        self.assertEqual(second["created_count"], 0)
+        cards = main.load_snapshot_store()["learning_quality_cards"]
+        win_card = cards["card-result-win:v1"]
+        loss_card = cards["card-result-loss:v1"]
+        self.assertEqual(win_card["priority_quality"]["label"], loss_card["priority_quality"]["label"])
+        self.assertEqual(win_card["selection_quality"]["label"], loss_card["selection_quality"]["label"])
+        self.assertEqual(win_card["selection_quality"]["label"], "failed")
+        self.assertNotEqual(win_card["outcome_context"]["process_classification"], loss_card["outcome_context"]["process_classification"])
+        self.assertFalse(win_card["outcome_context"]["final_score_copied_into_card"])
+        self.assertEqual(win_card["freeze_hash"], main._learning_freeze_by_id(main.load_snapshot_store(), "card-result-win:v1")["content_hash"])
+        self.assertFalse(first["result_outcome_used_for_labels"])
+        self.assertFalse(first["automatic_champion_change"])
+
+    def test_quality_calibration_uses_explicit_ratings_and_process_labels_only(self):
+        self.settle_selection_quality_sample(
+            "calibration-pass", "PROCESS_CORRECT_RESULT_LOSS", market_rating="A", match_status="passed",
+        )
+        self.settle_selection_quality_sample(
+            "calibration-fail", "PROCESS_ERROR_RESULT_WIN", market_rating="A", match_status="failed",
+        )
+        self.settle_selection_quality_sample(
+            "calibration-no-market-rating", "PROCESS_CORRECT_RESULT_WIN", match_status="passed",
+        )
+        main.refresh_learning_quality_cards(now_ts=9000)
+        report = main.learning_quality_calibration_report(minimum_samples=2)
+        priority = next(row for row in report["groups"] if row["dimension"] == "priority_quality")
+        selection = next(row for row in report["groups"] if row["dimension"] == "selection_quality")
+        self.assertEqual(priority["eligible_sample_count"], 3)
+        self.assertEqual(priority["observed_process_pass_rate"], 0.666667)
+        self.assertEqual(selection["eligible_sample_count"], 2)
+        self.assertEqual(selection["observed_process_pass_rate"], 1.0)
+        self.assertTrue(selection["sample_ready"])
+        self.assertEqual(report["excluded_counts"]["selection_rating_missing"], 1)
+        self.assertFalse(report["result_outcome_used_for_calibration"])
+        self.assertFalse(report["automatic_weight_change"])
+
+    def test_quality_calibration_counts_only_latest_freeze_version(self):
+        self.settle_selection_quality_sample(
+            "quality-card-versioned", "PROCESS_CORRECT_RESULT_LOSS", market_rating="B",
+        )
+        payload = self.learning_payload(
+            "quality-card-versioned", 950, 1000,
+            analysis={"fundamental_chain": {"status": "complete"}, "revision": 2},
+        )
+        payload["decision"] = {
+            "decision": "BET", "match_rating": "B", "market_rating": "B",
+            "selected_expression": {"market": "over_under", "selection": "under", "line": 2.75, "price": 1.91},
+        }
+        latest = main.freeze_learning_sample(payload, now_ts=950)
+        facts = self.collect_verified_learning_facts(latest, 3, 2, 8201)
+        review = self.learning_postmatch_review()
+        review["match_selection_quality"] = {"status": "failed"}
+        review["expression_audit"] = {"status": "failed"}
+        review["price_execution_audit"] = {"status": "passed"}
+        main.settle_learning_sample(
+            latest["freeze_id"], {"status": "FT", "home_goals": 3, "away_goals": 2},
+            "PROCESS_ERROR_RESULT_WIN", {"status": "clean"}, 8201, review, facts["fact_hash"],
+        )
+        main.refresh_learning_quality_cards(now_ts=9000)
+        report = main.learning_quality_calibration_report(minimum_samples=2)
+        self.assertEqual(report["stored_card_count"], 2)
+        self.assertEqual(report["latest_fixture_card_count"], 1)
+        self.assertEqual(report["excluded_counts"]["superseded_freeze_version"], 1)
+        self.assertTrue(all(row["eligible_sample_count"] == 1 for row in report["groups"]))
+
+    def test_quality_card_without_outcome_independence_attestation_is_audit_only(self):
+        payload = self.learning_payload("quality-unattested", 900, 1000)
+        payload["decision"] = {
+            "decision": "BET", "match_rating": "A", "market_rating": "A",
+            "selected_expression": {"market": "over_under", "selection": "under", "line": 2.75, "price": 1.91},
+        }
+        frozen = main.freeze_learning_sample(payload, now_ts=900)
+        facts = self.collect_verified_learning_facts(frozen, 3, 2, 8200)
+        review = self.learning_postmatch_review()
+        review.pop("outcome_not_used_for_process_grade")
+        review["match_selection_quality"] = {"status": "passed"}
+        review["expression_audit"] = {"status": "passed"}
+        review["price_execution_audit"] = {"status": "passed"}
+        main.settle_learning_sample(
+            frozen["freeze_id"], {"status": "FT", "home_goals": 3, "away_goals": 2},
+            "PROCESS_CORRECT_RESULT_WIN", {"status": "clean"}, 8200, review, facts["fact_hash"],
+        )
+        main.refresh_learning_quality_cards(now_ts=9000)
+        card = main.load_snapshot_store()["learning_quality_cards"][frozen["freeze_id"]]
+        self.assertFalse(card["sample_eligibility"]["eligible"])
+        self.assertEqual(card["sample_eligibility"]["reason"], "outcome_independence_attestation_missing")
+        report = main.learning_quality_calibration_report(minimum_samples=2)
+        self.assertEqual(report["calibration_group_count"], 0)
+        self.assertEqual(report["excluded_counts"]["sample_ineligible"], 1)
 
     def test_single_match_failure_cannot_create_research_proposal(self):
         self.settle_selection_quality_sample("proposal-single", "PROCESS_CORRECT_RESULT_WIN", expression_status="failed")

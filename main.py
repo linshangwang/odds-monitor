@@ -24,7 +24,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "1.96.0"
+VERSION = "1.97.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -182,7 +182,7 @@ LEARNING_TOP_FLIGHT_LEAGUES: Dict[int, Dict[str, str]] = {
 }
 LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
 LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
-LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v1.96").strip() or "MODEL_RULES.md@2026-10-08-v1.96"
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v1.97").strip() or "MODEL_RULES.md@2026-10-08-v1.97"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -4438,7 +4438,7 @@ def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6, ri
 
 @app.get("/")
 def root():
-    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}", "/shadow/learning/cycle-plan", "/shadow/learning/run", "/shadow/learning/review-queue", "/shadow/learning/review-draft", "/shadow/learning/complete-review", "/shadow/learning/research-proposals", "/shadow/learning/research-proposals/refresh", "/shadow/learning/validation-queue", "/shadow/learning/freeze", "/shadow/learning/settle", "/shadow/learning/hypotheses", "/shadow/learning/hypotheses/{id}/shadow-lock", "/shadow/learning/hypotheses/{id}/promotion-evidence", "/shadow/learning/league-dna", "/shadow/learning/league-dna/{tag_id}/activation-candidate", "/shadow/learning/league-dna/{tag_id}/confirm", "/shadow/learning/selection-quality", "/shadow/learning/status"]}
+    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}", "/shadow/learning/cycle-plan", "/shadow/learning/run", "/shadow/learning/review-queue", "/shadow/learning/review-draft", "/shadow/learning/complete-review", "/shadow/learning/quality-cards/refresh", "/shadow/learning/quality-calibration", "/shadow/learning/research-proposals", "/shadow/learning/research-proposals/refresh", "/shadow/learning/validation-queue", "/shadow/learning/freeze", "/shadow/learning/settle", "/shadow/learning/hypotheses", "/shadow/learning/hypotheses/{id}/shadow-lock", "/shadow/learning/hypotheses/{id}/promotion-evidence", "/shadow/learning/league-dna", "/shadow/learning/league-dna/{tag_id}/activation-candidate", "/shadow/learning/league-dna/{tag_id}/confirm", "/shadow/learning/selection-quality", "/shadow/learning/status"]}
 
 
 @app.get("/health")
@@ -6022,6 +6022,9 @@ def run_learning_cycle(
     auto_refresh_research_proposals = payload.get("auto_refresh_research_proposals", True)
     if not isinstance(auto_refresh_research_proposals, bool):
         raise HTTPException(status_code=400, detail="auto_refresh_research_proposals_must_be_boolean")
+    auto_refresh_quality_cards = payload.get("auto_refresh_quality_cards", True)
+    if not isinstance(auto_refresh_quality_cards, bool):
+        raise HTTPException(status_code=400, detail="auto_refresh_quality_cards_must_be_boolean")
     supplied_run_id = str(payload.get("run_id") or "").strip()
     safe_run_id = supplied_run_id and len(supplied_run_id) <= 100 and all(char in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in supplied_run_id)
     if apply_changes and not safe_run_id:
@@ -6140,6 +6143,20 @@ def run_learning_cycle(
                 "freeze_id": freeze_id, "action": "rejected",
                 "status_code": exc.status_code, "reason": exc.detail,
             })
+    quality_card_results = []
+    if auto_refresh_quality_cards:
+        if apply_changes:
+            quality_refresh = refresh_learning_quality_cards(now_ts=now_ts)
+            quality_card_results = quality_refresh.get("results") or []
+        else:
+            quality_preview = learning_quality_card_candidates()
+            quality_card_results = [
+                {
+                    "card_id": row.get("card_id"), "freeze_id": row.get("freeze_id"),
+                    "action": "would_create", "card_hash": row.get("card_hash"),
+                }
+                for row in quality_preview.get("candidates") or []
+            ]
     research_proposal_results = []
     if auto_refresh_research_proposals:
         if apply_changes:
@@ -6208,6 +6225,7 @@ def run_learning_cycle(
         "postmatch_fact_results": fact_results,
         "postmatch_review_draft_results": draft_results,
         "review_completion_results": review_completion_results,
+        "quality_card_results": quality_card_results,
         "research_proposal_results": research_proposal_results,
         "freeze_results": freeze_results,
         "forward_validation_queue": forward_validation_queue,
@@ -6220,6 +6238,7 @@ def run_learning_cycle(
         "settled_count": sum(row.get("action") == "settled" for row in settlement_results + review_completion_results),
         "frozen_count": sum(row.get("action") == "frozen" for row in freeze_results),
         "review_draft_count": sum(row.get("action") == "drafted" for row in draft_results),
+        "quality_card_created_count": sum(row.get("action") == "created" for row in quality_card_results),
         "research_proposal_version_count": sum(row.get("action") == "proposed" for row in research_proposal_results),
         "rejected_count": sum(row.get("action") in {"rejected", "would_reject"} for row in settlement_results + fact_results + draft_results + review_completion_results + freeze_results),
         "action": "completed" if apply_changes else "previewed",
@@ -7253,6 +7272,229 @@ def _learning_selected_expression(decision: Any) -> Dict[str, Any]:
     return {"market": "data_missing", "selection": None, "line": None, "price": None}
 
 
+def _learning_frozen_rating(decision: Dict[str, Any], rating_name: str) -> Any:
+    """Read an explicitly frozen rating without translating or inventing a score."""
+    candidates = [decision.get(rating_name)]
+    if rating_name == "market_rating":
+        selected = decision.get("selected_expression") if isinstance(decision.get("selected_expression"), dict) else {}
+        candidates.extend((selected.get("market_rating"), selected.get("rating")))
+    for value in candidates:
+        if isinstance(value, bool) or value in (None, ""):
+            continue
+        if isinstance(value, (int, float)):
+            return value
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _learning_quality_label(statuses: List[Any], required_count: int) -> Dict[str, Any]:
+    normalized = [str(value or "data_missing").strip().lower() for value in statuses]
+    if any(value == "failed" for value in normalized):
+        label = "failed"
+    elif len(normalized) == required_count and all(value == "passed" for value in normalized):
+        label = "passed"
+    else:
+        label = "ungraded"
+    return {
+        "label": label,
+        "calibration_eligible": label in {"passed", "failed"},
+        "component_statuses": normalized,
+    }
+
+
+def _learning_quality_card_candidate(freeze: Dict[str, Any], postmatch: Dict[str, Any]) -> Dict[str, Any]:
+    """Derive one immutable process card; result direction never assigns a quality label."""
+    decision = freeze.get("decision") if isinstance(freeze.get("decision"), dict) else {}
+    review = postmatch.get("review") if isinstance(postmatch.get("review"), dict) else {}
+    expression = _learning_selected_expression(decision)
+    priority_quality = _learning_quality_label([get_nested(review, ["match_selection_quality", "status"])], 1)
+    selection_quality = _learning_quality_label([
+        get_nested(review, ["expression_audit", "status"]),
+        get_nested(review, ["price_execution_audit", "status"]),
+    ], 2)
+    process_class = str(postmatch.get("process_classification") or "DATA_INSUFFICIENT")
+    outcome_independence_attested = review.get("outcome_not_used_for_process_grade") is True
+    result_backfit_rejected = get_nested(review, ["learning_disposition", "result_backfit_used"]) is False
+    sample_eligible = (
+        process_class not in {"EVENT_CONTAMINATED", "DATA_INSUFFICIENT"}
+        and outcome_independence_attested and result_backfit_rejected
+    )
+    match_rating = _learning_frozen_rating(decision, "match_rating")
+    market_rating = _learning_frozen_rating(decision, "market_rating")
+    immutable = {
+        "schema_version": "learning_quality_card_v1",
+        "freeze_id": freeze.get("freeze_id"), "fixture": freeze.get("fixture"),
+        "freeze_version_number": freeze.get("version_number"),
+        "freeze_hash": freeze.get("content_hash"), "postmatch_hash": postmatch.get("postmatch_hash"),
+        "fact_hash": postmatch.get("fact_hash"),
+        "scope": freeze.get("scope") if isinstance(freeze.get("scope"), dict) else {},
+        "frozen_decision": {
+            "action": decision.get("decision"), "match_rating": match_rating,
+            "market_rating": market_rating, "selected_expression": expression,
+        },
+        "priority_quality": {
+            **priority_quality, "source_section": "match_selection_quality",
+            "rating_available": match_rating is not None,
+            "label_derived_before_outcome": outcome_independence_attested,
+        },
+        "selection_quality": {
+            **selection_quality, "source_sections": ["expression_audit", "price_execution_audit"],
+            "rating_available": market_rating is not None,
+            "label_derived_before_outcome": outcome_independence_attested,
+        },
+        "diagnostics": {section: get_nested(review, [section, "status"]) for section in LEARNING_REVIEW_SECTIONS},
+        "sample_eligibility": {
+            "eligible": sample_eligible,
+            "reason": (
+                "verified_outcome_independent_process_review" if sample_eligible else
+                process_class.lower() if process_class in {"EVENT_CONTAMINATED", "DATA_INSUFFICIENT"} else
+                "outcome_independence_attestation_missing"
+            ),
+            "outcome_not_used_for_process_grade": outcome_independence_attested,
+            "result_backfit_explicitly_rejected": result_backfit_rejected,
+        },
+        "outcome_context": {
+            "process_classification": process_class, "result_reference": postmatch.get("postmatch_hash"),
+            "final_score_copied_into_card": False,
+            "excluded_from_priority_quality_label": True,
+            "excluded_from_selection_quality_label": True,
+        },
+        "result_backfit_used": False, "automatic_weight_change": False, "champion_effect": False,
+    }
+    card_hash = _content_hash(immutable)
+    return {**immutable, "card_id": "learning-card-" + card_hash[:16], "card_hash": card_hash, "immutable": True}
+
+
+def learning_quality_card_candidates() -> Dict[str, Any]:
+    store = load_snapshot_store()
+    cards, rejected = [], []
+    for freeze_id, postmatch in (store.get("learning_postmatch") or {}).items():
+        freeze = _learning_freeze_by_id(store, freeze_id)
+        if not freeze:
+            rejected.append({"freeze_id": freeze_id, "reason": "frozen_sample_missing"})
+            continue
+        cards.append(_learning_quality_card_candidate(freeze, postmatch))
+    cards.sort(key=lambda row: (str(row.get("fixture")), int(row.get("freeze_version_number") or 0)))
+    return {
+        "version": VERSION, "candidate_count": len(cards), "candidates": cards, "rejected": rejected,
+        "result_outcome_used_for_labels": False, "automatic_weight_change": False,
+        "automatic_champion_change": False,
+    }
+
+
+def refresh_learning_quality_cards(now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Persist hash-bound Learning Cards; existing cards can never be rewritten."""
+    now_ts = int(now_ts or time.time())
+    derived = learning_quality_card_candidates()
+    results = []
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        saved = store.setdefault("learning_quality_cards", {})
+        for candidate in derived["candidates"]:
+            freeze_id = str(candidate.get("freeze_id") or "")
+            existing = saved.get(freeze_id)
+            if existing:
+                if existing.get("card_hash") != candidate.get("card_hash"):
+                    raise HTTPException(status_code=409, detail="immutable_learning_quality_card_conflict")
+                results.append({**existing, "action": "unchanged"})
+                continue
+            record = {**candidate, "created_at": now_ts, "action": "created"}
+            saved[freeze_id] = record
+            results.append(record)
+        store["version"] = VERSION
+        write_snapshot_store(store)
+    return {
+        "version": VERSION, "created_count": sum(row.get("action") == "created" for row in results),
+        "results": results, "rejected": derived["rejected"],
+        "result_outcome_used_for_labels": False, "automatic_weight_change": False,
+        "automatic_champion_change": False,
+    }
+
+
+def _learning_rating_bucket(value: Any) -> Optional[str]:
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return f"numeric:{float(value):g}"
+    return "categorical:" + str(value).strip().upper()
+
+
+def learning_quality_calibration_report(minimum_samples: Optional[int] = None) -> Dict[str, Any]:
+    """Calibrate frozen ratings against process audits, never result wins."""
+    minimum_samples = max(2, int(minimum_samples or LEARNING_MIN_VALIDATION_SAMPLES))
+    store = load_snapshot_store()
+    cards = [row for row in (store.get("learning_quality_cards") or {}).values() if isinstance(row, dict)]
+    latest_by_fixture: Dict[str, Dict[str, Any]] = {}
+    superseded = 0
+    for card in cards:
+        fixture = str(card.get("fixture") or "")
+        current = latest_by_fixture.get(fixture)
+        if current and int(current.get("freeze_version_number") or 0) >= int(card.get("freeze_version_number") or 0):
+            superseded += 1
+            continue
+        if current:
+            superseded += 1
+        latest_by_fixture[fixture] = card
+    groups: Dict[Tuple[str, Any, str], Dict[str, Any]] = {}
+    excluded = {
+        "superseded_freeze_version": superseded, "sample_ineligible": 0,
+        "priority_rating_missing": 0, "priority_label_ungraded": 0,
+        "selection_rating_missing": 0, "selection_label_ungraded": 0,
+    }
+    for card in latest_by_fixture.values():
+        if get_nested(card, ["sample_eligibility", "eligible"]) is not True:
+            excluded["sample_ineligible"] += 1
+            continue
+        competition_id = get_nested(card, ["scope", "competition_id"])
+        competition_name = get_nested(card, ["scope", "competition_name"])
+        for dimension, rating_field, prefix in (
+            ("priority_quality", "match_rating", "priority"),
+            ("selection_quality", "market_rating", "selection"),
+        ):
+            rating = get_nested(card, ["frozen_decision", rating_field])
+            bucket = _learning_rating_bucket(rating)
+            label = get_nested(card, [dimension, "label"])
+            if bucket is None:
+                excluded[f"{prefix}_rating_missing"] += 1
+                continue
+            if label not in {"passed", "failed"}:
+                excluded[f"{prefix}_label_ungraded"] += 1
+                continue
+            key = (dimension, competition_id, bucket)
+            group = groups.setdefault(key, {
+                "dimension": dimension, "competition_id": competition_id,
+                "competition_name": competition_name, "rating_bucket": bucket,
+                "frozen_rating": rating, "eligible_sample_count": 0,
+                "passed_count": 0, "failed_count": 0, "card_ids": [], "freeze_ids": [], "fixture_ids": [],
+            })
+            group["eligible_sample_count"] += 1
+            group[f"{label}_count"] += 1
+            group["card_ids"].append(card.get("card_id"))
+            group["freeze_ids"].append(card.get("freeze_id"))
+            group["fixture_ids"].append(card.get("fixture"))
+    calibration_groups = []
+    for group in groups.values():
+        count = group["eligible_sample_count"]
+        calibration_groups.append({
+            **group, "minimum_samples": minimum_samples, "sample_ready": count >= minimum_samples,
+            "observed_process_pass_rate": round(group["passed_count"] / count, 6),
+            "interpretation": "internal_process_calibration_only", "result_win_rate_used": False,
+            "automatic_weight_change": False, "champion_effect": False,
+        })
+    calibration_groups.sort(key=lambda row: (str(row.get("competition_name")), row["dimension"], row["rating_bucket"]))
+    return {
+        "version": VERSION, "minimum_samples": minimum_samples, "stored_card_count": len(cards),
+        "latest_fixture_card_count": len(latest_by_fixture), "calibration_group_count": len(calibration_groups),
+        "sample_ready_group_count": sum(row["sample_ready"] for row in calibration_groups),
+        "groups": calibration_groups, "excluded_counts": excluded,
+        "result_outcome_used_for_calibration": False, "automatic_weight_change": False,
+        "automatic_champion_change": False,
+        "policy": "calibrate only explicitly frozen ratings against hash-bound process audits; missing ratings are excluded rather than inferred",
+    }
+
+
 def learning_selection_quality_report(minimum_samples: Optional[int] = None) -> Dict[str, Any]:
     """Aggregate process quality without using win/loss as a model-change signal."""
     minimum_samples = max(2, int(minimum_samples or LEARNING_MIN_VALIDATION_SAMPLES))
@@ -7522,6 +7764,7 @@ def learning_status_report() -> Dict[str, Any]:
     postmatch_facts = store.get("learning_postmatch_facts") or {}
     postmatch_drafts = store.get("learning_postmatch_drafts") or {}
     research_proposals = store.get("learning_research_proposals") or {}
+    quality_cards = store.get("learning_quality_cards") or {}
     runs = store.get("learning_runs") or {}
     hypotheses = store.get("learning_hypotheses") or {}
     shadow_locks = store.get("learning_shadow_locks") or {}
@@ -7548,6 +7791,7 @@ def learning_status_report() -> Dict[str, Any]:
         "postmatch_review_draft_version_count": sum(len(rows or []) for rows in postmatch_drafts.values()),
         "research_proposal_count": len(research_proposals),
         "research_proposal_version_count": sum(len(rows or []) for rows in research_proposals.values()),
+        "learning_quality_card_count": len(quality_cards),
         "postmatch_fact_pending_verification_count": sum(
             bool(rows) and max(rows, key=lambda row: int(row.get("version_number") or 0)).get("verification", {}).get("settlement_eligible") is not True
             for rows in postmatch_facts.values()
@@ -8196,6 +8440,20 @@ def shadow_learning_selection_quality(minimum_samples: Optional[int] = None, tok
     return JSONResponse({"ok": True, "selection_quality": learning_selection_quality_report(minimum_samples)})
 
 
+@app.get("/shadow/learning/quality-calibration")
+def shadow_learning_quality_calibration(minimum_samples: Optional[int] = None, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    if minimum_samples is not None and not 2 <= minimum_samples <= 10000:
+        raise HTTPException(status_code=400, detail="minimum_samples_must_be_between_2_and_10000")
+    return JSONResponse({"ok": True, "quality_calibration": learning_quality_calibration_report(minimum_samples)})
+
+
+@app.post("/shadow/learning/quality-cards/refresh")
+def shadow_learning_quality_cards_refresh(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "quality_cards": refresh_learning_quality_cards()})
+
+
 @app.get("/shadow/learning/research-proposals")
 def shadow_learning_research_proposals(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
@@ -8427,12 +8685,14 @@ def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[st
             "execution_order": result.get("execution_order"),
             "frozen_count": result.get("frozen_count"),
             "review_draft_count": result.get("review_draft_count"),
+            "quality_card_created_count": result.get("quality_card_created_count"),
             "research_proposal_version_count": result.get("research_proposal_version_count"),
             "settled_count": result.get("settled_count"),
             "rejected_count": result.get("rejected_count"),
             "postmatch_fact_results": result.get("postmatch_fact_results"),
             "postmatch_review_draft_results": result.get("postmatch_review_draft_results"),
             "review_completion_results": result.get("review_completion_results"),
+            "quality_card_results": result.get("quality_card_results"),
             "research_proposal_results": result.get("research_proposal_results"),
             "forward_validation_queue": result.get("forward_validation_queue"),
             "automatic_hypothesis_registration": False,
