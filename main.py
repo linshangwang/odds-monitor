@@ -23,7 +23,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "1.92.0"
+VERSION = "1.93.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -73,6 +73,9 @@ NAMI_ODDS_STARTUP_PROBE_STARTED = False
 NAMI_ODDS_PROBE_TTL_SECONDS = max(3600, int(os.getenv("NAMI_ODDS_PROBE_TTL_SECONDS", str(7 * 24 * 3600))))
 CALIBRATION_MIN_SAMPLE = max(1, int(os.getenv("CALIBRATION_MIN_SAMPLE", "30")))
 LEARNING_MIN_VALIDATION_SAMPLES = max(2, int(os.getenv("LEARNING_MIN_VALIDATION_SAMPLES", "30")))
+LEARNING_RESEARCH_PROPOSAL_MIN_MATCHES = max(3, int(os.getenv("LEARNING_RESEARCH_PROPOSAL_MIN_MATCHES", "5")))
+LEARNING_RESEARCH_PROPOSAL_MIN_FAILURES = max(2, int(os.getenv("LEARNING_RESEARCH_PROPOSAL_MIN_FAILURES", "3")))
+LEARNING_RESEARCH_PROPOSAL_MIN_FAILURE_RATE = min(1.0, max(0.05, float(os.getenv("LEARNING_RESEARCH_PROPOSAL_MIN_FAILURE_RATE", "0.25"))))
 LEARNING_PROCESS_CLASSES = {
     "PROCESS_CORRECT_RESULT_WIN", "PROCESS_CORRECT_RESULT_LOSS",
     "PROCESS_ERROR_RESULT_WIN", "PROCESS_ERROR_RESULT_LOSS",
@@ -3916,7 +3919,7 @@ def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6, ri
 
 @app.get("/")
 def root():
-    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}", "/shadow/learning/cycle-plan", "/shadow/learning/run", "/shadow/learning/review-queue", "/shadow/learning/review-draft", "/shadow/learning/freeze", "/shadow/learning/settle", "/shadow/learning/hypotheses", "/shadow/learning/hypotheses/{id}/shadow-lock", "/shadow/learning/hypotheses/{id}/promotion-evidence", "/shadow/learning/league-dna", "/shadow/learning/selection-quality", "/shadow/learning/status"]}
+    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}", "/shadow/learning/cycle-plan", "/shadow/learning/run", "/shadow/learning/review-queue", "/shadow/learning/review-draft", "/shadow/learning/research-proposals", "/shadow/learning/research-proposals/refresh", "/shadow/learning/validation-queue", "/shadow/learning/freeze", "/shadow/learning/settle", "/shadow/learning/hypotheses", "/shadow/learning/hypotheses/{id}/shadow-lock", "/shadow/learning/hypotheses/{id}/promotion-evidence", "/shadow/learning/league-dna", "/shadow/learning/selection-quality", "/shadow/learning/status"]}
 
 
 @app.get("/health")
@@ -5293,6 +5296,9 @@ def run_learning_cycle(
     auto_build_review_drafts = payload.get("auto_build_postmatch_review_drafts", True)
     if not isinstance(auto_build_review_drafts, bool):
         raise HTTPException(status_code=400, detail="auto_build_postmatch_review_drafts_must_be_boolean")
+    auto_refresh_research_proposals = payload.get("auto_refresh_research_proposals", True)
+    if not isinstance(auto_refresh_research_proposals, bool):
+        raise HTTPException(status_code=400, detail="auto_refresh_research_proposals_must_be_boolean")
     supplied_run_id = str(payload.get("run_id") or "").strip()
     safe_run_id = supplied_run_id and len(supplied_run_id) <= 100 and all(char in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in supplied_run_id)
     if apply_changes and not safe_run_id:
@@ -5387,6 +5393,21 @@ def run_learning_cycle(
                 })
             except HTTPException as exc:
                 draft_results.append({"freeze_id": freeze_id, "action": "rejected", "status_code": exc.status_code, "reason": exc.detail})
+    research_proposal_results = []
+    if auto_refresh_research_proposals:
+        if apply_changes:
+            proposal_refresh = refresh_learning_research_proposals(now_ts=now_ts)
+            research_proposal_results = proposal_refresh.get("results") or []
+        else:
+            proposal_preview = learning_research_proposal_candidates()
+            research_proposal_results = [
+                {
+                    "proposal_id": row.get("proposal_id"), "action": "would_propose",
+                    "proposal_hash": row.get("proposal_hash"),
+                    "scope": row.get("scope"), "signal_dimension": row.get("signal_dimension"),
+                }
+                for row in proposal_preview.get("candidates") or []
+            ]
     prematch_plan = learning_cycle_plan(now_ts=now_ts, fixture_rows=fixture_rows, include_discovery=True)
     freeze_results = []
     builder = prematch_packet_builder or build_shadow_ai_packet
@@ -5428,6 +5449,7 @@ def run_learning_cycle(
             })
         except HTTPException as exc:
             freeze_results.append({"fixture": fixture, "action": "rejected", "status_code": exc.status_code, "reason": exc.detail})
+    forward_validation_queue = learning_forward_validation_queue(now_ts=now_ts)
     immutable_summary = {
         "run_id": supplied_run_id or None,
         "mode": "apply" if apply_changes else "dry_run",
@@ -5438,7 +5460,9 @@ def run_learning_cycle(
         "settlement_results": settlement_results,
         "postmatch_fact_results": fact_results,
         "postmatch_review_draft_results": draft_results,
+        "research_proposal_results": research_proposal_results,
         "freeze_results": freeze_results,
+        "forward_validation_queue": forward_validation_queue,
         "automatic_hypothesis_registration": False,
         "automatic_champion_change": False,
         "result_backfit_allowed": False,
@@ -5448,6 +5472,7 @@ def run_learning_cycle(
         "settled_count": sum(row.get("action") == "settled" for row in settlement_results),
         "frozen_count": sum(row.get("action") == "frozen" for row in freeze_results),
         "review_draft_count": sum(row.get("action") == "drafted" for row in draft_results),
+        "research_proposal_version_count": sum(row.get("action") == "proposed" for row in research_proposal_results),
         "rejected_count": sum(row.get("action") in {"rejected", "would_reject"} for row in settlement_results + fact_results + draft_results + freeze_results),
         "action": "completed" if apply_changes else "previewed",
     }
@@ -5691,6 +5716,9 @@ def register_learning_hypothesis(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="discovery_freeze_ids_required")
     base = {key: str(payload.get(key)).strip() for key in required_text}
     hypothesis_id = str(payload.get("hypothesis_id") or f"hyp-{_content_hash({**base, 'type': hypothesis_type})[:16]}").strip()
+    source_proposal_id = str(payload.get("source_proposal_id") or "").strip()
+    source_proposal_hash = str(payload.get("source_proposal_hash") or "").strip()
+    validation_plan = payload.get("validation_plan") if isinstance(payload.get("validation_plan"), dict) else {}
     with SNAPSHOT_STORE_LOCK:
         store = load_snapshot_store()
         unknown = [freeze_id for freeze_id in discovery if not _learning_freeze_by_id(store, freeze_id)]
@@ -5699,13 +5727,45 @@ def register_learning_hypothesis(payload: Dict[str, Any]) -> Dict[str, Any]:
             raise HTTPException(status_code=404, detail={"error": "discovery_freeze_not_found", "freeze_ids": unknown})
         if unsettled:
             raise HTTPException(status_code=409, detail={"error": "discovery_sample_not_settled", "freeze_ids": unsettled})
+        source_proposal = None
+        if source_proposal_id:
+            proposal_versions = (store.get("learning_research_proposals") or {}).get(source_proposal_id) or []
+            source_proposal = max(
+                (row for row in proposal_versions if isinstance(row, dict)),
+                key=lambda row: int(row.get("version_number") or 0), default=None,
+            )
+            if not source_proposal:
+                raise HTTPException(status_code=404, detail="source_research_proposal_not_found")
+            if not source_proposal_hash or source_proposal_hash != source_proposal.get("proposal_hash"):
+                raise HTTPException(status_code=409, detail="latest_source_research_proposal_hash_required")
+            required_discovery = set(get_nested(source_proposal, ["evidence", "supporting_freeze_ids"], []) or [])
+            if set(discovery) != required_discovery:
+                raise HTTPException(status_code=409, detail="hypothesis_must_bind_all_and_only_supporting_proposal_samples")
+            try:
+                minimum_samples = int(validation_plan.get("minimum_samples") or 0)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=422, detail="proposal_hypothesis_validation_minimum_invalid") from exc
+            if minimum_samples < LEARNING_MIN_VALIDATION_SAMPLES:
+                raise HTTPException(status_code=422, detail="proposal_hypothesis_validation_minimum_below_governance_floor")
+            structured_scope = validation_plan.get("structured_scope") if isinstance(validation_plan.get("structured_scope"), dict) else {}
+            competition_ids = structured_scope.get("competition_ids") if isinstance(structured_scope.get("competition_ids"), list) else []
+            markets = structured_scope.get("markets") if isinstance(structured_scope.get("markets"), list) else []
+            proposal_competition_id = get_nested(source_proposal, ["scope", "competition_id"])
+            proposal_market = str(get_nested(source_proposal, ["scope", "market"]) or "")
+            if proposal_competition_id not in competition_ids or proposal_market not in {str(value) for value in markets}:
+                raise HTTPException(status_code=422, detail="proposal_hypothesis_structured_scope_must_cover_source_signal")
         content = {
             "hypothesis_id": hypothesis_id,
             "type": hypothesis_type,
             **base,
             "discovery_freeze_ids": sorted(set(discovery)),
-            "pre_registered_validation_plan": payload.get("validation_plan") if isinstance(payload.get("validation_plan"), dict) else {},
+            "pre_registered_validation_plan": validation_plan,
         }
+        if source_proposal:
+            content["source_research_proposal"] = {
+                "proposal_id": source_proposal_id,
+                "proposal_hash": source_proposal_hash,
+            }
         content_hash = _content_hash(content)
         hypotheses = store.setdefault("learning_hypotheses", {})
         existing = hypotheses.get(hypothesis_id)
@@ -5726,6 +5786,80 @@ def register_learning_hypothesis(payload: Dict[str, Any]) -> Dict[str, Any]:
         store["version"] = VERSION
         write_snapshot_store(store)
         return record
+
+
+def learning_forward_validation_queue(now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """List only independent post-registration frozen matches eligible for a future Shadow lock."""
+    now_ts = int(now_ts or time.time())
+    store = load_snapshot_store()
+    items = []
+    blocked_hypotheses = []
+    latest_freezes = []
+    for fixture, versions in (store.get("learning_frozen") or {}).items():
+        latest = max(
+            (row for row in versions or [] if isinstance(row, dict)),
+            key=lambda row: int(row.get("version_number") or 0), default=None,
+        )
+        if latest:
+            latest_freezes.append(latest)
+    for hypothesis_id, hypothesis in (store.get("learning_hypotheses") or {}).items():
+        if hypothesis.get("status") not in (*LEARNING_HYPOTHESIS_TYPES, "SHADOW_VALIDATION"):
+            continue
+        plan = hypothesis.get("pre_registered_validation_plan") if isinstance(hypothesis.get("pre_registered_validation_plan"), dict) else {}
+        structured_scope = plan.get("structured_scope") if isinstance(plan.get("structured_scope"), dict) else {}
+        competition_ids = set(structured_scope.get("competition_ids") or []) if isinstance(structured_scope.get("competition_ids"), list) else set()
+        markets = {str(value) for value in (structured_scope.get("markets") or [])} if isinstance(structured_scope.get("markets"), list) else set()
+        if not competition_ids or not markets:
+            blocked_hypotheses.append({
+                "hypothesis_id": hypothesis_id,
+                "reason": "structured_validation_scope_missing",
+                "required_fields": ["validation_plan.structured_scope.competition_ids", "validation_plan.structured_scope.markets"],
+            })
+            continue
+        discovery_ids = set(hypothesis.get("discovery_freeze_ids") or [])
+        locks = (store.get("learning_shadow_locks") or {}).get(hypothesis_id) or {}
+        locked_fixture_ids = {
+            str(((_learning_freeze_by_id(store, freeze_id) or {}).get("fixture")) or "")
+            for freeze_id in locks
+        }
+        for freeze in latest_freezes:
+            freeze_id = str(freeze.get("freeze_id") or "")
+            fixture = str(freeze.get("fixture") or "")
+            if freeze_id in discovery_ids or fixture in locked_fixture_ids:
+                continue
+            if freeze_id in (store.get("learning_postmatch") or {}):
+                continue
+            if int(freeze.get("captured_at") or 0) < int(hypothesis.get("registered_at") or 0):
+                continue
+            if int(freeze.get("kickoff_at") or 0) <= now_ts:
+                continue
+            competition_id = get_nested(freeze, ["scope", "competition_id"])
+            expression = _learning_selected_expression(freeze.get("decision"))
+            if competition_id not in competition_ids or expression.get("market") not in markets:
+                continue
+            items.append({
+                "hypothesis_id": hypothesis_id,
+                "hypothesis_hash": hypothesis.get("content_hash"),
+                "freeze_id": freeze_id,
+                "freeze_hash": freeze.get("content_hash"),
+                "fixture": freeze.get("fixture"),
+                "kickoff_at": freeze.get("kickoff_at"),
+                "competition_id": competition_id,
+                "market": expression.get("market"),
+                "required_action": "compute_champion_challenger_and_ablation_outputs_then_lock_before_kickoff",
+                "automatic_shadow_lock": False,
+                "champion_effect": False,
+            })
+    items.sort(key=lambda row: (int(row.get("kickoff_at") or 0), str(row.get("hypothesis_id")), str(row.get("fixture"))))
+    return {
+        "version": VERSION, "generated_at": now_ts,
+        "queue_count": len(items), "items": items,
+        "blocked_hypothesis_count": len(blocked_hypotheses),
+        "blocked_hypotheses": blocked_hypotheses,
+        "automatic_shadow_lock": False,
+        "automatic_champion_change": False,
+        "policy": "only post-registration, non-discovery, distinct future matches enter the forward queue; model outputs must be computed and locked before kickoff",
+    }
 
 
 def _normalize_1x2_probabilities(value: Any, field_name: str) -> Dict[str, float]:
@@ -5810,6 +5944,13 @@ def lock_hypothesis_shadow_prediction(hypothesis_id: Any, payload: Dict[str, Any
         }
         lock_hash = _content_hash(content)
         locks = store.setdefault("learning_shadow_locks", {}).setdefault(hypothesis_id, {})
+        duplicate_fixture_lock = next((
+            existing_lock for existing_freeze_id, existing_lock in locks.items()
+            if str(((_learning_freeze_by_id(store, existing_freeze_id) or {}).get("fixture")) or "") == str(freeze.get("fixture") or "")
+            and existing_freeze_id != freeze_id
+        ), None)
+        if duplicate_fixture_lock:
+            raise HTTPException(status_code=409, detail="validation_fixture_already_locked_for_hypothesis")
         existing = locks.get(freeze_id)
         if existing:
             if existing.get("lock_hash") == lock_hash:
@@ -6272,12 +6413,27 @@ def learning_selection_quality_report(minimum_samples: Optional[int] = None) -> 
     minimum_samples = max(2, int(minimum_samples or LEARNING_MIN_VALIDATION_SAMPLES))
     store = load_snapshot_store()
     groups: Dict[str, Dict[str, Any]] = {}
-    excluded_counts = {"event_contaminated": 0, "data_insufficient": 0, "frozen_sample_missing": 0}
+    excluded_counts = {
+        "event_contaminated": 0, "data_insufficient": 0,
+        "frozen_sample_missing": 0, "superseded_freeze_version": 0,
+    }
+    latest_by_fixture: Dict[str, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
     for freeze_id, postmatch in (store.get("learning_postmatch") or {}).items():
         freeze = _learning_freeze_by_id(store, freeze_id)
         if not freeze:
             excluded_counts["frozen_sample_missing"] += 1
             continue
+        fixture = str(freeze.get("fixture") or "")
+        existing = latest_by_fixture.get(fixture)
+        if existing and int(existing[0].get("version_number") or 0) >= int(freeze.get("version_number") or 0):
+            excluded_counts["superseded_freeze_version"] += 1
+            continue
+        if existing:
+            excluded_counts["superseded_freeze_version"] += 1
+        latest_by_fixture[fixture] = (freeze, postmatch)
+    for freeze, postmatch in latest_by_fixture.values():
+        freeze_id = str(freeze.get("freeze_id") or "")
+        fixture = str(freeze.get("fixture") or "")
         process_class = str(postmatch.get("process_classification") or "")
         if process_class == "EVENT_CONTAMINATED":
             excluded_counts["event_contaminated"] += 1
@@ -6295,14 +6451,20 @@ def learning_selection_quality_report(minimum_samples: Optional[int] = None) -> 
             "process_correct_count": 0, "process_error_count": 0,
             "match_selection_failed_count": 0, "expression_failed_count": 0,
             "price_execution_failed_count": 0, "inconclusive_review_count": 0,
-            "freeze_ids": [],
+            "freeze_ids": [], "fixture_ids": [],
+            "failure_freeze_ids": {
+                "process_error": [], "match_selection": [],
+                "expression": [], "price_execution": [],
+            },
         })
         group["eligible_sample_count"] += 1
         group["freeze_ids"].append(freeze_id)
+        group["fixture_ids"].append(fixture)
         if process_class.startswith("PROCESS_CORRECT_"):
             group["process_correct_count"] += 1
         elif process_class.startswith("PROCESS_ERROR_"):
             group["process_error_count"] += 1
+            group["failure_freeze_ids"]["process_error"].append(freeze_id)
         review = postmatch.get("review") if isinstance(postmatch.get("review"), dict) else {}
         section_statuses = {
             "match_selection": get_nested(review, ["match_selection_quality", "status"]),
@@ -6311,10 +6473,13 @@ def learning_selection_quality_report(minimum_samples: Optional[int] = None) -> 
         }
         if section_statuses["match_selection"] == "failed":
             group["match_selection_failed_count"] += 1
+            group["failure_freeze_ids"]["match_selection"].append(freeze_id)
         if section_statuses["expression"] == "failed":
             group["expression_failed_count"] += 1
+            group["failure_freeze_ids"]["expression"].append(freeze_id)
         if section_statuses["price_execution"] == "failed":
             group["price_execution_failed_count"] += 1
+            group["failure_freeze_ids"]["price_execution"].append(freeze_id)
         if any(status in {"inconclusive", "data_missing", None} for status in section_statuses.values()):
             group["inconclusive_review_count"] += 1
     cards = []
@@ -6329,7 +6494,11 @@ def learning_selection_quality_report(minimum_samples: Optional[int] = None) -> 
         }
         has_failure_evidence = any(group[key] > 0 for key in ("match_selection_failed_count", "expression_failed_count", "price_execution_failed_count", "process_error_count"))
         cards.append({
-            **group, "freeze_ids": group["freeze_ids"][:100], "freeze_ids_truncated": len(group["freeze_ids"]) > 100,
+            **group,
+            "freeze_ids": group["freeze_ids"],
+            "fixture_ids": group["fixture_ids"],
+            "failure_freeze_ids": group["failure_freeze_ids"],
+            "freeze_ids_truncated": False,
             "minimum_samples": minimum_samples, "sample_ready": sample_ready, "rates": rates,
             "research_signal": "HYPOTHESIS_ONLY_REVIEW_ALLOWED" if sample_ready and has_failure_evidence else "COLLECT_MORE_INDEPENDENT_SAMPLES",
             "champion_effect": False, "automatic_weight_change": False,
@@ -6346,12 +6515,168 @@ def learning_selection_quality_report(minimum_samples: Optional[int] = None) -> 
     }
 
 
+def learning_research_proposal_candidates(minimum_matches: Optional[int] = None) -> Dict[str, Any]:
+    """Derive repeated multi-match research signals without asserting a causal theory."""
+    minimum_matches = max(3, int(minimum_matches or LEARNING_RESEARCH_PROPOSAL_MIN_MATCHES))
+    quality = learning_selection_quality_report(minimum_samples=minimum_matches)
+    dimensions = (
+        ("process_error", "process_error_count", "process_accuracy"),
+        ("match_selection", "match_selection_failed_count", "match_selection_failure_rate"),
+        ("expression", "expression_failed_count", "expression_failure_rate"),
+        ("price_execution", "price_execution_failed_count", "price_execution_failure_rate"),
+    )
+    candidates = []
+    rejected = []
+    for card in quality.get("cards") or []:
+        if not card.get("sample_ready"):
+            rejected.append({
+                "competition_id": card.get("competition_id"), "market": card.get("market"),
+                "reason": "minimum_distinct_match_sample_not_reached",
+                "eligible_match_count": card.get("eligible_sample_count"),
+            })
+            continue
+        for dimension, count_key, rate_key in dimensions:
+            failure_count = int(card.get(count_key) or 0)
+            if dimension == "process_error":
+                accuracy = get_nested(card, ["rates", rate_key])
+                failure_rate = round(1.0 - float(accuracy), 6) if accuracy is not None else None
+            else:
+                failure_rate = get_nested(card, ["rates", rate_key])
+            supporting_freezes = list(get_nested(card, ["failure_freeze_ids", dimension], []) or [])
+            reasons = []
+            if failure_count < LEARNING_RESEARCH_PROPOSAL_MIN_FAILURES:
+                reasons.append("minimum_repeated_failures_not_reached")
+            if failure_rate is None or float(failure_rate) < LEARNING_RESEARCH_PROPOSAL_MIN_FAILURE_RATE:
+                reasons.append("minimum_failure_rate_not_reached")
+            if len(set(supporting_freezes)) < LEARNING_RESEARCH_PROPOSAL_MIN_FAILURES:
+                reasons.append("independent_supporting_freezes_insufficient")
+            if reasons:
+                rejected.append({
+                    "competition_id": card.get("competition_id"), "market": card.get("market"),
+                    "signal_dimension": dimension, "failure_count": failure_count,
+                    "failure_rate": failure_rate, "reasons": reasons,
+                })
+                continue
+            identity = {
+                "competition_id": card.get("competition_id"),
+                "market": card.get("market"), "signal_dimension": dimension,
+            }
+            proposal_id = "research-" + _content_hash(identity)[:16]
+            evidence = {
+                "eligible_distinct_match_count": int(card.get("eligible_sample_count") or 0),
+                "failure_count": failure_count,
+                "failure_rate": failure_rate,
+                "supporting_freeze_ids": sorted(set(supporting_freezes)),
+                "context_freeze_ids": sorted(set(card.get("freeze_ids") or [])),
+                "context_fixture_ids": sorted(set(card.get("fixture_ids") or [])),
+                "selection_quality_rates": card.get("rates"),
+                "result_outcome_used": False,
+            }
+            immutable = {
+                "proposal_id": proposal_id,
+                "status": "RESEARCH_PROPOSAL",
+                "scope": {
+                    "competition_id": card.get("competition_id"),
+                    "competition_name": card.get("competition_name"),
+                    "market": card.get("market"),
+                },
+                "signal_dimension": dimension,
+                "evidence": evidence,
+                "research_question": f"Why does the frozen {dimension} audit repeatedly fail in this competition and market, and what prematch-observable intervention would reduce that failure?",
+                "causal_claim_status": "not_formulated",
+                "required_next_action": "formulate_a_falsifiable_causal_hypothesis_and_challenger_before_forward_validation",
+                "forward_validation_blueprint": {
+                    "discovery_samples_must_be_excluded": True,
+                    "minimum_independent_validation_samples": LEARNING_MIN_VALIDATION_SAMPLES,
+                    "pre_registration_required": True,
+                    "pre_kickoff_shadow_lock_required": True,
+                    "required_comparators": ["Champion", "Challenger", "Ablation"],
+                    "required_metrics": ["Brier", "CLV", "Process Accuracy", "Tail Risk"],
+                    "unresolved_counterexample_blocks_promotion": True,
+                    "explicit_user_confirmation_required_for_champion": True,
+                },
+                "automatic_hypothesis_registration": False,
+                "automatic_model_effect": False,
+                "champion_effect": False,
+                "result_backfit_used": False,
+            }
+            candidates.append({**immutable, "proposal_hash": _content_hash(immutable)})
+    candidates.sort(key=lambda row: (
+        str(get_nested(row, ["scope", "competition_name"])),
+        str(get_nested(row, ["scope", "market"])), str(row.get("signal_dimension")),
+    ))
+    return {
+        "version": VERSION, "minimum_distinct_matches": minimum_matches,
+        "minimum_repeated_failures": LEARNING_RESEARCH_PROPOSAL_MIN_FAILURES,
+        "minimum_failure_rate": LEARNING_RESEARCH_PROPOSAL_MIN_FAILURE_RATE,
+        "candidate_count": len(candidates), "candidates": candidates,
+        "rejected_count": len(rejected), "rejected": rejected,
+        "automatic_hypothesis_registration": False,
+        "automatic_champion_change": False,
+        "policy": "multi-match process signals create research proposals only; a proposal is not a causal hypothesis and has no model effect",
+    }
+
+
+def refresh_learning_research_proposals(now_ts: Optional[int] = None, minimum_matches: Optional[int] = None) -> Dict[str, Any]:
+    """Persist immutable versions of repeated-signal proposals; never register hypotheses."""
+    now_ts = int(now_ts or time.time())
+    derived = learning_research_proposal_candidates(minimum_matches=minimum_matches)
+    results = []
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        proposals = store.setdefault("learning_research_proposals", {})
+        for candidate in derived["candidates"]:
+            proposal_id = candidate["proposal_id"]
+            rows = proposals.setdefault(proposal_id, [])
+            duplicate = next((row for row in rows if row.get("proposal_hash") == candidate.get("proposal_hash")), None)
+            if duplicate:
+                results.append({**duplicate, "action": "unchanged"})
+                continue
+            version_number = max([int(row.get("version_number") or 0) for row in rows] + [0]) + 1
+            record = {
+                **candidate, "version_number": version_number,
+                "created_at": now_ts, "immutable": True, "action": "proposed",
+            }
+            rows.append(record)
+            results.append(record)
+        store["version"] = VERSION
+        write_snapshot_store(store)
+    return {
+        "version": VERSION, "generated_at": now_ts,
+        "proposal_result_count": len(results),
+        "new_proposal_version_count": sum(row.get("action") == "proposed" for row in results),
+        "results": results,
+        "automatic_hypothesis_registration": False,
+        "automatic_champion_change": False,
+    }
+
+
+def learning_research_proposal_report() -> Dict[str, Any]:
+    store = load_snapshot_store()
+    rows = []
+    for proposal_id, versions in (store.get("learning_research_proposals") or {}).items():
+        latest = max((row for row in versions or [] if isinstance(row, dict)), key=lambda row: int(row.get("version_number") or 0), default=None)
+        if latest:
+            rows.append(latest)
+    rows.sort(key=lambda row: (
+        str(get_nested(row, ["scope", "competition_name"])),
+        str(get_nested(row, ["scope", "market"])), str(row.get("signal_dimension")),
+    ))
+    return {
+        "version": VERSION, "proposal_count": len(rows), "proposals": rows,
+        "automatic_hypothesis_registration": False,
+        "automatic_champion_change": False,
+        "policy": "research proposals require causal formulation and preregistration before any forward Shadow validation",
+    }
+
+
 def learning_status_report() -> Dict[str, Any]:
     store = load_snapshot_store()
     frozen = store.get("learning_frozen") or {}
     postmatches = store.get("learning_postmatch") or {}
     postmatch_facts = store.get("learning_postmatch_facts") or {}
     postmatch_drafts = store.get("learning_postmatch_drafts") or {}
+    research_proposals = store.get("learning_research_proposals") or {}
     runs = store.get("learning_runs") or {}
     hypotheses = store.get("learning_hypotheses") or {}
     shadow_locks = store.get("learning_shadow_locks") or {}
@@ -6376,6 +6701,8 @@ def learning_status_report() -> Dict[str, Any]:
         "postmatch_fact_queue_count": len(postmatch_facts),
         "postmatch_review_draft_queue_count": len(postmatch_drafts),
         "postmatch_review_draft_version_count": sum(len(rows or []) for rows in postmatch_drafts.values()),
+        "research_proposal_count": len(research_proposals),
+        "research_proposal_version_count": sum(len(rows or []) for rows in research_proposals.values()),
         "postmatch_fact_pending_verification_count": sum(
             bool(rows) and max(rows, key=lambda row: int(row.get("version_number") or 0)).get("verification", {}).get("settlement_eligible") is not True
             for rows in postmatch_facts.values()
@@ -6935,6 +7262,12 @@ async def shadow_learning_hypothesis(request: Request, token: Optional[str] = No
     return JSONResponse({"ok": True, "hypothesis": record})
 
 
+@app.get("/shadow/learning/validation-queue")
+def shadow_learning_validation_queue(now_ts: Optional[int] = None, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "validation_queue": learning_forward_validation_queue(now_ts=now_ts)})
+
+
 @app.post("/shadow/learning/hypotheses/{hypothesis_id}/validation")
 async def shadow_learning_validation(hypothesis_id: str, request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
@@ -6989,6 +7322,20 @@ def shadow_learning_selection_quality(minimum_samples: Optional[int] = None, tok
     if minimum_samples is not None and not 2 <= minimum_samples <= 10000:
         raise HTTPException(status_code=400, detail="minimum_samples_must_be_between_2_and_10000")
     return JSONResponse({"ok": True, "selection_quality": learning_selection_quality_report(minimum_samples)})
+
+
+@app.get("/shadow/learning/research-proposals")
+def shadow_learning_research_proposals(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "research_proposals": learning_research_proposal_report()})
+
+
+@app.post("/shadow/learning/research-proposals/refresh")
+def shadow_learning_research_proposals_refresh(minimum_matches: Optional[int] = None, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    if minimum_matches is not None and not 3 <= minimum_matches <= 10000:
+        raise HTTPException(status_code=400, detail="minimum_matches_must_be_between_3_and_10000")
+    return JSONResponse({"ok": True, "research_proposals": refresh_learning_research_proposals(minimum_matches=minimum_matches)})
 
 
 @app.get("/shadow/learning/status")
@@ -7181,6 +7528,7 @@ def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[st
             "status": "already_completed", "at": now_ts, "run_id": run_id,
             "frozen_count": existing.get("frozen_count"),
             "review_draft_count": existing.get("review_draft_count"),
+            "research_proposal_version_count": existing.get("research_proposal_version_count"),
         }
     try:
         result = run_learning_cycle(
@@ -7189,6 +7537,7 @@ def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[st
                 "auto_prepare_prematch": True,
                 "auto_collect_postmatch_facts": True,
                 "auto_build_postmatch_review_drafts": True,
+                "auto_refresh_research_proposals": True,
             },
             now_ts=now_ts,
             fixture_rows=fixture_rows,
@@ -7198,10 +7547,13 @@ def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[st
             "execution_order": result.get("execution_order"),
             "frozen_count": result.get("frozen_count"),
             "review_draft_count": result.get("review_draft_count"),
+            "research_proposal_version_count": result.get("research_proposal_version_count"),
             "settled_count": result.get("settled_count"),
             "rejected_count": result.get("rejected_count"),
             "postmatch_fact_results": result.get("postmatch_fact_results"),
             "postmatch_review_draft_results": result.get("postmatch_review_draft_results"),
+            "research_proposal_results": result.get("research_proposal_results"),
+            "forward_validation_queue": result.get("forward_validation_queue"),
             "automatic_hypothesis_registration": False,
             "automatic_champion_change": False,
         }

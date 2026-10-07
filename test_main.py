@@ -4027,6 +4027,179 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(report["automatic_hypothesis_registration"])
         self.assertFalse(report["automatic_champion_change"])
 
+    def test_selection_quality_counts_latest_version_per_fixture_only(self):
+        self.settle_selection_quality_sample("quality-versioned", "PROCESS_CORRECT_RESULT_LOSS", expression_status="failed")
+        payload = self.learning_payload(
+            "quality-versioned", 950, 1000,
+            analysis={"fundamental_chain": {"status": "complete"}, "revision": 2},
+        )
+        payload["decision"] = {
+            "decision": "BET", "match_rating": "B",
+            "selected_expression": {"market": "over_under", "selection": "under", "line": 2.75, "price": 1.91},
+        }
+        latest = main.freeze_learning_sample(payload, now_ts=950)
+        facts = self.collect_verified_learning_facts(latest, 3, 2, 8201)
+        review = self.learning_postmatch_review()
+        review["match_selection_quality"] = {"status": "passed"}
+        review["expression_audit"] = {"status": "failed"}
+        review["price_execution_audit"] = {"status": "passed"}
+        main.settle_learning_sample(
+            latest["freeze_id"], {"status": "FT", "home_goals": 3, "away_goals": 2},
+            "PROCESS_CORRECT_RESULT_WIN", {"status": "clean"}, 8201, review, facts["fact_hash"],
+        )
+
+        report = main.learning_selection_quality_report(minimum_samples=2)
+        self.assertEqual(report["cards"][0]["eligible_sample_count"], 1)
+        self.assertEqual(report["cards"][0]["fixture_ids"], ["quality-versioned"])
+        self.assertEqual(report["excluded_counts"]["superseded_freeze_version"], 1)
+
+    def test_single_match_failure_cannot_create_research_proposal(self):
+        self.settle_selection_quality_sample("proposal-single", "PROCESS_CORRECT_RESULT_WIN", expression_status="failed")
+        derived = main.learning_research_proposal_candidates(minimum_matches=3)
+        self.assertEqual(derived["candidate_count"], 0)
+        self.assertFalse(derived["automatic_hypothesis_registration"])
+        self.assertNotIn("learning_research_proposals", main.load_snapshot_store())
+        self.assertNotIn("learning_hypotheses", main.load_snapshot_store())
+
+    def test_repeated_multi_match_failure_creates_immutable_proposal_only(self):
+        for index in range(3):
+            self.settle_selection_quality_sample(
+                f"proposal-repeat-{index}", "PROCESS_CORRECT_RESULT_LOSS", expression_status="failed",
+            )
+        derived = main.learning_research_proposal_candidates(minimum_matches=3)
+        self.assertEqual(derived["candidate_count"], 1)
+        candidate = derived["candidates"][0]
+        self.assertEqual(candidate["signal_dimension"], "expression")
+        self.assertEqual(candidate["evidence"]["eligible_distinct_match_count"], 3)
+        self.assertEqual(candidate["evidence"]["failure_count"], 3)
+        self.assertFalse(candidate["evidence"]["result_outcome_used"])
+        self.assertEqual(candidate["causal_claim_status"], "not_formulated")
+        self.assertFalse(candidate["automatic_hypothesis_registration"])
+        self.assertFalse(candidate["automatic_model_effect"])
+        self.assertFalse(candidate["champion_effect"])
+
+        first = main.refresh_learning_research_proposals(now_ts=9000, minimum_matches=3)
+        second = main.refresh_learning_research_proposals(now_ts=9001, minimum_matches=3)
+        self.assertEqual(first["new_proposal_version_count"], 1)
+        self.assertEqual(first["results"][0]["action"], "proposed")
+        self.assertEqual(second["new_proposal_version_count"], 0)
+        self.assertEqual(second["results"][0]["action"], "unchanged")
+        self.assertEqual(main.learning_research_proposal_report()["proposal_count"], 1)
+        store = main.load_snapshot_store()
+        self.assertNotIn("learning_hypotheses", store)
+        self.assertNotIn("learning_promotions", store)
+
+    def test_learning_cycle_refreshes_repeated_signal_before_future_discovery(self):
+        for index in range(3):
+            self.settle_selection_quality_sample(
+                f"cycle-proposal-{index}", "PROCESS_CORRECT_RESULT_WIN", expression_status="failed",
+            )
+        with patch.object(main, "LEARNING_RESEARCH_PROPOSAL_MIN_MATCHES", 3):
+            result = main.run_learning_cycle(
+                {"apply": True, "run_id": "proposal-cycle"}, now_ts=9000, fixture_rows=[],
+            )
+        self.assertEqual(result["execution_order"], ["past_36h_postmatch", "future_24h_prematch"])
+        self.assertEqual(result["research_proposal_version_count"], 1)
+        self.assertEqual(result["research_proposal_results"][0]["action"], "proposed")
+        self.assertFalse(result["automatic_hypothesis_registration"])
+        self.assertNotIn("learning_hypotheses", main.load_snapshot_store())
+
+    def create_expression_research_proposal(self):
+        for index in range(3):
+            self.settle_selection_quality_sample(
+                f"proposal-source-{index}", "PROCESS_CORRECT_RESULT_LOSS", expression_status="failed",
+            )
+        refreshed = main.refresh_learning_research_proposals(now_ts=8400, minimum_matches=3)
+        return refreshed["results"][0]
+
+    def test_proposal_sourced_hypothesis_binds_latest_hash_and_all_discovery_samples(self):
+        proposal = self.create_expression_research_proposal()
+        base = {
+            "hypothesis_id": "proposal-hyp", "type": "HYPOTHESIS_ONLY",
+            "title": "Expression failure challenger",
+            "definition": "A preregistered challenger will test a lower-condition expression gate.",
+            "applicable_scope": "England Premier League over_under",
+            "expected_direction": "lower expression audit failure without worse tail risk",
+            "failure_conditions": "no out-of-sample process gain or worse tail risk",
+            "falsification_criteria": "any unresolved counterexample or failed promotion gate",
+            "discovery_freeze_ids": proposal["evidence"]["supporting_freeze_ids"],
+            "source_proposal_id": proposal["proposal_id"],
+            "source_proposal_hash": proposal["proposal_hash"],
+            "validation_plan": {
+                "minimum_samples": main.LEARNING_MIN_VALIDATION_SAMPLES,
+                "structured_scope": {"competition_ids": [39], "markets": ["over_under"]},
+            },
+        }
+        stale = {**base, "source_proposal_hash": "stale"}
+        with self.assertRaises(main.HTTPException) as stale_rejected:
+            main.register_learning_hypothesis(stale)
+        self.assertEqual(stale_rejected.exception.detail, "latest_source_research_proposal_hash_required")
+
+        partial = {**base, "discovery_freeze_ids": base["discovery_freeze_ids"][:-1]}
+        with self.assertRaises(main.HTTPException) as partial_rejected:
+            main.register_learning_hypothesis(partial)
+        self.assertEqual(partial_rejected.exception.detail, "hypothesis_must_bind_all_and_only_supporting_proposal_samples")
+
+        with patch.object(main.time, "time", return_value=8500):
+            hypothesis = main.register_learning_hypothesis(base)
+        self.assertEqual(hypothesis["source_research_proposal"]["proposal_id"], proposal["proposal_id"])
+        self.assertEqual(hypothesis["source_research_proposal"]["proposal_hash"], proposal["proposal_hash"])
+        self.assertFalse(hypothesis["champion_effect"])
+
+    def test_forward_validation_queue_requires_new_distinct_matching_frozen_match(self):
+        proposal = self.create_expression_research_proposal()
+        with patch.object(main.time, "time", return_value=8500):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "forward-hyp", "type": "HYPOTHESIS_ONLY",
+                "title": "Forward expression challenger",
+                "definition": "Test a preregistered lower-condition expression gate.",
+                "applicable_scope": "England Premier League over_under",
+                "expected_direction": "lower expression failures",
+                "failure_conditions": "no independent gain",
+                "falsification_criteria": "challenger fails any derived gate",
+                "discovery_freeze_ids": proposal["evidence"]["supporting_freeze_ids"],
+                "source_proposal_id": proposal["proposal_id"],
+                "source_proposal_hash": proposal["proposal_hash"],
+                "validation_plan": {
+                    "minimum_samples": main.LEARNING_MIN_VALIDATION_SAMPLES,
+                    "structured_scope": {"competition_ids": [39], "markets": ["over_under"]},
+                },
+            })
+
+        future_payload = self.learning_payload("forward-fixture", 8600, 10000)
+        future_payload["decision"] = {
+            "decision": "BET", "match_rating": "B",
+            "selected_expression": {"market": "over_under", "selection": "under", "line": 2.75, "price": 1.91},
+        }
+        frozen = main.freeze_learning_sample(future_payload, now_ts=8600)
+        queue = main.learning_forward_validation_queue(now_ts=8700)
+        self.assertEqual(queue["queue_count"], 1)
+        self.assertEqual(queue["items"][0]["freeze_id"], frozen["freeze_id"])
+        self.assertFalse(queue["items"][0]["automatic_shadow_lock"])
+
+        lock_payload = {
+            "freeze_id": frozen["freeze_id"],
+            "champion_probabilities": {"home": 0.45, "draw": 0.25, "away": 0.30},
+            "challenger_probabilities": {"home": 0.30, "draw": 0.45, "away": 0.25},
+            "ablation_probabilities": {"home": 0.33, "draw": 0.34, "away": 0.33},
+            "selected_expression": {"market": "over_under", "selection": "under", "entry_decimal_price": 1.91, "entry_price_evidence_ref": "test:entry:forward"},
+            "risk": {"champion_tail_risk": 0.10, "challenger_tail_risk": 0.10},
+        }
+        main.lock_hypothesis_shadow_prediction("forward-hyp", lock_payload, now_ts=8700)
+        self.assertEqual(main.learning_forward_validation_queue(now_ts=8750)["queue_count"], 0)
+
+        later_payload = self.learning_payload(
+            "forward-fixture", 8800, 10000,
+            analysis={"fundamental_chain": {"status": "complete"}, "revision": 2},
+        )
+        later_payload["decision"] = future_payload["decision"]
+        later = main.freeze_learning_sample(later_payload, now_ts=8800)
+        with self.assertRaises(main.HTTPException) as duplicate_fixture:
+            main.lock_hypothesis_shadow_prediction(
+                "forward-hyp", {**lock_payload, "freeze_id": later["freeze_id"]}, now_ts=8810,
+            )
+        self.assertEqual(duplicate_fixture.exception.detail, "validation_fixture_already_locked_for_hypothesis")
+
 
 if __name__ == "__main__":
     unittest.main()
