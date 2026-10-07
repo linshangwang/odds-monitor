@@ -186,7 +186,9 @@ League DNA具备单独的哈希绑定确认入口`POST /shadow/learning/league-d
 - 失败率至少25%。
 - 失败维度只能来自Process、场次选择、表达或价格执行审计，不得使用最终输赢作为标签。
 
-`RESEARCH_PROPOSAL`只说明存在值得研究的重复信号，不构成因果理论，固定`causal_claim_status=not_formulated`，不得自动登记Hypothesis、调整权重或影响Champion。提案会保存全部支持冻结ID、上下文样本和不可变提案哈希。
+`RESEARCH_PROPOSAL`只说明存在值得研究的重复信号，不构成因果理论，固定`causal_claim_status=not_formulated`，不得由提案内容临时编造Hypothesis、调整权重或影响Champion。提案会保存全部支持冻结ID、上下文样本和不可变提案哈希。
+
+允许的唯一自动登记路径是事前模板实例化。`POST /shadow/learning/hypothesis-templates`登记不可变模板，必须预先固定因果定义、联赛/市场/失败维度、验证样本下限、模块消融及赔率无关Challenger干预。模板的`registered_at`必须早于提案全部支持样本的结算时间；同一提案必须恰好匹配一个模板。无模板、模板晚于任一发现证据或多个模板冲突时，周期只记录blocked，不登记Hypothesis。成功实例化仍固定为`HYPOTHESIS_ONLY`/`LEAGUE_TAG_CANDIDATE`、`champion_effect=false`，随后仅使用登记后的新比赛做前向验证。
 
 把提案转为`HYPOTHESIS_ONLY`时，必须明确写出可证伪定义、适用范围、预期方向、失败条件和反证标准；必须绑定最新提案哈希、全部且仅限提案支持样本，并预登记不少于正式治理下限的独立验证样本数及结构化联赛/市场范围。
 
@@ -211,7 +213,7 @@ League DNA具备单独的哈希绑定确认入口`POST /shadow/learning/league-d
 - 没有仅靠更深盘口或更低赔率制造表面胜率。
 - 不显著增加尾部风险、拥堵风险或市场相关性。
 
-`GET /shadow/learning/selection-quality`按联赛与市场汇总冻结样本的Process Accuracy、场次选择失败率、表达失败率和价格执行失败率。`EVENT_CONTAMINATED`与`DATA_INSUFFICIENT`不进入有效样本。最终赢/输不得作为优化目标；即使达到最低样本量，报告也只能输出`HYPOTHESIS_ONLY_REVIEW_ALLOWED`研究信号，不会自动登记假设、调权或修改Champion。
+`GET /shadow/learning/selection-quality`按联赛与市场汇总冻结样本的Process Accuracy、场次选择失败率、表达失败率和价格执行失败率。`EVENT_CONTAMINATED`与`DATA_INSUFFICIENT`不进入有效样本。最终赢/输不得作为优化目标；达到最低样本量也只能输出`HYPOTHESIS_ONLY_REVIEW_ALLOWED`研究信号。只有更早登记且唯一匹配的模板可把该信号实例化为无模型效力的Hypothesis；否则不会自动登记、调权或修改Champion。
 
 每次完成可结算复盘后，周期在生成多场研究提案之前先刷新不可变 Learning Card。`POST /shadow/learning/quality-cards/refresh`按冻结版本保存哈希绑定卡片；`GET /shadow/learning/quality-calibration`只使用赛前明确冻结的评级与过程审计做`PriorityQuality`、`SelectionQuality`内部校准。同一比赛仅最新结算版本计入，缺失评级不补猜，比分与输赢不得进入质量标签。该报告无自动调权、自动理论登记或Champion效力。
 

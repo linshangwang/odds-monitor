@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.07.0"
+VERSION = "2.08.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -198,7 +198,7 @@ LEARNING_TOP_FLIGHT_LEAGUES: Dict[int, Dict[str, str]] = {
 }
 LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
 LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
-LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.07").strip() or "MODEL_RULES.md@2026-10-08-v2.07"
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.08").strip() or "MODEL_RULES.md@2026-10-08-v2.08"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -6874,7 +6874,7 @@ def run_learning_cycle(
     postmatch_fact_fetcher: Optional[Any] = None,
     shadow_model_runner: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Execute one bounded learning cycle. It never creates hypotheses or changes Champion."""
+    """Execute one bounded cycle; only preregistered templates may create Hypotheses, never Champion changes."""
     payload = payload if isinstance(payload, dict) else {}
     now_ts = int(now_ts or time.time())
     apply_changes = payload.get("apply") is True
@@ -6893,6 +6893,9 @@ def run_learning_cycle(
     auto_refresh_research_proposals = payload.get("auto_refresh_research_proposals", True)
     if not isinstance(auto_refresh_research_proposals, bool):
         raise HTTPException(status_code=400, detail="auto_refresh_research_proposals_must_be_boolean")
+    auto_register_preregistered_hypotheses = payload.get("auto_register_preregistered_hypotheses", True)
+    if not isinstance(auto_register_preregistered_hypotheses, bool):
+        raise HTTPException(status_code=400, detail="auto_register_preregistered_hypotheses_must_be_boolean")
     auto_refresh_quality_cards = payload.get("auto_refresh_quality_cards", True)
     if not isinstance(auto_refresh_quality_cards, bool):
         raise HTTPException(status_code=400, detail="auto_refresh_quality_cards_must_be_boolean")
@@ -7090,6 +7093,12 @@ def run_learning_cycle(
                 }
                 for row in proposal_preview.get("candidates") or []
             ]
+    hypothesis_registration_results = []
+    if auto_register_preregistered_hypotheses:
+        hypothesis_refresh = instantiate_preregistered_learning_hypotheses(
+            now_ts=now_ts, apply_changes=apply_changes,
+        )
+        hypothesis_registration_results = hypothesis_refresh.get("results") or []
     prematch_plan = learning_cycle_plan(now_ts=now_ts, fixture_rows=fixture_rows, include_discovery=True)
     freeze_results = []
     builder = prematch_packet_builder or build_shadow_ai_packet
@@ -7182,10 +7191,14 @@ def run_learning_cycle(
         "review_completion_results": review_completion_results,
         "quality_card_results": quality_card_results,
         "research_proposal_results": research_proposal_results,
+        "hypothesis_registration_results": hypothesis_registration_results,
         "freeze_results": freeze_results,
         "shadow_lock_results": shadow_lock_results,
         "forward_validation_queue": forward_validation_queue,
-        "automatic_hypothesis_registration": False,
+        "automatic_hypothesis_registration": any(
+            row.get("action") in {"registered", "would_register"} for row in hypothesis_registration_results
+        ),
+        "automatic_hypothesis_registration_policy": "preregistered_templates_only",
         "automatic_champion_change": False,
         "result_backfit_allowed": False,
     }
@@ -7199,6 +7212,7 @@ def run_learning_cycle(
         "quality_card_created_count": sum(row.get("action") == "created" for row in quality_card_results),
         "shadow_lock_created_count": sum(row.get("action") == "locked" for row in shadow_lock_results),
         "research_proposal_version_count": sum(row.get("action") == "proposed" for row in research_proposal_results),
+        "hypothesis_registered_count": sum(row.get("action") == "registered" for row in hypothesis_registration_results),
         "rejected_count": sum(row.get("action") in {"rejected", "would_reject"} for row in settlement_results + fact_results + draft_results + review_completion_results + freeze_results + shadow_lock_results),
         "action": "completed" if apply_changes else "previewed",
     }
@@ -7520,7 +7534,42 @@ def _normalize_learning_challenger_spec(value: Any, required_modules: List[str])
     return {**normalized_spec, "spec_hash": _content_hash(normalized_spec)}
 
 
-def register_learning_hypothesis(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_learning_validation_plan(value: Any) -> Dict[str, Any]:
+    value = value if isinstance(value, dict) else {}
+    normalized_ablation_plan = _normalize_learning_ablation_plan(value.get("ablation_plan"))
+    structured_scope = value.get("structured_scope") if isinstance(value.get("structured_scope"), dict) else {}
+    raw_competition_ids = structured_scope.get("competition_ids") if isinstance(structured_scope.get("competition_ids"), list) else []
+    try:
+        competition_ids = sorted(set(int(item) for item in raw_competition_ids if not isinstance(item, bool)))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="structured_scope_competition_ids_invalid") from exc
+    markets = sorted(set(
+        str(item).strip() for item in (structured_scope.get("markets") or []) if str(item).strip()
+    )) if isinstance(structured_scope.get("markets"), list) else []
+    if not competition_ids or not markets:
+        raise HTTPException(status_code=422, detail="structured_validation_scope_required")
+    invalid_markets = [market for market in markets if market not in LEAGUE_DNA_MARKETS]
+    if invalid_markets:
+        raise HTTPException(status_code=422, detail={"error": "unsupported_structured_scope_market", "markets": invalid_markets})
+    challenger_spec = _normalize_learning_challenger_spec(
+        value.get("challenger_spec"), normalized_ablation_plan["required_modules"],
+    )
+    return {
+        **value,
+        "structured_scope": {"competition_ids": competition_ids, "markets": markets},
+        "ablation_plan": normalized_ablation_plan,
+        "challenger_spec": challenger_spec,
+        "calculator_policy": {
+            "required_origin": "internal_shadow_runner",
+            "runner_schema": "learning_shadow_model_run_v1",
+            "required_runner_id": "builtin_preregistered_poisson_challenger",
+            "required_runner_version": "1",
+            "external_submitted_outputs_promotion_eligible": False,
+        },
+    }
+
+
+def register_learning_hypothesis(payload: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
     payload = payload if isinstance(payload, dict) else {}
     hypothesis_type = str(payload.get("type") or "").strip()
     if hypothesis_type not in LEARNING_HYPOTHESIS_TYPES:
@@ -7536,36 +7585,13 @@ def register_learning_hypothesis(payload: Dict[str, Any]) -> Dict[str, Any]:
     hypothesis_id = str(payload.get("hypothesis_id") or f"hyp-{_content_hash({**base, 'type': hypothesis_type})[:16]}").strip()
     source_proposal_id = str(payload.get("source_proposal_id") or "").strip()
     source_proposal_hash = str(payload.get("source_proposal_hash") or "").strip()
-    validation_plan = payload.get("validation_plan") if isinstance(payload.get("validation_plan"), dict) else {}
-    normalized_ablation_plan = _normalize_learning_ablation_plan(validation_plan.get("ablation_plan"))
-    structured_scope = validation_plan.get("structured_scope") if isinstance(validation_plan.get("structured_scope"), dict) else {}
-    raw_competition_ids = structured_scope.get("competition_ids") if isinstance(structured_scope.get("competition_ids"), list) else []
-    try:
-        competition_ids = sorted(set(int(value) for value in raw_competition_ids if not isinstance(value, bool)))
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=422, detail="structured_scope_competition_ids_invalid") from exc
-    markets = sorted(set(str(value).strip() for value in (structured_scope.get("markets") or []) if str(value).strip())) if isinstance(structured_scope.get("markets"), list) else []
-    if not competition_ids or not markets:
-        raise HTTPException(status_code=422, detail="structured_validation_scope_required")
-    invalid_markets = [market for market in markets if market not in LEAGUE_DNA_MARKETS]
-    if invalid_markets:
-        raise HTTPException(status_code=422, detail={"error": "unsupported_structured_scope_market", "markets": invalid_markets})
-    challenger_spec = _normalize_learning_challenger_spec(
-        validation_plan.get("challenger_spec"), normalized_ablation_plan["required_modules"],
-    )
-    validation_plan = {
-        **validation_plan,
-        "structured_scope": {"competition_ids": competition_ids, "markets": markets},
-        "ablation_plan": normalized_ablation_plan,
-        "challenger_spec": challenger_spec,
-        "calculator_policy": {
-            "required_origin": "internal_shadow_runner",
-            "runner_schema": "learning_shadow_model_run_v1",
-            "required_runner_id": "builtin_preregistered_poisson_challenger",
-            "required_runner_version": "1",
-            "external_submitted_outputs_promotion_eligible": False,
-        },
-    }
+    validation_plan = _normalize_learning_validation_plan(payload.get("validation_plan"))
+    registration_provenance = payload.get("registration_provenance") if isinstance(payload.get("registration_provenance"), dict) else None
+    if registration_provenance is not None:
+        if registration_provenance.get("mode") != "automatic_from_preregistered_template":
+            raise HTTPException(status_code=422, detail="unsupported_hypothesis_registration_provenance")
+        if not all(str(registration_provenance.get(key) or "").strip() for key in ("template_id", "template_hash", "proposal_id", "proposal_hash")):
+            raise HTTPException(status_code=422, detail="complete_hypothesis_registration_provenance_required")
     with SNAPSHOT_STORE_LOCK:
         store = load_snapshot_store()
         unknown = [freeze_id for freeze_id in discovery if not _learning_freeze_by_id(store, freeze_id)]
@@ -7601,6 +7627,44 @@ def register_learning_hypothesis(payload: Dict[str, Any]) -> Dict[str, Any]:
             proposal_market = str(get_nested(source_proposal, ["scope", "market"]) or "")
             if proposal_competition_id not in competition_ids or proposal_market not in {str(value) for value in markets}:
                 raise HTTPException(status_code=422, detail="proposal_hypothesis_structured_scope_must_cover_source_signal")
+        if registration_provenance is not None:
+            if not source_proposal:
+                raise HTTPException(status_code=422, detail="automatic_template_registration_requires_source_proposal")
+            template_id = str(registration_provenance.get("template_id") or "")
+            template = (store.get("learning_hypothesis_templates") or {}).get(template_id)
+            if not isinstance(template, dict):
+                raise HTTPException(status_code=404, detail="preregistered_hypothesis_template_not_found")
+            if str(registration_provenance.get("template_hash") or "") != str(template.get("template_hash") or ""):
+                raise HTTPException(status_code=409, detail="preregistered_hypothesis_template_hash_mismatch")
+            if (
+                str(registration_provenance.get("proposal_id") or "") != source_proposal_id
+                or str(registration_provenance.get("proposal_hash") or "") != source_proposal_hash
+            ):
+                raise HTTPException(status_code=409, detail="automatic_registration_proposal_provenance_mismatch")
+            postmatches = store.get("learning_postmatch") or {}
+            support_settled_at = [
+                int(get_nested(postmatches.get(str(freeze_id)) or {}, ["settled_at"]) or 0)
+                for freeze_id in discovery
+            ]
+            if not support_settled_at or any(value <= 0 for value in support_settled_at):
+                raise HTTPException(status_code=409, detail="automatic_registration_settled_discovery_evidence_required")
+            if int(template.get("registered_at") or 0) >= min(support_settled_at):
+                raise HTTPException(status_code=409, detail="hypothesis_template_must_predate_all_discovery_samples")
+            if hypothesis_type != template.get("type") or any(base[key] != str(template.get(key) or "") for key in required_text):
+                raise HTTPException(status_code=409, detail="hypothesis_must_exactly_instantiate_preregistered_template")
+            if _content_hash(validation_plan) != _content_hash(template.get("pre_registered_validation_plan") or {}):
+                raise HTTPException(status_code=409, detail="hypothesis_validation_plan_must_match_preregistered_template")
+            proposal_dimension = str(source_proposal.get("signal_dimension") or "")
+            if proposal_dimension not in (template.get("signal_dimensions") or []):
+                raise HTTPException(status_code=409, detail="hypothesis_template_signal_dimension_mismatch")
+            registration_provenance = {
+                "mode": "automatic_from_preregistered_template",
+                "template_id": template_id, "template_hash": template.get("template_hash"),
+                "template_registered_at": template.get("registered_at"),
+                "proposal_id": source_proposal_id, "proposal_hash": source_proposal_hash,
+                "all_supporting_samples_postdate_template": True,
+                "result_outcome_used": False,
+            }
         content = {
             "hypothesis_id": hypothesis_id,
             "type": hypothesis_type,
@@ -7608,6 +7672,8 @@ def register_learning_hypothesis(payload: Dict[str, Any]) -> Dict[str, Any]:
             "discovery_freeze_ids": sorted(set(discovery)),
             "pre_registered_validation_plan": validation_plan,
         }
+        if registration_provenance is not None:
+            content["registration_provenance"] = copy.deepcopy(registration_provenance)
         if source_proposal:
             content["source_research_proposal"] = {
                 "proposal_id": source_proposal_id,
@@ -7622,7 +7688,7 @@ def register_learning_hypothesis(payload: Dict[str, Any]) -> Dict[str, Any]:
             raise HTTPException(status_code=409, detail="hypothesis_id_already_registered")
         record = {
             **content,
-            "registered_at": int(time.time()),
+            "registered_at": int(now_ts or time.time()),
             "content_hash": content_hash,
             "status": hypothesis_type,
             "validation_evidence": [],
@@ -7633,6 +7699,170 @@ def register_learning_hypothesis(payload: Dict[str, Any]) -> Dict[str, Any]:
         store["version"] = VERSION
         write_snapshot_store(store)
         return record
+
+
+def register_learning_hypothesis_template(payload: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Register an immutable causal/Challenger template before its discovery samples exist."""
+    payload = payload if isinstance(payload, dict) else {}
+    hypothesis_type = str(payload.get("type") or "HYPOTHESIS_ONLY").strip()
+    if hypothesis_type not in LEARNING_HYPOTHESIS_TYPES:
+        raise HTTPException(status_code=400, detail="invalid_hypothesis_type")
+    required_text = ("title", "definition", "applicable_scope", "expected_direction", "failure_conditions", "falsification_criteria")
+    missing = [key for key in required_text if not str(payload.get(key) or "").strip()]
+    if missing:
+        raise HTTPException(status_code=400, detail={"error": "hypothesis_template_fields_required", "missing": missing})
+    allowed_dimensions = {"process_error", "match_selection", "expression", "price_execution"}
+    signal_dimensions = sorted(set(
+        str(value).strip() for value in (payload.get("signal_dimensions") or []) if str(value).strip()
+    )) if isinstance(payload.get("signal_dimensions"), list) else []
+    if not signal_dimensions or any(value not in allowed_dimensions for value in signal_dimensions):
+        raise HTTPException(status_code=422, detail="valid_hypothesis_template_signal_dimensions_required")
+    validation_plan = _normalize_learning_validation_plan(payload.get("validation_plan"))
+    try:
+        minimum_samples = int(validation_plan.get("minimum_samples") or 0)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="hypothesis_template_validation_minimum_invalid") from exc
+    if minimum_samples < LEARNING_MIN_VALIDATION_SAMPLES:
+        raise HTTPException(status_code=422, detail="hypothesis_template_validation_minimum_below_governance_floor")
+    base = {key: str(payload.get(key)).strip() for key in required_text}
+    immutable = {
+        "type": hypothesis_type, **base,
+        "signal_dimensions": signal_dimensions,
+        "pre_registered_validation_plan": validation_plan,
+        "automatic_instantiation_allowed": True,
+        "result_outcome_used": False,
+        "champion_effect": False,
+    }
+    template_id = str(payload.get("template_id") or f"hyp-template-{_content_hash(immutable)[:16]}").strip()
+    if not template_id or len(template_id) > 100 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in template_id):
+        raise HTTPException(status_code=400, detail="safe_hypothesis_template_id_required")
+    content = {"template_id": template_id, **immutable}
+    template_hash = _content_hash(content)
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        templates = store.setdefault("learning_hypothesis_templates", {})
+        existing = templates.get(template_id)
+        if existing:
+            if existing.get("template_hash") == template_hash:
+                return {**existing, "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="hypothesis_template_id_already_registered")
+        record = {
+            **content, "template_hash": template_hash,
+            "registered_at": int(now_ts or time.time()),
+            "immutable": True, "action": "registered",
+        }
+        templates[template_id] = record
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return record
+
+
+def learning_hypothesis_template_report() -> Dict[str, Any]:
+    templates = [
+        row for row in (load_snapshot_store().get("learning_hypothesis_templates") or {}).values()
+        if isinstance(row, dict)
+    ]
+    templates.sort(key=lambda row: str(row.get("template_id")))
+    return {
+        "version": VERSION, "template_count": len(templates), "templates": templates,
+        "automatic_instantiation_policy": "template_must_preexist_every_supporting_discovery_sample",
+        "automatic_champion_change": False,
+    }
+
+
+def instantiate_preregistered_learning_hypotheses(now_ts: Optional[int] = None, apply_changes: bool = True) -> Dict[str, Any]:
+    """Turn a repeated proposal into a Hypothesis only when one unique causal template predates all evidence."""
+    now_ts = int(now_ts or time.time())
+    store = load_snapshot_store()
+    templates = [row for row in (store.get("learning_hypothesis_templates") or {}).values() if isinstance(row, dict)]
+    existing_proposals = {
+        str(get_nested(row, ["source_research_proposal", "proposal_id"]) or "")
+        for row in (store.get("learning_hypotheses") or {}).values() if isinstance(row, dict)
+    }
+    proposals = []
+    for versions in (store.get("learning_research_proposals") or {}).values():
+        latest = max((row for row in versions or [] if isinstance(row, dict)), key=lambda row: int(row.get("version_number") or 0), default=None)
+        if latest:
+            proposals.append(latest)
+    results = []
+    for proposal in proposals:
+        proposal_id = str(proposal.get("proposal_id") or "")
+        if proposal_id in existing_proposals:
+            results.append({"proposal_id": proposal_id, "action": "skipped", "reason": "proposal_already_has_registered_hypothesis"})
+            continue
+        support_ids = sorted(set(get_nested(proposal, ["evidence", "supporting_freeze_ids"], []) or []))
+        postmatches = store.get("learning_postmatch") or {}
+        settled_times = [int(get_nested(postmatches.get(str(freeze_id)) or {}, ["settled_at"]) or 0) for freeze_id in support_ids]
+        if not support_ids or any(value <= 0 for value in settled_times):
+            results.append({"proposal_id": proposal_id, "action": "blocked", "reason": "complete_settled_discovery_evidence_required"})
+            continue
+        competition_id = get_nested(proposal, ["scope", "competition_id"])
+        market = str(get_nested(proposal, ["scope", "market"]) or "")
+        dimension = str(proposal.get("signal_dimension") or "")
+        matching = []
+        for template in templates:
+            scope = get_nested(template, ["pre_registered_validation_plan", "structured_scope"], {}) or {}
+            if (
+                dimension in (template.get("signal_dimensions") or [])
+                and competition_id in (scope.get("competition_ids") or [])
+                and market in (scope.get("markets") or [])
+                and int(template.get("registered_at") or 0) < min(settled_times)
+            ):
+                matching.append(template)
+        if len(matching) != 1:
+            results.append({
+                "proposal_id": proposal_id, "action": "blocked",
+                "reason": "no_preregistered_template" if not matching else "ambiguous_preregistered_templates",
+                "matching_template_count": len(matching),
+            })
+            continue
+        template = matching[0]
+        hypothesis_id = "auto-hyp-" + _content_hash({
+            "template_hash": template.get("template_hash"), "proposal_id": proposal_id,
+        })[:16]
+        payload = {
+            "hypothesis_id": hypothesis_id,
+            "type": template.get("type"),
+            **{key: template.get(key) for key in ("title", "definition", "applicable_scope", "expected_direction", "failure_conditions", "falsification_criteria")},
+            "discovery_freeze_ids": support_ids,
+            "source_proposal_id": proposal_id,
+            "source_proposal_hash": proposal.get("proposal_hash"),
+            "validation_plan": copy.deepcopy(template.get("pre_registered_validation_plan") or {}),
+            "registration_provenance": {
+                "mode": "automatic_from_preregistered_template",
+                "template_id": template.get("template_id"), "template_hash": template.get("template_hash"),
+                "template_registered_at": template.get("registered_at"),
+                "proposal_id": proposal_id, "proposal_hash": proposal.get("proposal_hash"),
+                "all_supporting_samples_postdate_template": True,
+                "result_outcome_used": False,
+            },
+        }
+        if not apply_changes:
+            results.append({
+                "proposal_id": proposal_id, "hypothesis_id": hypothesis_id,
+                "template_id": template.get("template_id"), "action": "would_register",
+            })
+            continue
+        try:
+            hypothesis = register_learning_hypothesis(payload, now_ts=now_ts)
+            results.append({
+                "proposal_id": proposal_id, "hypothesis_id": hypothesis.get("hypothesis_id"),
+                "template_id": template.get("template_id"), "action": hypothesis.get("action"),
+                "champion_effect": False,
+            })
+        except HTTPException as exc:
+            results.append({
+                "proposal_id": proposal_id, "hypothesis_id": hypothesis_id,
+                "template_id": template.get("template_id"), "action": "rejected",
+                "status_code": exc.status_code, "reason": exc.detail,
+            })
+    return {
+        "version": VERSION, "result_count": len(results), "results": results,
+        "registered_count": sum(row.get("action") == "registered" for row in results),
+        "automatic_registration_scope": "preregistered_templates_only",
+        "single_match_registration_allowed": False,
+        "automatic_champion_change": False,
+    }
 
 
 def learning_forward_validation_queue(now_ts: Optional[int] = None) -> Dict[str, Any]:
@@ -9520,6 +9750,7 @@ def learning_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
     quality_cards = store.get("learning_quality_cards") or {}
     runs = store.get("learning_runs") or {}
     hypotheses = store.get("learning_hypotheses") or {}
+    hypothesis_templates = store.get("learning_hypothesis_templates") or {}
     shadow_locks = store.get("learning_shadow_locks") or {}
     promotions = store.get("learning_promotions") or {}
     league_dna_candidates = store.get("league_dna_candidates") or {}
@@ -9556,6 +9787,7 @@ def learning_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         "implementation_gap_count": implementation_gap_count,
         "single_match_hypothesis_disposition_count": hypothesis_disposition_count,
         "hypothesis_count": len(hypotheses),
+        "hypothesis_template_count": len(hypothesis_templates),
         "shadow_validation_lock_count": sum(len(rows or {}) for rows in shadow_locks.values()),
         "hypothesis_status_counts": {status: sum(row.get("status") == status for row in hypotheses.values()) for status in (*LEARNING_HYPOTHESIS_TYPES, "SHADOW_VALIDATION", "PROMOTION_CANDIDATE")},
         "promotion_candidate_count": len(promotions),
@@ -10150,6 +10382,19 @@ async def shadow_learning_hypothesis(request: Request, token: Optional[str] = No
     return JSONResponse({"ok": True, "hypothesis": record})
 
 
+@app.post("/shadow/learning/hypothesis-templates")
+async def shadow_learning_hypothesis_template(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    record = register_learning_hypothesis_template(await request.json())
+    return JSONResponse({"ok": True, "hypothesis_template": record})
+
+
+@app.get("/shadow/learning/hypothesis-templates")
+def shadow_learning_hypothesis_templates(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "hypothesis_templates": learning_hypothesis_template_report()})
+
+
 @app.get("/shadow/learning/validation-queue")
 def shadow_learning_validation_queue(now_ts: Optional[int] = None, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
@@ -10522,6 +10767,7 @@ def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[st
             "probability_replay_missing_count": existing.get("probability_replay_missing_count"),
             "review_draft_count": existing.get("review_draft_count"),
             "research_proposal_version_count": existing.get("research_proposal_version_count"),
+            "hypothesis_registered_count": existing.get("hypothesis_registered_count"),
         }
     try:
         result = run_learning_cycle(
@@ -10531,6 +10777,7 @@ def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[st
                 "auto_collect_postmatch_facts": True,
                 "auto_build_postmatch_review_drafts": True,
                 "auto_refresh_research_proposals": True,
+                "auto_register_preregistered_hypotheses": True,
             },
             now_ts=now_ts,
             fixture_rows=fixture_rows,
@@ -10546,6 +10793,7 @@ def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[st
             "quality_card_created_count": result.get("quality_card_created_count"),
             "shadow_lock_created_count": result.get("shadow_lock_created_count"),
             "research_proposal_version_count": result.get("research_proposal_version_count"),
+            "hypothesis_registered_count": result.get("hypothesis_registered_count"),
             "settled_count": result.get("settled_count"),
             "rejected_count": result.get("rejected_count"),
             "postmatch_fact_results": result.get("postmatch_fact_results"),
@@ -10555,8 +10803,10 @@ def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[st
             "quality_card_results": result.get("quality_card_results"),
             "shadow_lock_results": result.get("shadow_lock_results"),
             "research_proposal_results": result.get("research_proposal_results"),
+            "hypothesis_registration_results": result.get("hypothesis_registration_results"),
             "forward_validation_queue": result.get("forward_validation_queue"),
-            "automatic_hypothesis_registration": False,
+            "automatic_hypothesis_registration": result.get("automatic_hypothesis_registration") is True,
+            "automatic_hypothesis_registration_policy": "preregistered_templates_only",
             "automatic_champion_change": False,
         }
     except Exception as exc:

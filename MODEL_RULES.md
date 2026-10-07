@@ -176,6 +176,7 @@ TheStatsAPI可作为第二事件权威，但其`match_id`必须在开赛前通�
 - 赛后只能复盘已有冻结样本。无冻结版本的比赛不得用于Champion学习或理论验证。
 - 自动任务可以修复有明确原规则依据的 `IMPLEMENTATION_GAP`，但不得借实现修复改变正式规则含义或权重。
 - 自动任务可以登记和验证 `HYPOTHESIS_ONLY`、`LEAGUE_TAG_CANDIDATE`，但不得自动将其并入Champion。
+- 自动登记只允许实例化事前存在的不可变因果/Challenger模板：模板必须早于全部发现样本，且联赛、市场、失败维度、消融计划和赔率无关干预唯一匹配。系统不得看见多场结果后临时生成模板；无匹配、晚登记或多模板冲突均失败关闭。
 - 只有形成完整 `PROMOTION_CANDIDATE` 且获得用户对该具体晋级包的明确确认后，才能版本化修改Champion。
 - 自动学习的首要目标是提高 `PriorityQuality`、`SelectionQuality`、价格质量与校准，不以短期命中率为优化目标。
 - 自动生成的赛前概率必须带`learning_probability_replay_v1`契约。契约必须保存完整的独立输入、PIT观测时间、来源内容哈希、估计器输出与哈希、概率输出与模型哈希，以及覆盖全部内容的`replay_hash`；冻结时由服务端独立重算，不能只相信调用方提交的概率。
