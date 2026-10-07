@@ -43,6 +43,8 @@
 
 每日周期默认在最新双源结果事实和对应草稿均存在时执行`automatic_evidence_review`。自动复盘只审计赛前不可变契约及哈希绑定事件证据，不读取终场比分来判定六项过程质量。若事件序列未达到两个独立权威来源，事件污染状态视为未知，分类固定为`DATA_INSUFFICIENT`且`selection_outcome_audit=not_used`；该记录不得进入过程质量校准、多场研究提案或Champion验证证据。只有事件序列已独立核实且全部过程证据可判定时，才允许先派生Process等级、再单独结算冻结选择。
 
+第二事件源固定采用TheStatsAPI的赛前身份与赛后timeline契约。赛前只能用UTC日期、主客队和开赛时间唯一匹配并冻结`match_id`；多匹配、无匹配或赛后才找到的ID都不合格。赛后match detail须核对同一比赛与比分，timeline须与API-Football的进球、红牌、点球、乌龙关键序列按类型、主客侧和分钟容差一致。双方事件证据必须绑定同一`event_signature_hash`，否则仍按单源处理。
+
 ## 四、赛前阶段
 
 ### 1. 发现与筛选

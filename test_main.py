@@ -4784,6 +4784,88 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(facts["verification"]["settlement_eligible"])
         self.assertEqual(facts["verification"]["independent_source_count"], 1)
 
+    def test_thestats_identity_is_uniquely_bound_before_kickoff(self):
+        kickoff_at, observed_at = 200000, 190000
+        fixture = {"home": "Home United", "away": "Away City", "timestamp": kickoff_at}
+        row = {
+            "id": "mt_8045", "utc_date": datetime.fromtimestamp(kickoff_at, tz=timezone.utc).isoformat(),
+            "status": "scheduled",
+            "home_team": {"name": "Home United"}, "away_team": {"name": "Away City"},
+        }
+        response = {"ok": True, "status_code": 200, "data": {"data": [row], "meta": {"total_pages": 1}}}
+        with patch.object(main, "THESTATS_API_KEY", "configured"), patch.object(main, "call_thestats", return_value=response) as fetch:
+            identity = main._resolve_thestats_prematch_identity(fixture, observed_at)
+        self.assertTrue(identity["ok"])
+        self.assertEqual(identity["match_id"], "mt_8045")
+        self.assertEqual(identity["source_hash"], main._content_hash({
+            "source": "thestats", "match_id": "mt_8045", "kickoff_at": kickoff_at,
+            "home_team": "Home United", "away_team": "Away City",
+        }))
+        self.assertEqual(fetch.call_args.args[0], "/football/matches")
+
+        packet = self.learning_prematch_packet(8045, observed_at)
+        packet["provider_identities"] = [{key: value for key, value in identity.items() if key != "ok"}]
+        candidate = main.discover_learning_fixtures(
+            now_ts=observed_at, fixture_rows=[self.learning_fixture_row(8045, 39, kickoff_at)],
+        )["candidates"][0]
+        freeze_payload = main.build_learning_freeze_payload(candidate, packet, now_ts=observed_at)
+        frozen_identity = next(row for row in freeze_payload["source_refs"] if row.get("source") == "thestats")
+        self.assertEqual(frozen_identity["match_id"], "mt_8045")
+        self.assertEqual(frozen_identity["identity_bound_at"], observed_at)
+
+    def test_thestats_postmatch_requires_exact_result_and_matching_material_events(self):
+        kickoff_at = 1000
+        identity = {
+            "source": "thestats", "match_id": "mt_8046", "kickoff_at": kickoff_at,
+            "home_team": "Home United", "away_team": "Away City",
+        }
+        payload = self.learning_payload("8046", 900, kickoff_at)
+        payload["source_refs"] = [{
+            **identity, "identity_bound_at": 900,
+            "identity_source_hash": main._content_hash(identity),
+        }]
+        frozen = main.freeze_learning_sample(payload, now_ts=900)
+        api_events = [
+            {"elapsed": 12, "type": "Goal", "detail": "Normal Goal", "team": "Home United"},
+            {"elapsed": 40, "type": "Goal", "detail": "Normal Goal", "team": "Away City"},
+        ]
+        detail = {
+            "ok": True, "status_code": 200,
+            "data": {"data": {
+                "id": "mt_8046", "utc_date": datetime.fromtimestamp(kickoff_at, tz=timezone.utc).isoformat(),
+                "status": "finished", "home_team": {"name": "Home United"},
+                "away_team": {"name": "Away City"}, "score": {"home": 1, "away": 1},
+            }},
+        }
+        timeline = {
+            "ok": True, "status_code": 200,
+            "data": {"data": {"events": [
+                {"minute": 12, "type": "goal", "detail": "normal", "team": {"name": "Home United"}},
+                {"minute": 41, "type": "goal", "detail": "normal", "team": {"name": "Away City"}},
+            ]}},
+        }
+        with patch.object(main, "call_thestats", side_effect=[detail, timeline]):
+            evidence = main._thestats_frozen_postmatch_evidence(
+                frozen, api_events, {"home_goals": 1, "away_goals": 1},
+            )
+        self.assertTrue(evidence["ok"])
+        self.assertTrue(evidence["result_audit"]["ok"])
+        self.assertTrue(evidence["event_audit"]["ok"])
+        self.assertEqual(
+            evidence["event_audit"]["event_signature_hash"],
+            main._content_hash(main._material_event_signature(api_events, "Home United", "Away City")),
+        )
+
+        bad_timeline = copy.deepcopy(timeline)
+        bad_timeline["data"]["data"]["events"][1]["minute"] = 70
+        with patch.object(main, "call_thestats", side_effect=[detail, bad_timeline]):
+            rejected_events = main._thestats_frozen_postmatch_evidence(
+                frozen, api_events, {"home_goals": 1, "away_goals": 1},
+            )
+        self.assertTrue(rejected_events["result_audit"]["ok"])
+        self.assertFalse(rejected_events["event_audit"]["ok"])
+        self.assertIsNone(rejected_events["event_audit"]["event_signature_hash"])
+
     def test_automatic_review_does_not_equate_verified_events_with_state_tree_correctness(self):
         payload = self.learning_payload("8044", 900, 1000)
         payload["analysis"]["state_tree"] = {"states": {"FGH": {"prediction": "home_first_goal"}}}
@@ -4905,9 +4987,10 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         frozen = main.freeze_learning_sample(self.learning_payload("draft-red", 900, 1000), now_ts=900)
         packet = self.learning_postmatch_facts(("api_football", "official_league"), 2, 1)
         packet["events"].append({"elapsed": 55, "type": "Card", "detail": "Red Card", "team": "Away"})
+        event_hash = main._content_hash(main._material_event_signature(packet["events"]))
         packet["source_audit"].extend([
-            {"source": "api_football", "component": "events", "ok": True, "evidence_ref": "test:api:events"},
-            {"source": "official_league", "component": "events", "ok": True, "evidence_ref": "test:official:events"},
+            {"source": "api_football", "component": "events", "ok": True, "evidence_ref": "test:api:events", "event_signature_hash": event_hash},
+            {"source": "official_league", "component": "events", "ok": True, "evidence_ref": "test:official:events", "event_signature_hash": event_hash},
         ])
         main.collect_learning_postmatch_facts(
             frozen["freeze_id"], now_ts=9000, fact_fetcher=lambda fixture_id: packet,
@@ -4921,9 +5004,10 @@ class ShadowV4UpgradeTests(unittest.TestCase):
     def test_event_verification_rejects_same_domain_aliases(self):
         frozen = main.freeze_learning_sample(self.learning_payload("draft-event-alias", 900, 1000), now_ts=900)
         packet = self.learning_postmatch_facts(("api_football", "official_league"), 2, 1)
+        event_hash = main._content_hash(main._material_event_signature(packet["events"]))
         packet["source_audit"].extend([
-            {"source": "event_feed_a", "component": "events", "ok": True, "evidence_ref": "https://events.example.test/match/1"},
-            {"source": "event_feed_b", "component": "events", "ok": True, "evidence_ref": "https://events.example.test/match/1/timeline"},
+            {"source": "event_feed_a", "component": "events", "ok": True, "evidence_ref": "https://events.example.test/match/1", "event_signature_hash": event_hash},
+            {"source": "event_feed_b", "component": "events", "ok": True, "evidence_ref": "https://events.example.test/match/1/timeline", "event_signature_hash": event_hash},
         ])
         main.collect_learning_postmatch_facts(
             frozen["freeze_id"], now_ts=9000, fact_fetcher=lambda fixture_id: packet,
@@ -4933,15 +5017,27 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(draft["event_evidence"]["event_verification"], "single_source")
         self.assertEqual(draft["event_evidence"]["event_source_authorities"], ["events.example.test"])
 
+    def test_event_verification_requires_both_sources_to_bind_same_sequence_hash(self):
+        facts = self.learning_postmatch_facts(("api_football", "official_league"), 1, 0)
+        event_hash = main._content_hash(main._material_event_signature(facts["events"]))
+        facts["source_audit"].extend([
+            {"source": "api_football", "component": "events", "ok": True, "evidence_ref": "https://api.example.test/events/1", "event_signature_hash": event_hash},
+            {"source": "official_league", "component": "events", "ok": True, "evidence_ref": "https://league.example.test/events/1", "event_signature_hash": "mismatched"},
+        ])
+        evidence = main._postmatch_event_evidence(facts)
+        self.assertEqual(evidence["event_source_count"], 1)
+        self.assertEqual(evidence["event_verification"], "single_source")
+
     def verified_event_fact_packet(self, home_goals=3, away_goals=2):
         packet = self.learning_postmatch_facts(("api_football", "official_league"), home_goals, away_goals)
         packet["events"] = [
             {"elapsed": 12, "type": "Goal", "detail": "Normal Goal", "team": "Home"},
             {"elapsed": 40, "type": "Goal", "detail": "Normal Goal", "team": "Away"},
         ]
+        event_hash = main._content_hash(main._material_event_signature(packet["events"]))
         packet["source_audit"].extend([
-            {"source": "api_football", "component": "events", "ok": True, "evidence_ref": "test:api:events"},
-            {"source": "official_league", "component": "events", "ok": True, "evidence_ref": "test:official:events"},
+            {"source": "api_football", "component": "events", "ok": True, "evidence_ref": "test:api:events", "event_signature_hash": event_hash},
+            {"source": "official_league", "component": "events", "ok": True, "evidence_ref": "test:official:events", "event_signature_hash": event_hash},
         ])
         return packet
 
