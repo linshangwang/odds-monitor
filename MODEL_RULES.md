@@ -114,6 +114,8 @@ A级真实资金包固定使用`real_money_v1`：必须绑定比赛ID、注册�
 
 无人值守周期可自动完成`automatic_evidence_review`，但只能根据冻结契约和哈希绑定证据判断过程。双源赛果只证明最终比分，不证明事件路径；若红牌、点球、乌龙等事件序列没有两个独立权威来源，事件污染状态必须视为未知并归类`DATA_INSUFFICIENT`，选择输赢不得派生。`DATA_INSUFFICIENT`和`EVENT_CONTAMINATED`均不得进入Learning Card有效样本、多场失败信号或Champion晋级证据。
 
+TheStatsAPI可作为第二事件权威，但其`match_id`必须在开赛前通过UTC日期、双方球队和开赛时间唯一匹配并哈希冻结。赛后match detail必须复核同一ID、双方、开赛时间、完赛状态和比分；`timeline`还必须与API-Football在进球、红牌、点球和乌龙的类型、主客侧及分钟容差上形成同一`event_signature_hash`。仅有两个不同域名而没有相同事件签名不得视为事件双源核验。
+
 新理论准入采用零例外硬门槛：
 
 - 单场比赛无论结果多典型、过程多吻合，都不能产生、确认或加入任何正式模型新理论，也不能据此修改 Champion 的字段、权重、阈值或决策规则。

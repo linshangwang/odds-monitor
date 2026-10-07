@@ -133,6 +133,7 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 - v2.00 将前向Shadow评分绑定到赛前冻结的实际市场、选择与盘口档位，不再用1X2结果替代其他市场的验证目标。1X2按`home/draw/away`、BTTS按`yes/no`评分；AH、O/U及主客队总进球按`full_win/half_win/push/half_loss/full_loss`精确结算类别评分，四分之一盘保留半赢半输。内部运行器必须返回与冻结Poisson重放完全一致的Champion市场分布，Challenger与全部模块消融也必须使用同一结算空间。历史`legacy_1x2_brier`记录仅保留审计兼容，不能通过Promotion预登记门禁。
 - v2.01 补齐无人值守前向验证的内置Challenger运行器。每个Hypothesis必须预登记`poisson_log_rate_adjustment_v1`规格，将每个待验证模块映射为有界、赔率无关的主客队对数进球率增量；完整Challenger等于全部模块贡献之和，逐模块消融只移除该模块贡献。单模块绝对增量上限为0.25、组合上限为0.40，零贡献、模块集合不一致、规格哈希或运行器身份不一致均拒绝。每日周期可直接执行并锁定该Challenger，不再依赖测试注入或外部概率；仍不会自动改变Champion。
 - v2.02 打通无人值守赛后结果核验与安全归档。赛前冻结会把The Odds API的sport key、event id及主客队身份连同内容哈希固化；赛后只用该冻结身份调用官方`scores`端点，并与API-Football最终比分交叉核验。事件ID、球队、运动键、响应状态或比分任一不一致都不能形成第二来源。双源结果通过后，周期自动生成哈希绑定复盘并完成结果无关的证据审计；事件序列没有两个独立权威来源时固定归档为`DATA_INSUFFICIENT`，不会计算选择输赢、生成Learning Card、研究提案或Champion效果。
+- v2.03 接入TheStatsAPI作为第二独立事件权威。系统只能在开赛前通过UTC日期、主客队和开赛时间唯一匹配`match_id`并将身份哈希写入冻结；赛后再按该ID读取match detail与`/timeline`。最终比分须与API-Football一致，关键事件序列还必须在进球、红牌、点球、乌龙的类型、主客侧及分钟容差上逐项一致。两个事件来源都必须绑定同一`event_signature_hash`，缺哈希、错比赛、比分或事件不一致均保持单源/`DATA_INSUFFICIENT`。
 
 真实资金包通过`/shadow/model/prematch-evaluate`或`/shadow/evaluate`请求体中的`real_money_data`提交。示例结构：
 

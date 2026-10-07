@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.02.0"
+VERSION = "2.03.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -195,7 +195,7 @@ LEARNING_TOP_FLIGHT_LEAGUES: Dict[int, Dict[str, str]] = {
 }
 LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
 LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
-LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.02").strip() or "MODEL_RULES.md@2026-10-08-v2.02"
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.03").strip() or "MODEL_RULES.md@2026-10-08-v2.03"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -5720,27 +5720,40 @@ def build_learning_freeze_payload(candidate: Dict[str, Any], packet: Dict[str, A
     }
     scope = candidate.get("scope") if isinstance(candidate.get("scope"), dict) else {}
     provider_identity = packet.get("provider_identity") if isinstance(packet.get("provider_identity"), dict) else {}
+    provider_identities = [row for row in (packet.get("provider_identities") or []) if isinstance(row, dict)]
+    if provider_identity and not any(row.get("source") == provider_identity.get("source") for row in provider_identities):
+        provider_identities.append(provider_identity)
     frozen_source_refs = [
         {"source": "api_football", "fixture_id": fixture, "captured_at": generated_at},
         {"source": str(packet.get("source") or "shadow_ai_packet"), "packet_version": str(packet.get("version") or VERSION)},
     ]
-    canonical_provider_identity = {
-        "source": "the_odds_api",
-        "sport_key": str(provider_identity.get("sport_key") or "").strip().lower(),
-        "event_id": str(provider_identity.get("event_id") or "").strip().lower(),
-        "home_team": str(provider_identity.get("home_team") or "").strip(),
-        "away_team": str(provider_identity.get("away_team") or "").strip(),
-    }
-    if (
-        provider_identity.get("source") == "the_odds_api"
-        and all(canonical_provider_identity[key] for key in ("sport_key", "event_id", "home_team", "away_team"))
-        and provider_identity.get("source_hash") == _content_hash(canonical_provider_identity)
-    ):
-        frozen_source_refs.append({
-            **canonical_provider_identity,
-            "identity_bound_at": generated_at,
-            "identity_source_hash": provider_identity["source_hash"],
-        })
+    for identity in provider_identities:
+        if identity.get("source") == "the_odds_api":
+            canonical = {
+                "source": "the_odds_api",
+                "sport_key": str(identity.get("sport_key") or "").strip().lower(),
+                "event_id": str(identity.get("event_id") or "").strip().lower(),
+                "home_team": str(identity.get("home_team") or "").strip(),
+                "away_team": str(identity.get("away_team") or "").strip(),
+            }
+            required = ("sport_key", "event_id", "home_team", "away_team")
+        elif identity.get("source") == "thestats":
+            canonical = {
+                "source": "thestats",
+                "match_id": str(identity.get("match_id") or "").strip(),
+                "kickoff_at": _parse_timestamp(identity.get("kickoff_at")),
+                "home_team": str(identity.get("home_team") or "").strip(),
+                "away_team": str(identity.get("away_team") or "").strip(),
+            }
+            required = ("match_id", "kickoff_at", "home_team", "away_team")
+        else:
+            continue
+        if all(canonical[key] not in (None, "") for key in required) and identity.get("source_hash") == _content_hash(canonical):
+            frozen_source_refs.append({
+                **canonical,
+                "identity_bound_at": generated_at,
+                "identity_source_hash": identity["source_hash"],
+            })
     return {
         "fixture": fixture,
         "scope": scope,
@@ -5757,6 +5770,178 @@ def build_learning_freeze_payload(candidate: Dict[str, Any], packet: Dict[str, A
         "decision": decision,
         "source_refs": frozen_source_refs,
     }
+
+
+def _thestats_payload_data(response: Dict[str, Any]) -> Any:
+    payload = response.get("data")
+    return payload.get("data") if isinstance(payload, dict) and "data" in payload else payload
+
+
+def _provider_team_name(value: Any) -> str:
+    if isinstance(value, dict):
+        value = value.get("name") or value.get("team_name") or value.get("label")
+    return str(value or "").strip()
+
+
+def _thestats_match_identity(row: Any) -> Dict[str, Any]:
+    row = row if isinstance(row, dict) else {}
+    home = row.get("home_team") if row.get("home_team") is not None else row.get("home")
+    away = row.get("away_team") if row.get("away_team") is not None else row.get("away")
+    return {
+        "match_id": str(row.get("id") or row.get("match_id") or "").strip(),
+        "kickoff_at": _parse_timestamp(row.get("utc_date") or row.get("kickoff_utc") or row.get("date")),
+        "home_team": _provider_team_name(home),
+        "away_team": _provider_team_name(away),
+        "status": str(row.get("status") or "").strip().casefold(),
+    }
+
+
+def _resolve_thestats_prematch_identity(fixture: Dict[str, Any], observed_at: Any) -> Dict[str, Any]:
+    """Bind a unique TheStats match id before kickoff; ambiguity always fails closed."""
+    if not THESTATS_API_KEY:
+        return {"ok": False, "error": "thestats_not_configured"}
+    kickoff_at = _parse_timestamp(fixture.get("timestamp") or fixture.get("date"))
+    observed_at = _parse_timestamp(observed_at)
+    home_team = str(fixture.get("home") or "").strip()
+    away_team = str(fixture.get("away") or "").strip()
+    if (
+        kickoff_at is None or observed_at is None or observed_at >= kickoff_at
+        or not home_team or not away_team
+    ):
+        return {"ok": False, "error": "thestats_prematch_identity_inputs_invalid"}
+    date_utc = datetime.fromtimestamp(kickoff_at, tz=timezone.utc).date().isoformat()
+    candidates = []
+    total_pages = 1
+    for page in range(1, 6):
+        if page > total_pages:
+            break
+        response = call_thestats("/football/matches", {
+            "date_from": date_utc, "date_to": date_utc, "per_page": 100, "page": page,
+        })
+        if response.get("ok") is not True:
+            return {"ok": False, "error": "thestats_fixture_lookup_failed", "status_code": response.get("status_code")}
+        payload = response.get("data") if isinstance(response.get("data"), dict) else {}
+        rows = _thestats_payload_data(response)
+        rows = rows if isinstance(rows, list) else []
+        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+        try:
+            total_pages = max(1, min(int(meta.get("total_pages") or 1), 5))
+        except (TypeError, ValueError):
+            total_pages = 1
+        for row in rows:
+            identity = _thestats_match_identity(row)
+            if (
+                identity["match_id"]
+                and identity["status"] not in {"live", "finished", "cancelled", "canceled", "abandoned", "forfeit"}
+                and identity["kickoff_at"] is not None
+                and abs(identity["kickoff_at"] - kickoff_at) <= 900
+                and normalize_fixture_identity_name(identity["home_team"]) == normalize_fixture_identity_name(home_team)
+                and normalize_fixture_identity_name(identity["away_team"]) == normalize_fixture_identity_name(away_team)
+            ):
+                candidates.append(identity)
+    unique = {row["match_id"]: row for row in candidates}
+    if len(unique) != 1:
+        return {"ok": False, "error": "thestats_fixture_identity_not_unique", "match_count": len(unique)}
+    match = next(iter(unique.values()))
+    content = {
+        "source": "thestats", "match_id": match["match_id"],
+        "kickoff_at": kickoff_at, "home_team": home_team, "away_team": away_team,
+    }
+    return {"ok": True, **content, "source_hash": _content_hash(content)}
+
+
+def _parse_event_minute(value: Any, offset: Any = None) -> Tuple[int, Optional[int]]:
+    raw = str(value or "0").strip()
+    base, plus = raw, None
+    if "+" in raw:
+        base, plus = raw.split("+", 1)
+    try:
+        minute = max(0, int(float(base)))
+    except (TypeError, ValueError):
+        minute = 0
+    if offset is not None:
+        plus = offset
+    try:
+        extra = max(0, int(float(plus))) if plus not in (None, "") else None
+    except (TypeError, ValueError):
+        extra = None
+    return minute, extra
+
+
+def _normalize_thestats_events(value: Any) -> List[Dict[str, Any]]:
+    if isinstance(value, dict):
+        value = value.get("events") if isinstance(value.get("events"), list) else value.get("timeline")
+    rows = value if isinstance(value, list) else []
+    normalized = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        event_type = str(row.get("type") or row.get("event_type") or "").strip()
+        raw_detail = row.get("detail") or row.get("subtype") or row.get("card_type") or row.get("outcome") or ""
+        detail = str(raw_detail).strip()
+        lowered = f"{event_type} {detail}".casefold().replace("_", " ").replace("-", " ")
+        if "goal" in lowered:
+            event_type = "Goal"
+        elif "card" in lowered:
+            event_type = "Card"
+        elif "penalty" in lowered:
+            event_type = "Penalty"
+        elif "substitution" in lowered or "substitute" in lowered:
+            event_type = "Substitution"
+        elif "var" in lowered:
+            event_type = "VAR"
+        if row.get("own_goal") is True or "own goal" in lowered:
+            detail = "Own Goal"
+        elif row.get("penalty") is True or "penalty" in lowered:
+            detail = "Penalty"
+        elif "red" in lowered and "card" in lowered:
+            detail = "Red Card"
+        minute, extra = _parse_event_minute(row.get("minute") or row.get("elapsed"), row.get("offset") or row.get("extra"))
+        team = _provider_team_name(row.get("team") or row.get("team_name"))
+        player = _provider_team_name(row.get("player") or row.get("scorer") or row.get("shooter"))
+        normalized.append({
+            "elapsed": minute, "extra": extra, "team": team or None,
+            "player": player or None, "type": event_type or None, "detail": detail or None,
+        })
+    return normalized
+
+
+def _material_event_signature(events: Any, home_team: Any = None, away_team: Any = None) -> List[Dict[str, Any]]:
+    home_key = normalize_fixture_identity_name(home_team)
+    away_key = normalize_fixture_identity_name(away_team)
+    signature = []
+    for row in events if isinstance(events, list) else []:
+        if not isinstance(row, dict):
+            continue
+        event_type = str(row.get("type") or "").strip().casefold()
+        detail = str(row.get("detail") or "").strip().casefold()
+        minute, extra = _parse_event_minute(row.get("elapsed") or row.get("minute"), row.get("extra") or row.get("offset"))
+        team_key = normalize_fixture_identity_name(row.get("team"))
+        side = "home" if home_key and team_key == home_key else ("away" if away_key and team_key == away_key else team_key or "unknown")
+        categories = []
+        if event_type == "goal":
+            categories.append("goal")
+        if event_type == "card" and ("red" in detail or "second yellow" in detail):
+            categories.append("red_card")
+        if "penalty" in event_type or "penalty" in detail:
+            categories.append("penalty_event")
+        if "own goal" in detail:
+            categories.append("own_goal")
+        for category in categories:
+            signature.append({"category": category, "side": side, "minute": minute, "extra": extra})
+    return sorted(signature, key=lambda row: (row["category"], row["side"], row["minute"], row.get("extra") or 0))
+
+
+def _material_event_sequences_match(left: List[Dict[str, Any]], right: List[Dict[str, Any]], total_goals: int) -> bool:
+    if sum(row["category"] == "goal" for row in left) != total_goals or sum(row["category"] == "goal" for row in right) != total_goals:
+        return False
+    if len(left) != len(right):
+        return False
+    return all(
+        a["category"] == b["category"] and a["side"] == b["side"]
+        and abs((a["minute"] + (a.get("extra") or 0)) - (b["minute"] + (b.get("extra") or 0))) <= 2
+        for a, b in zip(left, right)
+    )
 
 
 def _the_odds_api_frozen_result_evidence(freeze: Dict[str, Any]) -> Dict[str, Any]:
@@ -5837,6 +6022,89 @@ def _the_odds_api_frozen_result_evidence(freeze: Dict[str, Any]) -> Dict[str, An
     }
 
 
+def _thestats_frozen_postmatch_evidence(
+    freeze: Dict[str, Any], api_events: List[Dict[str, Any]], expected_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Verify a frozen TheStats result and material event sequence against API-Football."""
+    identity = next((
+        row for row in (freeze.get("source_refs") or [])
+        if isinstance(row, dict) and row.get("source") == "thestats"
+    ), None)
+    if not identity:
+        return {"ok": False, "error": "frozen_thestats_identity_missing"}
+    match_id = str(identity.get("match_id") or "").strip()
+    home_team = str(identity.get("home_team") or "").strip()
+    away_team = str(identity.get("away_team") or "").strip()
+    kickoff_at = _parse_timestamp(identity.get("kickoff_at"))
+    bound_at = _parse_timestamp(identity.get("identity_bound_at"))
+    identity_content = {
+        "source": "thestats", "match_id": match_id, "kickoff_at": kickoff_at,
+        "home_team": home_team, "away_team": away_team,
+    }
+    if (
+        not match_id or len(match_id) > 128 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for char in match_id)
+        or not home_team or not away_team or kickoff_at is None or bound_at is None
+        or bound_at >= int(freeze.get("kickoff_at") or 0)
+        or identity.get("identity_source_hash") != _content_hash(identity_content)
+    ):
+        return {"ok": False, "error": "frozen_thestats_identity_invalid"}
+    detail_response = call_thestats(f"/football/matches/{match_id}")
+    if detail_response.get("ok") is not True:
+        return {"ok": False, "error": "thestats_match_detail_failed", "status_code": detail_response.get("status_code")}
+    match = _thestats_payload_data(detail_response)
+    match = match if isinstance(match, dict) else {}
+    parsed = _thestats_match_identity(match)
+    if (
+        parsed["match_id"] != match_id
+        or parsed["status"] not in {"finished", "ft", "aet", "pen"}
+        or parsed["kickoff_at"] is None or abs(parsed["kickoff_at"] - kickoff_at) > 900
+        or normalize_fixture_identity_name(parsed["home_team"]) != normalize_fixture_identity_name(home_team)
+        or normalize_fixture_identity_name(parsed["away_team"]) != normalize_fixture_identity_name(away_team)
+    ):
+        return {"ok": False, "error": "thestats_bound_match_identity_mismatch", "status_code": detail_response.get("status_code")}
+    score = match.get("score") if isinstance(match.get("score"), dict) else {}
+    home_score_value = score.get("home")
+    away_score_value = score.get("away")
+    if home_score_value is None and isinstance(match.get("home_team"), dict):
+        home_score_value = match["home_team"].get("score")
+    if away_score_value is None and isinstance(match.get("away_team"), dict):
+        away_score_value = match["away_team"].get("score")
+    try:
+        home_goals, away_goals = int(home_score_value), int(away_score_value)
+        expected_home = int(expected_result.get("home_goals"))
+        expected_away = int(expected_result.get("away_goals"))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "thestats_bound_match_score_incomplete", "status_code": detail_response.get("status_code")}
+    if min(home_goals, away_goals) < 0 or (home_goals, away_goals) != (expected_home, expected_away):
+        return {"ok": False, "error": "thestats_bound_match_score_mismatch", "status_code": detail_response.get("status_code")}
+    timeline_response = call_thestats(f"/football/matches/{match_id}/timeline")
+    timeline_data = _thestats_payload_data(timeline_response) if timeline_response.get("ok") is True else None
+    thestats_events = _normalize_thestats_events(timeline_data)
+    api_signature = _material_event_signature(api_events, home_team, away_team)
+    thestats_signature = _material_event_signature(thestats_events, home_team, away_team)
+    sequence_matches = bool(timeline_response.get("ok") is True) and _material_event_sequences_match(
+        api_signature, thestats_signature, home_goals + away_goals,
+    )
+    signature_hash = _content_hash(api_signature) if sequence_matches else None
+    return {
+        "ok": True,
+        "result_audit": {
+            "source": "thestats", "component": "result", "ok": True,
+            "home_goals": home_goals, "away_goals": away_goals,
+            "evidence_ref": f"https://api.thestatsapi.com/api/football/matches/{match_id}",
+            "status_code": detail_response.get("status_code"), "match_id": match_id,
+        },
+        "event_audit": {
+            "source": "thestats", "component": "events", "ok": sequence_matches,
+            "evidence_ref": f"https://api.thestatsapi.com/api/football/matches/{match_id}/timeline",
+            "status_code": timeline_response.get("status_code"),
+            "event_signature_hash": signature_hash,
+            "error": None if sequence_matches else "thestats_material_event_sequence_mismatch_or_unavailable",
+        },
+        "events": thestats_events,
+    }
+
+
 def _learning_postmatch_fact_fetch(freeze: Dict[str, Any]) -> Dict[str, Any]:
     """Fetch API-Football facts and independently corroborate the frozen result when possible."""
     fixture_id = int(freeze.get("fixture"))
@@ -5883,9 +6151,13 @@ def _learning_postmatch_fact_fetch(freeze: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(item, dict) and str(item.get("type")) in allowed_statistics
         }
         statistics.append({"team_id": get_nested(team_row, ["team", "id"]), "team": get_nested(team_row, ["team", "name"]), "statistics": values})
+    home_team_name = str(get_nested(row, ["teams", "home", "name"]) or "").strip()
+    away_team_name = str(get_nested(row, ["teams", "away", "name"]) or "").strip()
+    api_event_signature = _material_event_signature(events, home_team_name, away_team_name)
+    api_event_signature_hash = _content_hash(api_event_signature)
     source_audit = [
         {"source": "api_football", "component": "result", "ok": bool(detail.get("ok")), "status_code": detail.get("status_code"), "evidence_ref": f"api_football:/fixtures?id={fixture_id}", "home_goals": int(goals["home"]), "away_goals": int(goals["away"])},
-        {"source": "api_football", "component": "events", "ok": bool(events_response.get("ok")), "status_code": events_response.get("status_code"), "evidence_ref": f"api_football:/fixtures/events?fixture={fixture_id}"},
+        {"source": "api_football", "component": "events", "ok": bool(events_response.get("ok")), "status_code": events_response.get("status_code"), "evidence_ref": f"api_football:/fixtures/events?fixture={fixture_id}", "event_signature_hash": api_event_signature_hash if events_response.get("ok") else None},
         {"source": "api_football", "component": "statistics", "ok": bool(statistics_response.get("ok")), "status_code": statistics_response.get("status_code"), "evidence_ref": f"api_football:/fixtures/statistics?fixture={fixture_id}"},
     ]
     odds_result = _the_odds_api_frozen_result_evidence(freeze)
@@ -5893,6 +6165,16 @@ def _learning_postmatch_fact_fetch(freeze: Dict[str, Any]) -> Dict[str, Any]:
         "source": "the_odds_api", "component": "result", "ok": False,
         "error": odds_result.get("error"), "status_code": odds_result.get("status_code"),
     })
+    thestats = _thestats_frozen_postmatch_evidence(
+        freeze, events, {"home_goals": int(goals["home"]), "away_goals": int(goals["away"])},
+    )
+    if thestats.get("ok") is True:
+        source_audit.extend([thestats["result_audit"], thestats["event_audit"]])
+    else:
+        source_audit.extend([
+            {"source": "thestats", "component": "result", "ok": False, "error": thestats.get("error"), "status_code": thestats.get("status_code")},
+            {"source": "thestats", "component": "events", "ok": False, "error": thestats.get("error"), "status_code": thestats.get("status_code")},
+        ])
     return {
         "ok": True,
         "result": {"status": status, "home_goals": int(goals["home"]), "away_goals": int(goals["away"])},
@@ -6016,6 +6298,10 @@ def _postmatch_event_evidence(facts: Dict[str, Any]) -> Dict[str, Any]:
             penalties.append(normalized)
         if "own goal" in detail:
             own_goals.append(normalized)
+    fixture = facts.get("fixture") if isinstance(facts.get("fixture"), dict) else {}
+    expected_event_signature_hash = _content_hash(_material_event_signature(
+        events, fixture.get("home") or fixture.get("home_team_name"), fixture.get("away") or fixture.get("away_team_name"),
+    ))
     event_sources, event_authorities, event_evidence_refs = set(), set(), set()
     for row in facts.get("source_audit") or []:
         if (
@@ -6025,7 +6311,7 @@ def _postmatch_event_evidence(facts: Dict[str, Any]) -> Dict[str, Any]:
             continue
         source = str(row.get("source") or "").strip().casefold()
         evidence_ref = str(row.get("evidence_ref") or "").strip()
-        if not source or not evidence_ref:
+        if not source or not evidence_ref or row.get("event_signature_hash") != expected_event_signature_hash:
             continue
         normalized_ref = evidence_ref.casefold()
         if normalized_ref in event_evidence_refs:
@@ -6049,6 +6335,7 @@ def _postmatch_event_evidence(facts: Dict[str, Any]) -> Dict[str, Any]:
         "event_sources": sorted(event_sources),
         "event_source_authorities": sorted(event_authorities),
         "event_unique_evidence_ref_count": len(event_evidence_refs),
+        "event_signature_hash": expected_event_signature_hash,
         "event_verification": "verified" if len(event_authorities) >= 2 else ("single_source" if event_authorities else "data_missing"),
         "first_goal": first_goal,
         "goal_count_in_event_feed": len(goals),
@@ -9886,6 +10173,10 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
     script = pure_fundamental_script(data)
     versions = get_fundamental_versions(fixture)
     generated_at = int(data.get("generated_at") or time.time())
+    provider_identities = [provider_identity] if provider_identity else []
+    thestats_identity = _resolve_thestats_prematch_identity(data.get("fixture") or {}, generated_at)
+    if thestats_identity.get("ok") is True:
+        provider_identities.append({key: value for key, value in thestats_identity.items() if key != "ok"})
     probability_replay = build_learning_probability_replay(
         fixture, si.get("independent_model_inputs"), generated_at=generated_at,
     )
@@ -9926,6 +10217,12 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
         "generated_at": generated_at,
         "fixture": data.get("fixture"),
         "provider_identity": provider_identity,
+        "provider_identities": provider_identities,
+        "provider_identity_audit": {
+            "the_odds_api": "bound" if provider_identity else "data_missing",
+            "thestats": "bound" if thestats_identity.get("ok") is True else "data_missing",
+            "thestats_reason": thestats_identity.get("error"),
+        },
         "data_quality": data.get("data_quality"),
         "coverage": data.get("coverage"),
         "fundamentals": {
