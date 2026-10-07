@@ -5,6 +5,8 @@
 - [MODEL_RULES.md](MODEL_RULES.md)
 - [PROJECT_STATE.md](PROJECT_STATE.md)
 - [THE_ODDS_API.md](THE_ODDS_API.md)
+- [AUTO_LEARNING_TASK.md](AUTO_LEARNING_TASK.md)
+- [LEAGUE_DNA.md](LEAGUE_DNA.md)
 
 这是一个 Railway 可部署的 FastAPI 项目，用来测试：
 
@@ -112,6 +114,12 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 - v1.28 校准闭环通过 `/shadow/calibration/lock` 在赛前锁定 1X2 概率，通过 `/settle` 录入赛果，并由 `/report` 汇总 Brier Score、Log Loss、单位收益与 ROI；PASS 计入概率校准但不计入投注收益。
 - v1.29 的 `/shadow/operations/status` 汇总持久化完整性、自动采集线程、外部数据时效、逾期复核任务和校准样本门槛，并以 `healthy/degraded/blocked` 及 info/warning/critical 告警输出。
 - v1.30 冻结影子可用版契约。`/shadow/release-acceptance` 汇总发布检查、外部缺口和使用边界；当前只授权影子运行，任何正式建议仍必须通过单场 `decision_ready` 且达到校准样本门槛。
+- v1.88 增加顶级联赛自动学习治理接口：`/shadow/learning/freeze` 只接受明确核实的男子职业国内一级联赛并在开赛前生成不可覆写版本；`/settle` 必须绑定冻结ID；新理论只能登记为候选并使用独立已结算样本验证；即使全部门槛通过也只能生成等待用户确认的晋级候选，系统不存在自动写入Champion的路径。
+- v1.88 的 The Odds API 采集默认只请求本地尚未记录的节点；全节点已存在时零调用返回，已知 event id 的普通节点补采不重复扫描 Opening，`data_missing` 只有显式请求才重试。
+- v1.88 将自动学习发现范围与通用比赛范围彻底分离：`/shadow/learning/cycle-plan`只列出注册表确认的男子职业国内顶级联赛，生成未来24小时候选和过去36小时待复盘计划；所有学习接口在未配置`SHADOW_ACCESS_TOKEN`时均关闭。
+- v1.88 的学习结算要求结构化复盘场次选择、基本面、State Tree、盘口语言、市场表达和价格执行；必须明确声明未使用赛果倒推且未请求单场修改Champion。实现错误须引用既有规则并要求回归测试。
+- v1.89 增加幂等自动学习运行器`POST /shadow/learning/run`：默认dry-run，正式执行需要唯一run_id；自动生成计划内顶级联赛PIT赛前包、冻结原始决策并收集到期赛后事实，但没有自动理论注册或Champion写入路径。
+- v1.89 增加`GET /shadow/learning/review-queue`：单源赛果只能待核实，至少两个可定位且比分一致的独立来源才进入复盘就绪；事实与赛前冻结并列展示，Process分类仍必须基于过程审计而不是比分倒推。
 - Opening 导入必须同时包含可解析的观测时间和非空公司盘口数组；缺一项即标记 `opening_source_unverified`，上游汇总值不能单独充当开盘证据。
 - 每个节点保存 1X2、亚洲让球、大小球，并在上游提供时保存 BTTS、主队进球数、客队进球数。
 - `primary` 字段继续保留以兼容旧调用方，但内容改为基于完整公司数组计算的 `consensus_main_line`，不再机械取第一家公司。
@@ -429,9 +437,37 @@ POST /shadow/model/fundamental-xg
 POST /shadow/model/prematch-evaluate
 POST /shadow/portfolio/evaluate
 GET  /shadow/imported-prematch/{MATCH_UUID}
+POST /shadow/learning/freeze
+GET  /shadow/learning/cycle-plan
+POST /shadow/learning/run
+GET  /shadow/learning/review-queue
+POST /shadow/learning/settle
+POST /shadow/learning/hypotheses
+POST /shadow/learning/hypotheses/{HYPOTHESIS_ID}/validation
+POST /shadow/learning/hypotheses/{HYPOTHESIS_ID}/promotion-candidate
+POST /shadow/learning/league-dna
+POST /shadow/learning/league-dna/{TAG_ID}/activation-candidate
+GET  /shadow/learning/league-dna/status
+GET  /shadow/learning/selection-quality
+GET  /shadow/learning/status
 ```
 
 以上请求推荐通过 Header 携带令牌，不在 URL 中传递。
+
+自动周期默认只预览。正式执行示例：
+
+```json
+{
+  "apply": true,
+  "run_id": "daily-20261008-0930",
+  "auto_prepare_prematch": true,
+  "auto_collect_postmatch_facts": true,
+  "postmatch_fact_packets": {},
+  "settlement_packets": []
+}
+```
+
+`postmatch_fact_packets`用于补入第二个独立结果来源；两个来源必须分别带可定位`evidence_ref`且比分一致。即使事实已核实，运行器也不会自动生成Process分类；结构化复盘仍通过`settlement_packets`提交并接受反倒推门禁，并且必须携带复盘队列返回的最新已核实`fact_hash`。
 
 POST 请求可直接传一个数据包、数据包数组，或 `{ "packets": [...] }`。
 外部 UUID 与原有数字 fixture ID 分开使用；缺失节点保留为 `data_missing`，不会用当前盘口反推。

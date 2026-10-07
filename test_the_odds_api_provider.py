@@ -119,6 +119,54 @@ class TheOddsApiProviderTests(unittest.TestCase):
         self.assertEqual(result["error"], "unauthorized")
         self.assertEqual(len(calls), 1)
 
+    def test_incremental_known_event_fetches_only_requested_nodes(self):
+        calls = []
+
+        def audited_api(path, params):
+            calls.append((path, params))
+            return historical_api(path, params)
+
+        result = provider.collect_historical_timeline(
+            audited_api,
+            fixture="fin-1", sport_key="soccer_finland_veikkausliiga", league="Finland Veikkausliiga",
+            home_team="IF Gnistan", away_team="Inter Turku", kickoff_utc=provider.iso_utc(KICKOFF),
+            known_event_id="event-gnistan-inter", requested_stages=["T-6h", "T-1h"],
+            minimums={"1x2": 5, "asian_handicap": 3, "over_under": 3},
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["requested_stages"], ["T-6h", "T-1h"])
+        self.assertEqual([row["stage"] for row in result["packet"]["timeline"]], ["T-6h", "T-1h"])
+        self.assertEqual(result["request_count"], 2)
+        self.assertTrue(all("/odds" in path for path, _ in calls))
+        self.assertFalse(result["opening_discovery"]["attempted"])
+
+    def test_incremental_unknown_event_uses_one_discovery_call(self):
+        calls = []
+
+        def audited_api(path, params):
+            calls.append((path, params))
+            return historical_api(path, params)
+
+        result = provider.collect_historical_timeline(
+            audited_api,
+            fixture="fin-1", sport_key="soccer_finland_veikkausliiga", league="Finland Veikkausliiga",
+            home_team="IF Gnistan", away_team="Inter Turku", kickoff_utc=provider.iso_utc(KICKOFF),
+            requested_stages=["T-3h"],
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["request_count"], 2)
+        self.assertTrue(calls[0][0].endswith("/events"))
+        self.assertIn("/odds", calls[1][0])
+
+    def test_incremental_rejects_invalid_stage(self):
+        with self.assertRaisesRegex(ValueError, "invalid_requested_stage"):
+            provider.collect_historical_timeline(
+                historical_api,
+                fixture="fin-1", sport_key="soccer_finland_veikkausliiga", league="Finland Veikkausliiga",
+                home_team="IF Gnistan", away_team="Inter Turku", kickoff_utc=provider.iso_utc(KICKOFF),
+                requested_stages=["T-15m"],
+            )
+
     def test_import_preserves_provider_provenance_and_primary_gate(self):
         old_store = main.SNAPSHOT_STORE_PATH
         with tempfile.TemporaryDirectory() as directory:
@@ -140,6 +188,18 @@ class TheOddsApiProviderTests(unittest.TestCase):
                 opening = next(row for row in store["fixtures"]["fin-1"] if row["stage"] == "Opening")
                 self.assertTrue(opening["opening_source_audit"]["verified"])
                 self.assertEqual(opening["source"], "the_odds_api_import")
+
+                incremental = provider.collect_historical_timeline(
+                    historical_api,
+                    fixture="fin-1", sport_key="soccer_finland_veikkausliiga", league="Finland Veikkausliiga",
+                    home_team="IF Gnistan", away_team="Inter Turku", kickoff_utc=provider.iso_utc(KICKOFF),
+                    known_event_id="event-gnistan-inter", requested_stages=["T-6h"],
+                    minimums={"1x2": 5, "asian_handicap": 3, "over_under": 3},
+                )
+                main.import_prematch_packet(incremental["packet"])
+                metadata = main.load_snapshot_store()["external_prematch"]["fin-1"]
+                self.assertEqual(metadata["data_quality"]["primary_reference_eligible_stage_count"], 8)
+                self.assertEqual(metadata["data_quality"]["last_requested_stages"], ["T-6h"])
             finally:
                 main.SNAPSHOT_STORE_PATH = old_store
 

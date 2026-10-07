@@ -256,11 +256,22 @@ def collect_historical_timeline(
     max_requests: int = 48,
     minimums: Optional[Dict[str, int]] = None,
     snapshot_lag_tolerance_seconds: int = 600,
+    requested_stages: Optional[Sequence[str]] = None,
+    known_event_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     sport_key = validate_sport_key(sport_key)
     kickoff_at = parse_timestamp(kickoff_utc)
     if kickoff_at is None:
         raise ValueError("invalid_kickoff_utc")
+    stages = list(PREMATCH_STAGES) if requested_stages is None else list(dict.fromkeys(requested_stages))
+    if not stages:
+        raise ValueError("requested_stages_empty")
+    invalid_stages = [stage for stage in stages if stage not in PREMATCH_STAGES]
+    if invalid_stages:
+        raise ValueError(f"invalid_requested_stage:{invalid_stages[0]}")
+    event_id = str(known_event_id or "").strip()
+    if len(event_id) > 200 or any(ord(char) < 32 for char in event_id):
+        raise ValueError("invalid_the_odds_api_event_id")
     minimums = minimums or {"1x2": 5, "asian_handicap": 3, "over_under": 3}
     request_count = 0
     request_audit: List[Dict[str, Any]] = []
@@ -300,28 +311,31 @@ def collect_historical_timeline(
         event_cache[query_at] = selected
         return selected
 
-    # Find the first provider snapshot containing this event.  A preceding
-    # verified absence is mandatory; otherwise Opening remains left-censored.
+    # Opening needs a first-seen proof.  Incremental non-Opening collection can
+    # reuse a previously verified provider event id and avoid spending credits
+    # on the Opening discovery scan again.
     window_start = kickoff_at - max(1, min(opening_lookback_days, 30)) * 86400
     window_end = kickoff_at - 60
     step = max(3600, min(opening_scan_hours, 24) * 3600)
     previous_absent: Optional[int] = None
     first_present: Optional[int] = None
     selected_event: Optional[Dict[str, Any]] = None
-    cursor = window_start
-    while cursor <= window_end and request_count < max_requests:
-        presence = event_presence(cursor)
-        if not presence.get("request_ok"):
-            return {"ok": False, "error": presence.get("provider_error") or "provider_event_discovery_failed", "request_count": request_count, "request_audit": request_audit}
-        if presence.get("status") == "matched":
-            first_present, selected_event = cursor, presence.get("event")
-            break
-        if presence.get("status") == "ambiguous":
-            return {"ok": False, "error": "ambiguous_provider_event", "request_count": request_count, "request_audit": request_audit}
-        previous_absent = cursor
-        cursor += step
+    opening_requested = "Opening" in stages
+    if opening_requested:
+        cursor = window_start
+        while cursor <= window_end and request_count < max_requests:
+            presence = event_presence(cursor)
+            if not presence.get("request_ok"):
+                return {"ok": False, "error": presence.get("provider_error") or "provider_event_discovery_failed", "request_count": request_count, "request_audit": request_audit}
+            if presence.get("status") == "matched":
+                first_present, selected_event = cursor, presence.get("event")
+                break
+            if presence.get("status") == "ambiguous":
+                return {"ok": False, "error": "ambiguous_provider_event", "request_count": request_count, "request_audit": request_audit}
+            previous_absent = cursor
+            cursor += step
 
-    if first_present is None and window_end not in event_cache and request_count < max_requests:
+    if opening_requested and first_present is None and window_end not in event_cache and request_count < max_requests:
         presence = event_presence(window_end)
         if not presence.get("request_ok"):
             return {"ok": False, "error": presence.get("provider_error") or "provider_event_discovery_failed", "request_count": request_count, "request_audit": request_audit}
@@ -330,11 +344,11 @@ def collect_historical_timeline(
         elif presence.get("status") == "ambiguous":
             return {"ok": False, "error": "ambiguous_provider_event", "request_count": request_count, "request_audit": request_audit}
 
-    if first_present is None or selected_event is None:
+    if opening_requested and (first_present is None or selected_event is None):
         return {"ok": False, "error": "provider_event_not_found_in_opening_window", "request_count": request_count, "request_audit": request_audit}
 
-    opening_verified = previous_absent is not None
-    if opening_verified:
+    opening_verified = opening_requested and previous_absent is not None
+    if opening_requested and opening_verified:
         low, high = previous_absent, first_present
         while high - low > 300 and request_count < max_requests:
             midpoint = int(((low + high) // 2) // 300 * 300)
@@ -351,14 +365,29 @@ def collect_historical_timeline(
                 low = midpoint
         first_present = high
 
-    event_id = str((selected_event or {}).get("id") or "")
+    discovered_event_id = str((selected_event or {}).get("id") or "")
+    if event_id and discovered_event_id and event_id != discovered_event_id:
+        return {"ok": False, "error": "known_event_id_conflict", "request_count": request_count, "request_audit": request_audit}
+    event_id = event_id or discovered_event_id
+    if not event_id:
+        # A one-shot near-kickoff event lookup is sufficient to resolve the id
+        # for an incremental non-Opening request.
+        presence = event_presence(window_end)
+        if not presence.get("request_ok"):
+            return {"ok": False, "error": presence.get("provider_error") or "provider_event_discovery_failed", "request_count": request_count, "request_audit": request_audit}
+        if presence.get("status") == "ambiguous":
+            return {"ok": False, "error": "ambiguous_provider_event", "request_count": request_count, "request_audit": request_audit}
+        if presence.get("status") != "matched":
+            return {"ok": False, "error": "provider_event_not_found", "request_count": request_count, "request_audit": request_audit}
+        selected_event = presence.get("event")
+        event_id = str((selected_event or {}).get("id") or "")
     if not event_id:
         return {"ok": False, "error": "provider_event_id_missing", "request_count": request_count, "request_audit": request_audit}
 
     targets: Dict[str, Optional[int]] = {"Opening": first_present if opening_verified else None}
     targets.update({stage: kickoff_at - offset for stage, offset in STAGE_OFFSETS.items()})
     timeline: List[Dict[str, Any]] = []
-    for stage in PREMATCH_STAGES:
+    for stage in stages:
         target_at = targets.get(stage)
         if target_at is None:
             timeline.append({
@@ -433,14 +462,18 @@ def collect_historical_timeline(
             "source": "the_odds_api", "primary_reference_eligible_stages": eligible_stages,
             "primary_reference_eligible_stage_count": len(eligible_stages),
             "required_stage_count": len(PREMATCH_STAGES),
+            "requested_stages": stages,
+            "incremental_collection": stages != list(PREMATCH_STAGES),
         },
     }
     return {
         "ok": True, "source": "the_odds_api", "sport_key": sport_key,
         "event_id": event_id, "packet": packet, "request_count": request_count,
+        "requested_stages": stages,
         "request_audit": request_audit,
         "opening_discovery": {
-            "verified": opening_verified, "window_start": window_start,
+            "attempted": opening_requested,
+            "verified": opening_verified if opening_requested else None, "window_start": window_start if opening_requested else None,
             "first_present_at": first_present, "preceding_absence_at": previous_absent,
         },
         "quota_last_known": request_audit[-1] if request_audit else None,
