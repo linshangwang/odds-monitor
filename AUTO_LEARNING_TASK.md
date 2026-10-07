@@ -28,6 +28,8 @@
 
 `GET /shadow/learning/status`中的`automatic_learning_runtime`是无人值守运行硬门禁。API-Football、The Odds API、TheStatsAPI、安全令牌、`/data`持久化及备份、自动工作线程、顶级联赛注册表和14:30调度必须全部通过；缺一项只能视为实现就绪，不能宣称闭环正在运行。该状态只返回布尔检查和阻塞项，绝不返回凭据内容。
 
+运行配置通过后仍须检查`automatic_learning_schedule`：系统以持久化`learning_runs`中的当日确定性run id、执行顺序、开始时间和run hash为完成证据。14:30后允许最多`max(2×轮询间隔, 600秒)`的首轮询宽限；超过宽限仍无合格记录，或记录结构无效，运维状态必须发出critical告警。内存里的“最后运行结果”不能代替持久化证据。
+
 1. 过去36小时已经完赛且存在冻结快照的比赛。
 2. 未来24小时尚未开赛的合格顶级联赛比赛。
 
