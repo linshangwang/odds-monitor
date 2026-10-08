@@ -161,6 +161,8 @@ TheStatsAPI赛前比赛列表按UTC比赛日批量抓取并在同一运行进程
 
 每日周期会自动结算已经锁定且赛后核实完成的前向样本。价格质量证据必须由服务端从开赛前保存的`T-1h`快照自行派生，使用完整公司数组形成的共识价，并与Shadow锁保持同一市场、同一选择和同一盘口档位；调用方提交价格或证据引用会被拒绝。缺快照、覆盖不足或盘口跨档时固定blocked，不使用Closing、当前赔率或其他档位替代。普通赛前分析的八节点及Closing规则保持不变。九项Promotion门槛全部由账本达到passed后，周期可以自动创建`AWAITING_EXPLICIT_USER_CONFIRMATION`，但该动作只生成候选包，`champion_effect=false`且不能替代用户确认。
 
+自动赛后复盘对比赛优先级与市场选择实行独立、赛果无关的过程审核：只有冻结的A/B字母评级才可满足“B以上”门槛，数值评级不得擅自换算；价格执行只比较冻结入场价与服务端核验的同市场/同选择/同档位T-1h共识价。State Tree或其他维度暂时无法自动判定时，整体过程仍为`DATA_INSUFFICIENT`，但已经独立通过或失败的优先级、表达和价格维度可进入各自校准，不得互相污染，也不得因此影响Champion。
+
 前向队列由内置`builtin_preregistered_poisson_challenger@1`自动执行。Hypothesis登记时必须提供`poisson_log_rate_adjustment_v1`：为每个预登记模块声明有界、赔率无关的主客队对数进球率贡献；运行器在冻结Poisson基线上生成全量Challenger，并逐项移除模块形成消融输出。规格缺失、零贡献、越界、身份或哈希不一致时必须fail-closed，禁止临场或赛后临时选择参数。
 
 `GET /shadow/learning/hypotheses/{id}/promotion-evidence`输出派生门槛。`create_promotion_candidate`禁止调用方提交自定义passed状态；九项门槛必须全部由账本证据达到passed，任何缺失、失败或反例都阻止候选生成。

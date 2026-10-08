@@ -141,6 +141,7 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 - v2.08 打通多场提案到前向验证的安全自动桥接，但禁止赛后临时编造理论。只有在全部发现样本之前就登记、且对联赛/市场/失败维度唯一匹配的不可变因果模板，才能自动实例化为`HYPOTHESIS_ONLY`；模板预先固定验证下限、消融模块和赔率无关Challenger。无模板、晚登记或多模板冲突均失败关闭，实例化后仍无Champion效力，只能使用登记后的新比赛进入Shadow验证。
 - v2.09 补齐前向验证的赛后自动结算与确认候选生成。系统从不可变Shadow锁、已核实Postmatch和赛前Closing共识快照派生Brier、CLV、模块消融、Process Accuracy与风险；Closing必须同市场、同选择、同档位且公司覆盖合格，缺失或跨档时失败关闭。九项门槛全部通过后只自动创建`AWAITING_EXPLICIT_USER_CONFIRMATION`，不会自动激活Champion。
 - v2.10 修正v2.09与四节点学习时间轴的冲突。自动学习的价格质量终点改为`T-1h`，只接受同市场、同选择、同档位且公司覆盖合格的T-1h共识价；价格和证据引用必须由服务端从持久化快照派生，调用方自报会被拒绝，Closing不能替代缺失的学习节点。普通赛前分析仍保留完整八节点及Closing。Promotion仍只生成等待用户明确确认的候选，绝不自动激活Champion。
+- v2.11 补齐自动赛后选择质量审核。比赛优先级只按冻结的A/B字母评级及决策合同判断，数字分数不擅自映射；价格执行只用服务端核验的同线T-1h证据，过程标签不读取赛果。State Tree等未决维度仍可让整体过程保持`DATA_INSUFFICIENT`，但不会再连带丢弃已独立核验的优先级和市场选择校准样本。
 
 真实资金包通过`/shadow/model/prematch-evaluate`或`/shadow/evaluate`请求体中的`real_money_data`提交。示例结构：
 
