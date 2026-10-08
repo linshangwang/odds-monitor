@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.17.0"
+VERSION = "2.18.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -144,6 +144,8 @@ LEARNING_ABLATION_INTERVENTIONS = {
     "OCR": "neutralize_ocr_state_parameter",
 }
 API_FOOTBALL_RATE_LIMIT_UNTIL = 0
+API_FOOTBALL_STARTUP_PROBE_STARTED = False
+API_FOOTBALL_STARTUP_PROBE: Dict[str, Any] = {"status": "not_started", "authenticated": False}
 SNAPSHOT_STORE_LOCK = threading.RLock()
 
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
@@ -380,6 +382,52 @@ def call_api_football(path: str, params: Optional[Dict[str, Any]] = None) -> Dic
         return {"ok": bool(resp.ok and not business_error), "status_code": resp.status_code, "request_url": mask_secret(resp.url), "data": payload, "error": business_error}
     except requests.RequestException as exc:
         return {"ok": False, "error": mask_secret(str(exc)), "request_url": mask_secret(url)}
+
+
+def api_football_capability_check() -> Dict[str, Any]:
+    """Verify the configured credential without exposing it or consuming fixture quota."""
+    if not API_FOOTBALL_KEY:
+        return {"status": "skipped", "configured": False, "authenticated": False, "reason": "api_football_not_configured"}
+    result = call_api_football("/status")
+    payload = result.get("data") if isinstance(result.get("data"), dict) else {}
+    errors = payload.get("errors") if isinstance(payload, dict) else None
+    error_text = str(errors or result.get("error") or "").lower()
+    if result.get("ok"):
+        category = None
+    elif any(token in error_text for token in ("missing application key", "invalid", "token", "unauthor")):
+        category = "credential_rejected"
+    elif any(token in error_text for token in ("limit", "quota", "rate")):
+        category = "quota_or_rate_limit"
+    else:
+        category = "upstream_error"
+    return {
+        "status": "completed", "checked_at": int(time.time()),
+        "configured": True, "authenticated": result.get("ok") is True,
+        "status_code": result.get("status_code"), "error_category": category,
+    }
+
+
+def run_api_football_startup_probe() -> None:
+    global API_FOOTBALL_STARTUP_PROBE
+    try:
+        API_FOOTBALL_STARTUP_PROBE = api_football_capability_check()
+    except Exception as exc:
+        API_FOOTBALL_STARTUP_PROBE = {
+            "status": "error", "checked_at": int(time.time()),
+            "configured": bool(API_FOOTBALL_KEY), "authenticated": False,
+            "error_type": type(exc).__name__,
+        }
+
+
+def start_api_football_startup_probe() -> None:
+    global API_FOOTBALL_STARTUP_PROBE_STARTED, API_FOOTBALL_STARTUP_PROBE
+    if API_FOOTBALL_STARTUP_PROBE_STARTED:
+        return
+    API_FOOTBALL_STARTUP_PROBE_STARTED = True
+    if not API_FOOTBALL_KEY:
+        API_FOOTBALL_STARTUP_PROBE = {"status": "skipped", "configured": False, "authenticated": False, "reason": "api_football_not_configured"}
+        return
+    threading.Thread(target=run_api_football_startup_probe, name="api-football-startup-probe", daemon=True).start()
 
 
 def call_thestats(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -4927,7 +4975,7 @@ def health():
         "fresh_fixture_count": get_nested(route, ["pang", "fresh_fixture_count"], 0),
         "missing_action": route.get("missing_action"),
     }
-    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "the_odds_api_base_url": THE_ODDS_API_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "has_thestats_key": bool(THESTATS_API_KEY), "thestats_fixture_day_cache_ttl_seconds": THESTATS_FIXTURE_DAY_CACHE_TTL_SECONDS, "thestats_fixture_day_cache_entries": len(THESTATS_FIXTURE_DAY_CACHE), "has_the_odds_api_key": bool(THE_ODDS_API_KEY), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "nami_odds_startup_probe": NAMI_ODDS_STARTUP_PROBE, "nami_odds_probe_ttl_seconds": NAMI_ODDS_PROBE_TTL_SECONDS, "market_data_route": route_summary, "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "snapshot_store_writer_workers": SNAPSHOT_STORE_WRITER_WORKERS, "snapshot_store_single_writer_required": True, "snapshot_store_warn_bytes": SNAPSHOT_STORE_WARN_BYTES, "snapshot_store_max_decompressed_bytes": SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES, "fundamental_version_retention": FUNDAMENTAL_VERSION_RETENTION, "portfolio_run_retention": PORTFOLIO_RUN_RETENTION, "external_data_stale_seconds": EXTERNAL_DATA_STALE_SECONDS, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}, "auto_provider_reconciliation": AUTO_RECONCILIATION_LAST_RESULT}
+    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "the_odds_api_base_url": THE_ODDS_API_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "api_football_startup_probe": API_FOOTBALL_STARTUP_PROBE, "has_thestats_key": bool(THESTATS_API_KEY), "thestats_fixture_day_cache_ttl_seconds": THESTATS_FIXTURE_DAY_CACHE_TTL_SECONDS, "thestats_fixture_day_cache_entries": len(THESTATS_FIXTURE_DAY_CACHE), "has_the_odds_api_key": bool(THE_ODDS_API_KEY), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "nami_odds_startup_probe": NAMI_ODDS_STARTUP_PROBE, "nami_odds_probe_ttl_seconds": NAMI_ODDS_PROBE_TTL_SECONDS, "market_data_route": route_summary, "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "snapshot_store_writer_workers": SNAPSHOT_STORE_WRITER_WORKERS, "snapshot_store_single_writer_required": True, "snapshot_store_warn_bytes": SNAPSHOT_STORE_WARN_BYTES, "snapshot_store_max_decompressed_bytes": SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES, "fundamental_version_retention": FUNDAMENTAL_VERSION_RETENTION, "portfolio_run_retention": PORTFOLIO_RUN_RETENTION, "external_data_stale_seconds": EXTERNAL_DATA_STALE_SECONDS, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}, "auto_provider_reconciliation": AUTO_RECONCILIATION_LAST_RESULT}
 
 
 @app.get("/shadow/nami-capabilities")
@@ -12696,6 +12744,78 @@ def completed_auto_snapshot_stages(history: List[Dict[str, Any]]) -> set:
     }
 
 
+def auto_collect_the_odds_api_due_stages(
+    now: Optional[datetime] = None,
+    store_override: Optional[Dict[str, Any]] = None,
+    collector: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Advance persisted The Odds API fixtures at due fixed timeline nodes.
+
+    Recorded data_missing attempts are intentionally not retried automatically: a
+    retry remains an explicit and auditable quota decision.
+    """
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    if not THE_ODDS_API_KEY:
+        return {"status": "skipped", "reason": "the_odds_api_not_configured", "due_count": 0, "collected_count": 0, "results": []}
+    store = store_override if isinstance(store_override, dict) else load_snapshot_store()
+    collect = collector or collect_the_odds_api_timeline
+    results: List[Dict[str, Any]] = []
+    due_count = 0
+    for fixture, metadata in (store.get("external_prematch") or {}).items():
+        if not isinstance(metadata, dict) or metadata.get("source") != "the_odds_api":
+            continue
+        match = metadata.get("match") if isinstance(metadata.get("match"), dict) else {}
+        kickoff_ts = _parse_timestamp(match.get("kickoff_utc"))
+        event_id = str(get_nested(metadata, ["provider_fixture_ids", "the_odds_api"], "") or "").strip()
+        sport_key = str(match.get("the_odds_api_sport_key") or "").strip()
+        home_team = str(match.get("home_team_name") or match.get("home") or "").strip()
+        away_team = str(match.get("away_team_name") or match.get("away") or "").strip()
+        if not kickoff_ts or kickoff_ts <= int(now.timestamp()) or not all((event_id, sport_key, home_team, away_team)):
+            results.append({"fixture": str(fixture), "status": "skipped", "reason": "incomplete_or_non_prematch_provider_identity"})
+            continue
+        kickoff = datetime.fromtimestamp(kickoff_ts, tz=timezone.utc)
+        recorded = {
+            row.get("stage") for row in ((store.get("fixtures") or {}).get(str(fixture)) or [])
+            if isinstance(row, dict) and row.get("stage") in PREMATCH_STAGE_ORDER
+        }
+        due_stages = [
+            stage["key"] for stage in TRACKING_STAGES
+            if stage.get("key") not in {"Opening", "FT"}
+            and stage.get("key") not in recorded
+            and auto_snapshot_stage_due(now, kickoff, stage)
+        ]
+        if not due_stages:
+            continue
+        due_count += len(due_stages)
+        payload = {
+            "fixture": str(fixture), "sport_key": sport_key,
+            "league": str(metadata.get("league") or ""),
+            "home_team": home_team, "away_team": away_team,
+            "home_aliases": list(match.get("home_aliases") or []),
+            "away_aliases": list(match.get("away_aliases") or []),
+            "kickoff_utc": match.get("kickoff_utc"),
+            "requested_stages": due_stages, "only_missing": True,
+            "retry_data_missing": False, "persist": True,
+            "the_odds_api_event_id": event_id,
+        }
+        try:
+            outcome = collect(payload)
+            results.append({
+                "fixture": str(fixture), "status": "collected" if outcome.get("ok") else "failed",
+                "requested_stages": due_stages, "request_count": int(outcome.get("request_count") or 0),
+                "persist_changed": bool(get_nested(outcome, ["persist_result", "changed"], False)),
+            })
+        except Exception as exc:
+            results.append({"fixture": str(fixture), "status": "failed", "requested_stages": due_stages, "error_type": type(exc).__name__})
+    collected_count = sum(row.get("status") == "collected" for row in results)
+    failed_count = sum(row.get("status") == "failed" for row in results)
+    return {
+        "status": "completed" if due_count else "not_due", "at": int(now.timestamp()),
+        "due_count": due_count, "collected_count": collected_count,
+        "failed_count": failed_count, "results": results,
+    }
+
+
 def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Run once after 14:30 Asia/Shanghai; a late worker poll catches up the same day."""
     now = now.astimezone(timezone.utc)
@@ -12799,6 +12919,7 @@ def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[st
 def auto_snapshot_cycle(now: Optional[datetime] = None) -> Dict[str, Any]:
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     learning_result = auto_learning_daily_cycle(now)
+    the_odds_api_due_collection = auto_collect_the_odds_api_due_stages(now)
     dates = sorted({(now + timedelta(days=i)).astimezone(ZoneInfo(AUTO_FETCH_TIMEZONE)).date().isoformat() for i in range(AUTO_SNAPSHOT_DAYS_AHEAD + 1)})
     for date_str in dates:
         try:
@@ -12854,7 +12975,7 @@ def auto_snapshot_cycle(now: Optional[datetime] = None) -> Dict[str, Any]:
         except Exception as exc:
             print("[AUTO_SNAPSHOT] date failed: " + date_str + " " + str(exc))
     node_result = run_learning_node_executor(now_ts=int(now.timestamp()), apply_changes=True)
-    combined = {**learning_result, "node_execution": node_result}
+    combined = {**learning_result, "node_execution": node_result, "the_odds_api_due_collection": the_odds_api_due_collection}
     if learning_result.get("status") == "not_due" and node_result.get("advanced_count", 0) > 0:
         combined["status"] = "node_cycle_completed"
     return combined
@@ -13017,6 +13138,7 @@ def startup_fetch():
     # Production startup is intentionally API-light. The background scheduler owns
     # fixture discovery and stage collection; startup only validates local persistence.
     start_auto_snapshot_worker()
+    start_api_football_startup_probe()
     start_nami_odds_startup_probe()
     startup_ai_packet_selfcheck()
     live_check = sportradar_live_selfcheck()

@@ -92,6 +92,11 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 
 ## V4 兼容升级
 
+V2.18 将已持久化的 The Odds API 赛事接入后台固定节点调度。只要赛事身份、sport key、开赛时间和
+provider event id 已经唯一绑定，后台线程会在 T-24h、T-12h、T-6h、T-3h、T-1h、T-30m 与
+Closing 的允许窗口内增量采集尚未记录的节点；已记录的 `data_missing` 不会自动重试烧额度。
+`/health` 同时公开脱敏的 `api_football_startup_probe`，区分“已配置密钥”和“上游鉴权成功”。
+
 - 固定时间轴：`Opening → T-24h → T-12h → T-6h → T-3h → T-1h → T-30m → Closing`。未真实采集的节点返回 `data_missing`，不使用当前赔率回填。
 - T-1h、T-30m 和 Closing 快照持久化 `team_news_snapshot`，包含伤停、阵型、教练及确认首发名单；接口请求结束后不会丢失阵容详情。
 - 伤停数据区分 `confirmed_empty`（接口成功且确认无伤停）与 `fetch_failed`（数据缺失），失败时人数为 `null`，禁止按零伤停参与模型。

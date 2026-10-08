@@ -4,7 +4,7 @@ import gzip
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 import main
@@ -3666,6 +3666,67 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             retry = main.collect_the_odds_api_timeline(self.odds_collection_payload(requested_stages=["T-3h"], retry_data_missing=True))
         self.assertEqual(retry["stages_to_fetch"], ["T-3h"])
         collector.assert_called_once()
+
+    def test_the_odds_api_persisted_fixture_auto_collects_due_stage(self):
+        kickoff = datetime(2026, 10, 9, 17, 0, tzinfo=timezone.utc)
+        now = kickoff - timedelta(hours=12)
+        fixture = "theodds-event-1"
+        store = {
+            "fixtures": {fixture: [{"stage": "T-24h", "import_status": "available"}]},
+            "external_prematch": {fixture: {
+                "source": "the_odds_api", "league": "Norway Eliteserien",
+                "provider_fixture_ids": {"the_odds_api": "event-1"},
+                "match": {
+                    "kickoff_utc": kickoff.isoformat(),
+                    "home_team_name": "SK Brann", "away_team_name": "Viking FK",
+                    "home_aliases": ["Brann"], "away_aliases": ["Viking"],
+                    "the_odds_api_sport_key": "soccer_norway_eliteserien",
+                },
+            }},
+        }
+        collector = Mock(return_value={"ok": True, "request_count": 1, "persist_result": {"changed": True}})
+        with patch.object(main, "THE_ODDS_API_KEY", "configured"):
+            result = main.auto_collect_the_odds_api_due_stages(now, store_override=store, collector=collector)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["due_count"], 1)
+        self.assertEqual(result["collected_count"], 1)
+        payload = collector.call_args.args[0]
+        self.assertEqual(payload["requested_stages"], ["T-12h"])
+        self.assertEqual(payload["the_odds_api_event_id"], "event-1")
+        self.assertTrue(payload["only_missing"])
+        self.assertFalse(payload["retry_data_missing"])
+
+    def test_the_odds_api_auto_collection_does_not_retry_recorded_missing_stage(self):
+        kickoff = datetime(2026, 10, 9, 17, 0, tzinfo=timezone.utc)
+        fixture = "theodds-event-2"
+        store = {
+            "fixtures": {fixture: [{"stage": "T-12h", "import_status": "data_missing"}]},
+            "external_prematch": {fixture: {
+                "source": "the_odds_api", "league": "Norway Eliteserien",
+                "provider_fixture_ids": {"the_odds_api": "event-2"},
+                "match": {
+                    "kickoff_utc": kickoff.isoformat(), "home_team_name": "A", "away_team_name": "B",
+                    "the_odds_api_sport_key": "soccer_norway_eliteserien",
+                },
+            }},
+        }
+        collector = Mock()
+        with patch.object(main, "THE_ODDS_API_KEY", "configured"):
+            result = main.auto_collect_the_odds_api_due_stages(kickoff - timedelta(hours=12), store_override=store, collector=collector)
+        self.assertEqual(result["status"], "not_due")
+        self.assertEqual(result["due_count"], 0)
+        collector.assert_not_called()
+
+    def test_api_football_capability_probe_reports_rejected_credential_without_secret(self):
+        rejected = {
+            "ok": False, "status_code": 200, "error": "api_football_business_error",
+            "data": {"errors": {"token": "Error/Missing application key."}},
+        }
+        with patch.object(main, "API_FOOTBALL_KEY", "private-key"), patch.object(main, "call_api_football", return_value=rejected):
+            result = main.api_football_capability_check()
+        self.assertFalse(result["authenticated"])
+        self.assertEqual(result["error_category"], "credential_rejected")
+        self.assertNotIn("private-key", str(result))
 
     def learning_payload(self, fixture="learn-1", captured_at=900, kickoff_at=1000, analysis=None):
         return {
