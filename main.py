@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.19.1"
+VERSION = "2.19.2"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -164,6 +164,7 @@ THE_ODDS_API_MIN_AH_BOOKMAKERS = max(1, int(os.getenv("THE_ODDS_API_MIN_AH_BOOKM
 THE_ODDS_API_MIN_OU_BOOKMAKERS = max(1, int(os.getenv("THE_ODDS_API_MIN_OU_BOOKMAKERS", "3")))
 THE_ODDS_API_DISCOVERY_MAX_ATTEMPTS = max(1, min(int(os.getenv("THE_ODDS_API_DISCOVERY_MAX_ATTEMPTS", "3")), 5))
 THE_ODDS_API_DISCOVERY_RETRY_SECONDS = max(300, min(int(os.getenv("THE_ODDS_API_DISCOVERY_RETRY_SECONDS", "900")), 3600))
+THE_ODDS_API_WATCHLIST_ARCHIVE_RETENTION = max(100, min(int(os.getenv("THE_ODDS_API_WATCHLIST_ARCHIVE_RETENTION", "5000")), 50000))
 NAMI_API_USER = os.getenv("NAMI_API_USER", "")
 NAMI_API_SECRET = os.getenv("NAMI_API_SECRET", "")
 NAMI_API_BASE_URL = os.getenv("NAMI_API_BASE_URL", "https://open.sportnanoapi.com").rstrip("/")
@@ -12777,6 +12778,7 @@ def the_odds_api_watchlist_health(
     except SnapshotStoreReadError:
         return {"status": "store_unavailable", "active_count": 0, "expired_count": 0, "latest_run": None}
     rows = [row for row in (store.get("the_odds_api_watchlist") or {}).values() if isinstance(row, dict)]
+    archived_rows = [row for row in (store.get("the_odds_api_watchlist_archive") or {}).values() if isinstance(row, dict)]
     active_count = sum((_parse_timestamp(row.get("expires_at")) or 0) >= now_ts for row in rows)
     expired_count = len(rows) - active_count
     runs = [row for row in (store.get("the_odds_api_discovery_runs") or {}).values() if isinstance(row, dict)]
@@ -12791,6 +12793,8 @@ def the_odds_api_watchlist_health(
     return {
         "status": "ready" if latest_summary else "awaiting_first_run",
         "active_count": active_count, "expired_count": expired_count,
+        "archived_count": len(archived_rows),
+        "archived_without_any_node_count": sum(not row.get("recorded_stages") for row in archived_rows),
         "latest_run": latest_summary,
         "learning_eligibility": "MODEL_LEARNING_EXCLUDED",
     }
@@ -12824,8 +12828,27 @@ def discover_the_odds_api_watchlist(
         fixture for fixture, row in watchlist.items()
         if not isinstance(row, dict) or (_parse_timestamp(row.get("expires_at")) or 0) < now_ts
     ]
+    archive = store.setdefault("the_odds_api_watchlist_archive", {})
+    fixture_rows = store.get("fixtures") or {}
     for fixture in expired_fixtures:
-        watchlist.pop(fixture, None)
+        row = watchlist.pop(fixture, None)
+        history = [item for item in (fixture_rows.get(str(fixture)) or []) if isinstance(item, dict)]
+        recorded_stages = sorted({item.get("stage") for item in history if item.get("stage") in LEARNING_PREMATCH_STAGE_ORDER})
+        available_stages = sorted({item.get("stage") for item in history if item.get("stage") in LEARNING_PREMATCH_STAGE_ORDER and snapshot_stage_usable(item)})
+        data_missing_stages = sorted({item.get("stage") for item in history if item.get("stage") in LEARNING_PREMATCH_STAGE_ORDER and item.get("import_status") == "data_missing"})
+        archive[f"{fixture}:{now_ts}"] = {
+            **(row if isinstance(row, dict) else {"fixture": str(fixture), "invalid_watchlist_row": True}),
+            "archived_at": now_ts, "archive_reason": "watchlist_expired",
+            "required_stages": list(LEARNING_PREMATCH_STAGE_ORDER),
+            "recorded_stages": recorded_stages, "available_stages": available_stages,
+            "data_missing_stages": data_missing_stages,
+            "unobserved_stages": [stage for stage in LEARNING_PREMATCH_STAGE_ORDER if stage not in recorded_stages],
+            "model_learning_effect": False,
+        }
+    if len(archive) > THE_ODDS_API_WATCHLIST_ARCHIVE_RETENTION:
+        ordered_archive_keys = sorted(archive, key=lambda key: int((archive.get(key) or {}).get("archived_at") or 0))
+        for archive_key in ordered_archive_keys[:-THE_ODDS_API_WATCHLIST_ARCHIVE_RETENTION]:
+            archive.pop(archive_key, None)
 
     def persist_pruning_if_needed() -> None:
         if expired_fixtures and persist and store_override is None:
@@ -12840,7 +12863,7 @@ def discover_the_odds_api_watchlist(
             "status": "already_completed", "run_id": run_id, "at": now_ts,
             "discovered_count": int(prior.get("discovered_count") or 0),
             "request_count": int(prior.get("request_count") or 0),
-            "pruned_count": len(expired_fixtures),
+            "archived_count": len(expired_fixtures), "pruned_count": len(expired_fixtures),
         }
     prior_attempt_count = int((prior or {}).get("attempt_count") or 0) if isinstance(prior, dict) else 0
     if isinstance(prior, dict) and prior_status == "degraded":
@@ -12850,7 +12873,7 @@ def discover_the_odds_api_watchlist(
             return {
                 "status": "retry_exhausted", "run_id": run_id, "at": now_ts,
                 "attempt_count": prior_attempt_count, "failed_request_count": prior.get("failed_request_count", 0),
-                "pruned_count": len(expired_fixtures),
+                "archived_count": len(expired_fixtures), "pruned_count": len(expired_fixtures),
             }
         if now_ts < next_retry_at:
             persist_pruning_if_needed()
@@ -12858,7 +12881,7 @@ def discover_the_odds_api_watchlist(
                 "status": "retry_scheduled", "run_id": run_id, "at": now_ts,
                 "attempt_count": prior_attempt_count, "next_retry_at": next_retry_at,
                 "failed_request_count": prior.get("failed_request_count", 0),
-                "pruned_count": len(expired_fixtures),
+                "archived_count": len(expired_fixtures), "pruned_count": len(expired_fixtures),
             }
 
     caller = api_caller or call_the_odds_api
@@ -12947,7 +12970,7 @@ def discover_the_odds_api_watchlist(
         "next_retry_at": now_ts + retry_seconds if failed_count and attempt_count < THE_ODDS_API_DISCOVERY_MAX_ATTEMPTS else None,
         "discovered_count": len(all_discovered), "rejected_count": int((prior or {}).get("rejected_count") or 0) + rejected_count,
         "discovered_fixtures": all_discovered, "request_audit": request_audit,
-        "pruned_count": len(expired_fixtures),
+        "archived_count": len(expired_fixtures), "pruned_count": len(expired_fixtures),
         "historical_odds_requested": False, "model_learning_effect": False,
     }
     store.setdefault("the_odds_api_discovery_runs", {})[run_id] = audit
@@ -12974,8 +12997,12 @@ def auto_collect_the_odds_api_due_stages(
     collect = collector or collect_the_odds_api_timeline
     results: List[Dict[str, Any]] = []
     due_count = 0
-    tracked = dict(store.get("the_odds_api_watchlist") or {})
-    tracked.update(store.get("external_prematch") or {})
+    watchlist_rows = store.get("the_odds_api_watchlist") or {}
+    external_rows = store.get("external_prematch") or {}
+    watchlist_keys = set(watchlist_rows)
+    external_keys = set(external_rows)
+    tracked = dict(watchlist_rows)
+    tracked.update(external_rows)
     for fixture, metadata in tracked.items():
         if not isinstance(metadata, dict) or metadata.get("source") != "the_odds_api":
             continue
@@ -12993,9 +13020,15 @@ def auto_collect_the_odds_api_due_stages(
             row.get("stage") for row in ((store.get("fixtures") or {}).get(str(fixture)) or [])
             if isinstance(row, dict) and row.get("stage") in PREMATCH_STAGE_ORDER
         }
+        allowed_stage_keys = (
+            set(LEARNING_PREMATCH_STAGE_ORDER)
+            if fixture in watchlist_keys and fixture not in external_keys
+            else set(PREMATCH_STAGE_ORDER)
+        )
         due_stages = [
             stage["key"] for stage in TRACKING_STAGES
             if stage.get("key") not in {"Opening", "FT"}
+            and stage.get("key") in allowed_stage_keys
             and stage.get("key") not in recorded
             and auto_snapshot_stage_due(now, kickoff, stage)
         ]
