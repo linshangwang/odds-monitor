@@ -2647,6 +2647,11 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(blocked["status"], "blocked")
         self.assertIn("auto_snapshot_worker_not_running", [alert["code"] for alert in blocked["alerts"]])
 
+        with patch.object(main, "AUTO_SNAPSHOT_ENABLED", False), patch.object(main, "SNAPSHOT_STORE_WRITER_WORKERS", 2):
+            multiple_writers = main.operations_status_report(now_ts=4000)
+        self.assertEqual(multiple_writers["status"], "blocked")
+        self.assertIn("snapshot_store_single_writer_required", [alert["code"] for alert in multiple_writers["alerts"]])
+
         alive = unittest.mock.Mock()
         alive.is_alive.return_value = True
         with patch.object(main, "AUTO_SNAPSHOT_ENABLED", True), patch.object(main, "AUTO_SNAPSHOT_THREAD", alive), patch.object(main, "AUTO_SNAPSHOT_LAST_CYCLE_AT", 1000), patch.object(main, "AUTO_SNAPSHOT_LAST_ERROR", "TimeoutError"):
@@ -2712,9 +2717,13 @@ class ShadowV4UpgradeTests(unittest.TestCase):
              patch.object(main, "AUTO_SNAPSHOT_ENABLED", True), \
              patch.object(main, "AUTO_SNAPSHOT_THREAD", alive):
             ready = main.automatic_learning_runtime_readiness(store_integrity=integrity)
+            with patch.object(main, "SNAPSHOT_STORE_WRITER_WORKERS", 2):
+                multiple_writers = main.automatic_learning_runtime_readiness(store_integrity=integrity)
         self.assertTrue(ready["ready"])
         self.assertEqual(ready["blockers"], [])
         self.assertFalse(ready["secrets_exposed"])
+        self.assertFalse(multiple_writers["ready"])
+        self.assertIn("persistent_store_single_writer", multiple_writers["blockers"])
 
         with patch.object(main, "API_FOOTBALL_KEY", ""), \
              patch.object(main, "THE_ODDS_API_KEY", ""), \
@@ -2745,16 +2754,24 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(late["healthy"])
 
         run_id = "daily-20261008-1430"
-        completed_store = {"learning_runs": {run_id: {
+        run_content = main.learning_run_hash_content({
             "run_id": run_id, "started_at": just_due,
             "execution_order": ["past_36h_postmatch", "future_24h_prematch"],
-            "run_hash": "persisted-run-hash",
-        }}}
+            "automatic_champion_change": False,
+        })
+        run_record = {**run_content, "immutable": True, "run_hash": main._content_hash(run_content)}
+        completed_store = {"learning_runs": {run_id: run_record}}
         completed = main.automatic_learning_schedule_health(overdue, completed_store)
         self.assertEqual(completed["status"], "completed")
         self.assertTrue(completed["healthy"])
         self.assertEqual(completed["trigger_delay_seconds"], 5 * 60)
         self.assertTrue(completed["persisted_evidence"])
+        self.assertTrue(completed["run_hash_valid"])
+
+        tampered_store = {"learning_runs": {run_id: {**run_record, "automatic_champion_change": True}}}
+        tampered = main.automatic_learning_schedule_health(overdue, tampered_store)
+        self.assertEqual(tampered["status"], "invalid_persisted_run")
+        self.assertFalse(tampered["run_hash_valid"])
 
         invalid = {"learning_runs": {run_id: {"started_at": just_due}}}
         self.assertEqual(
@@ -3045,6 +3062,26 @@ class ShadowV4UpgradeTests(unittest.TestCase):
                 main.write_snapshot_store({"version": main.VERSION, "fixtures": {}})
         self.assertEqual(str(raised.exception), "snapshot_store_write_failed")
 
+    def test_snapshot_store_rejects_gzip_expansion_over_runtime_limit(self):
+        oversized = main.gzip.compress(b'{"version":"x","fixtures":{},"padding":"' + b"x" * 200 + b'"}')
+        main.Path(main.SNAPSHOT_STORE_PATH).write_bytes(oversized)
+        with patch.object(main, "SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES", 64):
+            with self.assertRaises(main.SnapshotStoreReadError):
+                main.load_snapshot_store()
+            inspection = main.inspect_snapshot_store_file(main.Path(main.SNAPSHOT_STORE_PATH))
+        self.assertEqual(inspection["status"], "corrupt")
+        self.assertEqual(inspection["error"], "ValueError")
+
+    def test_snapshot_store_write_limit_preserves_existing_primary(self):
+        main.write_snapshot_store({"version": "baseline", "fixtures": {}})
+        primary_before = main.Path(main.SNAPSHOT_STORE_PATH).read_bytes()
+        backup_before = main.snapshot_backup_path().read_bytes()
+        with patch.object(main, "SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES", 64):
+            with self.assertRaises(main.SnapshotStoreWriteError):
+                main.write_snapshot_store({"version": "too-large", "fixtures": {}, "padding": "x" * 200})
+        self.assertEqual(main.Path(main.SNAPSHOT_STORE_PATH).read_bytes(), primary_before)
+        self.assertEqual(main.snapshot_backup_path().read_bytes(), backup_before)
+
     def test_corrupt_existing_snapshot_store_is_not_treated_as_empty(self):
         with open(main.SNAPSHOT_STORE_PATH, "wb") as handle:
             handle.write(b"not-json-and-not-gzip")
@@ -3100,6 +3137,91 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(integrity["operational"])
         self.assertEqual(integrity["primary"]["status"], "corrupt")
         self.assertTrue(integrity["recovery_ready"])
+        self.assertTrue(integrity["manual_recovery_required"])
+        self.assertFalse(integrity["automatic_restore"])
+
+    def test_snapshot_store_recovery_preview_is_read_only_and_state_bound(self):
+        main.write_snapshot_store({"version": "good", "fixtures": {"a": []}})
+        backup_before = main.snapshot_backup_path().read_bytes()
+        with open(main.SNAPSHOT_STORE_PATH, "wb") as handle:
+            handle.write(b"corrupt-primary")
+        corrupt_before = main.Path(main.SNAPSHOT_STORE_PATH).read_bytes()
+        preview = main.snapshot_store_recovery_preview()
+        self.assertTrue(preview["eligible"])
+        self.assertEqual(preview["reason"], "primary_unreadable_and_backup_verified")
+        self.assertTrue(preview["recovery_token"])
+        self.assertTrue(preview["required_confirmation"].startswith("RESTORE_SNAPSHOT_BACKUP:"))
+        self.assertEqual(main.Path(main.SNAPSHOT_STORE_PATH).read_bytes(), corrupt_before)
+        self.assertEqual(main.snapshot_backup_path().read_bytes(), backup_before)
+
+    def test_snapshot_store_recovery_refuses_healthy_primary_and_bad_confirmation(self):
+        main.write_snapshot_store({"version": "good", "fixtures": {}})
+        healthy = main.snapshot_store_recovery_preview()
+        self.assertFalse(healthy["eligible"])
+        with self.assertRaises(main.HTTPException) as not_eligible:
+            main.restore_snapshot_store_from_backup({"recovery_token": "x", "confirmation": "x"}, now_ts=100)
+        self.assertEqual(not_eligible.exception.detail, "snapshot_store_manual_recovery_not_eligible")
+
+        with open(main.SNAPSHOT_STORE_PATH, "wb") as handle:
+            handle.write(b"corrupt-primary")
+        preview = main.snapshot_store_recovery_preview()
+        with self.assertRaises(main.HTTPException) as bad_phrase:
+            main.restore_snapshot_store_from_backup({
+                "recovery_token": preview["recovery_token"], "confirmation": "wrong",
+            }, now_ts=101)
+        self.assertEqual(bad_phrase.exception.detail, "snapshot_recovery_confirmation_mismatch")
+
+    def test_snapshot_store_recovery_restores_backup_and_quarantines_corruption(self):
+        main.write_snapshot_store({"version": "good", "fixtures": {"a": [{"stage": "Opening"}]}})
+        backup_before = main.snapshot_backup_path().read_bytes()
+        backup_hash = main.hashlib.sha256(backup_before).hexdigest()
+        with open(main.SNAPSHOT_STORE_PATH, "wb") as handle:
+            handle.write(b"corrupt-primary")
+        preview = main.snapshot_store_recovery_preview()
+        result = main.restore_snapshot_store_from_backup({
+            "recovery_token": preview["recovery_token"],
+            "confirmation": preview["required_confirmation"],
+        }, now_ts=12345)
+        self.assertTrue(result["restored"])
+        self.assertFalse(result["automatic"])
+        self.assertTrue(result["displaced_primary_quarantined"])
+        self.assertTrue(result["backup_preserved"])
+        self.assertEqual(main.snapshot_backup_path().read_bytes(), backup_before)
+        self.assertEqual(result["recovered_from_backup_sha256"], backup_hash)
+        restored = main.load_snapshot_store()
+        self.assertEqual(set(restored["fixtures"]), {"a"})
+        self.assertEqual(restored["snapshot_store_recovery_audit"][-1]["recovered_at"], 12345)
+        self.assertFalse(restored["snapshot_store_recovery_audit"][-1]["automatic"])
+        quarantined = list(main.Path(main.SNAPSHOT_STORE_PATH).parent.glob("store.json.quarantine.12345.*"))
+        self.assertEqual(len(quarantined), 1)
+        self.assertEqual(quarantined[0].read_bytes(), b"corrupt-primary")
+        self.assertTrue(main.snapshot_store_integrity()["operational"])
+
+    def test_snapshot_store_recovery_rejects_stale_preview_after_backup_change(self):
+        main.write_snapshot_store({"version": "good", "fixtures": {}})
+        with open(main.SNAPSHOT_STORE_PATH, "wb") as handle:
+            handle.write(b"corrupt-primary")
+        preview = main.snapshot_store_recovery_preview()
+        main.snapshot_backup_path().write_bytes(b'{"version":"different","fixtures":{}}')
+        with self.assertRaises(main.HTTPException) as stale:
+            main.restore_snapshot_store_from_backup({
+                "recovery_token": preview["recovery_token"],
+                "confirmation": preview["required_confirmation"],
+            }, now_ts=200)
+        self.assertEqual(stale.exception.detail, "snapshot_recovery_preview_token_mismatch")
+        self.assertEqual(main.Path(main.SNAPSHOT_STORE_PATH).read_bytes(), b"corrupt-primary")
+
+    def test_operations_status_remains_observable_when_primary_store_is_corrupt(self):
+        main.write_snapshot_store({"version": "good", "fixtures": {}})
+        with open(main.SNAPSHOT_STORE_PATH, "wb") as handle:
+            handle.write(b"corrupt-primary")
+        status = main.operations_status_report(now_ts=300)
+        self.assertEqual(status["status"], "blocked")
+        codes = {row["code"] for row in status["alerts"]}
+        self.assertIn("snapshot_store_unavailable", codes)
+        self.assertIn("snapshot_store_manual_recovery_available", codes)
+        self.assertTrue(status["store"]["manual_recovery_available"])
+        self.assertEqual(status["automatic_learning_data_health"]["status"], "critical")
 
     def test_shadow_token_supports_header_and_bearer(self):
         self.assertEqual(main.resolve_shadow_token("query", None, "header"), "header")
@@ -3742,25 +3864,41 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             main.freeze_learning_sample(late, now_ts=1000)
         self.assertEqual(after_kickoff.exception.status_code, 409)
 
-    def test_learning_scope_requires_registry_match_or_external_evidence(self):
+    def test_learning_scope_requires_explicit_major_league_registry_membership(self):
         unverified = self.learning_payload()["scope"]
         unverified["competition_id"] = 999999
         unverified["competition_name"] = "Unregistered Premier"
         audit = main.audit_learning_scope(unverified)
         self.assertFalse(audit["eligible"])
-        self.assertIn("top_flight_verification_required", audit["reasons"])
+        self.assertIn("competition_not_in_major_learning_registry", audit["reasons"])
+        self.assertEqual(audit["learning_eligibility"], "MODEL_LEARNING_EXCLUDED")
+        self.assertEqual(audit["allowed_modes"], ["MARKET_LANGUAGE_ONLY", "SETTLEMENT_ONLY"])
 
         unverified["verification_status"] = "verified"
         unverified["verification_refs"] = [{"source": "league_organizer", "url": "https://example.test/competition"}]
         evidenced = main.audit_learning_scope(unverified)
-        self.assertTrue(evidenced["eligible"])
-        self.assertEqual(evidenced["normalized"]["verification_method"], "explicit_external_evidence")
+        self.assertFalse(evidenced["eligible"])
+        self.assertIn("competition_not_in_major_learning_registry", evidenced["reasons"])
+        self.assertEqual(evidenced["normalized"]["verification_method"], "not_in_major_learning_registry")
+
+        finland = self.learning_payload()["scope"]
+        finland.update({"competition_id": 244, "competition_name": "Finland Veikkausliiga", "country": "Finland"})
+        finland_audit = main.audit_learning_scope(finland)
+        self.assertFalse(finland_audit["eligible"])
+        self.assertEqual(finland_audit["allowed_modes"], ["MARKET_LANGUAGE_ONLY", "SETTLEMENT_ONLY"])
 
         mismatch = self.learning_payload()["scope"]
         mismatch["competition_name"] = "UEFA Champions League"
         registry_audit = main.audit_learning_scope(mismatch)
         self.assertFalse(registry_audit["eligible"])
         self.assertIn("competition_name_registry_mismatch", registry_audit["reasons"])
+
+        manifest = main.learning_major_league_registry_manifest()
+        self.assertEqual(manifest["version"], main.LEARNING_MAJOR_LEAGUES_VERSION)
+        self.assertEqual(manifest["league_count"], len(main.LEARNING_MAJOR_LEAGUES))
+        self.assertEqual(len(manifest["registry_hash"]), 64)
+        self.assertTrue(manifest["requires_explicit_user_confirmation_for_changes"])
+        self.assertEqual(audit["normalized"]["major_league_registry_hash"], manifest["registry_hash"])
 
     def learning_fixture_row(self, fixture_id, league_id, kickoff_at, status="NS"):
         return {
@@ -3783,9 +3921,153 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(discovery["candidates"][0]["fixture_id"], 1)
         self.assertTrue(discovery["candidates"][0]["learning_scope_verified"])
         self.assertEqual(discovery["candidates"][0]["scope"]["competition_type"], "domestic_league")
-        self.assertEqual(discovery["excluded_counts"]["competition_not_in_top_flight_registry"], 1)
+        self.assertEqual(discovery["excluded_counts"]["competition_not_in_major_learning_registry"], 1)
         self.assertEqual(discovery["excluded_counts"]["fixture_not_not_started"], 1)
         self.assertEqual(discovery["excluded_counts"]["outside_learning_discovery_horizon"], 1)
+
+    def test_learning_discovery_excludes_non_major_top_flight_for_market_language_only(self):
+        now_ts = 100000
+        rows = [self.learning_fixture_row(2441, 244, now_ts + 3600)]
+        discovery = main.discover_learning_fixtures(now_ts=now_ts, fixture_rows=rows)
+        self.assertEqual(discovery["candidate_count"], 0)
+        self.assertEqual(discovery["excluded_count"], 1)
+        excluded = discovery["excluded_sample"][0]
+        self.assertEqual(excluded["learning_eligibility"], "MODEL_LEARNING_EXCLUDED")
+        self.assertEqual(excluded["allowed_modes"], ["MARKET_LANGUAGE_ONLY", "SETTLEMENT_ONLY"])
+        self.assertEqual(discovery["observation_candidate_count"], 1)
+        observation = discovery["observation_candidates"][0]
+        self.assertEqual(observation["fixture_id"], 2441)
+        self.assertEqual(observation["routing_reason"], "competition_not_in_major_learning_registry")
+
+    def test_non_major_observation_is_separate_from_learning_and_settles_without_model_effect(self):
+        paths = {route.path for route in main.app.routes}
+        self.assertIn("/shadow/market-language/freeze", paths)
+        self.assertIn("/shadow/market-language/settle", paths)
+        payload = self.learning_payload("finland-observe", captured_at=900, kickoff_at=1000)
+        payload["scope"].update({
+            "competition_id": 244, "competition_name": "Finland Veikkausliiga", "country": "Finland",
+        })
+        frozen = main.freeze_market_language_observation(payload, now_ts=900)
+        self.assertEqual(frozen["observation_id"], "market:finland-observe:v1")
+        self.assertEqual(frozen["learning_eligibility"], "MODEL_LEARNING_EXCLUDED")
+        self.assertFalse(frozen["model_learning_effect"])
+        store = main.load_snapshot_store()
+        self.assertNotIn("learning_frozen", store)
+        self.assertIn("finland-observe", store["market_language_frozen"])
+
+        settled = main.settle_market_language_observation(frozen["observation_id"], {
+            "result": {"status": "FT", "home_goals": 1, "away_goals": 2},
+            "verification_refs": [
+                {"source": "official_league", "id": "result-1"},
+                {"source": "independent_stats", "url": "https://example.test/result-1"},
+            ],
+            "market_read_evaluation": "PARTIAL",
+            "settlement": {"payout_outcome": "LOSS", "unit_return": -1.0},
+            "event_audit": {"status": "clean"},
+            "settled_at": 1100,
+        }, now_ts=1100)
+        self.assertEqual(settled["action"], "settled")
+        self.assertFalse(settled["hypothesis_effect"])
+        self.assertFalse(settled["league_dna_effect"])
+        final_store = main.load_snapshot_store()
+        self.assertNotIn("learning_postmatch", final_store)
+        self.assertIn(frozen["observation_id"], final_store["market_language_settlements"])
+
+    def test_major_league_cannot_use_market_language_only_freeze(self):
+        with self.assertRaises(main.HTTPException) as blocked:
+            main.freeze_market_language_observation(self.learning_payload(), now_ts=900)
+        self.assertEqual(blocked.exception.status_code, 409)
+        self.assertEqual(blocked.exception.detail, "major_league_sample_requires_learning_pipeline")
+
+    def test_market_language_settlement_rejects_two_labels_from_same_authority(self):
+        payload = self.learning_payload("cup-observe", captured_at=900, kickoff_at=1000)
+        payload["scope"].update({"competition_id": 2, "competition_name": "Continental Cup", "competition_type": "continental_cup"})
+        frozen = main.freeze_market_language_observation(payload, now_ts=900)
+        with self.assertRaises(main.HTTPException) as blocked:
+            main.settle_market_language_observation(frozen["observation_id"], {
+                "result": {"status": "FT", "home_goals": 1, "away_goals": 0},
+                "verification_refs": [
+                    {"source": "label_a", "url": "https://same.test/a"},
+                    {"source": "label_b", "url": "https://same.test/b"},
+                ],
+                "market_read_evaluation": "CONFIRMED",
+                "settlement": {"payout_outcome": "WIN"},
+                "settled_at": 1100,
+            }, now_ts=1100)
+        self.assertEqual(blocked.exception.status_code, 409)
+        self.assertEqual(blocked.exception.detail, "two_independent_result_sources_required")
+
+    def test_market_language_status_separates_prematch_due_and_settled(self):
+        future = self.learning_payload("observe-future", captured_at=900, kickoff_at=20000)
+        future["scope"].update({"competition_id": 244, "competition_name": "Finland Veikkausliiga", "country": "Finland"})
+        main.freeze_market_language_observation(future, now_ts=900)
+        due = self.learning_payload("observe-due", captured_at=900, kickoff_at=1000)
+        due["scope"].update({"competition_id": 244, "competition_name": "Finland Veikkausliiga", "country": "Finland"})
+        main.freeze_market_language_observation(due, now_ts=900)
+        report = main.market_language_observation_status_report(now_ts=8300)
+        self.assertEqual(report["fixture_count"], 2)
+        self.assertEqual(report["state_counts"]["prematch_frozen"], 1)
+        self.assertEqual(report["state_counts"]["fact_collection_due"], 1)
+        self.assertFalse(report["model_learning_effect"])
+        self.assertEqual(report["fact_collection_due"][0]["fixture"], "observe-due")
+
+    def test_market_language_facts_are_isolated_and_settlement_binds_latest_fact_hash(self):
+        payload = self.learning_payload("observe-facts", captured_at=900, kickoff_at=1000)
+        payload["scope"].update({"competition_id": 244, "competition_name": "Finland Veikkausliiga", "country": "Finland"})
+        frozen = main.freeze_market_language_observation(payload, now_ts=900)
+        facts = main.collect_market_language_postmatch_facts(
+            frozen["observation_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(
+                sources=("api_football", "the_odds_api"), home_goals=2, away_goals=1,
+            ),
+        )
+        self.assertEqual(facts["verification"]["status"], "verified")
+        self.assertTrue(facts["verification"]["settlement_eligible"])
+        store = main.load_snapshot_store()
+        self.assertIn(frozen["observation_id"], store["market_language_postmatch_facts"])
+        self.assertNotIn("learning_postmatch_facts", store)
+
+        settlement_payload = {
+            "fact_hash": "wrong",
+            "result": {"status": "FT", "home_goals": 2, "away_goals": 1},
+            "market_read_evaluation": "INCONCLUSIVE",
+            "settlement": {"payout_outcome": "PASS"},
+            "settled_at": 9001,
+        }
+        with self.assertRaises(main.HTTPException) as wrong_hash:
+            main.settle_market_language_observation(frozen["observation_id"], settlement_payload, now_ts=9001)
+        self.assertEqual(wrong_hash.exception.detail, "latest_market_language_fact_hash_required")
+
+        settlement_payload["fact_hash"] = facts["fact_hash"]
+        settled = main.settle_market_language_observation(
+            frozen["observation_id"], settlement_payload, now_ts=9001,
+        )
+        self.assertEqual(settled["fact_hash"], facts["fact_hash"])
+        self.assertFalse(settled["model_learning_effect"])
+        status = main.market_language_observation_status_report(now_ts=9002)
+        self.assertEqual(status["state_counts"]["settled"], 1)
+
+    def test_daily_cycle_collects_observation_facts_without_grading_market_read(self):
+        payload = self.learning_payload("observe-auto-facts", captured_at=900, kickoff_at=1000)
+        payload["scope"].update({"competition_id": 244, "competition_name": "Finland Veikkausliiga", "country": "Finland"})
+        frozen = main.freeze_market_language_observation(payload, now_ts=900)
+        result = main.run_learning_cycle(
+            {"apply": True, "run_id": "observation-fact-cycle"},
+            now_ts=9000, fixture_rows=[],
+            market_language_fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(
+                sources=("api_football", "the_odds_api"), home_goals=1, away_goals=1,
+            ),
+        )
+        self.assertEqual(result["market_language_postmatch_fact_collected_count"], 1)
+        fact_result = result["market_language_postmatch_fact_results"][0]
+        self.assertEqual(fact_result["action"], "facts_collected")
+        self.assertTrue(fact_result["verification"]["settlement_eligible"])
+        store = main.load_snapshot_store()
+        facts = store["market_language_postmatch_facts"][frozen["observation_id"]][-1]
+        self.assertIsNone(facts["market_read_evaluation"])
+        self.assertFalse(facts["model_learning_effect"])
+        self.assertNotIn("learning_postmatch_facts", store)
+        self.assertNotIn("learning_postmatch", store)
 
     def test_learning_discovery_accepts_canonical_fixture_summaries_from_snapshot_worker(self):
         now_ts = 100000
@@ -4573,6 +4855,9 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         store = main.load_snapshot_store()
         self.assertIn("72", store["learning_frozen"])
         self.assertIn("cycle-20261008-a", store["learning_runs"])
+        persisted_run = store["learning_runs"]["cycle-20261008-a"]
+        self.assertTrue(persisted_run["immutable"])
+        self.assertEqual(persisted_run["run_hash"], main._content_hash(main.learning_run_hash_content(persisted_run)))
         self.assertNotIn("learning_hypotheses", store)
         self.assertNotIn("league_dna_active", store)
 
@@ -4580,6 +4865,14 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(second["action"], "unchanged")
         self.assertEqual(builder_calls, [72])
         self.assertEqual(len(main.load_snapshot_store()["learning_frozen"]["72"]), 1)
+
+        tampered_store = main.load_snapshot_store()
+        tampered_store["learning_runs"]["cycle-20261008-a"]["automatic_champion_change"] = True
+        main.write_snapshot_store(tampered_store)
+        with self.assertRaises(main.HTTPException) as invalid_run:
+            main.run_learning_cycle(payload, now_ts=now_ts, fixture_rows=[fixture_row], prematch_packet_builder=builder)
+        self.assertEqual(invalid_run.exception.status_code, 409)
+        self.assertEqual(invalid_run.exception.detail, "learning_run_integrity_invalid")
 
     def test_learning_cycle_creates_one_version_per_due_clock_node(self):
         kickoff_at = 200000
@@ -4753,13 +5046,20 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             calls.append("raw_snapshot_fixture_discovery")
             return {"fixtures": []}
 
+        def node_executor(now_ts=None, apply_changes=True):
+            calls.append("learning_node_executor")
+            return {"advanced_count": 0, "discovery_performed": False}
+
         with patch.object(main, "auto_learning_daily_cycle", side_effect=daily), \
-             patch.object(main, "target_fixtures_for_date", side_effect=targets):
+             patch.object(main, "target_fixtures_for_date", side_effect=targets), \
+             patch.object(main, "run_learning_node_executor", side_effect=node_executor):
             result = main.auto_snapshot_cycle(due)
         self.assertEqual(calls[0], "learning")
+        self.assertEqual(calls[-1], "learning_node_executor")
         self.assertEqual(result["execution_order"], ["past_36h_postmatch", "future_24h_prematch"])
+        self.assertFalse(result["node_execution"]["discovery_performed"])
 
-    def test_learning_cycle_only_builds_packets_for_top_flight_not_started_candidates(self):
+    def test_learning_cycle_routes_non_major_packets_to_isolated_observation_store(self):
         now_ts = 100000
         rows = [
             self.learning_fixture_row(73, 39, now_ts + 3600),
@@ -4777,8 +5077,180 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             now_ts=now_ts, fixture_rows=rows, prematch_packet_builder=builder,
         )
         self.assertEqual(result["frozen_count"], 1)
-        self.assertEqual(built, [73])
-        self.assertEqual(set(main.load_snapshot_store()["learning_frozen"]), {"73"})
+        self.assertEqual(result["market_language_observation_frozen_count"], 1)
+        self.assertEqual(built, [73, 74])
+        store = main.load_snapshot_store()
+        self.assertEqual(set(store["learning_frozen"]), {"73"})
+        self.assertEqual(set(store["market_language_frozen"]), {"74"})
+        self.assertNotIn("74", store["learning_frozen"])
+
+    def test_node_executor_advances_only_previously_admitted_fixture(self):
+        kickoff_at = 200000
+        t12_now = kickoff_at - 10 * 3600
+        t6_now = kickoff_at - 5 * 3600
+        fixture_row = self.learning_fixture_row(760, 39, kickoff_at)
+        first = main.run_learning_cycle(
+            {"apply": True, "run_id": "admit-for-node-executor"},
+            now_ts=t12_now, fixture_rows=[fixture_row],
+            prematch_packet_builder=lambda fixture_id: self.learning_prematch_packet(fixture_id, t12_now),
+        )
+        self.assertEqual(first["freeze_results"][0]["analysis_node"], "T-12h")
+
+        plan = main.learning_node_execution_plan(now_ts=t6_now)
+        self.assertEqual(plan["due_count"], 1)
+        self.assertEqual(plan["due"][0]["fixture_id"], "760")
+        self.assertFalse(plan["discovery_performed"])
+        result = main.run_learning_node_executor(
+            now_ts=t6_now,
+            prematch_packet_builder=lambda fixture_id: self.learning_prematch_packet(fixture_id, t6_now),
+        )
+        self.assertEqual(result["advanced_count"], 1)
+        self.assertEqual(result["results"][0]["analysis_node"], "T-6h")
+        self.assertFalse(result["discovery_performed"])
+        self.assertFalse(result["postmatch_learning_performed"])
+        self.assertEqual(len(main.load_snapshot_store()["learning_frozen"]["760"]), 2)
+
+        repeat = main.run_learning_node_executor(
+            now_ts=t6_now + 60,
+            prematch_packet_builder=Mock(side_effect=AssertionError("same node must not rebuild")),
+        )
+        self.assertEqual(repeat["advanced_count"], 0)
+        self.assertEqual(repeat["plan"]["due_count"], 0)
+
+    def test_daily_governance_admits_before_first_node_then_executor_freezes_at_t12(self):
+        kickoff_at = 300000
+        governance_now = kickoff_at - 20 * 3600
+        t12_now = kickoff_at - 10 * 3600
+        fixture_row = self.learning_fixture_row(761, 39, kickoff_at)
+
+        daily = main.run_learning_cycle(
+            {"apply": True, "run_id": "admit-before-first-node"},
+            now_ts=governance_now,
+            fixture_rows=[fixture_row],
+            prematch_packet_builder=Mock(side_effect=AssertionError("no analysis node is due yet")),
+        )
+        self.assertEqual(daily["admitted_count"], 1)
+        self.assertEqual(daily["frozen_count"], 0)
+        self.assertEqual(daily["freeze_results"][0]["reason"], "analysis_clock_node_not_due")
+        store = main.load_snapshot_store()
+        self.assertIn("761", store["learning_admissions"])
+        self.assertNotIn("761", store.get("learning_frozen") or {})
+
+        plan = main.learning_node_execution_plan(now_ts=t12_now)
+        self.assertEqual(plan["due_count"], 1)
+        self.assertEqual(plan["due"][0]["fixture_id"], "761")
+        self.assertEqual(plan["due"][0]["target_analysis_node"], "T-12h")
+        advanced = main.run_learning_node_executor(
+            now_ts=t12_now,
+            prematch_packet_builder=lambda fixture_id: self.learning_prematch_packet(fixture_id, t12_now),
+        )
+        self.assertEqual(advanced["advanced_count"], 1)
+        self.assertEqual(advanced["results"][0]["analysis_node"], "T-12h")
+        self.assertEqual(len(main.load_snapshot_store()["learning_frozen"]["761"]), 1)
+        status = main.learning_status_report(now_ts=t12_now)
+        self.assertEqual(status["admitted_fixture_count"], 1)
+        self.assertEqual(status["major_league_registry"]["version"], main.LEARNING_MAJOR_LEAGUES_VERSION)
+        self.assertFalse(status["node_executor"]["scope_expansion_allowed"])
+
+    def test_node_executor_persists_failure_backoff_then_recovers(self):
+        kickoff_at = 400000
+        governance_now = kickoff_at - 20 * 3600
+        node_now = kickoff_at - 10 * 3600
+        fixture_row = self.learning_fixture_row(762, 39, kickoff_at)
+        main.run_learning_cycle(
+            {"apply": True, "run_id": "admit-for-retry"},
+            now_ts=governance_now, fixture_rows=[fixture_row],
+            prematch_packet_builder=Mock(side_effect=AssertionError("node not due")),
+        )
+
+        failed = main.run_learning_node_executor(
+            now_ts=node_now,
+            prematch_packet_builder=Mock(side_effect=TimeoutError("provider unavailable")),
+        )
+        self.assertEqual(failed["rejected_count"], 1)
+        execution_key = failed["results"][0]["execution_key"]
+        attempt = main.load_snapshot_store()["learning_node_attempts"][execution_key]
+        self.assertEqual(attempt["status"], "failed")
+        self.assertEqual(attempt["attempt_count"], 1)
+        self.assertGreater(attempt["retry_after_at"], node_now)
+
+        blocked_builder = Mock(side_effect=AssertionError("backoff must prevent provider call"))
+        blocked = main.run_learning_node_executor(
+            now_ts=node_now + 60, prematch_packet_builder=blocked_builder,
+        )
+        self.assertEqual(blocked["plan"]["due_count"], 0)
+        self.assertIn("node_retry_backoff_active", [row["reason"] for row in blocked["plan"]["skipped"]])
+        blocked_builder.assert_not_called()
+
+        retry_at = int(attempt["retry_after_at"])
+        recovered = main.run_learning_node_executor(
+            now_ts=retry_at,
+            prematch_packet_builder=lambda fixture_id: self.learning_prematch_packet(fixture_id, retry_at),
+        )
+        self.assertEqual(recovered["advanced_count"], 1)
+        final_attempt = main.load_snapshot_store()["learning_node_attempts"][execution_key]
+        self.assertEqual(final_attempt["status"], "completed")
+        self.assertEqual(final_attempt["attempt_count"], 2)
+        self.assertTrue(final_attempt["freeze_id"])
+
+    def test_node_executor_active_lease_prevents_duplicate_provider_call(self):
+        kickoff_at = 500000
+        governance_now = kickoff_at - 20 * 3600
+        node_now = kickoff_at - 10 * 3600
+        fixture_row = self.learning_fixture_row(763, 39, kickoff_at)
+        main.run_learning_cycle(
+            {"apply": True, "run_id": "admit-for-lease"},
+            now_ts=governance_now, fixture_rows=[fixture_row],
+            prematch_packet_builder=Mock(side_effect=AssertionError("node not due")),
+        )
+        plan = main.learning_node_execution_plan(now_ts=node_now)
+        claimed = main.claim_learning_node_execution(plan["due"][0], now_ts=node_now)
+        self.assertTrue(claimed["claimed"])
+
+        builder = Mock(side_effect=AssertionError("leased job must not call provider"))
+        blocked = main.run_learning_node_executor(now_ts=node_now + 1, prematch_packet_builder=builder)
+        self.assertEqual(blocked["plan"]["due_count"], 0)
+        self.assertIn("node_execution_lease_active", [row["reason"] for row in blocked["plan"]["skipped"]])
+        builder.assert_not_called()
+
+    def test_learning_data_health_flags_admission_that_expired_without_freeze(self):
+        now_ts = 600000
+        fixture_row = self.learning_fixture_row(764, 39, now_ts + 100)
+        candidate = main.discover_learning_fixtures(now_ts=now_ts, fixture_rows=[fixture_row])["candidates"][0]
+        main.admit_learning_candidate(candidate, now_ts=now_ts)
+
+        health = main.automatic_learning_data_health(now_ts=now_ts + 200)
+        self.assertEqual(health["status"], "critical")
+        self.assertEqual(health["expired_unfrozen_count"], 1)
+        self.assertEqual(health["state_counts"]["expired_without_freeze"], 1)
+        with patch.object(main, "AUTO_SNAPSHOT_ENABLED", False):
+            operations = main.operations_status_report(now_ts=now_ts + 200)
+        self.assertIn("learning_admission_expired_without_freeze", [row["code"] for row in operations["alerts"]])
+        self.assertEqual(operations["status"], "blocked")
+
+    def test_postmatch_recovery_queue_keeps_expired_automatic_window_recoverable(self):
+        frozen = main.freeze_learning_sample(
+            self.learning_payload("recovery-fixture", captured_at=900, kickoff_at=1000), now_ts=900,
+        )
+        recovery_now = 1000 + (main.LEARNING_POSTMATCH_LOOKBACK_HOURS + 1) * 3600
+        queue = main.learning_postmatch_recovery_queue(now_ts=recovery_now)
+        self.assertEqual(queue["manual_recovery_required_count"], 1)
+        self.assertEqual(queue["items"][0]["freeze_id"], frozen["freeze_id"])
+        self.assertFalse(queue["items"][0]["prematch_rebuild_allowed"])
+        with patch.object(main, "AUTO_SNAPSHOT_ENABLED", False):
+            operations = main.operations_status_report(now_ts=recovery_now)
+        self.assertIn("learning_postmatch_manual_recovery_required", [row["code"] for row in operations["alerts"]])
+
+        facts = main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=recovery_now,
+            fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(
+                sources=("api_football", "the_odds_api"), home_goals=2, away_goals=0,
+            ),
+        )
+        self.assertTrue(facts["verification"]["settlement_eligible"])
+        recovered_queue = main.learning_postmatch_recovery_queue(now_ts=recovery_now + 1)
+        self.assertEqual(recovered_queue["manual_recovery_required_count"], 0)
+        self.assertEqual(recovered_queue["verified_facts_awaiting_review_count"], 1)
 
     def test_learning_cycle_settles_only_due_freeze_using_explicit_process_review(self):
         frozen = main.freeze_learning_sample(self.learning_payload("cycle-due", 900, 1000), now_ts=900)

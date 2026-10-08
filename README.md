@@ -142,6 +142,11 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 - v2.09 补齐前向验证的赛后自动结算与确认候选生成。系统从不可变Shadow锁、已核实Postmatch和赛前Closing共识快照派生Brier、CLV、模块消融、Process Accuracy与风险；Closing必须同市场、同选择、同档位且公司覆盖合格，缺失或跨档时失败关闭。九项门槛全部通过后只自动创建`AWAITING_EXPLICIT_USER_CONFIRMATION`，不会自动激活Champion。
 - v2.10 修正v2.09与四节点学习时间轴的冲突。自动学习的价格质量终点改为`T-1h`，只接受同市场、同选择、同档位且公司覆盖合格的T-1h共识价；价格和证据引用必须由服务端从持久化快照派生，调用方自报会被拒绝，Closing不能替代缺失的学习节点。普通赛前分析仍保留完整八节点及Closing。Promotion仍只生成等待用户明确确认的候选，绝不自动激活Champion。
 - v2.11 补齐自动赛后选择质量审核。比赛优先级只按冻结的A/B字母评级及决策合同判断，数字分数不擅自映射；价格执行只用服务端核验的同线T-1h证据，过程标签不读取赛果。State Tree等未决维度仍可让整体过程保持`DATA_INSUFFICIENT`，但不会再连带丢弃已独立核验的优先级和市场选择校准样本。
+- v2.12 将自动学习范围收紧为用户明确确认的“大型男子职业国内顶级联赛”白名单。注册表外赛事即使有官方一级联赛证明也不能自行进入学习池；它们只能通过`POST /shadow/market-language/freeze`和`POST /shadow/market-language/settle`进入独立观察/兑现存储，并固定声明对模型、Hypothesis、League DNA和Champion均无影响。
+- v2.13 补齐14:30治理周期与四节点分析之间的执行缺口。每日周期会把未来24小时合格比赛写入不可变`learning_admissions`，即使当时尚未到T-12h；5分钟工作线程只对这些已准入比赛推进`Opening/T-12h/T-6h/T-1h`版本，禁止重新发现或扩大范围。大型联赛注册表增加版本与内容哈希；注册表外赛前比赛自动路由到隔离的盘口语言观察存储。新增`/shadow/learning/registry`、`/shadow/learning/node-plan`、`/shadow/learning/node-run`和`/shadow/market-language/status`。
+- v2.14 将节点执行链加固为可恢复的生产契约。每个比赛/节点/证据组合生成稳定执行键，持久化`running/failed/completed`尝试账本；活跃租约阻止重复供应商调用，失败按有上限的指数退避重试，旧尝试按配置保留。`/shadow/learning/data-health`报告漏冻结、节点积压、过期赛后窗口、失败尝试、陈旧租约及隔离观察待兑现数量，并接入运维告警。14:30运行账本不再只检查`run_hash`存在，而是重新计算不可变内容哈希；被修改的记录直接判为无效。正式节点执行禁止调用方覆盖服务器时间。
+- v2.15 补齐非大型赛事“盘口语言观察→双源事实→待人工/代理复核兑现”闭环。14:30周期会在36小时窗口内为隔离观察自动采集赛果、事件和统计，写入独立`market_language_postmatch_facts`；双源一致后只进入`settlement_ready`，不会自动判断盘口语言正确、创建Learning Card或影响模型。兑现必须绑定最新事实哈希。新增`/shadow/market-language/collect-facts`及`/shadow/market-language/settlement-plan`。大型联赛超过36小时自动窗口后不再静默丢失，`/shadow/learning/postmatch-recovery`列出恢复项，`/shadow/learning/collect-facts`只补事实而禁止重建赛前分析。文件型事实库同时强制单worker运行，Procfile与Railway启动命令明确`--workers 1`，多写者配置会阻断无人值守授权。
+- v2.16 补齐单文件事实库的受保护人工恢复闭环。`GET /shadow/store-recovery-preview`只在主库不可读或缺失、且滚动备份可验证时生成绑定双方字节指纹的恢复令牌与精确确认短语；`POST /shadow/store-recover`重新核对同一状态后才原子恢复，损坏主文件保留为隔离副本，备份原件不改写，并把恢复审计写入新主库。后台任务永不调用恢复接口；主库损坏时运维状态仍可返回blocked与明确恢复提示，而不是因读取异常失去可观测性。主库、备份、检查和恢复路径同时统一采用有界gzip解压，并在原子写入前拒绝超过同一上限的事实库。
 
 真实资金包通过`/shadow/model/prematch-evaluate`或`/shadow/evaluate`请求体中的`real_money_data`提交。示例结构：
 
@@ -197,6 +202,8 @@ Edge、EV、脚本覆盖率、拥挤度和阵容可信度门槛，且不存在 D
 - `first_choice_high_consistency`：优先选择 Script Coverage 和基本面/盘口一致性最高的表达，允许赔率较低。
 - `second_choice_higher_return`：仍通过全部标准门槛，但在其他候选中优先更高 EV。
 - `high_variance_single`：Edge/EV 为正、覆盖率至少达到独立门槛，但未达到主推荐覆盖率，只能作为高博弈单关。
+
+单关候选还必须满足十进制赔率 `>= 1.75`（香港盘 `>= HK0.75`）。价格跌破门槛时返回 `WAIT`，不能为了凑出单关而切换到相反方向；更高赔率本身也不构成优先理由。
 
 高博弈候选不会为了填充结果而进入第一或第二首选；Crowding、Lineup Confidence、Death Path
 或关键字段出现硬性问题时，三层都清空并返回 `PASS`。
@@ -368,10 +375,14 @@ conservative、balanced、aggressive，复核原因必须是数组。异常输�
 而是清理临时文件并抛出统一的 `snapshot_store_write_failed`；只有原子替换完成才返回成功。
 读取端只在文件确实不存在时初始化空库；现有文件解压失败、JSON损坏或根结构不是对象时返回
 `snapshot_store_read_failed` 并停止后续写入，绝不把损坏文件当成空库覆盖。
-每次成功写入还会以相同编码原子更新 `.bak` 滚动备份。主文件损坏时不会自动恢复或覆盖，
-但可通过内部备份读取逻辑验证并用于人工恢复；备份不存在或损坏会返回独立错误。
+每次成功写入还会以相同编码原子更新 `.bak` 滚动备份。主文件损坏时绝不自动恢复或覆盖；
+受保护的`GET /shadow/store-recovery-preview`先生成绑定当前主文件和备份SHA-256的恢复令牌与精确确认短语，
+`POST /shadow/store-recover`只有在状态未变化且确认完全匹配时才原子恢复。损坏主文件会保留为带时间戳和指纹的隔离副本，
+备份原件保持不变，恢复审计写入新主库。备份不存在或损坏时恢复保持关闭。
 受令牌保护的 `GET /shadow/store-health` 可检查主文件与备份是否存在、可读、gzip状态、大小、
-版本、记录数量和SHA-256指纹。接口不返回比赛内容，也不会自动恢复或改写任何文件。
+版本、记录数量和SHA-256指纹。健康与预览接口不返回比赛内容，任何自动任务都没有恢复权限。
+主库、备份、健康检查和恢复候选统一使用`SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES`解压上限，默认512 MiB；
+超过上限的gzip或明文文件按损坏处理，新写入若超过同一上限也会在替换主库前失败，避免生成下次无法读取的事实库。
 为防止Railway卷无限增长，每场基本面版本和每个组合历史默认各保留最近100条，可分别通过
 `FUNDAMENTAL_VERSION_RETENTION`、`PORTFOLIO_RUN_RETENTION` 在10–1000范围调整。裁剪后版本号
 继续单调递增，不会重新从保留条数开始编号。
@@ -390,6 +401,9 @@ conservative、balanced、aggressive，复核原因必须是数组。异常输�
 ```text
 GET  /shadow/ai-packet?fixture=FIXTURE_ID
 POST /shadow/evaluate
+GET  /shadow/store-health
+GET  /shadow/store-recovery-preview
+POST /shadow/store-recover
 ```
 
 `/shadow/evaluate` 的 JSON 示例：
