@@ -11,7 +11,7 @@
 这是一个 Railway 可部署的 FastAPI 项目，用来测试：
 
 1. API-Football / API-SPORTS 的实时比赛、事件、技术统计接口
-2. TheStatsAPI 的通用 REST 接口代理测试
+2. 可选TheStatsAPI事件时间线增强适配器（未配置时不阻断主闭环）
 3. 后续可扩展 iSports 盘口接口、Sportradar Push/Webhook 接收口
 
 ## 本地运行
@@ -19,7 +19,7 @@
 ```bash
 pip install -r requirements.txt
 copy .env.example .env
-# 编辑 .env，填入 API_FOOTBALL_KEY / THESTATS_API_KEY
+# 编辑 .env，至少填入 API_FOOTBALL_KEY / THE_ODDS_API_KEY；THESTATS_API_KEY可留空
 uvicorn main:app --reload
 ```
 
@@ -39,7 +39,7 @@ uvicorn main:app --reload
 ```text
 API_FOOTBALL_KEY=你的 API-Football / API-SPORTS key
 API_FOOTBALL_BASE_URL=https://v3.football.api-sports.io
-THESTATS_API_KEY=你的 TheStatsAPI key
+THESTATS_API_KEY=可选；不用时留空
 THESTATS_BASE_URL=https://api.thestatsapi.com/api
 REQUEST_TIMEOUT=30
 ```
@@ -136,7 +136,7 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 - v2.03 接入TheStatsAPI作为第二独立事件权威。系统只能在开赛前通过UTC日期、主客队和开赛时间唯一匹配`match_id`并将身份哈希写入冻结；赛后再按该ID读取match detail与`/timeline`。最终比分须与API-Football一致，关键事件序列还必须在进球、红牌、点球、乌龙的类型、主客侧及分钟容差上逐项一致。两个事件来源都必须绑定同一`event_signature_hash`，缺哈希、错比赛、比分或事件不一致均保持单源/`DATA_INSUFFICIENT`。
 - v2.04 将TheStatsAPI赛前身份发现改为按UTC比赛日批量复用。一次完整分页结果在进程内短时缓存，同日多场及并发冻结共享同一份只读副本，避免逐场重复请求触发供应商分钟限速；失败、无效schema或不完整分页绝不缓存。缓存键绑定API域名、密钥指纹和UTC日期，默认TTL为600秒且最多保留16个比赛日键，不含真实密钥。
 - v2.05 加固每日14:30调度可靠性。14:30前严格不运行，之后由当日首个可用轮询补跑，不再因服务重启或轮询越过十分钟窗口而永久漏掉该日闭环；日期化run_id继续保证最多一次不可变写入，并记录计划时间与实际触发延迟。跨日不会伪造旧日期PIT运行。
-- v2.06 增加自动学习运行就绪契约，将API-Football、The Odds API、TheStatsAPI、安全令牌、持久化主存储与备份、自动工作线程、顶级联赛注册表和14:30调度逐项列为硬门禁。普通手工Shadow可用不再被误解为无人值守闭环已运行；状态与发布报告只公开布尔检查和阻塞项，不泄露密钥。
+- v2.06 增加自动学习运行就绪契约，当时将API-Football、The Odds API、TheStatsAPI、安全令牌、持久化主存储与备份、自动工作线程、顶级联赛注册表和14:30调度逐项列为硬门禁；v2.17已将不再使用的TheStatsAPI改为可选事件增强源。普通手工Shadow可用不再被误解为无人值守闭环已运行；状态与发布报告只公开布尔检查和阻塞项，不泄露密钥。
 - v2.07 增加持久化每日执行健康审计。系统不再相信进程内“最后运行”状态，而是核对当日run id、固定执行顺序、开始时间和run hash；14:30后给予最多两轮询或600秒宽限，之后仍无有效记录即产生critical告警并撤销自动学习运行授权。服务重启后仍可从持久化账本证明当日是否真正执行。
 - v2.08 打通多场提案到前向验证的安全自动桥接，但禁止赛后临时编造理论。只有在全部发现样本之前就登记、且对联赛/市场/失败维度唯一匹配的不可变因果模板，才能自动实例化为`HYPOTHESIS_ONLY`；模板预先固定验证下限、消融模块和赔率无关Challenger。无模板、晚登记或多模板冲突均失败关闭，实例化后仍无Champion效力，只能使用登记后的新比赛进入Shadow验证。
 - v2.09 补齐前向验证的赛后自动结算与确认候选生成。系统从不可变Shadow锁、已核实Postmatch和赛前Closing共识快照派生Brier、CLV、模块消融、Process Accuracy与风险；Closing必须同市场、同选择、同档位且公司覆盖合格，缺失或跨档时失败关闭。九项门槛全部通过后只自动创建`AWAITING_EXPLICIT_USER_CONFIRMATION`，不会自动激活Champion。
@@ -147,6 +147,7 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 - v2.14 将节点执行链加固为可恢复的生产契约。每个比赛/节点/证据组合生成稳定执行键，持久化`running/failed/completed`尝试账本；活跃租约阻止重复供应商调用，失败按有上限的指数退避重试，旧尝试按配置保留。`/shadow/learning/data-health`报告漏冻结、节点积压、过期赛后窗口、失败尝试、陈旧租约及隔离观察待兑现数量，并接入运维告警。14:30运行账本不再只检查`run_hash`存在，而是重新计算不可变内容哈希；被修改的记录直接判为无效。正式节点执行禁止调用方覆盖服务器时间。
 - v2.15 补齐非大型赛事“盘口语言观察→双源事实→待人工/代理复核兑现”闭环。14:30周期会在36小时窗口内为隔离观察自动采集赛果、事件和统计，写入独立`market_language_postmatch_facts`；双源一致后只进入`settlement_ready`，不会自动判断盘口语言正确、创建Learning Card或影响模型。兑现必须绑定最新事实哈希。新增`/shadow/market-language/collect-facts`及`/shadow/market-language/settlement-plan`。大型联赛超过36小时自动窗口后不再静默丢失，`/shadow/learning/postmatch-recovery`列出恢复项，`/shadow/learning/collect-facts`只补事实而禁止重建赛前分析。文件型事实库同时强制单worker运行，Procfile与Railway启动命令明确`--workers 1`，多写者配置会阻断无人值守授权。
 - v2.16 补齐单文件事实库的受保护人工恢复闭环。`GET /shadow/store-recovery-preview`只在主库不可读或缺失、且滚动备份可验证时生成绑定双方字节指纹的恢复令牌与精确确认短语；`POST /shadow/store-recover`重新核对同一状态后才原子恢复，损坏主文件保留为隔离副本，备份原件不改写，并把恢复审计写入新主库。后台任务永不调用恢复接口；主库损坏时运维状态仍可返回blocked与明确恢复提示，而不是因读取异常失去可观测性。主库、备份、检查和恢复路径同时统一采用有界gzip解压，并在原子写入前拒绝超过同一上限的事实库。
+- v2.17 按当前供应商策略把TheStatsAPI从无人值守启动硬门禁降为可选事件增强源。未配置时，API-Football与The Odds API仍可完成赛程、赛前冻结、赔率时间线和双源赛果归档；任何依赖红牌、点球、乌龙及进球顺序的过程复盘继续安全标记`DATA_INSUFFICIENT`，不得生成有效Learning Card、研究提案或Champion证据。若未来启用任一第二事件源，仍必须通过赛前身份冻结和一致`event_signature_hash`核验。
 
 真实资金包通过`/shadow/model/prematch-evaluate`或`/shadow/evaluate`请求体中的`real_money_data`提交。示例结构：
 
