@@ -3720,6 +3720,66 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["due_count"], 0)
         collector.assert_not_called()
 
+    def test_the_odds_api_watchlist_discovers_only_approved_next_24h_events(self):
+        now = datetime(2026, 10, 9, 7, 0, tzinfo=timezone.utc)
+        store = {"fixtures": {}}
+
+        def caller(path, params):
+            self.assertTrue(path.startswith("/sports/"))
+            self.assertIn("commenceTimeFrom", params)
+            if "soccer_norway_eliteserien" not in path:
+                return {"ok": True, "status_code": 200, "data": []}
+            return {"ok": True, "status_code": 200, "data": [
+                {"id": "inside", "commence_time": (now + timedelta(hours=12)).isoformat(), "home_team": "Brann", "away_team": "Viking"},
+                {"id": "outside", "commence_time": (now + timedelta(hours=25)).isoformat(), "home_team": "A", "away_team": "B"},
+            ]}
+
+        with patch.object(main, "THE_ODDS_API_KEY", "configured"):
+            result = main.discover_the_odds_api_watchlist(now, store_override=store, api_caller=caller, persist=False)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["request_count"], len(main.THE_ODDS_API_MAJOR_LEAGUE_SPORT_KEYS))
+        self.assertEqual(result["discovered_count"], 1)
+        row = store["the_odds_api_watchlist"]["odds-watch-inside"]
+        self.assertEqual(row["league_id"], 103)
+        self.assertEqual(row["learning_eligibility"], "MODEL_LEARNING_EXCLUDED")
+        self.assertFalse(row["model_learning_effect"])
+        self.assertFalse(row["direction_generation_allowed"])
+        self.assertEqual(row["fundamentals_status"], "data_missing")
+        self.assertFalse(result["historical_odds_requested"])
+
+    def test_the_odds_api_watchlist_daily_discovery_is_idempotent(self):
+        now = datetime(2026, 10, 9, 7, 0, tzinfo=timezone.utc)
+        run_id = "odds-watchlist-20261009-1430"
+        store = {"the_odds_api_discovery_runs": {run_id: {"discovered_count": 3, "request_count": 14}}}
+        caller = Mock()
+        with patch.object(main, "THE_ODDS_API_KEY", "configured"):
+            result = main.discover_the_odds_api_watchlist(now, store_override=store, api_caller=caller, persist=False)
+        self.assertEqual(result["status"], "already_completed")
+        self.assertEqual(result["discovered_count"], 3)
+        caller.assert_not_called()
+
+    def test_the_odds_api_watchlist_fixture_reaches_due_collector_without_learning_admission(self):
+        kickoff = datetime(2026, 10, 10, 3, 0, tzinfo=timezone.utc)
+        fixture = "odds-watch-event-3"
+        store = {
+            "fixtures": {},
+            "the_odds_api_watchlist": {fixture: {
+                "source": "the_odds_api", "league": "Norway Eliteserien",
+                "learning_eligibility": "MODEL_LEARNING_EXCLUDED", "model_learning_effect": False,
+                "provider_fixture_ids": {"the_odds_api": "event-3"},
+                "match": {
+                    "kickoff_utc": kickoff.isoformat(), "home_team_name": "A", "away_team_name": "B",
+                    "the_odds_api_sport_key": "soccer_norway_eliteserien",
+                },
+            }},
+        }
+        collector = Mock(return_value={"ok": True, "request_count": 1, "persist_result": {"changed": True}})
+        with patch.object(main, "THE_ODDS_API_KEY", "configured"):
+            result = main.auto_collect_the_odds_api_due_stages(kickoff - timedelta(hours=12), store_override=store, collector=collector)
+        self.assertEqual(result["collected_count"], 1)
+        self.assertEqual(collector.call_args.args[0]["requested_stages"], ["T-12h"])
+        self.assertNotIn("learning_admissions", store)
+
     def test_api_football_capability_probe_reports_rejected_credential_without_secret(self):
         rejected = {
             "ok": False, "status_code": 200, "error": "api_football_business_error",
@@ -5131,6 +5191,8 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             return {"advanced_count": 0, "discovery_performed": False}
 
         with patch.object(main, "auto_learning_daily_cycle", side_effect=daily), \
+             patch.object(main, "discover_the_odds_api_watchlist", return_value={"status": "completed"}), \
+             patch.object(main, "auto_collect_the_odds_api_due_stages", return_value={"status": "not_due"}), \
              patch.object(main, "API_FOOTBALL_STARTUP_PROBE", {"status": "completed", "authenticated": True}), \
              patch.object(main, "target_fixtures_for_date", side_effect=targets), \
              patch.object(main, "run_learning_node_executor", side_effect=node_executor):
@@ -5144,12 +5206,14 @@ class ShadowV4UpgradeTests(unittest.TestCase):
     def test_snapshot_worker_skips_rejected_api_football_but_keeps_odds_scheduler(self):
         due = datetime(2026, 10, 8, 6, 30, tzinfo=timezone.utc)
         with patch.object(main, "auto_learning_daily_cycle", return_value={"status": "not_due"}), \
+             patch.object(main, "discover_the_odds_api_watchlist", return_value={"status": "already_completed"}) as discovery, \
              patch.object(main, "API_FOOTBALL_STARTUP_PROBE", {"status": "completed", "authenticated": False, "error_category": "credential_rejected"}), \
              patch.object(main, "auto_collect_the_odds_api_due_stages", return_value={"status": "not_due", "due_count": 0}) as odds, \
              patch.object(main, "target_fixtures_for_date") as targets, \
              patch.object(main, "run_learning_node_executor", return_value={"advanced_count": 0}):
             result = main.auto_snapshot_cycle(due)
         odds.assert_called_once_with(due)
+        discovery.assert_called_once_with(due)
         targets.assert_not_called()
         self.assertEqual(result["api_football_due_collection"]["status"], "skipped")
         self.assertEqual(result["api_football_due_collection"]["reason"], "api_football_not_authenticated")
