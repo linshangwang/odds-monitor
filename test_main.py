@@ -2710,6 +2710,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         alive.is_alive.return_value = True
         integrity = {"operational": True, "recovery_ready": True}
         with patch.object(main, "API_FOOTBALL_KEY", "configured-api-football"), \
+             patch.object(main, "API_FOOTBALL_STARTUP_PROBE", {"status": "completed", "authenticated": True}), \
              patch.object(main, "THE_ODDS_API_KEY", "configured-odds"), \
              patch.object(main, "THESTATS_API_KEY", "configured-events"), \
              patch.object(main, "SHADOW_ACCESS_TOKEN", "configured-shadow"), \
@@ -2726,6 +2727,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("persistent_store_single_writer", multiple_writers["blockers"])
 
         with patch.object(main, "API_FOOTBALL_KEY", "configured-api-football"), \
+             patch.object(main, "API_FOOTBALL_STARTUP_PROBE", {"status": "completed", "authenticated": True}), \
              patch.object(main, "THE_ODDS_API_KEY", "configured-odds"), \
              patch.object(main, "THESTATS_API_KEY", ""), \
              patch.object(main, "SHADOW_ACCESS_TOKEN", "configured-shadow"), \
@@ -2749,6 +2751,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             )
         self.assertFalse(blocked["ready"])
         self.assertIn("api_football_configured", blocked["blockers"])
+        self.assertIn("api_football_authenticated", blocked["blockers"])
         self.assertIn("the_odds_api_configured", blocked["blockers"])
         self.assertFalse(blocked["checks"]["optional_event_enrichment_configured"])
         self.assertNotIn("optional_event_enrichment_configured", blocked["blockers"])
@@ -5128,6 +5131,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             return {"advanced_count": 0, "discovery_performed": False}
 
         with patch.object(main, "auto_learning_daily_cycle", side_effect=daily), \
+             patch.object(main, "API_FOOTBALL_STARTUP_PROBE", {"status": "completed", "authenticated": True}), \
              patch.object(main, "target_fixtures_for_date", side_effect=targets), \
              patch.object(main, "run_learning_node_executor", side_effect=node_executor):
             result = main.auto_snapshot_cycle(due)
@@ -5135,6 +5139,20 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(calls[-1], "learning_node_executor")
         self.assertEqual(result["execution_order"], ["past_36h_postmatch", "future_24h_prematch"])
         self.assertFalse(result["node_execution"]["discovery_performed"])
+        self.assertTrue(result["api_football_due_collection"]["authenticated"])
+
+    def test_snapshot_worker_skips_rejected_api_football_but_keeps_odds_scheduler(self):
+        due = datetime(2026, 10, 8, 6, 30, tzinfo=timezone.utc)
+        with patch.object(main, "auto_learning_daily_cycle", return_value={"status": "not_due"}), \
+             patch.object(main, "API_FOOTBALL_STARTUP_PROBE", {"status": "completed", "authenticated": False, "error_category": "credential_rejected"}), \
+             patch.object(main, "auto_collect_the_odds_api_due_stages", return_value={"status": "not_due", "due_count": 0}) as odds, \
+             patch.object(main, "target_fixtures_for_date") as targets, \
+             patch.object(main, "run_learning_node_executor", return_value={"advanced_count": 0}):
+            result = main.auto_snapshot_cycle(due)
+        odds.assert_called_once_with(due)
+        targets.assert_not_called()
+        self.assertEqual(result["api_football_due_collection"]["status"], "skipped")
+        self.assertEqual(result["api_football_due_collection"]["reason"], "api_football_not_authenticated")
 
     def test_learning_cycle_routes_non_major_packets_to_isolated_observation_store(self):
         now_ts = 100000
