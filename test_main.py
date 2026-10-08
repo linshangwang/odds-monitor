@@ -2090,6 +2090,97 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("fundamental_estimator", second["fundamental_version"]["variable_changes"])
         self.assertEqual(second["fundamental_version"]["trigger"]["reasons"], ["significant_line_move"])
         self.assertTrue(second["fundamental_version"]["script"]["odds_independent"])
+        self.assertEqual(second["fundamental_first_pipeline_audit"]["status"], "passed")
+        self.assertTrue(second["fundamental_first_pipeline_audit"]["fundamental_stage_completed_before_market"])
+        self.assertFalse(second["fundamental_first_pipeline_audit"]["market_processing_mutated_fundamentals"])
+
+    def test_imported_pipeline_executes_and_freezes_fundamentals_before_market(self):
+        main.import_prematch_packet(self.prematch_packet())
+        latest = max(row.get("snapshot_at") or 0 for row in main.get_fixture_snapshots("uuid-1") if row.get("import_status") == "available")
+        payload = {
+            "fixture": "uuid-1", "league_home_rate": 1.5, "league_away_rate": 1.2,
+            "home_attack_rate": 1.8, "home_defense_rate": 1.0,
+            "away_attack_rate": 1.1, "away_defense_rate": 1.5,
+            "home_sample_size": 10, "away_sample_size": 10, "league_sample_size": 100,
+            "metric_type": "xg", "home_adjustment": 1.0, "away_adjustment": 1.0,
+            "lineup_confidence": .85,
+            "provenance": {"source": "verified_event_data", "uses_market_odds": False},
+            "script_coverage": {"home": .8, "draw": .4, "away": .3},
+            "crowding": .3, "death_path": [],
+        }
+        calls = []
+        original_script = main._fundamental_evaluation_script
+        original_audit = main.audit_fundamental_chain
+        original_history = main.get_fixture_snapshots
+        original_decision = main.decision_layer
+
+        def record_script(*args, **kwargs):
+            calls.append("pure_fundamental_script")
+            return original_script(*args, **kwargs)
+
+        def record_audit(*args, **kwargs):
+            calls.append("fundamental_chain_audit")
+            return original_audit(*args, **kwargs)
+
+        def record_history(*args, **kwargs):
+            calls.append("market_snapshot")
+            return original_history(*args, **kwargs)
+
+        def record_decision(*args, **kwargs):
+            calls.append("market_candidate_generation")
+            return original_decision(*args, **kwargs)
+
+        with patch("main.time.time", return_value=latest + 60), \
+             patch("main._fundamental_evaluation_script", side_effect=record_script), \
+             patch("main.audit_fundamental_chain", side_effect=record_audit), \
+             patch("main.get_fixture_snapshots", side_effect=record_history), \
+             patch("main.decision_layer", side_effect=record_decision):
+            result = main.evaluate_imported_prematch(payload, persist_version=False)
+
+        self.assertLess(calls.index("pure_fundamental_script"), calls.index("market_snapshot"))
+        self.assertLess(calls.index("fundamental_chain_audit"), calls.index("market_snapshot"))
+        self.assertLess(calls.index("market_snapshot"), calls.index("market_candidate_generation"))
+        self.assertEqual(result["fundamental_freeze"]["schema"], "fundamental_first_freeze_v1")
+        self.assertTrue(result["fundamental_freeze"]["odds_independent"])
+        self.assertEqual(result["fundamental_first_pipeline_audit"]["status"], "passed")
+        self.assertEqual(result["decision_summary"]["market_evaluation_mode"], "diagnostic_only")
+
+    def test_fundamental_first_freeze_blocks_market_contaminated_chain(self):
+        estimator = {
+            "uses_market_odds": False, "method": "independent", "inputs": {},
+            "expected_goals": {"home": 1.4, "away": 1.0}, "confidence": .8,
+        }
+        model = {"model_hash": "model-1"}
+        script = {
+            "content_hash": "script-1", "odds_independent": True,
+            "chain": {key: {"status": "data_missing"} for key in main.FUNDAMENTAL_CHAIN},
+        }
+        script["chain"]["tactical_matchup"] = {
+            "status": "partial", "source": "bookmaker market odds", "observed_at": 100,
+            "market_probability": .62,
+        }
+        audit = main.audit_fundamental_chain(script, now_ts=200)
+        frozen = main.freeze_fundamental_stage("fixture-1", script, audit, estimator, model, 200)
+        self.assertFalse(frozen["odds_independent"])
+        self.assertFalse(frozen["market_decision_authorized"])
+        self.assertEqual(frozen["status"], "diagnostic_only")
+
+        clean_model = {
+            "method": "independent_poisson", "model_hash": "model-2",
+            "probabilities": {"1x2": {"home": .48, "draw": .28, "away": .24}},
+        }
+        clean_script = main._fundamental_evaluation_script({"fixture": "fixture-1"}, estimator, clean_model)
+        clean_audit = main.audit_fundamental_chain(clean_script, now_ts=200)
+        clean_freeze = main.freeze_fundamental_stage("fixture-1", clean_script, clean_audit, estimator, clean_model, 200)
+        clean_pipeline = main.audit_fundamental_first_pipeline(clean_freeze, clean_script)
+        self.assertTrue(clean_freeze["script_hash_valid"])
+        self.assertTrue(clean_pipeline["fundamental_freeze_hash_valid"])
+        self.assertEqual(clean_pipeline["status"], "passed")
+
+        tampered = {**clean_freeze, "frozen_at": 201}
+        tampered_pipeline = main.audit_fundamental_first_pipeline(tampered, clean_script)
+        self.assertFalse(tampered_pipeline["fundamental_freeze_hash_valid"])
+        self.assertEqual(tampered_pipeline["status"], "failed")
 
     def test_fundamental_version_persists_audit_fields(self):
         script = {"content_hash": "x", "chain": {key: {"status": "data_missing"} for key in main.FUNDAMENTAL_CHAIN}}

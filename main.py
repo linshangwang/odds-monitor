@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.19.3"
+VERSION = "2.19.4"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -4562,6 +4562,98 @@ def audit_fundamental_chain(script: Dict[str, Any], now_ts: Optional[int] = None
     }
 
 
+def freeze_fundamental_stage(
+    fixture: Any,
+    script: Dict[str, Any],
+    chain_audit: Dict[str, Any],
+    estimator: Dict[str, Any],
+    model: Dict[str, Any],
+    frozen_at: int,
+) -> Dict[str, Any]:
+    script_hash = str(script.get("content_hash") or "").strip() or None
+    recomputed_script_hash = _content_hash({
+        "fixture": str(fixture), "chain": script.get("chain") or {},
+        "estimator_method": get_nested(script, ["estimator", "method"]),
+        "estimator_inputs": get_nested(script, ["estimator", "inputs"]),
+        "expected_goals": get_nested(script, ["estimator", "expected_goals"]),
+        "model_method": get_nested(script, ["model", "method"]),
+        "model_probability": get_nested(script, ["model", "probabilities", "1x2"]),
+    })
+    script_hash_valid = bool(script_hash and script_hash == recomputed_script_hash)
+    estimator_independent = estimator.get("uses_market_odds") is False
+    chain_independent = not bool(chain_audit.get("market_contaminated_sections"))
+    odds_independent = script.get("odds_independent") is True and estimator_independent and chain_independent and script_hash_valid
+    normalized = {
+        "schema": "fundamental_first_freeze_v1",
+        "fixture": str(fixture),
+        "frozen_at": int(frozen_at),
+        "script_hash": script_hash,
+        "recomputed_script_hash": recomputed_script_hash,
+        "script_hash_valid": script_hash_valid,
+        "estimator_hash": _content_hash({
+            "method": estimator.get("method"), "inputs": estimator.get("inputs"),
+            "expected_goals": estimator.get("expected_goals"), "confidence": estimator.get("confidence"),
+        }),
+        "model_hash": model.get("model_hash"),
+        "chain_audit_hash": _content_hash(chain_audit),
+        "odds_independent": odds_independent,
+        "fundamental_decision_eligible": chain_audit.get("decision_eligible") is True,
+    }
+    eligible = bool(script_hash and odds_independent and normalized["fundamental_decision_eligible"])
+    return {
+        **normalized,
+        "status": "ready" if eligible else "diagnostic_only",
+        "market_decision_authorized": eligible,
+        "freeze_hash": _content_hash(normalized),
+        "policy": "this immutable fundamental stage must complete before market comparison; ineligible fundamentals allow diagnostic market output only",
+    }
+
+
+def audit_fundamental_first_pipeline(fundamental_freeze: Dict[str, Any], script: Dict[str, Any]) -> Dict[str, Any]:
+    post_market_script_hash = str(script.get("content_hash") or "").strip() or None
+    freeze_hash_payload = {
+        key: fundamental_freeze.get(key) for key in (
+            "schema", "fixture", "frozen_at", "script_hash", "recomputed_script_hash",
+            "script_hash_valid", "estimator_hash", "model_hash", "chain_audit_hash",
+            "odds_independent", "fundamental_decision_eligible",
+        )
+    }
+    freeze_hash_valid = bool(
+        fundamental_freeze.get("freeze_hash")
+        and _content_hash(freeze_hash_payload) == fundamental_freeze.get("freeze_hash")
+    )
+    freeze_valid = (
+        fundamental_freeze.get("schema") == "fundamental_first_freeze_v1"
+        and freeze_hash_valid
+        and fundamental_freeze.get("script_hash_valid") is True
+        and fundamental_freeze.get("odds_independent") is True
+    )
+    script_preserved = bool(post_market_script_hash and post_market_script_hash == fundamental_freeze.get("script_hash"))
+    return {
+        "schema": "fundamental_first_pipeline_audit_v1",
+        "status": "passed" if freeze_valid and script_preserved else "failed",
+        "decision_eligible": freeze_valid and script_preserved,
+        "required_order": [
+            "fundamental_estimator", "independent_probability_model", "pure_fundamental_script",
+            "fundamental_chain_audit", "fundamental_freeze", "market_snapshot",
+            "market_candidate_generation", "market_language", "expression_optimizer",
+        ],
+        "observed_order": [
+            "fundamental_estimator", "independent_probability_model", "pure_fundamental_script",
+            "fundamental_chain_audit", "fundamental_freeze", "market_snapshot",
+            "market_candidate_generation", "market_language", "expression_optimizer",
+        ],
+        "fundamental_stage_completed_before_market": True,
+        "fundamental_freeze_hash": fundamental_freeze.get("freeze_hash"),
+        "fundamental_freeze_hash_valid": freeze_hash_valid,
+        "pre_market_script_hash": fundamental_freeze.get("script_hash"),
+        "post_market_script_hash": post_market_script_hash,
+        "market_processing_mutated_fundamentals": not script_preserved,
+        "market_evaluation_mode": "decision_eligible" if fundamental_freeze.get("market_decision_authorized") is True else "diagnostic_only",
+        "policy": "market processing may confirm, resist, or optimize an expression but cannot create or rewrite the frozen fundamental script",
+    }
+
+
 def build_decision_summary(decision: Dict[str, Any], chain_audit: Dict[str, Any], model: Dict[str, Any]) -> Dict[str, Any]:
     best = decision.get("best_market") or {}
     execution_action = decision.get("execution_action") or ("PASS" if decision.get("decision") == "PASS" else "BET")
@@ -4578,6 +4670,8 @@ def build_decision_summary(decision: Dict[str, Any], chain_audit: Dict[str, Any]
         "script_coverage": None if passed else best.get("script_coverage"),
         "model_status": model.get("status"),
         "fundamental_chain_status": chain_audit.get("status"),
+        "fundamental_first_pipeline_status": get_nested(decision, ["fundamental_first_pipeline_audit", "status"]),
+        "market_evaluation_mode": get_nested(decision, ["fundamental_first_pipeline_audit", "market_evaluation_mode"]),
         "market_move_classification": decision.get("market_move_classification"),
         "market_acceptance": get_nested(decision, ["market_language", "selected_acceptance"]),
         "repricing_attribution": get_nested(decision, ["market_language", "selected_repricing_attribution"]),
@@ -4597,6 +4691,19 @@ def audit_decision_output(decision: Dict[str, Any]) -> Dict[str, Any]:
     execution_action = decision.get("execution_action") or ("PASS" if decision_name == "PASS" else "BET")
     pass_mode = execution_action == "PASS" or decision_name == "PASS"
     consistency_issues = []
+    if "fundamental_freeze" in decision or "fundamental_first_pipeline_audit" in decision:
+        freeze = decision.get("fundamental_freeze") if isinstance(decision.get("fundamental_freeze"), dict) else {}
+        pipeline = decision.get("fundamental_first_pipeline_audit") if isinstance(decision.get("fundamental_first_pipeline_audit"), dict) else {}
+        if freeze.get("schema") != "fundamental_first_freeze_v1" or not freeze.get("freeze_hash"):
+            consistency_issues.append("fundamental_first_freeze_v1_required")
+        if pipeline.get("schema") != "fundamental_first_pipeline_audit_v1" or pipeline.get("status") != "passed":
+            consistency_issues.append("fundamental_first_pipeline_audit_must_pass")
+        if pipeline.get("fundamental_stage_completed_before_market") is not True:
+            consistency_issues.append("fundamental_stage_must_complete_before_market")
+        if pipeline.get("market_processing_mutated_fundamentals") is not False:
+            consistency_issues.append("market_processing_must_not_mutate_fundamentals")
+        if execution_action in ("BET", "WAIT") and freeze.get("market_decision_authorized") is not True:
+            consistency_issues.append("actionable_market_decision_requires_eligible_fundamental_freeze")
     if "line_movement_audit" in decision:
         if not isinstance(decision.get("market_language"), dict):
             consistency_issues.append("terminal_decision_requires_market_language")
@@ -4717,12 +4824,17 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
     model = poisson_probability_model(xg["home"], xg["away"], estimator["confidence"], payload.get("provenance"))
     if estimator.get("status") != "ready":
         model["status"] = "insufficient_confidence"
+    evaluation_cutoff = int(time.time())
+    script = _fundamental_evaluation_script(effective_payload, estimator, model)
+    chain_audit = audit_fundamental_chain(script, now_ts=evaluation_cutoff)
+    fundamental_freeze = freeze_fundamental_stage(
+        fixture, script, chain_audit, estimator, model, evaluation_cutoff
+    )
     history = get_fixture_snapshots(fixture)
     available = [row for row in history if row.get("import_status") == "available"]
     latest = latest_prematch_snapshot(available)
     market = (latest or {}).get("market_snapshot") or empty_market_snapshot()
     freshness = imported_fixture_freshness(metadata, history)
-    evaluation_cutoff = int(time.time())
     match_metadata = metadata.get("match") if isinstance(metadata.get("match"), dict) else {}
     kickoff_at = match_metadata.get("kickoff_utc") or match_metadata.get("date") or match_metadata.get("kickoff_at")
     real_money_audit = audit_real_money_data(
@@ -4734,7 +4846,15 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
         as_float(payload.get("crowding")), lineup_audit.get("effective_confidence"), payload.get("death_path") if "death_path" in payload else None,
     )
     decision["lineup_confidence_audit"] = lineup_audit
+    decision["fundamental_chain_audit"] = chain_audit
+    decision["fundamental_freeze"] = fundamental_freeze
+    if not fundamental_freeze["market_decision_authorized"]:
+        force_pass_decision(decision, "fundamental_chain_insufficient")
     decision = apply_line_movement_gate(decision, history, real_money_audit)
+    pipeline_order_audit = audit_fundamental_first_pipeline(fundamental_freeze, script)
+    decision["fundamental_first_pipeline_audit"] = pipeline_order_audit
+    if not pipeline_order_audit["decision_eligible"]:
+        force_pass_decision(decision, "fundamental_first_pipeline_failed")
     decision["data_freshness"] = freshness
     if payload.get("real_money_data") not in (None, {}) and real_money_audit.get("status") == "rejected":
         decision["pass_reasons"].append("real_money_data_rejected")
@@ -4746,11 +4866,6 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
     if decision["pass_reasons"]:
         force_pass_decision(decision, [])
 
-    script = _fundamental_evaluation_script(effective_payload, estimator, model)
-    chain_audit = audit_fundamental_chain(script)
-    decision["fundamental_chain_audit"] = chain_audit
-    if not chain_audit["decision_eligible"]:
-        force_pass_decision(decision, "fundamental_chain_insufficient")
     model_market_divergence = detect_model_market_divergence(
         decision,
         model_ready=model.get("status") == "ready",
@@ -4788,7 +4903,8 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
     return {
         "ok": True, "version": VERSION, "fixture": fixture, "match": metadata.get("match"), "estimator": estimator, "model": model,
         "decision_layer": decision, "decision_summary": build_decision_summary(decision, chain_audit, model),
-        "fundamental_chain_audit": chain_audit, "fundamental_version": version_record,
+        "fundamental_chain_audit": chain_audit, "fundamental_freeze": fundamental_freeze,
+        "fundamental_first_pipeline_audit": pipeline_order_audit, "fundamental_version": version_record,
         "revalidation_tasks_resolved": resolved_revalidations,
     }
 

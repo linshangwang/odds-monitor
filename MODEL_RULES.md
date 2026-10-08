@@ -18,6 +18,8 @@
 
 `PIT数据冻结 → 赛事/赛季/阶段识别 → Verified League DNA → 球队相对联赛残差 → 本场基本面链 → State Tree → 公平价格 → 盘口时间线 → 市场接受/拒绝 → 表达优化 → BET/WAIT/PASS`
 
+机器执行必须在读取盘口快照、生成市场候选或运行Expression Optimizer之前，完成并冻结赔率无关的基本面估计、概率、Pure Fundamental Script及基本面链审计。冻结使用`fundamental_first_freeze_v1`，并由`fundamental_first_pipeline_audit_v1`验证市场处理前后脚本哈希一致。基本面不足或污染时仍可输出盘口诊断，但固定为`diagnostic_only`并强制`PASS`，不得产生BET或WAIT表达。
+
 League DNA 是统一模型中的正式先验层，不是独立预测模型：
 
 - 每个联赛、赛季和竞赛阶段可以拥有不同的进球、大小球主线、让球深度、角球、节奏、主场、旅行、比赛状态弹性和市场微结构标签。
