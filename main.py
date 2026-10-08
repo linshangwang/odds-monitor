@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.18.0"
+VERSION = "2.18.1"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -11399,6 +11399,7 @@ def automatic_learning_runtime_readiness(
     registry_manifest = learning_major_league_registry_manifest()
     checks = {
         "api_football_configured": bool(API_FOOTBALL_KEY),
+        "api_football_authenticated": API_FOOTBALL_STARTUP_PROBE.get("authenticated") is True,
         "the_odds_api_configured": bool(THE_ODDS_API_KEY),
         "optional_event_enrichment_configured": bool(THESTATS_API_KEY),
         "protected_api_configured": bool(SHADOW_ACCESS_TOKEN),
@@ -11417,7 +11418,7 @@ def automatic_learning_runtime_readiness(
         "daily_schedule_configured": True,
     }
     required = (
-        "api_football_configured", "the_odds_api_configured",
+        "api_football_configured", "api_football_authenticated", "the_odds_api_configured",
         "protected_api_configured", "persistent_store_configured",
         "persistent_store_operational", "persistent_backup_ready", "persistent_store_single_writer",
         "auto_snapshot_enabled", "auto_snapshot_worker_alive",
@@ -12920,7 +12921,8 @@ def auto_snapshot_cycle(now: Optional[datetime] = None) -> Dict[str, Any]:
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     learning_result = auto_learning_daily_cycle(now)
     the_odds_api_due_collection = auto_collect_the_odds_api_due_stages(now)
-    dates = sorted({(now + timedelta(days=i)).astimezone(ZoneInfo(AUTO_FETCH_TIMEZONE)).date().isoformat() for i in range(AUTO_SNAPSHOT_DAYS_AHEAD + 1)})
+    api_football_authenticated = API_FOOTBALL_STARTUP_PROBE.get("authenticated") is True
+    dates = sorted({(now + timedelta(days=i)).astimezone(ZoneInfo(AUTO_FETCH_TIMEZONE)).date().isoformat() for i in range(AUTO_SNAPSHOT_DAYS_AHEAD + 1)}) if api_football_authenticated else []
     for date_str in dates:
         try:
             fixtures = target_fixtures_for_date(date_str, AUTO_FETCH_TIMEZONE)
@@ -12975,7 +12977,16 @@ def auto_snapshot_cycle(now: Optional[datetime] = None) -> Dict[str, Any]:
         except Exception as exc:
             print("[AUTO_SNAPSHOT] date failed: " + date_str + " " + str(exc))
     node_result = run_learning_node_executor(now_ts=int(now.timestamp()), apply_changes=True)
-    combined = {**learning_result, "node_execution": node_result, "the_odds_api_due_collection": the_odds_api_due_collection}
+    api_football_due_collection = {
+        "status": "completed" if api_football_authenticated else "skipped",
+        "authenticated": api_football_authenticated,
+        "reason": None if api_football_authenticated else "api_football_not_authenticated",
+    }
+    combined = {
+        **learning_result, "node_execution": node_result,
+        "the_odds_api_due_collection": the_odds_api_due_collection,
+        "api_football_due_collection": api_football_due_collection,
+    }
     if learning_result.get("status") == "not_due" and node_result.get("advanced_count", 0) > 0:
         combined["status"] = "node_cycle_completed"
     return combined

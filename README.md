@@ -96,6 +96,8 @@ V2.18 将已持久化的 The Odds API 赛事接入后台固定节点调度。只
 provider event id 已经唯一绑定，后台线程会在 T-24h、T-12h、T-6h、T-3h、T-1h、T-30m 与
 Closing 的允许窗口内增量采集尚未记录的节点；已记录的 `data_missing` 不会自动重试烧额度。
 `/health` 同时公开脱敏的 `api_football_startup_probe`，区分“已配置密钥”和“上游鉴权成功”。
+V2.18.1进一步把鉴权结果接入无人值守门禁：API-Football只有实际通过`/status`鉴权后才会参与
+周期性赛事发现和快照采集；被拒绝的密钥不会因变量非空而误报ready，也不会被后台每5分钟重复调用。
 
 - 固定时间轴：`Opening → T-24h → T-12h → T-6h → T-3h → T-1h → T-30m → Closing`。未真实采集的节点返回 `data_missing`，不使用当前赔率回填。
 - T-1h、T-30m 和 Closing 快照持久化 `team_news_snapshot`，包含伤停、阵型、教练及确认首发名单；接口请求结束后不会丢失阵容详情。
