@@ -13,8 +13,8 @@
 - 仓库：`linshangwang/odds-monitor`
 - 分支：`codex/auto-learning-v1.89`（草稿发布候选；生产仍跟踪`main`）
 - 接管基线提交：`b7feddc`
-- 本地候选版本：`2.18.0`（线上为 `2.17.0`，本版本尚未部署）
-- 测试基线：409 项通过
+- 本地候选版本：`2.18.1`（线上为 `2.18.0`，本版本尚未部署）
+- 测试基线：410 项通过
 - GitHub发布候选：草稿PR `#1`，分支`codex/auto-learning-v1.89`；Railway仍只跟踪`main`，因此草稿PR不会触发生产部署。分支名称保留历史版本标识，PR内容将以当前`2.17.0`为准。
 - 正式赛前时间轴：Opening、T-24h、T-12h、T-6h、T-3h、T-1h、T-30m、Closing
 - 自动学习时间轴：Opening、T-12h、T-6h、T-1h。该精简只适用于学习任务，不改写普通赛前分析时间轴。
@@ -37,6 +37,7 @@
 - 自动学习API不会自动修改Champion；即使达到验证样本和全部审计门槛，也只生成`AWAITING_EXPLICIT_USER_CONFIRMATION`候选。
 - The Odds API 已支持缺失节点增量采集：默认跳过任何已记录节点，全节点已有时不发外部请求；普通节点复用已保存event id，只有补Opening时才重新执行首次出现证明扫描；`data_missing`默认不无限重试。
 - 已持久化且唯一绑定event id的The Odds API赛事可由后台线程在固定八节点窗口自动续采，不再依赖API-Football赛事发现路径；已记录的`data_missing`仍不自动重试。健康接口新增脱敏API-Football启动鉴权探针，明确区分“已配置”和“上游接受”。
+- API-Football启动鉴权结果已进入无人值守门禁和后台调用开关：只有`authenticated=true`才运行其周期性赛事发现；变量存在但凭据被拒绝时明确not-ready并停止重复请求，The Odds API持久化赛事续采独立运行。
 - 自动学习已有独立大型联赛白名单与24小时/36小时只读周期计划；洲际、国家队和注册表外联赛无法混入学习池。外部层级证据只能用于赛事识别，不能自行授予学习资格。非大型赛事进入独立`market_language_frozen/market_language_settlements`命名空间，只做盘口语言观察与兑现，永不生成模型、Hypothesis、League DNA或Champion效果。学习接口在Shadow令牌缺失时全部 fail-closed。
 - 赛后学习结算已增加结构化反倒推审计：六类固定复盘对象必须逐项记录，`result_backfit_used=false`和`champion_change_requested=false`为硬门槛；实现错误必须绑定既有规则位置与回归测试要求。
 - 自动学习固定每天14:30（Asia/Shanghai）运行一次，严格先处理过去36小时冻结样本的赛后事实和复盘证据草稿，再发现未来24小时合格比赛并进行赛前冻结；日期化run_id保证重复触发不重复写入。
@@ -94,7 +95,7 @@
 3. 如需恢复事件路径学习，接入一个经授权的第二事件源并用真实顶级联赛样本验收赛前身份、赛后比赛详情及timeline schema；通过前保持事件维度`DATA_INSUFFICIENT`。
 4. 数据源恢复后先进行 Shadow 验收；满足新鲜度、完整公司数组、基本面链和阵容置信门槛后，才允许生成非 PASS 建议。
 5. 为MLS、巴西甲、阿根廷甲和挪威顶级联赛积累合格冻结发现样本后，按新League DNA存储登记候选并启动独立验证；在此之前不影响任何正式分析。
-6. 部署并验收本地`2.18.0`，重点确认The Odds API持久化赛事能在北京时间13:00自动补采布兰–维京T-12h节点，并确认API-Football启动探针报告`credential_rejected`而不是误报可用。
+6. 部署并验收本地`2.18.1`，重点确认The Odds API持久化赛事能在北京时间13:00自动补采布兰–维京T-12h节点，同时API-Football鉴权失败会阻断其自身周期调用但不阻断Odds续采。
 
 ## 接管原则
 
