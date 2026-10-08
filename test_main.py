@@ -3804,10 +3804,16 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["status"], "already_completed")
         self.assertEqual(result["pruned_count"], 1)
         self.assertEqual(set(store["the_odds_api_watchlist"]), {"active"})
+        archived = next(iter(store["the_odds_api_watchlist_archive"].values()))
+        self.assertEqual(archived["archive_reason"], "watchlist_expired")
+        self.assertEqual(archived["unobserved_stages"], main.LEARNING_PREMATCH_STAGE_ORDER)
+        self.assertFalse(archived["model_learning_effect"])
         health = main.the_odds_api_watchlist_health(now_ts=now_ts, store_override=store)
         self.assertEqual(health["status"], "ready")
         self.assertEqual(health["active_count"], 1)
         self.assertEqual(health["expired_count"], 0)
+        self.assertEqual(health["archived_count"], 1)
+        self.assertEqual(health["archived_without_any_node_count"], 1)
         self.assertEqual(health["latest_run"]["status"], "completed")
         self.assertEqual(health["learning_eligibility"], "MODEL_LEARNING_EXCLUDED")
 
@@ -3832,6 +3838,49 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["collected_count"], 1)
         self.assertEqual(collector.call_args.args[0]["requested_stages"], ["T-12h"])
         self.assertNotIn("learning_admissions", store)
+
+    def test_the_odds_api_watchlist_uses_only_four_node_learning_timeline(self):
+        kickoff = datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc)
+        fixture = "odds-watch-learning-timeline"
+        store = {
+            "fixtures": {},
+            "the_odds_api_watchlist": {fixture: {
+                "source": "the_odds_api", "league": "England Premier League",
+                "provider_fixture_ids": {"the_odds_api": "event-learning"},
+                "match": {
+                    "kickoff_utc": kickoff.isoformat(), "home_team_name": "A", "away_team_name": "B",
+                    "the_odds_api_sport_key": "soccer_epl",
+                },
+            }},
+        }
+        collector = Mock(return_value={"ok": True, "request_count": 1, "persist_result": {"changed": True}})
+        with patch.object(main, "THE_ODDS_API_KEY", "configured"):
+            t3 = main.auto_collect_the_odds_api_due_stages(kickoff - timedelta(hours=3), store_override=store, collector=collector)
+            t1 = main.auto_collect_the_odds_api_due_stages(kickoff - timedelta(hours=1), store_override=store, collector=collector)
+        self.assertEqual(t3["status"], "not_due")
+        self.assertEqual(t1["status"], "completed")
+        collector.assert_called_once()
+        self.assertEqual(collector.call_args.args[0]["requested_stages"], ["T-1h"])
+
+    def test_manual_external_odds_fixture_retains_full_analysis_timeline(self):
+        kickoff = datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc)
+        fixture = "external-analysis-timeline"
+        store = {
+            "fixtures": {},
+            "external_prematch": {fixture: {
+                "source": "the_odds_api", "league": "England Premier League",
+                "provider_fixture_ids": {"the_odds_api": "event-analysis"},
+                "match": {
+                    "kickoff_utc": kickoff.isoformat(), "home_team_name": "A", "away_team_name": "B",
+                    "the_odds_api_sport_key": "soccer_epl",
+                },
+            }},
+        }
+        collector = Mock(return_value={"ok": True, "request_count": 1, "persist_result": {"changed": True}})
+        with patch.object(main, "THE_ODDS_API_KEY", "configured"):
+            result = main.auto_collect_the_odds_api_due_stages(kickoff - timedelta(hours=3), store_override=store, collector=collector)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(collector.call_args.args[0]["requested_stages"], ["T-3h"])
 
     def test_api_football_capability_probe_reports_rejected_credential_without_secret(self):
         rejected = {
