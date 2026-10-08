@@ -1,4 +1,4 @@
-# 顶级联赛自动学习任务
+# 大型顶级联赛自动学习任务
 
 ## 一、任务目标
 
@@ -10,25 +10,29 @@
 
 ## 二、比赛范围
 
-只纳入男子职业国内最高级别联赛：
+只纳入大型男子职业国内最高级别联赛：
 
 - `competition_type = domestic_league`
 - `tier = 1`
 - 常规赛、官方争冠组、保级组和顶级联赛季后赛可纳入，但必须分别标记阶段。
 - 排除国内杯赛、超级杯、洲际赛事、国家队赛事、友谊赛、二级及以下联赛、预备队、青年赛事和女子赛事。
 - 联赛名称中出现“甲级”不代表一定是最高级别，必须核实该国联赛层级。
-- 自动发现只使用与通用赛事目标分离的`LEARNING_TOP_FLIGHT_LEAGUES`注册表；欧冠、欧联、欧协联和欧国联即使可做普通分析，也不得进入学习池。
+- 最高级别身份只是必要条件，不是充分条件；赛事还必须列入用户确认的“大型联赛学习注册表”。非大型顶级联赛即使`domestic_league + tier=1`也不得进入学习池。
+- 自动发现只使用与通用赛事目标分离的、带版本与内容哈希的`LEARNING_MAJOR_LEAGUES`注册表；欧冠、欧联、欧协联和欧国联即使可做普通分析，也不得进入学习池。
 - 注册表外赛事必须附带可定位的官方/高权威层级证据和`verification_status=verified`，不能只靠调用方声明`tier=1`。
+- 注册表外赛事的官方层级证据只用于赛事识别，不能自行授予学习资格；扩大注册表必须获得用户明确确认。
+- 非大型赛事允许以`MARKET_LANGUAGE_ONLY + SETTLEMENT_ONLY`留档，但不得生成Learning Card、假设、验证样本或Champion证据。
+- 该留档必须使用独立接口`POST /shadow/market-language/freeze`与`POST /shadow/market-language/settle`，分别写入`market_language_frozen`和`market_language_settlements`；不得复用`learning_frozen`或`learning_postmatch`。
 
 ## 三、持续运行窗口
 
-自动学习周期固定每天上海时间`14:30`运行一次。服务内原始快照采集器仍可按自己的轮询频率保存数据，但不得据此额外启动学习写入周期。每日学习周期使用日期化`run_id`保证幂等，固定按以下顺序执行：
+自动学习治理周期固定每天上海时间`14:30`运行一次。服务内原始快照采集器仍按自己的轮询频率保存数据；同一工作线程可以在节点到期时执行赛前版本推进，但只能处理14:30周期已经写入`learning_admissions`的比赛，不得重新发现比赛、扩大范围、运行赛后学习或修改Champion。每日治理周期使用日期化`run_id`保证幂等，固定按以下顺序执行：
 
 调度采用当日补跑语义：`14:30`之前不得提前执行；`14:30`之后由首个可用工作线程轮询触发，即使服务重启或短暂中断越过原定分钟也不能漏掉当日周期。每个响应记录`scheduled_at`和`trigger_delay_seconds`，同一日期的确定性`run_id`确保补跑或并发触发最多形成一次不可变写入。跨日后不把旧日期任务伪装为新鲜PIT运行。
 
 `GET /shadow/learning/status`中的`automatic_learning_runtime`是无人值守运行硬门禁。API-Football、The Odds API、TheStatsAPI、安全令牌、`/data`持久化及备份、自动工作线程、顶级联赛注册表和14:30调度必须全部通过；缺一项只能视为实现就绪，不能宣称闭环正在运行。该状态只返回布尔检查和阻塞项，绝不返回凭据内容。
 
-运行配置通过后仍须检查`automatic_learning_schedule`：系统以持久化`learning_runs`中的当日确定性run id、执行顺序、开始时间和run hash为完成证据。14:30后允许最多`max(2×轮询间隔, 600秒)`的首轮询宽限；超过宽限仍无合格记录，或记录结构无效，运维状态必须发出critical告警。内存里的“最后运行结果”不能代替持久化证据。
+运行配置通过后仍须检查`automatic_learning_schedule`：系统以持久化`learning_runs`中的当日确定性run id、执行顺序、开始时间和可重算run hash为完成证据。系统必须根据固定字段重算哈希并进行常量时间比较；仅有非空哈希、记录被改写或`immutable`标记缺失均不算完成。14:30后允许最多`max(2×轮询间隔, 600秒)`的首轮询宽限；超过宽限仍无合格记录，或记录结构无效，运维状态必须发出critical告警。内存里的“最后运行结果”不能代替持久化证据。
 
 1. 过去36小时已经完赛且存在冻结快照的比赛。
 2. 未来24小时尚未开赛的合格顶级联赛比赛。
@@ -39,7 +43,23 @@
 
 `POST /shadow/learning/run`执行一次幂等周期。默认只预览；`apply=true`时必须携带唯一安全`run_id`，重复运行返回原记录。执行器先处理已提交的合格赛后复盘，再为未结算样本收集赛后事实并生成证据草稿，完成后才发现未来赛程、构建PIT数据包并冻结。单场失败只记录为rejected，不得污染其他场次。
 
+未来24小时候选一经范围审计通过，即在每日治理周期写入不可变`learning_admissions`。即使14:30时尚未到首个时钟节点，也必须先准入，状态保持`admitted_waiting_for_due_node`。随后`GET /shadow/learning/node-plan`只读取准入台账生成到期计划，后台工作线程通过同一执行器推进版本；`POST /shadow/learning/node-run`仅用于受控预览或人工触发。节点执行器的`discovery_performed`、`scope_expansion_allowed`和`postmatch_learning_performed`固定为false。
+
+每个到期节点以比赛、目标节点、上个冻结版本、快照证据哈希和触发原因生成稳定`execution_key`。正式执行前写入带租约的`learning_node_attempts`记录；租约有效时其他线程不得重复调用供应商。失败记录只保存受限错误类别与原因，按`LEARNING_NODE_RETRY_BASE_SECONDS`至`LEARNING_NODE_RETRY_MAX_SECONDS`指数退避，到期自动重试；服务中断遗留的过期租约允许恢复。尝试账本按`LEARNING_NODE_ATTEMPT_RETENTION`有界保留。正式`node-run`只能使用服务器时间，调用方时间覆盖只允许无写入预览。
+
 学习任务的赛前赔率节点固定为`Opening → T-12h → T-6h → T-1h`。Opening只有在真实来源、观测时间和盘口内容通过审计时才可形成Opening版本；不得按时钟伪造。节点推进、当前节点出现新快照证据或新的基本面复核触发器时生成不可覆写的新版本；同节点且无新证据时跳过。错过的节点保持`data_missing`，不得用后续信息回填。普通赛前分析仍可保留更完整的八节点时间轴，两者不得混淆。
+
+大型联赛注册表通过`GET /shadow/learning/registry`公开版本、联赛数量和内容哈希，不公开凭据。准入记录同时绑定当时的注册表版本与哈希；执行节点前还要按当前注册表重新审计，已被移出的赛事不得继续自动推进。注册表外、尚未开赛且位于未来24小时的比赛自动进入独立盘口语言观察路由，可通过`GET /shadow/market-language/status`查看，但对学习模型始终无效。
+
+`GET /shadow/learning/data-health`是学习数据面的只读健康审计，不调用任何外部供应商。它必须区分等待节点、节点到期、执行中、退避中、节点当前、赛后待处理、赛后窗口过期和“已准入但未冻结即开赛”。最后一种状态为critical；节点超宽限、未解决失败或陈旧租约为warning。非大型赛事待兑现数量单独显示，但不得升级为模型学习证据。
+
+非大型赛事观察在开赛至少2小时后、且仍位于36小时窗口内，可以由14:30周期自动采集赛果、事件和统计。记录必须写入`market_language_postmatch_facts`，采用与学习样本相同的双源结果独立性检查，但不得生成Process等级或盘口语言对错判断。双源一致后状态仅变为`settlement_ready`；`POST /shadow/market-language/settle`必须绑定最新`fact_hash`，再由独立复核明确`CONFIRMED/PARTIAL/REJECTED/INCONCLUSIVE`。超过自动窗口的记录继续留在兑现队列，不得静默转成学习样本。
+
+运行时事实库采用单JSON主文件与备份，因此当前部署契约只允许一个写者进程。Procfile和Railway命令固定`--workers 1`，`UVICORN_WORKERS`也必须为1；多worker或无效配置会使`persistent_store_single_writer`门禁失败并产生critical告警。
+
+主事实库不可读或缺失时，自动学习和快照线程必须保持阻塞，禁止把损坏文件当成空库继续写入。人工恢复只能先通过受保护预览接口取得绑定当时主库与备份字节指纹的恢复令牌，再提交精确确认短语；状态变化、备份变化、主库仍健康或备份不可读均拒绝恢复。恢复时原损坏主库隔离保留、备份原件不改写，并写入有界恢复审计。14:30周期、分钟级执行器和定时线程均不得自动调用恢复接口。
+
+大型联赛样本超过36小时自动窗口后停止自动供应商调用，但记录不得从系统中消失。`GET /shadow/learning/postmatch-recovery`列出`manual_fact_recovery_required`、`automatic_fact_collection_pending`和`verified_facts_awaiting_review`三类状态；`POST /shadow/learning/collect-facts`可在受保护模式下重新采集事实。恢复接口禁止重新构建赛前分析、修改冻结版本或直接生成Process等级。
 
 学习池不限制合格比赛数量，也暂不设置完整历史赔率样本额度上限。幂等、节点去重、时间审计和来源审计仍然生效，防止重复请求或伪造节点。
 
