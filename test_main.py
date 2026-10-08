@@ -2725,6 +2725,19 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(multiple_writers["ready"])
         self.assertIn("persistent_store_single_writer", multiple_writers["blockers"])
 
+        with patch.object(main, "API_FOOTBALL_KEY", "configured-api-football"), \
+             patch.object(main, "THE_ODDS_API_KEY", "configured-odds"), \
+             patch.object(main, "THESTATS_API_KEY", ""), \
+             patch.object(main, "SHADOW_ACCESS_TOKEN", "configured-shadow"), \
+             patch.object(main, "SNAPSHOT_STORE_PATH", "/data/shadow_snapshots.json"), \
+             patch.object(main, "AUTO_SNAPSHOT_ENABLED", True), \
+             patch.object(main, "AUTO_SNAPSHOT_THREAD", alive):
+            ready_without_optional_events = main.automatic_learning_runtime_readiness(store_integrity=integrity)
+        self.assertTrue(ready_without_optional_events["ready"])
+        self.assertEqual(ready_without_optional_events["blockers"], [])
+        self.assertFalse(ready_without_optional_events["checks"]["optional_event_enrichment_configured"])
+        self.assertFalse(ready_without_optional_events["provider_contract"]["event_dependent_learning_effect"])
+
         with patch.object(main, "API_FOOTBALL_KEY", ""), \
              patch.object(main, "THE_ODDS_API_KEY", ""), \
              patch.object(main, "THESTATS_API_KEY", ""), \
@@ -2737,7 +2750,10 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(blocked["ready"])
         self.assertIn("api_football_configured", blocked["blockers"])
         self.assertIn("the_odds_api_configured", blocked["blockers"])
-        self.assertIn("thestats_configured", blocked["blockers"])
+        self.assertFalse(blocked["checks"]["optional_event_enrichment_configured"])
+        self.assertNotIn("optional_event_enrichment_configured", blocked["blockers"])
+        self.assertEqual(blocked["provider_contract"]["independent_event_timeline"], "optional_enrichment_only")
+        self.assertEqual(blocked["provider_contract"]["missing_secondary_event_policy"], "DATA_INSUFFICIENT")
         self.assertIn("persistent_store_configured", blocked["blockers"])
         self.assertIn("persistent_backup_ready", blocked["blockers"])
         self.assertIn("auto_snapshot_worker_alive", blocked["blockers"])

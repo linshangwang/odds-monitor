@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.16.0"
+VERSION = "2.17.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -218,7 +218,7 @@ LEARNING_NODE_RETRY_MAX_SECONDS = max(
     min(int(os.getenv("LEARNING_NODE_RETRY_MAX_SECONDS", "3600")), 12 * 3600),
 )
 LEARNING_NODE_ATTEMPT_RETENTION = max(100, min(int(os.getenv("LEARNING_NODE_ATTEMPT_RETENTION", "5000")), 50000))
-LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.15").strip() or "MODEL_RULES.md@2026-10-08-v2.15"
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-09-v2.17").strip() or "MODEL_RULES.md@2026-10-09-v2.17"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -11352,7 +11352,7 @@ def automatic_learning_runtime_readiness(
     checks = {
         "api_football_configured": bool(API_FOOTBALL_KEY),
         "the_odds_api_configured": bool(THE_ODDS_API_KEY),
-        "thestats_configured": bool(THESTATS_API_KEY),
+        "optional_event_enrichment_configured": bool(THESTATS_API_KEY),
         "protected_api_configured": bool(SHADOW_ACCESS_TOKEN),
         "persistent_store_configured": str(SNAPSHOT_STORE_PATH).replace("\\", "/").startswith("/data/"),
         "persistent_store_operational": integrity.get("operational") is True,
@@ -11369,7 +11369,7 @@ def automatic_learning_runtime_readiness(
         "daily_schedule_configured": True,
     }
     required = (
-        "api_football_configured", "the_odds_api_configured", "thestats_configured",
+        "api_football_configured", "the_odds_api_configured",
         "protected_api_configured", "persistent_store_configured",
         "persistent_store_operational", "persistent_backup_ready", "persistent_store_single_writer",
         "auto_snapshot_enabled", "auto_snapshot_worker_alive",
@@ -11385,7 +11385,10 @@ def automatic_learning_runtime_readiness(
         "provider_contract": {
             "fixture_and_primary_facts": "api_football",
             "odds_timeline_and_independent_result": "the_odds_api",
-            "independent_event_timeline": "thestats",
+            "independent_event_timeline": "optional_enrichment_only",
+            "configured_optional_event_provider": "thestats" if THESTATS_API_KEY else None,
+            "missing_secondary_event_policy": "DATA_INSUFFICIENT",
+            "event_dependent_learning_effect": False if not THESTATS_API_KEY else "requires_verified_matching_event_signature",
         },
         "major_league_registry": {
             "version": registry_manifest["version"],
