@@ -1,4 +1,5 @@
 import json
+import copy
 import gzip
 import io
 import math
@@ -13,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -23,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "1.87.0"
+VERSION = "2.17.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -33,6 +35,10 @@ AUTO_FETCH_FIXTURE_ID = os.getenv("AUTO_FETCH_FIXTURE_ID", "")
 SHADOW_ACCESS_TOKEN = os.getenv("SHADOW_ACCESS_TOKEN", "")
 SNAPSHOT_STORE_PATH = os.getenv("SNAPSHOT_STORE_PATH", "/tmp/shadow_snapshots.json")
 SNAPSHOT_STORE_GZIP = os.getenv("SNAPSHOT_STORE_GZIP", "true").lower() in ("1", "true", "yes", "on")
+try:
+    SNAPSHOT_STORE_WRITER_WORKERS = int(os.getenv("UVICORN_WORKERS", "1"))
+except (TypeError, ValueError):
+    SNAPSHOT_STORE_WRITER_WORKERS = 0
 EXTERNAL_DATA_STALE_SECONDS = max(60, int(os.getenv("EXTERNAL_DATA_STALE_SECONDS", "1800")))
 FUNDAMENTAL_VERSION_RETENTION = max(10, min(int(os.getenv("FUNDAMENTAL_VERSION_RETENTION", "100")), 1000))
 PORTFOLIO_RUN_RETENTION = max(10, min(int(os.getenv("PORTFOLIO_RUN_RETENTION", "100")), 1000))
@@ -47,6 +53,10 @@ def bounded_gzip_decompress(raw: bytes, max_bytes: int) -> bytes:
         raise ValueError("decompressed_size_limit_exceeded")
     return decoded
 SNAPSHOT_STORE_WARN_BYTES = max(1024 * 1024, int(os.getenv("SNAPSHOT_STORE_WARN_BYTES", str(256 * 1024 * 1024))))
+SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES = max(
+    1024 * 1024,
+    int(os.getenv("SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES", str(512 * 1024 * 1024))),
+)
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.03"))
 MIN_EV = float(os.getenv("MIN_EV", "0.03"))
 MIN_SCRIPT_COVERAGE = float(os.getenv("MIN_SCRIPT_COVERAGE", "0.60"))
@@ -58,6 +68,22 @@ MAX_CONSENSUS_PRICE_SPREAD = max(0.01, float(os.getenv("MAX_CONSENSUS_PRICE_SPRE
 MAX_CONSENSUS_NO_VIG_PROBABILITY_SPREAD = max(0.005, float(os.getenv("MAX_CONSENSUS_NO_VIG_PROBABILITY_SPREAD", "0.05")))
 MIN_MARKET_IMPLIED_PROBABILITY_TOTAL = min(1.0, max(0.5, float(os.getenv("MIN_MARKET_IMPLIED_PROBABILITY_TOTAL", "0.80"))))
 MAX_MARKET_IMPLIED_PROBABILITY_TOTAL = max(1.0, min(2.0, float(os.getenv("MAX_MARKET_IMPLIED_PROBABILITY_TOTAL", "1.40"))))
+REAL_MONEY_MAX_AGE_SECONDS = max(300, int(os.getenv("REAL_MONEY_MAX_AGE_SECONDS", "21600")))
+REAL_MONEY_SOURCE_TYPES = {"bookmaker_official", "betting_exchange", "regulated_market_data", "verified_money_vendor"}
+try:
+    _real_money_registry_raw = json.loads(os.getenv("REAL_MONEY_SOURCE_REGISTRY_JSON", "{}"))
+    REAL_MONEY_SOURCE_REGISTRY = {
+        str(domain).strip().lower(): entry
+        for domain, entry in (_real_money_registry_raw.items() if isinstance(_real_money_registry_raw, dict) else [])
+        if str(domain).strip() and isinstance(entry, dict)
+    }
+except (TypeError, ValueError, json.JSONDecodeError):
+    REAL_MONEY_SOURCE_REGISTRY = {}
+REAL_MONEY_MARKET_SELECTIONS = {
+    "1x2": ("home", "draw", "away"), "asian_handicap": ("home", "away"),
+    "over_under": ("over", "under"), "btts": ("yes", "no"),
+    "home_team_total": ("over", "under"), "away_team_total": ("over", "under"),
+}
 AUTO_SNAPSHOT_ENABLED = os.getenv("AUTO_SNAPSHOT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 AUTO_SNAPSHOT_POLL_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_POLL_SECONDS", "300")))
 AUTO_SNAPSHOT_WINDOW_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_WINDOW_SECONDS", "600")))
@@ -67,10 +93,56 @@ AUTO_SNAPSHOT_THREAD: Optional[threading.Thread] = None
 AUTO_SNAPSHOT_LAST_CYCLE_AT: Optional[int] = None
 AUTO_SNAPSHOT_LAST_ERROR: Optional[str] = None
 AUTO_RECONCILIATION_LAST_RESULT: Optional[Dict[str, Any]] = None
+AUTO_LEARNING_LAST_RESULT: Optional[Dict[str, Any]] = None
+LEARNING_SHADOW_MODEL_RUNNER: Optional[Any] = None
+LEARNING_CHALLENGER_MAX_MODULE_LOG_RATE_DELTA = 0.25
+LEARNING_CHALLENGER_MAX_COMBINED_LOG_RATE_DELTA = 0.40
+THESTATS_FIXTURE_DAY_CACHE_TTL_SECONDS = max(60, min(int(os.getenv("THESTATS_FIXTURE_DAY_CACHE_TTL_SECONDS", "600")), 3600))
+THESTATS_FIXTURE_DAY_CACHE_LOCK = threading.RLock()
+THESTATS_FIXTURE_DAY_CACHE: Dict[str, Dict[str, Any]] = {}
 NAMI_ODDS_STARTUP_PROBE: Dict[str, Any] = {"status": "pending", "decision_use": False}
 NAMI_ODDS_STARTUP_PROBE_STARTED = False
 NAMI_ODDS_PROBE_TTL_SECONDS = max(3600, int(os.getenv("NAMI_ODDS_PROBE_TTL_SECONDS", str(7 * 24 * 3600))))
 CALIBRATION_MIN_SAMPLE = max(1, int(os.getenv("CALIBRATION_MIN_SAMPLE", "30")))
+LEARNING_MIN_VALIDATION_SAMPLES = max(2, int(os.getenv("LEARNING_MIN_VALIDATION_SAMPLES", "30")))
+LEARNING_RESEARCH_PROPOSAL_MIN_MATCHES = max(3, int(os.getenv("LEARNING_RESEARCH_PROPOSAL_MIN_MATCHES", "5")))
+LEARNING_RESEARCH_PROPOSAL_MIN_FAILURES = max(2, int(os.getenv("LEARNING_RESEARCH_PROPOSAL_MIN_FAILURES", "3")))
+LEARNING_RESEARCH_PROPOSAL_MIN_FAILURE_RATE = min(1.0, max(0.05, float(os.getenv("LEARNING_RESEARCH_PROPOSAL_MIN_FAILURE_RATE", "0.25"))))
+LEARNING_PROCESS_CLASSES = {
+    "PROCESS_CORRECT_RESULT_WIN", "PROCESS_CORRECT_RESULT_LOSS",
+    "PROCESS_ERROR_RESULT_WIN", "PROCESS_ERROR_RESULT_LOSS",
+    "EVENT_CONTAMINATED", "DATA_INSUFFICIENT",
+}
+LEARNING_HYPOTHESIS_TYPES = {"HYPOTHESIS_ONLY", "LEAGUE_TAG_CANDIDATE"}
+LEARNING_REVIEW_STATUSES = {"passed", "failed", "inconclusive", "data_missing", "not_applicable"}
+LEARNING_REVIEW_SECTIONS = (
+    "match_selection_quality", "fundamental_chain_audit", "state_tree_coverage",
+    "market_language_audit", "expression_audit", "price_execution_audit",
+)
+LEAGUE_DNA_CATEGORIES = {
+    "goal_environment", "handicap_and_parity", "corner_environment",
+    "tempo_and_state_elasticity", "match_context",
+    "discipline_and_officiating", "market_microstructure",
+}
+LEAGUE_DNA_MARKETS = {
+    "goals", "1x2", "asian_handicap", "over_under", "btts",
+    "corners", "cards", "state_tree", "market_expression",
+}
+LEARNING_PROMOTION_REQUIRED_GATES = (
+    "pre_registration", "pit_integrity", "event_pollution_audit",
+    "out_of_sample_shadow", "ablation", "calibration",
+    "clv_or_price_quality", "process_accuracy", "risk_review",
+)
+LEARNING_ABLATION_INTERVENTIONS = {
+    "MSCB": "remove_mscb_adjustment",
+    "STATE_TREE": "remove_state_tree_layer",
+    "IEH": "neutralize_ieh_state_parameter",
+    "TAC": "neutralize_tac_state_parameter",
+    "TDD": "neutralize_tdd_state_parameter",
+    "LET": "neutralize_let_state_parameter",
+    "LPS": "neutralize_lps_state_parameter",
+    "OCR": "neutralize_ocr_state_parameter",
+}
 API_FOOTBALL_RATE_LIMIT_UNTIL = 0
 SNAPSHOT_STORE_LOCK = threading.RLock()
 
@@ -112,6 +184,41 @@ DEFAULT_TARGET_LEAGUES: Dict[int, str] = {
     203: "Turkey Super Lig",
     848: "UEFA Conference League",
 }
+# Curated major-league learning scope is intentionally separate from the
+# broader analysis target list above. Being a domestic tier-one league is only
+# a necessary condition: competitions outside this explicit user-approved
+# allowlist remain available for ordinary analysis and market-language
+# settlement, but can never enter model learning automatically.
+LEARNING_MAJOR_LEAGUES_VERSION = os.getenv("LEARNING_MAJOR_LEAGUES_VERSION", "2026-10-08-v1").strip() or "2026-10-08-v1"
+LEARNING_MAJOR_LEAGUES: Dict[int, Dict[str, str]] = {
+    39: {"name": "England Premier League", "country": "England"},
+    61: {"name": "France Ligue 1", "country": "France"},
+    71: {"name": "Brazil Serie A", "country": "Brazil"},
+    78: {"name": "Germany Bundesliga", "country": "Germany"},
+    88: {"name": "Netherlands Eredivisie", "country": "Netherlands"},
+    94: {"name": "Portugal Primeira Liga", "country": "Portugal"},
+    103: {"name": "Norway Eliteserien", "country": "Norway"},
+    113: {"name": "Sweden Allsvenskan", "country": "Sweden"},
+    128: {"name": "Argentina Liga Profesional", "country": "Argentina"},
+    135: {"name": "Italy Serie A", "country": "Italy"},
+    140: {"name": "Spain La Liga", "country": "Spain"},
+    144: {"name": "Belgium Pro League", "country": "Belgium"},
+    203: {"name": "Turkey Super Lig", "country": "Turkey"},
+    253: {"name": "USA Major League Soccer", "country": "USA"},
+}
+# Backward-compatible alias. New code and external contracts should use the
+# major-league name because domestic tier one alone is not sufficient.
+LEARNING_TOP_FLIGHT_LEAGUES = LEARNING_MAJOR_LEAGUES
+LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
+LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
+LEARNING_NODE_LEASE_SECONDS = max(60, min(int(os.getenv("LEARNING_NODE_LEASE_SECONDS", "900")), 3600))
+LEARNING_NODE_RETRY_BASE_SECONDS = max(60, min(int(os.getenv("LEARNING_NODE_RETRY_BASE_SECONDS", "300")), 3600))
+LEARNING_NODE_RETRY_MAX_SECONDS = max(
+    LEARNING_NODE_RETRY_BASE_SECONDS,
+    min(int(os.getenv("LEARNING_NODE_RETRY_MAX_SECONDS", "3600")), 12 * 3600),
+)
+LEARNING_NODE_ATTEMPT_RETENTION = max(100, min(int(os.getenv("LEARNING_NODE_ATTEMPT_RETENTION", "5000")), 50000))
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-09-v2.17").strip() or "MODEL_RULES.md@2026-10-09-v2.17"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -134,6 +241,7 @@ TRACKING_STAGES = [
 ]
 STAGE_ORDER = [x["key"] for x in TRACKING_STAGES]
 PREMATCH_STAGE_ORDER = [x for x in STAGE_ORDER if x != "FT"]
+LEARNING_PREMATCH_STAGE_ORDER = ["Opening", "T-12h", "T-6h", "T-1h"]
 STAGE_ALIASES = {}
 for s in TRACKING_STAGES:
     STAGE_ALIASES[s["key"].lower()] = s["key"]
@@ -157,6 +265,23 @@ class SnapshotStoreReadError(RuntimeError):
 def require_shadow_token(token: Optional[str]) -> None:
     if SHADOW_ACCESS_TOKEN and not hmac.compare_digest(str(token or ""), str(SHADOW_ACCESS_TOKEN)):
         raise HTTPException(status_code=401, detail="Invalid or missing token")
+
+
+def require_configured_shadow_token(token: Optional[str], unavailable_detail: str = "shadow_access_token_required") -> None:
+    """Fail closed for endpoints that can mutate learning state or consume paid quota."""
+    if not SHADOW_ACCESS_TOKEN:
+        raise HTTPException(status_code=503, detail=unavailable_detail)
+    require_shadow_token(token)
+
+
+def require_learning_token(token: Optional[str]) -> None:
+    """Learning writes and discovery fail closed until an access token exists."""
+    require_configured_shadow_token(token, "shadow_access_token_required_for_learning")
+
+
+def require_paid_odds_token(token: Optional[str]) -> None:
+    """Paid historical-odds requests must never become public when auth is unset."""
+    require_configured_shadow_token(token, "shadow_access_token_required_for_paid_odds")
 
 
 def resolve_shadow_token(query_token: Optional[str], authorization: Optional[str], header_token: Optional[str]) -> Optional[str]:
@@ -676,6 +801,116 @@ def standings_for_team(result: Dict[str, Any], team_id: Optional[int]) -> Option
     return None
 
 
+def independent_model_inputs_from_standings(
+    result: Dict[str, Any],
+    home_id: Optional[int],
+    away_id: Optional[int],
+    observed_at: Optional[int] = None,
+    lineup_confidence: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Build odds-independent, venue-split model inputs from one PIT standings response.
+
+    This deliberately refuses total-only or incomplete tables.  It never substitutes
+    bookmaker prices, provider predictions, later results, or another observation.
+    """
+    observed_at = int(observed_at or time.time())
+    groups = get_nested(response_list(result), [0, "league", "standings"], [])
+    rows = [row for group in groups if isinstance(group, list) for row in group if isinstance(row, dict)]
+    home_row = next((row for row in rows if get_nested(row, ["team", "id"]) == home_id), None)
+    away_row = next((row for row in rows if get_nested(row, ["team", "id"]) == away_id), None)
+
+    def venue_values(row: Optional[Dict[str, Any]], venue: str) -> Optional[Dict[str, float]]:
+        played = as_float(get_nested(row or {}, [venue, "played"]))
+        goals_for = as_float(get_nested(row or {}, [venue, "goals", "for"]))
+        goals_against = as_float(get_nested(row or {}, [venue, "goals", "against"]))
+        if played is None or played < 1 or goals_for is None or goals_against is None:
+            return None
+        return {
+            "played": played,
+            "goals_for": goals_for,
+            "goals_against": goals_against,
+            "attack_rate": goals_for / played,
+            "defense_rate": goals_against / played,
+        }
+
+    home_values = venue_values(home_row, "home")
+    away_values = venue_values(away_row, "away")
+    league_home_goals = league_away_goals = league_matches = 0.0
+    usable_league_rows = 0
+    for row in rows:
+        home_split = venue_values(row, "home")
+        away_split = venue_values(row, "away")
+        if not home_split or not away_split:
+            continue
+        # Every league match appears once in the aggregate home split.  Requiring
+        # equal home/away sample counts prevents silently accepting malformed tables.
+        if abs(home_split["played"] - away_split["played"]) > 1:
+            continue
+        league_matches += home_split["played"]
+        league_home_goals += home_split["goals_for"]
+        league_away_goals += away_split["goals_for"]
+        usable_league_rows += 1
+
+    blockers = []
+    if not rows:
+        blockers.append("standings_response_missing")
+    if home_values is None:
+        blockers.append("home_team_home_split_missing")
+    if away_values is None:
+        blockers.append("away_team_away_split_missing")
+    if usable_league_rows < 2 or league_matches < 10:
+        blockers.append("league_venue_baseline_sample_insufficient")
+    if blockers:
+        return {
+            "status": "data_missing",
+            "decision_eligible": False,
+            "blockers": blockers,
+            "observed_at": observed_at,
+            "uses_market_odds": False,
+        }
+
+    relevant_table = [{
+        "team_id": get_nested(row, ["team", "id"]),
+        "home": row.get("home"),
+        "away": row.get("away"),
+    } for row in rows]
+    source_hash = _content_hash(relevant_table)
+    lineup_confidence = as_float(lineup_confidence)
+    if lineup_confidence is None or not 0.0 <= lineup_confidence <= 1.0:
+        lineup_confidence = 0.0
+    model_inputs = {
+        "league_home_rate": round(league_home_goals / league_matches, 6),
+        "league_away_rate": round(league_away_goals / league_matches, 6),
+        "home_attack_rate": round(home_values["attack_rate"], 6),
+        "home_defense_rate": round(home_values["defense_rate"], 6),
+        "away_attack_rate": round(away_values["attack_rate"], 6),
+        "away_defense_rate": round(away_values["defense_rate"], 6),
+        "home_sample_size": int(home_values["played"]),
+        "away_sample_size": int(away_values["played"]),
+        "league_sample_size": int(league_matches),
+        "metric_type": "goals",
+        "home_adjustment": 1.0,
+        "away_adjustment": 1.0,
+        "lineup_confidence": lineup_confidence,
+        "provenance": {
+            "source": "api_football_standings_venue_split",
+            "uses_market_odds": False,
+            "observed_at": observed_at,
+            "source_content_hash": source_hash,
+        },
+    }
+    return {
+        "status": "ready",
+        "decision_eligible": True,
+        "observed_at": observed_at,
+        "uses_market_odds": False,
+        "usable_league_team_count": usable_league_rows,
+        "source_content_hash": source_hash,
+        "inputs": model_inputs,
+        "input_hash": _content_hash(model_inputs),
+    }
+
+
 def season_stats_summary(result: Dict[str, Any]) -> Dict[str, Any]:
     row = get_nested(result, ["data", "response"], {})
     if not isinstance(row, dict) or not row:
@@ -1084,9 +1319,14 @@ def collect_prematch_data(fixture_id: int, include_raw: bool = False) -> Dict[st
     coverage = {name: coverage_summary(result) for name, result in calls.items()}
     market_snapshot = extract_market_snapshot(calls.get("odds_prematch", {}))
     normalized_lineups = lineup_summary(calls.get("lineups", {}))
-    structured = {"standings": {"home": standings_for_team(calls.get("standings", {}), home_id), "away": standings_for_team(calls.get("standings", {}), away_id)}, "recent_form_last_10": {"home": recent_form(response_list(calls.get("home_recent_10", {})), home_id), "away": recent_form(response_list(calls.get("away_recent_10", {})), away_id)}, "season_stats": {"home": season_stats_summary(calls.get("home_team_season_stats", {})), "away": season_stats_summary(calls.get("away_team_season_stats", {}))}, "head_to_head_count": len(response_list(calls.get("head_to_head_last_10", {}))), "injuries": injuries_summary(calls.get("injuries", {}), home_id, away_id), "prediction": prediction_summary(calls.get("predictions", {})), "odds": odds_summary(calls.get("odds_prematch", {})), "odds_market_snapshot": market_snapshot, "lineups": normalized_lineups, "lineups_available": normalized_lineups.get("available", False), "lineups_confirmed": normalized_lineups.get("confirmed", False), "snapshot_requirements": {"required_markets": ["1x2", "asian_handicap", "over_under"], "optional_markets": ["btts", "home_team_total", "away_team_total"], "metrics_supported": ["line_crossing", "continuous_strengthening", "reversal", "market_saturation", "cross_market_divergence", "fundamental_revalidation"]}}
+    generated_at = int(time.time())
+    independent_model_inputs = independent_model_inputs_from_standings(
+        calls.get("standings", {}), home_id, away_id, generated_at,
+        normalized_lineups.get("confidence"),
+    )
+    structured = {"standings": {"home": standings_for_team(calls.get("standings", {}), home_id), "away": standings_for_team(calls.get("standings", {}), away_id)}, "recent_form_last_10": {"home": recent_form(response_list(calls.get("home_recent_10", {})), home_id), "away": recent_form(response_list(calls.get("away_recent_10", {})), away_id)}, "season_stats": {"home": season_stats_summary(calls.get("home_team_season_stats", {})), "away": season_stats_summary(calls.get("away_team_season_stats", {}))}, "head_to_head_count": len(response_list(calls.get("head_to_head_last_10", {}))), "injuries": injuries_summary(calls.get("injuries", {}), home_id, away_id), "prediction": prediction_summary(calls.get("predictions", {})), "independent_model_inputs": independent_model_inputs, "odds": odds_summary(calls.get("odds_prematch", {})), "odds_market_snapshot": market_snapshot, "lineups": normalized_lineups, "lineups_available": normalized_lineups.get("available", False), "lineups_confirmed": normalized_lineups.get("confirmed", False), "snapshot_requirements": {"required_markets": ["1x2", "asian_handicap", "over_under"], "optional_markets": ["btts", "home_team_total", "away_team_total"], "metrics_supported": ["line_crossing", "continuous_strengthening", "reversal", "market_saturation", "cross_market_divergence", "fundamental_revalidation"]}}
     quality = data_quality(coverage)
-    return {"ok": True, "version": VERSION, "generated_at": int(time.time()), "fixture": {k: v for k, v in ctx.items() if k not in ["fixture_detail", "fixture_row"]}, "coverage": coverage, "data_quality": quality, "structured_inputs": structured, "shadow_summary": make_shadow_summary(ctx, structured, quality), "football_ai_prompt": make_prompt(ctx), "raw_data_pack": {"fixture_detail": ctx.get("fixture_detail"), **{k: compact_result(v) for k, v in calls.items()}} if include_raw else None}
+    return {"ok": True, "version": VERSION, "generated_at": generated_at, "fixture": {k: v for k, v in ctx.items() if k not in ["fixture_detail", "fixture_row"]}, "coverage": coverage, "data_quality": quality, "structured_inputs": structured, "shadow_summary": make_shadow_summary(ctx, structured, quality), "football_ai_prompt": make_prompt(ctx), "raw_data_pack": {"fixture_detail": ctx.get("fixture_detail"), **{k: compact_result(v) for k, v in calls.items()}} if include_raw else None}
 
 
 
@@ -1207,7 +1447,9 @@ def load_snapshot_store() -> Dict[str, Any]:
         try:
             raw = p.read_bytes()
             if raw.startswith(b"\x1f\x8b"):
-                raw = gzip.decompress(raw)
+                raw = bounded_gzip_decompress(raw, SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES)
+            elif len(raw) > SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES:
+                raise ValueError("snapshot_store_size_limit_exceeded")
             store = json.loads(raw.decode("utf-8"))
             if not isinstance(store, dict):
                 raise ValueError("snapshot store root must be an object")
@@ -1229,7 +1471,9 @@ def load_snapshot_backup_store() -> Dict[str, Any]:
     try:
         raw = backup.read_bytes()
         if raw.startswith(b"\x1f\x8b"):
-            raw = gzip.decompress(raw)
+            raw = bounded_gzip_decompress(raw, SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES)
+        elif len(raw) > SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES:
+            raise ValueError("snapshot_store_backup_size_limit_exceeded")
         store = json.loads(raw.decode("utf-8"))
         if not isinstance(store, dict):
             raise ValueError("snapshot backup root must be an object")
@@ -1246,25 +1490,37 @@ def inspect_snapshot_store_file(path: Path) -> Dict[str, Any]:
         return {"exists": False, "readable": False, "status": "data_missing"}
     try:
         encoded = path.read_bytes()
-        raw = gzip.decompress(encoded) if encoded.startswith(b"\x1f\x8b") else encoded
+        raw = (
+            bounded_gzip_decompress(encoded, SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES)
+            if encoded.startswith(b"\x1f\x8b") else encoded
+        )
+        if len(raw) > SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES:
+            raise ValueError("snapshot_store_size_limit_exceeded")
         store = json.loads(raw.decode("utf-8"))
         if not isinstance(store, dict):
             raise ValueError("store root must be an object")
         fixtures = store.get("fixtures") or {}
         snapshot_count = sum(len(rows or []) for rows in fixtures.values())
         queue = store.get("fundamental_revalidation_queue") or {}
+        node_attempts = store.get("learning_node_attempts") or {}
         return {
             "exists": True, "readable": True, "status": "ok", "gzip": encoded.startswith(b"\x1f\x8b"),
             "size_bytes": len(encoded), "raw_size_bytes": len(raw),
             "compression_ratio": round(len(encoded) / len(raw), 6) if raw else 1.0,
             "capacity_state": "warning" if len(encoded) >= SNAPSHOT_STORE_WARN_BYTES else "normal",
             "warning_threshold_bytes": SNAPSHOT_STORE_WARN_BYTES,
+            "maximum_decompressed_bytes": SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES,
             "content_sha256": hashlib.sha256(encoded).hexdigest(),
             "store_version": store.get("version"),
             "fixture_count": len(fixtures), "snapshot_count": snapshot_count,
             "portfolio_count": len(store.get("portfolio_runs") or {}),
             "revalidation_task_count": len(queue),
             "pending_revalidation_count": sum(task.get("status") == "pending" for task in queue.values()),
+            "learning_admission_count": len(store.get("learning_admissions") or {}),
+            "learning_node_attempt_count": len(node_attempts),
+            "learning_node_failed_attempt_count": sum(
+                isinstance(row, dict) and row.get("status") == "failed" for row in node_attempts.values()
+            ),
         }
     except Exception as exc:
         return {"exists": True, "readable": False, "status": "corrupt", "error": type(exc).__name__}
@@ -1273,13 +1529,156 @@ def inspect_snapshot_store_file(path: Path) -> Dict[str, Any]:
 def snapshot_store_integrity() -> Dict[str, Any]:
     primary = inspect_snapshot_store_file(Path(SNAPSHOT_STORE_PATH))
     backup = inspect_snapshot_store_file(snapshot_backup_path())
+    manual_recovery_required = primary.get("readable") is not True and backup.get("readable") is True
     return {
         "primary": primary, "backup": backup,
         "operational": primary.get("readable") is True,
         "recovery_ready": backup.get("readable") is True,
+        "manual_recovery_required": manual_recovery_required,
+        "manual_recovery_available": manual_recovery_required,
+        "manual_recovery_requires_exact_preview_token": True,
         "capacity_ok": primary.get("capacity_state") in (None, "normal"),
         "automatic_restore": False,
     }
+
+
+def _snapshot_store_file_fingerprint(path: Path) -> Optional[str]:
+    """Hash encoded bytes without attempting to interpret a damaged store."""
+    if not path.exists():
+        return None
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except Exception as exc:
+        raise SnapshotStoreReadError("snapshot_store_fingerprint_failed") from exc
+
+
+def snapshot_store_recovery_preview() -> Dict[str, Any]:
+    """Build a state-bound manual recovery token; never modify either store file."""
+    with SNAPSHOT_STORE_LOCK:
+        primary_path = Path(SNAPSHOT_STORE_PATH)
+        backup_path = snapshot_backup_path()
+        integrity = snapshot_store_integrity()
+        primary_fingerprint = _snapshot_store_file_fingerprint(primary_path)
+        backup_fingerprint = _snapshot_store_file_fingerprint(backup_path)
+        eligible = bool(integrity.get("manual_recovery_required"))
+        token_content = {
+            "action": "restore_snapshot_backup_to_primary",
+            "primary_exists": primary_path.exists(),
+            "primary_status": get_nested(integrity, ["primary", "status"]),
+            "primary_fingerprint_sha256": primary_fingerprint,
+            "backup_status": get_nested(integrity, ["backup", "status"]),
+            "backup_fingerprint_sha256": backup_fingerprint,
+        }
+        recovery_token = _content_hash(token_content) if eligible else None
+        confirmation_phrase = (
+            "RESTORE_SNAPSHOT_BACKUP:" + str(backup_fingerprint)[:16]
+            if eligible and backup_fingerprint else None
+        )
+        return {
+            "eligible": eligible,
+            "reason": (
+                "primary_unreadable_and_backup_verified"
+                if eligible else (
+                    "primary_is_operational"
+                    if integrity.get("operational") else "readable_backup_not_available"
+                )
+            ),
+            "primary": integrity.get("primary"),
+            "backup": integrity.get("backup"),
+            "primary_fingerprint_sha256": primary_fingerprint,
+            "backup_fingerprint_sha256": backup_fingerprint,
+            "recovery_token": recovery_token,
+            "required_confirmation": confirmation_phrase,
+            "automatic_restore": False,
+            "state_bound": True,
+            "policy": "manual protected recovery only; automatic workers never invoke restoration",
+        }
+
+
+def restore_snapshot_store_from_backup(payload: Any, now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Restore only an unreadable/missing primary from the exact previewed backup state."""
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="snapshot_recovery_payload_must_be_object")
+    supplied_token = str(payload.get("recovery_token") or "")
+    supplied_confirmation = str(payload.get("confirmation") or "")
+    now_ts = int(now_ts or time.time())
+    with SNAPSHOT_STORE_LOCK:
+        preview = snapshot_store_recovery_preview()
+        if not preview["eligible"]:
+            raise HTTPException(status_code=409, detail="snapshot_store_manual_recovery_not_eligible")
+        expected_token = str(preview.get("recovery_token") or "")
+        expected_confirmation = str(preview.get("required_confirmation") or "")
+        if not supplied_token or not hmac.compare_digest(supplied_token, expected_token):
+            raise HTTPException(status_code=409, detail="snapshot_recovery_preview_token_mismatch")
+        if not supplied_confirmation or not hmac.compare_digest(supplied_confirmation, expected_confirmation):
+            raise HTTPException(status_code=422, detail="snapshot_recovery_confirmation_mismatch")
+
+        primary_path = Path(SNAPSHOT_STORE_PATH)
+        backup_path = snapshot_backup_path()
+        backup_encoded = backup_path.read_bytes()
+        backup_fingerprint = hashlib.sha256(backup_encoded).hexdigest()
+        if not hmac.compare_digest(backup_fingerprint, str(preview.get("backup_fingerprint_sha256") or "")):
+            raise HTTPException(status_code=409, detail="snapshot_recovery_backup_changed_after_preview")
+        recovered_store = load_snapshot_backup_store()
+        audit = {
+            "recovered_at": now_ts,
+            "action": "manual_restore_backup_to_primary",
+            "automatic": False,
+            "preview_token": expected_token,
+            "recovered_from_backup_sha256": backup_fingerprint,
+            "displaced_primary_sha256": preview.get("primary_fingerprint_sha256"),
+            "confirmation_method": "exact_state_bound_phrase",
+        }
+        recovery_audit = list(recovered_store.get("snapshot_store_recovery_audit") or [])
+        recovery_audit.append(audit)
+        recovered_store["snapshot_store_recovery_audit"] = recovery_audit[-100:]
+        recovered_store["version"] = VERSION
+        raw = json.dumps(recovered_store, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(raw) > SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES:
+            raise SnapshotStoreWriteError("snapshot_store_recovery_size_limit_exceeded")
+        restored_encoded = gzip.compress(raw, compresslevel=6) if SNAPSHOT_STORE_GZIP else raw
+
+        primary_path.parent.mkdir(parents=True, exist_ok=True)
+        restore_tmp = primary_path.with_suffix(primary_path.suffix + ".restore.tmp")
+        restore_tmp.write_bytes(restored_encoded)
+        tmp_audit = inspect_snapshot_store_file(restore_tmp)
+        if tmp_audit.get("readable") is not True:
+            restore_tmp.unlink(missing_ok=True)
+            raise SnapshotStoreWriteError("snapshot_store_recovery_candidate_invalid")
+
+        quarantine_path = None
+        if primary_path.exists():
+            displaced = str(preview.get("primary_fingerprint_sha256") or "unknown")[:16]
+            quarantine_path = primary_path.with_suffix(
+                primary_path.suffix + f".quarantine.{now_ts}.{displaced}"
+            )
+            if quarantine_path.exists():
+                restore_tmp.unlink(missing_ok=True)
+                raise HTTPException(status_code=409, detail="snapshot_recovery_quarantine_target_exists")
+            primary_path.replace(quarantine_path)
+        try:
+            restore_tmp.replace(primary_path)
+        except Exception:
+            if quarantine_path is not None and quarantine_path.exists() and not primary_path.exists():
+                quarantine_path.replace(primary_path)
+            restore_tmp.unlink(missing_ok=True)
+            raise
+
+        restored_integrity = inspect_snapshot_store_file(primary_path)
+        if restored_integrity.get("readable") is not True:
+            raise SnapshotStoreWriteError("snapshot_store_recovery_verification_failed")
+        return {
+            "restored": True,
+            "automatic": False,
+            "recovered_at": now_ts,
+            "recovered_from_backup_sha256": backup_fingerprint,
+            "restored_primary_sha256": restored_integrity.get("content_sha256"),
+            "displaced_primary_quarantined": quarantine_path is not None,
+            "displaced_primary_sha256": preview.get("primary_fingerprint_sha256"),
+            "backup_preserved": _snapshot_store_file_fingerprint(backup_path) == backup_fingerprint,
+            "integrity": snapshot_store_integrity(),
+            "recovery_audit_hash": _content_hash(audit),
+        }
 
 
 def write_snapshot_store(store: Dict[str, Any]) -> bool:
@@ -1292,6 +1691,8 @@ def write_snapshot_store(store: Dict[str, Any]) -> bool:
             backup = snapshot_backup_path()
             backup_tmp = backup.with_suffix(backup.suffix + ".tmp")
             raw = json.dumps(store, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            if len(raw) > SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES:
+                raise ValueError("snapshot_store_size_limit_exceeded")
             encoded = gzip.compress(raw, compresslevel=6) if SNAPSHOT_STORE_GZIP else raw
             tmp.write_bytes(encoded)
             # Keep the last successfully committed primary as the rollback point.
@@ -1434,6 +1835,7 @@ def force_pass_decision(decision: Dict[str, Any], reasons: Any) -> Dict[str, Any
     decision.setdefault("pass_reasons", []).extend(str(reason) for reason in additions if reason)
     decision["pass_reasons"] = list(dict.fromkeys(decision["pass_reasons"]))
     decision["decision"] = "PASS"
+    decision["execution_action"] = "PASS"
     decision["best_market"] = None
     decision["edge"] = None
     decision["ev"] = None
@@ -1441,17 +1843,462 @@ def force_pass_decision(decision: Dict[str, Any], reasons: Any) -> Dict[str, Any
     if isinstance(tiers, dict):
         for key in ("first_choice_high_consistency", "second_choice_higher_return", "high_variance_single"):
             tiers[key] = None
+    optimizer = decision.get("expression_optimizer") if isinstance(decision.get("expression_optimizer"), dict) else {}
+    decision["expression_optimizer"] = {
+        **optimizer,
+        "action": "PASS", "selected_expression": None,
+        "reason": "mandatory_gate_failed",
+        "automatic_direction_reversal": False,
+    }
     return decision
 
 
-def apply_line_movement_gate(decision: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _normalize_real_money_percentages(value: Any, selections: Tuple[str, ...], field: str) -> Tuple[Optional[Dict[str, float]], List[str]]:
+    if value in (None, {}):
+        return None, []
+    if not isinstance(value, dict):
+        return None, [f"{field}_must_be_object"]
+    unknown = sorted(str(key) for key in value if key not in selections)
+    missing = [key for key in selections if key not in value]
+    normalized = {key: as_float(value.get(key)) for key in selections}
+    invalid = [key for key, number in normalized.items() if number is None or not 0 <= number <= 100]
+    reasons = []
+    if unknown:
+        reasons.append(f"{field}_unknown_selections:" + ",".join(unknown))
+    if missing:
+        reasons.append(f"{field}_missing_selections:" + ",".join(missing))
+    if invalid:
+        reasons.append(f"{field}_percent_out_of_range:" + ",".join(invalid))
+    if not reasons and abs(sum(normalized.values()) - 100.0) > 1.5:
+        reasons.append(f"{field}_percentages_must_sum_to_100")
+    return ({key: round(float(normalized[key]), 4) for key in selections} if not reasons else None), reasons
+
+
+def audit_real_money_data(payload: Any, expected_fixture: Any = None, data_cutoff_at: Any = None, kickoff_at: Any = None, now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Validate a separately sourced A-grade money packet; odds movements can never satisfy this schema."""
+    if payload in (None, {}):
+        return {
+            "schema": "real_money_v1", "status": "data_missing", "decision_eligible": False,
+            "evidence_grade": "data_missing", "is_real_money": False,
+            "money_percent": None, "bet_percent": None, "turnover": None,
+            "markets": {}, "reasons": ["real_money_packet_not_supplied"],
+        }
+    if not isinstance(payload, dict):
+        return {
+            "schema": "real_money_v1", "status": "rejected", "decision_eligible": False,
+            "evidence_grade": "rejected", "is_real_money": False, "markets": {},
+            "reasons": ["real_money_packet_must_be_object"],
+        }
+    reasons = []
+    if payload.get("schema") != "real_money_v1":
+        reasons.append("real_money_schema_must_be_real_money_v1")
+    fixture = str(payload.get("fixture") or "").strip()
+    if expected_fixture is not None and fixture != str(expected_fixture):
+        reasons.append("real_money_fixture_mismatch")
+    source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+    source_name = str(source.get("name") or "").strip()
+    source_type = str(source.get("type") or "").strip().lower()
+    evidence_ref = str(source.get("evidence_ref") or "").strip()
+    methodology = str(source.get("methodology") or "").strip()
+    parsed_ref = urlparse(evidence_ref)
+    if not source_name:
+        reasons.append("real_money_source_name_required")
+    if source_type not in REAL_MONEY_SOURCE_TYPES:
+        reasons.append("real_money_source_type_not_a_grade")
+    if parsed_ref.scheme not in {"http", "https"} or not parsed_ref.hostname or parsed_ref.path in {"", "/"}:
+        reasons.append("real_money_locatable_http_evidence_required")
+    authority_domain = parsed_ref.hostname.lower() if parsed_ref.hostname else None
+    registry_entry = REAL_MONEY_SOURCE_REGISTRY.get(authority_domain) if authority_domain else None
+    if not isinstance(registry_entry, dict):
+        reasons.append("real_money_source_not_in_verified_registry")
+    else:
+        if not str(registry_entry.get("registry_id") or "").strip():
+            reasons.append("real_money_registered_source_requires_stable_id")
+        allowed_types = registry_entry.get("allowed_types") if isinstance(registry_entry.get("allowed_types"), list) else []
+        if source_type not in allowed_types:
+            reasons.append("real_money_source_type_not_allowed_for_registered_domain")
+    if source.get("authority_verified") is not True:
+        reasons.append("real_money_source_authority_verification_required")
+    if source.get("methodology_verified") is not True or len(methodology) < 20:
+        reasons.append("real_money_verified_methodology_required")
+    observed_at = _parse_timestamp(payload.get("observed_at"))
+    cutoff_at = _parse_timestamp(data_cutoff_at) or int(now_ts or time.time())
+    kickoff_ts = _parse_timestamp(kickoff_at)
+    if observed_at is None:
+        reasons.append("real_money_observed_at_required")
+        age_seconds = None
+    else:
+        age_seconds = cutoff_at - observed_at
+        if observed_at > cutoff_at:
+            reasons.append("real_money_observation_after_data_cutoff")
+        if kickoff_ts is not None and observed_at >= kickoff_ts:
+            reasons.append("real_money_observation_not_prematch")
+        if age_seconds > REAL_MONEY_MAX_AGE_SECONDS:
+            reasons.append("real_money_observation_stale")
+        if age_seconds < -300:
+            reasons.append("real_money_observation_in_future")
+    raw_markets = payload.get("markets") if isinstance(payload.get("markets"), dict) else {}
+    if not raw_markets:
+        reasons.append("real_money_markets_required")
+    unknown_markets = sorted(str(key) for key in raw_markets if key not in REAL_MONEY_MARKET_SELECTIONS)
+    if unknown_markets:
+        reasons.append("real_money_unknown_markets:" + ",".join(unknown_markets))
+    markets = {}
+    for market, selections in REAL_MONEY_MARKET_SELECTIONS.items():
+        if market not in raw_markets:
+            continue
+        row = raw_markets.get(market) if isinstance(raw_markets.get(market), dict) else {}
+        if not row:
+            reasons.append(f"real_money_{market}_must_be_object")
+            continue
+        money, money_reasons = _normalize_real_money_percentages(row.get("money_percent"), selections, f"{market}_money_percent")
+        bets, bet_reasons = _normalize_real_money_percentages(row.get("bet_percent"), selections, f"{market}_bet_percent")
+        reasons.extend(money_reasons + bet_reasons)
+        if money is None and bets is None:
+            reasons.append(f"real_money_{market}_money_or_bet_percent_required")
+        line = as_float(row.get("line")) if market not in {"1x2", "btts"} else None
+        if market not in {"1x2", "btts"} and line is None:
+            reasons.append(f"real_money_{market}_line_required")
+        turnover = as_float(row.get("turnover"))
+        currency = str(row.get("currency") or "").strip().upper() or None
+        if row.get("turnover") is not None and (turnover is None or turnover < 0 or currency is None):
+            reasons.append(f"real_money_{market}_turnover_requires_nonnegative_value_and_currency")
+        concentration = money or bets or {}
+        ordered = sorted(concentration.items(), key=lambda item: item[1], reverse=True)
+        direction = ordered[0][0] if ordered and (len(ordered) == 1 or ordered[0][1] > ordered[1][1]) else None
+        concentration_gap = round((ordered[0][1] - ordered[1][1]) / 100.0, 6) if len(ordered) >= 2 and direction else None
+        markets[market] = {
+            "line": line, "money_percent": money, "bet_percent": bets,
+            "turnover": turnover, "currency": currency,
+            "direction": direction, "direction_basis": "money_percent_top_share" if money else ("bet_percent_top_share" if bets else None),
+            "concentration_gap": concentration_gap,
+        }
+    eligible = not reasons and bool(markets)
+    normalized = {
+        "schema": "real_money_v1", "fixture": fixture,
+        "source": {
+            "name": source_name, "type": source_type, "evidence_ref": evidence_ref,
+            "authority_domain": authority_domain,
+            "registry_id": str((registry_entry or {}).get("registry_id") or "").strip() or None,
+            "authority_verified": source.get("authority_verified") is True,
+            "methodology_verified": source.get("methodology_verified") is True,
+            "methodology": methodology,
+        },
+        "observed_at": observed_at, "data_cutoff_at": cutoff_at, "age_seconds": age_seconds,
+        "maximum_age_seconds": REAL_MONEY_MAX_AGE_SECONDS,
+        "markets": markets,
+    }
+    return {
+        **normalized,
+        "status": "available" if eligible else "rejected",
+        "decision_eligible": eligible,
+        "evidence_grade": "A" if eligible else "rejected",
+        "is_real_money": eligible,
+        "reasons": reasons,
+        "evidence_hash": _content_hash(normalized) if eligible else None,
+        "policy": "only this independently audited schema may populate real Money%/Bet%/turnover fields; odds paths remain a separate proxy",
+    }
+
+
+def _movement_probability_delta(dynamics: Dict[str, Any], market: str, selection: str) -> Optional[float]:
+    detail = (dynamics.get("no_vig_probability_movements") or {}).get(market) or {}
+    if detail.get("status") != "compared":
+        return None
+    return as_float((detail.get("deltas") or {}).get(selection))
+
+
+def _market_axis_for_candidate(candidate: Dict[str, Any]) -> str:
+    market, selection = candidate.get("market"), candidate.get("selection")
+    if market in ("1x2", "asian_handicap") and selection in ("home", "away"):
+        return str(selection).title()
+    if market == "over_under" and selection in ("over", "under"):
+        return str(selection).title()
+    if market == "btts" and selection in ("yes", "no"):
+        return "BTTS Yes" if selection == "yes" else "BTTS No"
+    if market in ("home_team_total", "away_team_total") and selection in ("over", "under"):
+        side = "Home TT" if market == "home_team_total" else "Away TT"
+        return f"{side} {str(selection).title()}"
+    return f"{market}:{selection}"
+
+
+def _candidate_real_money_signal(candidate: Dict[str, Any], real_money_data: Dict[str, Any]) -> Tuple[Optional[float], str, Optional[Dict[str, Any]]]:
+    if not isinstance(real_money_data, dict) or real_money_data.get("decision_eligible") is not True:
+        return None, "data_missing", None
+    market, selection = str(candidate.get("market") or ""), str(candidate.get("selection") or "")
+    row = (real_money_data.get("markets") or {}).get(market)
+    if not isinstance(row, dict) or row.get("direction") is None:
+        return None, "data_missing", None
+    candidate_line, evidence_line = as_float(candidate.get("line")), as_float(row.get("line"))
+    if market not in {"1x2", "btts"} and (candidate_line is None or evidence_line is None or abs(candidate_line - evidence_line) > 1e-9):
+        return None, "real_money_line_mismatch", row
+    magnitude = as_float(row.get("concentration_gap"))
+    if magnitude is None:
+        return None, "real_money_direction_concentration_missing", row
+    signed = max(0.005, magnitude) if row.get("direction") == selection else -max(0.005, magnitude)
+    return signed, f"a_grade_{market}_money_distribution", row
+
+
+def _candidate_pressure_signal(candidate: Dict[str, Any], dynamics: Dict[str, Any]) -> Tuple[Optional[float], str]:
+    """Return signed proxy pressure toward this selection, never a claim about actual money flow."""
+    market, selection = candidate.get("market"), candidate.get("selection")
+    direct = _movement_probability_delta(dynamics, str(market), str(selection))
+    if direct is not None:
+        return direct, f"{market}_same_line_no_vig_probability_delta"
+    if market == "asian_handicap" and selection in ("home", "away"):
+        companion = _movement_probability_delta(dynamics, "1x2", str(selection))
+        if companion is not None:
+            return companion, "1x2_no_vig_probability_companion"
+    if market == "over_under" and selection in ("over", "under"):
+        btts_yes = _movement_probability_delta(dynamics, "btts", "yes")
+        if btts_yes is not None:
+            return btts_yes if selection == "over" else -btts_yes, "btts_no_vig_probability_companion"
+    return None, "data_missing"
+
+
+def _candidate_line_response(candidate: Dict[str, Any], dynamics: Dict[str, Any], pressure: Optional[float]) -> Dict[str, Any]:
+    market, selection = candidate.get("market"), candidate.get("selection")
+    movements = dynamics.get("market_movements") or {}
+    structural_market = market
+    structural_selection = selection
+    if market == "1x2" and selection in ("home", "away"):
+        structural_market = "asian_handicap"
+    line_delta = as_float((movements.get(structural_market) or {}).get("line"))
+    signed_response = None
+    if line_delta is not None:
+        if structural_market == "asian_handicap" and structural_selection in ("home", "away"):
+            signed_response = -line_delta if structural_selection == "home" else line_delta
+        elif structural_selection in ("over", "under"):
+            signed_response = line_delta if structural_selection == "over" else -line_delta
+    if signed_response is not None:
+        response = "upgrade" if signed_response >= 0.249 else ("downgrade" if signed_response <= -0.249 else "static")
+        return {
+            "status": "available", "response": response, "signed_line_response": round(signed_response, 6),
+            "raw_line_delta": line_delta, "structural_market": structural_market,
+            "basis": "main_line_change_toward_candidate",
+        }
+    if pressure is not None and market in ("1x2", "btts"):
+        return {
+            "status": "partial", "response": "price_only", "signed_line_response": None,
+            "raw_line_delta": None, "structural_market": market,
+            "basis": "line_free_market_price_confirmation_only",
+        }
+    return {
+        "status": "data_missing", "response": "data_missing", "signed_line_response": None,
+        "raw_line_delta": line_delta, "structural_market": structural_market,
+        "basis": "structural_line_response_unavailable",
+    }
+
+
+def _pressure_strength(value: Optional[float]) -> str:
+    if value is None:
+        return "data_missing"
+    magnitude = abs(value)
+    if magnitude >= 0.03:
+        return "strong"
+    if magnitude >= 0.015:
+        return "medium"
+    if magnitude >= 0.005:
+        return "weak"
+    return "neutral"
+
+
+def market_language_for_candidate(candidate: Dict[str, Any], dynamics: Dict[str, Any], timeline_audit: Dict[str, Any], real_money_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    axis = _market_axis_for_candidate(candidate)
+    if not timeline_audit.get("decision_eligible") or dynamics.get("comparison_status") != "compared":
+        real_pressure, real_basis, real_market = _candidate_real_money_signal(candidate, real_money_data or {})
+        return {
+            "axis": axis,
+            "capital_pressure": {
+                "status": "real_money_available" if real_pressure is not None else "data_missing",
+                "label": "Real Funds" if real_pressure is not None else "data_missing",
+                "signed_toward_candidate": round(real_pressure, 6) if real_pressure is not None else None,
+                "strength": _pressure_strength(real_pressure), "basis": real_basis,
+                "evidence_grade": "A" if real_pressure is not None else "C_or_missing",
+                "is_real_money": real_pressure is not None,
+                "money_percent": (real_market or {}).get("money_percent") if real_pressure is not None else None,
+                "bet_percent": (real_market or {}).get("bet_percent") if real_pressure is not None else None,
+                "turnover": (real_market or {}).get("turnover") if real_pressure is not None else None,
+                "currency": (real_market or {}).get("currency") if real_pressure is not None else None,
+                "real_money_evidence_hash": (real_money_data or {}).get("evidence_hash") if real_pressure is not None else None,
+            },
+            "line_response": {"status": "data_missing", "response": "data_missing"},
+            "market_acceptance": "data_missing", "diagnostic": "insufficient_comparable_timeline",
+            "expression_risk": "unknown",
+        }
+    real_pressure, real_basis, real_market = _candidate_real_money_signal(candidate, real_money_data or {})
+    if real_pressure is not None:
+        pressure, basis, pressure_is_real = real_pressure, real_basis, True
+    else:
+        pressure, basis = _candidate_pressure_signal(candidate, dynamics)
+        pressure_is_real = False
+    response = _candidate_line_response(candidate, dynamics, pressure)
+    strength = _pressure_strength(pressure)
+    if pressure is None:
+        acceptance, diagnostic, risk = "data_missing", "capital_pressure_proxy_unavailable", "unknown"
+    elif pressure <= -0.005:
+        acceptance, diagnostic, risk = "Rejected", "Opposing Capital Pressure Proxy", "high"
+    elif strength == "neutral":
+        acceptance, diagnostic, risk = "Partial", "No Material Capital Pressure Proxy", "medium"
+    elif response["response"] == "upgrade":
+        acceptance, diagnostic, risk = "Accepted", "Accepted Repricing", "low"
+    elif response["response"] == "static":
+        acceptance, diagnostic, risk = "Resistance", "Market Resistance", "high"
+    elif response["response"] == "downgrade":
+        acceptance, diagnostic, risk = "Rejected", "Strong Resistance / Divergence", "very_high"
+    elif response["response"] == "price_only":
+        acceptance, diagnostic, risk = "Partial", "Price Confirmation Without Structural Line", "medium_low"
+    else:
+        acceptance, diagnostic, risk = "data_missing", "line_response_unavailable", "unknown"
+    opposite = None
+    if axis == "Home": opposite = "Away"
+    elif axis == "Away": opposite = "Home"
+    elif axis == "Over": opposite = "Under"
+    elif axis == "Under": opposite = "Over"
+    elif axis == "BTTS Yes": opposite = "BTTS No"
+    elif axis == "BTTS No": opposite = "BTTS Yes"
+    elif axis.endswith(" Over"): opposite = axis[:-5] + " Under"
+    elif axis.endswith(" Under"): opposite = axis[:-6] + " Over"
+    return {
+        "axis": axis,
+        "capital_pressure": {
+            "status": "real_money_available" if pressure is not None and pressure_is_real else ("proxy_available" if pressure is not None else "data_missing"),
+            "label": "Real Funds" if pressure is not None and pressure_is_real else ("Capital Pressure Proxy" if pressure is not None else "data_missing"),
+            "signed_toward_candidate": round(pressure, 6) if pressure is not None else None,
+            "direction": axis if pressure is not None and pressure >= 0.005 else (opposite if pressure is not None and pressure <= -0.005 else "neutral"),
+            "strength": strength, "basis": basis, "evidence_grade": "A" if pressure_is_real else ("B" if pressure is not None else "C_or_missing"),
+            "is_real_money": pressure_is_real,
+            "money_percent": (real_market or {}).get("money_percent") if pressure_is_real else None,
+            "bet_percent": (real_market or {}).get("bet_percent") if pressure_is_real else None,
+            "turnover": (real_market or {}).get("turnover") if pressure_is_real else None,
+            "currency": (real_market or {}).get("currency") if pressure_is_real else None,
+            "real_money_evidence_hash": (real_money_data or {}).get("evidence_hash") if pressure_is_real else None,
+        },
+        "line_response": response,
+        "market_acceptance": acceptance,
+        "diagnostic": diagnostic,
+        "expression_risk": risk,
+    }
+
+
+def _expression_family(candidate: Dict[str, Any]) -> str:
+    market, selection = candidate.get("market"), candidate.get("selection")
+    if market in ("1x2", "asian_handicap") and selection in ("home", "away"):
+        return f"team_result_{selection}"
+    if market in ("over_under", "btts"):
+        if (market == "over_under" and selection == "over") or (market == "btts" and selection == "yes"):
+            return "open_goal_script"
+        if (market == "over_under" and selection == "under") or (market == "btts" and selection == "no"):
+            return "closed_goal_script"
+    return f"{market}_{selection}"
+
+
+def _candidate_is_qualified(candidate: Dict[str, Any]) -> bool:
+    coverage = as_float(candidate.get("script_coverage"))
+    return bool(
+        candidate.get("market_coverage_eligible", True)
+        and candidate.get("consensus_source_eligible", True)
+        and candidate.get("dispersion_eligible", True)
+        and as_float(candidate.get("edge")) is not None and as_float(candidate.get("edge")) >= MIN_EDGE
+        and as_float(candidate.get("ev")) is not None and as_float(candidate.get("ev")) >= MIN_EV
+        and coverage is not None and MIN_SCRIPT_COVERAGE <= coverage <= 1.0
+    )
+
+
+def apply_market_language_and_expression_optimizer(decision: Dict[str, Any], history: List[Dict[str, Any]], real_money_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    audit = decision.get("line_movement_audit") or audit_line_movement_timeline(history)
+    latest = latest_prematch_snapshot(history)
+    dynamics = (latest or {}).get("market_dynamics") if isinstance((latest or {}).get("market_dynamics"), dict) else {}
+    axis_language = {
+        "Home": market_language_for_candidate({"market": "asian_handicap", "selection": "home"}, dynamics, audit, real_money_data),
+        "Away": market_language_for_candidate({"market": "asian_handicap", "selection": "away"}, dynamics, audit, real_money_data),
+        "Over": market_language_for_candidate({"market": "over_under", "selection": "over"}, dynamics, audit, real_money_data),
+        "Under": market_language_for_candidate({"market": "over_under", "selection": "under"}, dynamics, audit, real_money_data),
+    }
+    normalized_real_money = real_money_data if isinstance(real_money_data, dict) else {
+        "status": "data_missing", "money_percent": None, "bet_percent": None, "turnover": None,
+        "policy": "real funds require an independently sourced and timestamped A-grade feed",
+    }
+    real_money_used = any(get_nested(row, ["capital_pressure", "is_real_money"]) is True for row in axis_language.values())
+    candidates = []
+    for raw in decision.get("candidates") or []:
+        candidate = dict(raw)
+        candidate["market_language"] = market_language_for_candidate(candidate, dynamics, audit, real_money_data)
+        candidate["expression_family"] = _expression_family(candidate)
+        candidate["expression_qualified"] = _candidate_is_qualified(candidate)
+        candidates.append(candidate)
+    real_money_used = real_money_used or any(get_nested(row, ["market_language", "capital_pressure", "is_real_money"]) is True for row in candidates)
+    decision["candidates"] = candidates
+    candidate_map = {(row.get("market"), row.get("selection"), row.get("line")): row for row in candidates}
+    original_raw = decision.get("best_market") if isinstance(decision.get("best_market"), dict) else None
+    original = candidate_map.get(((original_raw or {}).get("market"), (original_raw or {}).get("selection"), (original_raw or {}).get("line"))) if original_raw else None
+    if decision.get("decision") == "PASS" or original is None:
+        decision["execution_action"] = "PASS"
+        decision["market_language"] = {
+            "status": "data_missing" if not audit.get("decision_eligible") else "available_no_eligible_expression",
+            "axes": axis_language, "real_money_data": normalized_real_money, "capital_pressure_is_proxy_only": not real_money_used,
+        }
+        decision["expression_optimizer"] = {"action": "PASS", "original_expression": original, "selected_expression": None, "switch_type": None, "reason": "mandatory_gate_failed_or_no_eligible_expression", "automatic_direction_reversal": False}
+        return decision
+    original_language = original["market_language"]
+    acceptance_rank = {"Accepted": 4, "Partial": 3, "data_missing": 2, "Resistance": 1, "Rejected": 0}
+    original_acceptance = original_language.get("market_acceptance", "data_missing")
+    same_family = [
+        row for row in candidates
+        if row.get("expression_qualified") and row.get("expression_family") == original.get("expression_family")
+        and (row.get("market"), row.get("selection"), row.get("line")) != (original.get("market"), original.get("selection"), original.get("line"))
+        and acceptance_rank.get(get_nested(row, ["market_language", "market_acceptance"]), -1) > acceptance_rank.get(original_acceptance, -1)
+        and get_nested(row, ["market_language", "market_acceptance"]) in ("Accepted", "Partial")
+    ]
+    selected = max(same_family, key=lambda row: (acceptance_rank.get(get_nested(row, ["market_language", "market_acceptance"]), -1), as_float(row.get("script_coverage")) or -1, as_float(row.get("ev")) or -999), default=None)
+    switched = selected is not None
+    selected = selected or original
+    if original_acceptance in ("Accepted", "Partial") or switched:
+        action = "BET"
+        reason = "current_expression_market_accepted" if not switched else "same_script_lower_resistance_expression_selected"
+    else:
+        action = "WAIT"
+        reason = "market_resistance_requires_better_expression_or_new_evidence"
+    if switched:
+        decision["best_market"] = selected
+        decision["edge"], decision["ev"] = selected.get("edge"), selected.get("ev")
+        decision["decision"] = selected.get("selection") if selected.get("market") == "1x2" else f"{selected.get('market')}:{selected.get('selection')}"
+    tiers = decision.get("recommendation_tiers") if isinstance(decision.get("recommendation_tiers"), dict) else {}
+    for tier_name in ("first_choice_high_consistency", "second_choice_higher_return", "high_variance_single"):
+        tier_raw = tiers.get(tier_name)
+        tier = candidate_map.get(((tier_raw or {}).get("market"), (tier_raw or {}).get("selection"), (tier_raw or {}).get("line"))) if isinstance(tier_raw, dict) else None
+        if tier and get_nested(tier, ["market_language", "market_acceptance"]) in ("Accepted", "Partial"):
+            tiers[tier_name] = tier
+        else:
+            tiers[tier_name] = None
+    if action == "BET":
+        tiers["first_choice_high_consistency"] = selected
+    decision["recommendation_tiers"] = tiers
+    decision["execution_action"] = action
+    decision["market_language"] = {
+        "status": "available", "axes": axis_language,
+        "real_money_data": normalized_real_money, "capital_pressure_is_proxy_only": not real_money_used,
+        "selected_axis": get_nested(selected, ["market_language", "axis"]),
+        "selected_acceptance": get_nested(selected, ["market_language", "market_acceptance"]),
+        "selected_diagnostic": get_nested(selected, ["market_language", "diagnostic"]),
+        "policy": "odds path is Capital Pressure Proxy; only explicit Money%/Bet%/turnover data may be called real funds",
+    }
+    decision["expression_optimizer"] = {
+        "action": action, "original_expression": original, "selected_expression": selected,
+        "switch_type": "cross_market_same_script" if switched else "original_expression",
+        "reason": reason, "automatic_direction_reversal": False,
+        "wait_conditions": ["structural_line_accepts_pressure", "lower_resistance_same_script_expression_appears", "new_verified_fundamental_evidence"] if action == "WAIT" else [],
+    }
+    return decision
+
+
+def apply_line_movement_gate(decision: Dict[str, Any], history: List[Dict[str, Any]], real_money_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     audit = audit_line_movement_timeline(history)
     latest = latest_prematch_snapshot(history)
     decision["line_movement"] = (latest or {}).get("market_dynamics") or {"status": "data_missing"}
     decision["line_movement_audit"] = audit
     if not audit.get("decision_eligible"):
         force_pass_decision(decision, audit.get("reason") or "line_movement_insufficient")
-    return decision
+    return apply_market_language_and_expression_optimizer(decision, history, real_money_data)
 
 
 def snapshot_stage_usable(row: Dict[str, Any]) -> bool:
@@ -1742,6 +2589,15 @@ def _parse_timestamp(value: Any) -> Optional[int]:
         return None
 
 
+def version_at_least(value: Any, minimum: Tuple[int, int, int]) -> bool:
+    parts = str(value or "").split(".")
+    try:
+        parsed = tuple(int("".join(char for char in part if char.isdigit()) or "0") for part in parts[:3])
+    except (TypeError, ValueError):
+        return False
+    return (parsed + (0, 0, 0))[:3] >= minimum
+
+
 def _import_consensus(source: Dict[str, Any]) -> Dict[str, Any]:
     result: Dict[str, Any] = {}
     for market in ("1x2", "asian_handicap", "over_under", "btts", "home_team_total", "away_team_total"):
@@ -1968,6 +2824,171 @@ def imported_market_snapshot(stage: Dict[str, Any]) -> Dict[str, Any]:
 def _content_hash(value: Any) -> str:
     raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def build_learning_probability_replay(
+    fixture: Any,
+    model_input_bundle: Any,
+    generated_at: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Run the built-in odds-independent calculator and retain every replay input."""
+    generated_at = int(generated_at or time.time())
+    fixture_key = str(fixture or "").strip()
+    bundle = model_input_bundle if isinstance(model_input_bundle, dict) else {}
+    if bundle.get("status") != "ready" or not isinstance(bundle.get("inputs"), dict):
+        return {
+            "schema": "learning_probability_replay_v1",
+            "status": "data_missing",
+            "decision_eligible": False,
+            "fixture": fixture_key or None,
+            "generated_at": generated_at,
+            "uses_market_odds": False,
+            "blockers": list(bundle.get("blockers") or ["independent_model_inputs_missing"]),
+        }
+    inputs = copy.deepcopy(bundle["inputs"])
+    estimator = fundamental_expected_goals(inputs)
+    if estimator.get("ok") is not True:
+        return {
+            "schema": "learning_probability_replay_v1",
+            "status": "data_missing",
+            "decision_eligible": False,
+            "fixture": fixture_key or None,
+            "generated_at": generated_at,
+            "uses_market_odds": False,
+            "input_hash": _content_hash(inputs),
+            "inputs": inputs,
+            "blockers": ["independent_estimator_input_invalid", *(estimator.get("errors") or [])],
+        }
+    expected_goals = estimator["expected_goals"]
+    model = poisson_probability_model(
+        expected_goals["home"], expected_goals["away"], estimator["confidence"], inputs.get("provenance")
+    )
+    if model.get("ok") is not True:
+        return {
+            "schema": "learning_probability_replay_v1",
+            "status": "data_missing",
+            "decision_eligible": False,
+            "fixture": fixture_key or None,
+            "generated_at": generated_at,
+            "uses_market_odds": False,
+            "input_hash": _content_hash(inputs),
+            "inputs": inputs,
+            "estimator": estimator,
+            "blockers": ["probability_model_input_invalid", *(model.get("errors") or [])],
+        }
+    contract = {
+        "schema": "learning_probability_replay_v1",
+        "status": "ready" if estimator.get("status") == "ready" and model.get("status") == "ready" else "insufficient_confidence",
+        "decision_eligible": estimator.get("status") == "ready" and model.get("status") == "ready",
+        "fixture": fixture_key,
+        "generated_at": generated_at,
+        "calculator": {"runner_id": "builtin_fundamental_poisson", "runner_version": "1", "uses_market_odds": False},
+        "uses_market_odds": False,
+        "input_hash": _content_hash(inputs),
+        "inputs": inputs,
+        "estimator": estimator,
+        "model": model,
+        "source_content_hash": bundle.get("source_content_hash"),
+    }
+    contract["replay_hash"] = _content_hash(contract)
+    return contract
+
+
+def audit_learning_probability_replay(
+    replay: Any,
+    expected_fixture: Any,
+    data_cutoff_at: Any,
+    kickoff_at: Any,
+) -> Dict[str, Any]:
+    """Recompute a frozen probability contract; caller-supplied outputs never suffice."""
+    replay = replay if isinstance(replay, dict) else {}
+    if replay.get("status") == "data_missing":
+        return {
+            "status": "data_missing",
+            "decision_eligible": False,
+            "blockers": list(replay.get("blockers") or ["learning_probability_replay_inputs_missing"]),
+            "recomputed": False,
+        }
+    issues = []
+    if replay.get("schema") != "learning_probability_replay_v1":
+        issues.append("unsupported_replay_schema")
+    if str(replay.get("fixture") or "") != str(expected_fixture or ""):
+        issues.append("replay_fixture_mismatch")
+    generated_at = _parse_timestamp(replay.get("generated_at"))
+    cutoff = _parse_timestamp(data_cutoff_at)
+    kickoff = _parse_timestamp(kickoff_at)
+    if generated_at is None:
+        issues.append("replay_generated_at_missing")
+    elif cutoff is not None and generated_at > cutoff:
+        issues.append("replay_generated_after_packet_cutoff")
+    if generated_at is not None and kickoff is not None and generated_at >= kickoff:
+        issues.append("replay_generated_after_kickoff")
+    inputs = replay.get("inputs") if isinstance(replay.get("inputs"), dict) else {}
+    provenance = inputs.get("provenance") if isinstance(inputs.get("provenance"), dict) else {}
+    allowed_input_fields = {
+        "league_home_rate", "league_away_rate", "home_attack_rate", "home_defense_rate",
+        "away_attack_rate", "away_defense_rate", "home_sample_size", "away_sample_size",
+        "league_sample_size", "metric_type", "home_adjustment", "away_adjustment",
+        "lineup_confidence", "provenance",
+    }
+    unexpected_input_fields = sorted(set(inputs) - allowed_input_fields)
+    if unexpected_input_fields:
+        issues.append("unexpected_model_input_fields:" + ",".join(unexpected_input_fields))
+    forbidden_tokens = ("odd", "bookmaker", "market_probability", "implied_probability", "line_movement")
+    if any(any(token in str(field).lower() for token in forbidden_tokens) for field in inputs):
+        issues.append("market_derived_model_input_field_forbidden")
+    observed_at = _parse_timestamp(provenance.get("observed_at"))
+    if replay.get("uses_market_odds") is not False or provenance.get("uses_market_odds") is not False:
+        issues.append("market_odds_forbidden_in_probability_calculator")
+    if observed_at is None:
+        issues.append("model_input_observed_at_missing")
+    elif cutoff is not None and observed_at > cutoff:
+        issues.append("model_input_observed_after_packet_cutoff")
+    if observed_at is not None and kickoff is not None and observed_at >= kickoff:
+        issues.append("model_input_observed_after_kickoff")
+    if replay.get("input_hash") != _content_hash(inputs):
+        issues.append("model_input_hash_mismatch")
+    source_content_hash = str(provenance.get("source_content_hash") or "")
+    if len(source_content_hash) != 64 or any(char not in "0123456789abcdef" for char in source_content_hash.lower()):
+        issues.append("model_input_source_content_hash_invalid")
+    if replay.get("source_content_hash") != source_content_hash:
+        issues.append("replay_source_content_hash_mismatch")
+    calculator = replay.get("calculator") if isinstance(replay.get("calculator"), dict) else {}
+    if calculator != {"runner_id": "builtin_fundamental_poisson", "runner_version": "1", "uses_market_odds": False}:
+        issues.append("untrusted_probability_calculator")
+    supplied_hash = replay.get("replay_hash")
+    replay_without_hash = {key: value for key, value in replay.items() if key != "replay_hash"}
+    if supplied_hash != _content_hash(replay_without_hash):
+        issues.append("replay_hash_mismatch")
+    estimator = fundamental_expected_goals(inputs) if inputs else {"ok": False}
+    recomputed_model = {"ok": False}
+    if estimator.get("ok") is True:
+        xg = estimator["expected_goals"]
+        recomputed_model = poisson_probability_model(
+            xg["home"], xg["away"], estimator["confidence"], inputs.get("provenance")
+        )
+    supplied_estimator = replay.get("estimator") if isinstance(replay.get("estimator"), dict) else {}
+    supplied_model = replay.get("model") if isinstance(replay.get("model"), dict) else {}
+    if estimator.get("ok") is not True:
+        issues.append("recomputed_estimator_invalid")
+    elif supplied_estimator.get("estimator_hash") != estimator.get("estimator_hash") or supplied_estimator.get("expected_goals") != estimator.get("expected_goals"):
+        issues.append("estimator_output_mismatch")
+    if recomputed_model.get("ok") is not True:
+        issues.append("recomputed_model_invalid")
+    elif supplied_model.get("model_hash") != recomputed_model.get("model_hash") or supplied_model.get("probabilities") != recomputed_model.get("probabilities"):
+        issues.append("probability_output_mismatch")
+    expected_eligible = estimator.get("status") == "ready" and recomputed_model.get("status") == "ready"
+    if bool(replay.get("decision_eligible")) != expected_eligible:
+        issues.append("replay_eligibility_mismatch")
+    return {
+        "status": "invalid" if issues else ("ready" if expected_eligible else "insufficient_confidence"),
+        "decision_eligible": not issues and expected_eligible,
+        "issues": issues,
+        "recomputed": True,
+        "input_hash": _content_hash(inputs) if inputs else None,
+        "estimator_hash": estimator.get("estimator_hash"),
+        "model_hash": recomputed_model.get("model_hash"),
+    }
 
 
 def normalize_fixture_identity_name(value: Any) -> str:
@@ -2249,12 +3270,30 @@ def import_prematch_packet(packet: Dict[str, Any], store_override: Optional[Dict
             provider_fixture_ids["pang"] = fixture
         else:
             provider_fixture_ids["the_odds_api"] = str(match.get("the_odds_api_event_id") or "") or None
+        next_data_quality = packet.get("data_quality") or previous_meta.get("data_quality")
+        if packet_source == "the_odds_api" and isinstance(packet.get("data_quality"), dict) and isinstance(previous_meta.get("data_quality"), dict):
+            previous_quality = previous_meta["data_quality"]
+            incoming_quality = packet["data_quality"]
+            eligible_stages = [
+                stage for stage in PREMATCH_STAGE_ORDER
+                if stage in set(previous_quality.get("primary_reference_eligible_stages") or [])
+                or stage in set(incoming_quality.get("primary_reference_eligible_stages") or [])
+            ]
+            next_data_quality = {
+                **previous_quality,
+                **incoming_quality,
+                "primary_reference_eligible_stages": eligible_stages,
+                "primary_reference_eligible_stage_count": len(eligible_stages),
+                "required_stage_count": len(PREMATCH_STAGE_ORDER),
+                "last_requested_stages": list(incoming_quality.get("requested_stages") or []),
+                "incremental_collection": bool(incoming_quality.get("incremental_collection")),
+            }
         next_meta_content = {
             "schema_version": packet.get("schema_version"), "league": packet.get("league") or previous_meta.get("league"),
             "exported_at": packet.get("exported_at") or previous_meta.get("exported_at"), "match": match or previous_meta.get("match"),
             "required_timeline": packet.get("required_timeline") or previous_meta.get("required_timeline") or PREMATCH_STAGE_ORDER,
             "lineup_history": lineup_history if "lineup_history" in packet else previous_meta.get("lineup_history", []),
-            "data_quality": packet.get("data_quality") or previous_meta.get("data_quality"),
+            "data_quality": next_data_quality,
             "fixture_identity": fixture_identity,
             "source": packet_source,
             "provider_fixture_ids": {key: value for key, value in provider_fixture_ids.items() if value},
@@ -2322,7 +3361,7 @@ def import_prematch_packet_batch(packets: List[Dict[str, Any]]) -> Tuple[List[Di
 
 
 def collect_the_odds_api_timeline(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Collect and optionally persist one verified eight-node provider timeline."""
+    """Collect and optionally persist missing nodes of a verified timeline."""
     if not THE_ODDS_API_KEY:
         raise HTTPException(status_code=503, detail="the_odds_api_not_configured")
     if not isinstance(payload, dict):
@@ -2334,6 +3373,40 @@ def collect_the_odds_api_timeline(payload: Dict[str, Any]) -> Dict[str, Any]:
     fixture = str(payload.get("fixture")).strip()
     if not fixture or len(fixture) > 128:
         raise HTTPException(status_code=400, detail="invalid_fixture")
+    requested_stages = payload.get("requested_stages")
+    if requested_stages is not None:
+        if not isinstance(requested_stages, list) or not requested_stages or any(not isinstance(stage, str) for stage in requested_stages):
+            raise HTTPException(status_code=400, detail="invalid_requested_stages")
+        requested_stages = list(dict.fromkeys(requested_stages))
+        invalid_stages = [stage for stage in requested_stages if stage not in PREMATCH_STAGE_ORDER]
+        if invalid_stages:
+            raise HTTPException(status_code=400, detail={"error": "invalid_requested_stage", "stages": invalid_stages})
+    else:
+        requested_stages = list(PREMATCH_STAGE_ORDER)
+    only_missing = payload.get("only_missing", True)
+    retry_data_missing = payload.get("retry_data_missing", False)
+    if not isinstance(only_missing, bool) or not isinstance(retry_data_missing, bool):
+        raise HTTPException(status_code=400, detail="incremental_flags_must_be_boolean")
+    store = load_snapshot_store()
+    existing_rows = list((store.get("fixtures") or {}).get(fixture) or [])
+    if retry_data_missing:
+        completed_stages = {row.get("stage") for row in existing_rows if snapshot_stage_usable(row)}
+    else:
+        completed_stages = {row.get("stage") for row in existing_rows if row.get("stage") in PREMATCH_STAGE_ORDER}
+    stages_to_fetch = [stage for stage in requested_stages if not only_missing or stage not in completed_stages]
+    metadata = (store.get("external_prematch") or {}).get(fixture) or {}
+    provider_ids = metadata.get("provider_fixture_ids") if isinstance(metadata.get("provider_fixture_ids"), dict) else {}
+    known_event_id = str(payload.get("the_odds_api_event_id") or provider_ids.get("the_odds_api") or "").strip()
+    if len(known_event_id) > 200 or any(ord(char) < 32 for char in known_event_id):
+        raise HTTPException(status_code=400, detail="invalid_the_odds_api_event_id")
+    if not stages_to_fetch:
+        return {
+            "ok": True, "source": "the_odds_api", "fixture": fixture,
+            "request_count": 0, "request_audit": [], "requested_stages": requested_stages,
+            "stages_to_fetch": [], "skipped_existing_stages": requested_stages,
+            "incremental_noop": True, "persist_requested": payload.get("persist", True) is not False,
+            "persist_result": None, "credential_exposed": False,
+        }
     aliases = {}
     for side in ("home", "away"):
         raw = payload.get(f"{side}_aliases") or []
@@ -2369,6 +3442,8 @@ def collect_the_odds_api_timeline(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "asian_handicap": THE_ODDS_API_MIN_AH_BOOKMAKERS,
                 "over_under": THE_ODDS_API_MIN_OU_BOOKMAKERS,
             },
+            requested_stages=stages_to_fetch,
+            known_event_id=known_event_id or None,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2377,6 +3452,9 @@ def collect_the_odds_api_timeline(payload: Dict[str, Any]) -> Dict[str, Any]:
         persisted = import_prematch_packet(result["packet"])
     return {
         **result,
+        "stages_to_fetch": stages_to_fetch,
+        "skipped_existing_stages": [stage for stage in requested_stages if stage not in stages_to_fetch],
+        "incremental_noop": False,
         "persist_requested": payload.get("persist", True) is not False,
         "persist_result": persisted,
         "credential_exposed": False,
@@ -3091,7 +4169,8 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
             high_variance = None
     decision = "PASS" if pass_reasons or not first_choice else (first_choice["selection"] if first_choice["market"] == "1x2" else f"{first_choice['market']}:{first_choice['selection']}")
     return {
-        "decision": decision, "best_market": first_choice, "candidates": candidates,
+        "decision": decision, "execution_action": "PASS" if decision == "PASS" else "PENDING_MARKET_LANGUAGE",
+        "best_market": first_choice, "candidates": candidates,
         "recommendation_tiers": {
             "first_choice_high_consistency": first_choice,
             "second_choice_higher_return": second_choice,
@@ -3308,10 +4387,11 @@ def audit_fundamental_chain(script: Dict[str, Any], now_ts: Optional[int] = None
 
 def build_decision_summary(decision: Dict[str, Any], chain_audit: Dict[str, Any], model: Dict[str, Any]) -> Dict[str, Any]:
     best = decision.get("best_market") or {}
-    passed = decision.get("decision") == "PASS"
+    execution_action = decision.get("execution_action") or ("PASS" if decision.get("decision") == "PASS" else "BET")
+    passed = execution_action == "PASS"
     return {
-        "decision": decision.get("decision"),
-        "status": "pass" if passed else "actionable",
+        "decision": decision.get("decision"), "execution_action": execution_action,
+        "status": "pass" if passed else ("wait" if execution_action == "WAIT" else "actionable"),
         "recommended_market": None if passed else best.get("market"),
         "recommended_selection": None if passed else best.get("selection"),
         "line": None if passed else best.get("line"),
@@ -3322,8 +4402,9 @@ def build_decision_summary(decision: Dict[str, Any], chain_audit: Dict[str, Any]
         "model_status": model.get("status"),
         "fundamental_chain_status": chain_audit.get("status"),
         "market_move_classification": decision.get("market_move_classification"),
+        "market_acceptance": get_nested(decision, ["market_language", "selected_acceptance"]),
         "pass_reasons": decision.get("pass_reasons") or [],
-        "explanation": "No bet: one or more mandatory gates failed." if passed else "Selection passed model, price, script and risk gates.",
+        "explanation": "No bet: one or more mandatory gates failed." if passed else ("Wait: model direction is retained but the market has not accepted this expression." if execution_action == "WAIT" else "Selection passed model, price, script, market-language and risk gates."),
     }
 
 
@@ -3335,8 +4416,33 @@ def audit_decision_output(decision: Dict[str, Any]) -> Dict[str, Any]:
     )
     missing_fields = [field for field in required_fields if field not in decision]
     decision_name = decision.get("decision")
-    pass_mode = decision_name == "PASS"
+    execution_action = decision.get("execution_action") or ("PASS" if decision_name == "PASS" else "BET")
+    pass_mode = execution_action == "PASS" or decision_name == "PASS"
     consistency_issues = []
+    if "line_movement_audit" in decision:
+        if not isinstance(decision.get("market_language"), dict):
+            consistency_issues.append("terminal_decision_requires_market_language")
+        if not isinstance(decision.get("expression_optimizer"), dict):
+            consistency_issues.append("terminal_decision_requires_expression_optimizer")
+        axes = get_nested(decision, ["market_language", "axes"])
+        if not isinstance(axes, dict) or any(axis not in axes for axis in ("Home", "Away", "Over", "Under")):
+            consistency_issues.append("terminal_market_language_requires_four_axes")
+        any_real_axis = isinstance(axes, dict) and any(get_nested(axes, [axis, "capital_pressure", "is_real_money"]) is True for axis in ("Home", "Away", "Over", "Under"))
+        any_real_candidate = any(get_nested(row, ["market_language", "capital_pressure", "is_real_money"]) is True for row in (decision.get("candidates") or []) if isinstance(row, dict))
+        any_real_pressure = any_real_axis or any_real_candidate
+        proxy_only_flag = get_nested(decision, ["market_language", "capital_pressure_is_proxy_only"])
+        if proxy_only_flag != (not any_real_pressure):
+            consistency_issues.append("capital_pressure_proxy_flag_mismatch")
+        if any_real_pressure and (
+            get_nested(decision, ["market_language", "real_money_data", "decision_eligible"]) is not True
+            or not get_nested(decision, ["market_language", "real_money_data", "evidence_hash"])
+        ):
+            consistency_issues.append("real_money_axis_requires_audited_evidence_hash")
+        if get_nested(decision, ["expression_optimizer", "automatic_direction_reversal"]) is not False:
+            consistency_issues.append("expression_optimizer_must_forbid_automatic_direction_reversal")
+        optimizer_action = get_nested(decision, ["expression_optimizer", "action"])
+        if optimizer_action != execution_action:
+            consistency_issues.append("expression_optimizer_action_mismatch")
     if pass_mode:
         if decision.get("best_market") is not None:
             consistency_issues.append("pass_must_not_have_best_market")
@@ -3351,6 +4457,10 @@ def audit_decision_output(decision: Dict[str, Any]) -> Dict[str, Any]:
                 consistency_issues.append(f"actionable_best_market_missing_{field}")
         if decision.get("pass_reasons"):
             consistency_issues.append("actionable_decision_must_not_have_pass_reasons")
+        if execution_action not in ("BET", "WAIT", "PENDING_MARKET_LANGUAGE"):
+            consistency_issues.append("actionable_execution_action_must_be_bet_or_wait")
+        if execution_action == "BET" and isinstance(decision.get("market_language"), dict) and decision["market_language"].get("status") == "available" and get_nested(decision, ["market_language", "selected_acceptance"]) not in ("Accepted", "Partial"):
+            consistency_issues.append("bet_requires_accepted_or_partial_market_expression")
     eligible = not missing_fields and not consistency_issues
     return {
         "status": "complete" if eligible else "incomplete",
@@ -3412,13 +4522,22 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
     latest = latest_prematch_snapshot(available)
     market = (latest or {}).get("market_snapshot") or empty_market_snapshot()
     freshness = imported_fixture_freshness(metadata, history)
+    evaluation_cutoff = int(time.time())
+    match_metadata = metadata.get("match") if isinstance(metadata.get("match"), dict) else {}
+    kickoff_at = match_metadata.get("kickoff_utc") or match_metadata.get("date") or match_metadata.get("kickoff_at")
+    real_money_audit = audit_real_money_data(
+        payload.get("real_money_data"), expected_fixture=fixture,
+        data_cutoff_at=evaluation_cutoff, kickoff_at=kickoff_at, now_ts=evaluation_cutoff,
+    )
     decision = decision_layer(
         market, model.get("probabilities"), payload.get("script_coverage"),
         as_float(payload.get("crowding")), lineup_audit.get("effective_confidence"), payload.get("death_path") if "death_path" in payload else None,
     )
     decision["lineup_confidence_audit"] = lineup_audit
-    decision = apply_line_movement_gate(decision, history)
+    decision = apply_line_movement_gate(decision, history, real_money_audit)
     decision["data_freshness"] = freshness
+    if payload.get("real_money_data") not in (None, {}) and real_money_audit.get("status") == "rejected":
+        decision["pass_reasons"].append("real_money_data_rejected")
     if model.get("status") != "ready":
         decision["pass_reasons"].append("model_input_confidence_below_0_6")
     if not freshness.get("decision_eligible"):
@@ -3498,6 +4617,12 @@ def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int,
         as_float(get_nested(row, ["evaluation", "decision_layer", "recommendation_tiers", tier, "ev"])) or -999,
     ), reverse=True)
     for row in ordered:
+        execution_action = get_nested(row, ["evaluation", "decision_layer", "execution_action"])
+        if execution_action is None:
+            execution_action = "BET"
+        if execution_action != "BET":
+            excluded.append({"fixture": row.get("fixture"), "reason": "execution_action_not_bet", "execution_action": execution_action or "data_missing", "requested_tier": tier})
+            continue
         tiers = get_nested(row, ["evaluation", "decision_layer", "recommendation_tiers"]) or {}
         candidate = tiers.get(tier)
         source_tier = tier
@@ -3790,7 +4915,7 @@ def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6, ri
 
 @app.get("/")
 def root():
-    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}"]}
+    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/store-health", "/shadow/store-recovery-preview", "/shadow/store-recover", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}", "/shadow/market-language/freeze", "/shadow/market-language/collect-facts", "/shadow/market-language/settlement-plan", "/shadow/market-language/settle", "/shadow/market-language/status", "/shadow/learning/registry", "/shadow/learning/node-plan", "/shadow/learning/node-run", "/shadow/learning/data-health", "/shadow/learning/postmatch-recovery", "/shadow/learning/collect-facts", "/shadow/learning/cycle-plan", "/shadow/learning/run", "/shadow/learning/review-queue", "/shadow/learning/review-draft", "/shadow/learning/complete-review", "/shadow/learning/quality-cards/refresh", "/shadow/learning/quality-calibration", "/shadow/learning/research-proposals", "/shadow/learning/research-proposals/refresh", "/shadow/learning/validation-queue", "/shadow/learning/freeze", "/shadow/learning/settle", "/shadow/learning/hypotheses", "/shadow/learning/hypotheses/{id}/shadow-lock", "/shadow/learning/hypotheses/{id}/promotion-evidence", "/shadow/learning/league-dna", "/shadow/learning/league-dna/{tag_id}/activation-candidate", "/shadow/learning/league-dna/{tag_id}/confirm", "/shadow/learning/selection-quality", "/shadow/learning/status"]}
 
 
 @app.get("/health")
@@ -3802,7 +4927,7 @@ def health():
         "fresh_fixture_count": get_nested(route, ["pang", "fresh_fixture_count"], 0),
         "missing_action": route.get("missing_action"),
     }
-    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "the_odds_api_base_url": THE_ODDS_API_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "has_thestats_key": bool(THESTATS_API_KEY), "has_the_odds_api_key": bool(THE_ODDS_API_KEY), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "nami_odds_startup_probe": NAMI_ODDS_STARTUP_PROBE, "nami_odds_probe_ttl_seconds": NAMI_ODDS_PROBE_TTL_SECONDS, "market_data_route": route_summary, "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "snapshot_store_warn_bytes": SNAPSHOT_STORE_WARN_BYTES, "fundamental_version_retention": FUNDAMENTAL_VERSION_RETENTION, "portfolio_run_retention": PORTFOLIO_RUN_RETENTION, "external_data_stale_seconds": EXTERNAL_DATA_STALE_SECONDS, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}, "auto_provider_reconciliation": AUTO_RECONCILIATION_LAST_RESULT}
+    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "the_odds_api_base_url": THE_ODDS_API_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "has_thestats_key": bool(THESTATS_API_KEY), "thestats_fixture_day_cache_ttl_seconds": THESTATS_FIXTURE_DAY_CACHE_TTL_SECONDS, "thestats_fixture_day_cache_entries": len(THESTATS_FIXTURE_DAY_CACHE), "has_the_odds_api_key": bool(THE_ODDS_API_KEY), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "nami_odds_startup_probe": NAMI_ODDS_STARTUP_PROBE, "nami_odds_probe_ttl_seconds": NAMI_ODDS_PROBE_TTL_SECONDS, "market_data_route": route_summary, "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "snapshot_store_writer_workers": SNAPSHOT_STORE_WRITER_WORKERS, "snapshot_store_single_writer_required": True, "snapshot_store_warn_bytes": SNAPSHOT_STORE_WARN_BYTES, "snapshot_store_max_decompressed_bytes": SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES, "fundamental_version_retention": FUNDAMENTAL_VERSION_RETENTION, "portfolio_run_retention": PORTFOLIO_RUN_RETENTION, "external_data_stale_seconds": EXTERNAL_DATA_STALE_SECONDS, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}, "auto_provider_reconciliation": AUTO_RECONCILIATION_LAST_RESULT}
 
 
 @app.get("/shadow/nami-capabilities")
@@ -3834,13 +4959,13 @@ def thestats_raw(path: str, token: Optional[str] = None, authorization: Optional
 
 @app.get("/shadow/historical-odds-test")
 def shadow_historical_odds_test(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
-    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    require_paid_odds_token(resolve_shadow_token(token, authorization, x_shadow_token))
     return JSONResponse(historical_odds_selfcheck())
 
 
 @app.post("/shadow/the-odds-api/collect-timeline")
 async def shadow_the_odds_api_collect_timeline(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
-    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    require_paid_odds_token(resolve_shadow_token(token, authorization, x_shadow_token))
     body = await request.body()
     if len(body) > 100 * 1024:
         raise HTTPException(status_code=413, detail="request_body_too_large")
@@ -4318,12 +5443,6194 @@ def calibration_report() -> Dict[str, Any]:
     }
 
 
-def operations_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
+def learning_major_league_registry_manifest() -> Dict[str, Any]:
+    leagues = [
+        {"competition_id": competition_id, **LEARNING_MAJOR_LEAGUES[competition_id]}
+        for competition_id in sorted(LEARNING_MAJOR_LEAGUES)
+    ]
+    immutable_content = {
+        "version": LEARNING_MAJOR_LEAGUES_VERSION,
+        "leagues": leagues,
+        "admission_policy": "explicit_user_approved_major_domestic_top_flights_only",
+    }
+    return {
+        **immutable_content,
+        "registry_hash": _content_hash(immutable_content),
+        "league_count": len(leagues),
+        "historical_reclassification_allowed": False,
+        "external_evidence_can_self_admit": False,
+        "requires_explicit_user_confirmation_for_changes": True,
+    }
+
+
+def audit_learning_scope(scope: Any) -> Dict[str, Any]:
+    """Admit only user-approved major men's professional domestic top flights."""
+    scope = scope if isinstance(scope, dict) else {}
+    reasons = []
+    competition_type = str(scope.get("competition_type") or "").strip().lower()
+    gender = str(scope.get("gender") or "").strip().lower()
+    team_level = str(scope.get("team_level") or "").strip().lower()
+    try:
+        tier = int(scope.get("tier"))
+    except (TypeError, ValueError):
+        tier = None
+    try:
+        competition_id = int(scope.get("competition_id"))
+    except (TypeError, ValueError):
+        competition_id = None
+    registry_manifest = learning_major_league_registry_manifest()
+    registry = LEARNING_MAJOR_LEAGUES.get(competition_id)
+    verification_refs = scope.get("verification_refs") if isinstance(scope.get("verification_refs"), list) else []
+    valid_verification_refs = [
+        ref for ref in verification_refs
+        if isinstance(ref, dict)
+        and str(ref.get("source") or "").strip()
+        and str(ref.get("url") or ref.get("id") or ref.get("title") or "").strip()
+    ]
+    if competition_type != "domestic_league":
+        reasons.append("domestic_league_required")
+    if tier != 1:
+        reasons.append("tier_one_required")
+    if gender not in ("men", "male"):
+        reasons.append("mens_competition_required")
+    if scope.get("professional") is not True:
+        reasons.append("professional_competition_required")
+    if team_level != "first_team":
+        reasons.append("first_team_required")
+    if not str(scope.get("competition_name") or "").strip():
+        reasons.append("competition_name_required")
+    if not str(scope.get("season") or "").strip():
+        reasons.append("season_required")
+    if registry:
+        supplied_name = normalize_fixture_identity_name(scope.get("competition_name"))
+        registered_name = normalize_fixture_identity_name(registry.get("name"))
+        if supplied_name != registered_name:
+            reasons.append("competition_name_registry_mismatch")
+        supplied_country = normalize_fixture_identity_name(scope.get("country"))
+        registered_country = normalize_fixture_identity_name(registry.get("country"))
+        if supplied_country and supplied_country != registered_country:
+            reasons.append("competition_country_registry_mismatch")
+        verification_method = "curated_major_top_flight_registry"
+    else:
+        verification_method = "not_in_major_learning_registry"
+        reasons.append("competition_not_in_major_learning_registry")
+    eligible = not reasons
+    return {
+        "eligible": eligible,
+        "learning_eligibility": "MODEL_LEARNING_ELIGIBLE" if eligible else "MODEL_LEARNING_EXCLUDED",
+        "allowed_modes": ["AUTOMATIC_MODEL_LEARNING"] if eligible else ["MARKET_LANGUAGE_ONLY", "SETTLEMENT_ONLY"],
+        "reasons": reasons,
+        "normalized": {
+            "competition_name": str(scope.get("competition_name") or "").strip(),
+            "competition_id": competition_id,
+            "country": str(scope.get("country") or (registry or {}).get("country") or "").strip(),
+            "competition_type": competition_type or None,
+            "tier": tier,
+            "gender": gender or None,
+            "professional": scope.get("professional") is True,
+            "team_level": team_level or None,
+            "season": str(scope.get("season") or "").strip(),
+            "phase": str(scope.get("phase") or "unknown").strip(),
+            "format_version": str(scope.get("format_version") or "unknown").strip(),
+            "verification_method": verification_method,
+            "verification_refs": valid_verification_refs[:10],
+            "major_league_registry_version": registry_manifest["version"],
+            "major_league_registry_hash": registry_manifest["registry_hash"],
+        },
+        "policy": "only the explicit user-approved major domestic top-flight registry is model-learning eligible; external tier evidence cannot self-admit a competition",
+    }
+
+
+def discover_learning_fixtures(now_ts: Optional[int] = None, fixture_rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Discover only registry-verified domestic top-flight fixtures in the next horizon."""
+    now_ts = int(now_ts or time.time())
+    horizon_ts = now_ts + LEARNING_DISCOVERY_HORIZON_HOURS * 3600
+    source_audit = []
+    rows: List[Dict[str, Any]] = []
+    if fixture_rows is not None:
+        rows = [row for row in fixture_rows if isinstance(row, dict)]
+        source_audit.append({"source": "injected_fixture_rows", "ok": True, "row_count": len(rows)})
+    else:
+        local_now = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(ZoneInfo("Asia/Shanghai"))
+        dates = sorted({local_now.date().isoformat(), (local_now + timedelta(days=1)).date().isoformat()})
+        for date_str in dates:
+            result = call_api_football("/fixtures", {"date": date_str, "timezone": "Asia/Shanghai"})
+            batch = response_list(result)
+            rows.extend(row for row in batch if isinstance(row, dict))
+            source_audit.append({
+                "source": "api_football", "date": date_str, "ok": bool(result.get("ok")),
+                "status_code": result.get("status_code"), "row_count": len(batch), "error": result.get("error"),
+            })
+    registry_manifest = learning_major_league_registry_manifest()
+    candidates, observation_candidates, excluded = [], [], []
+    seen = set()
+    for row in rows:
+        summary = dict(row) if row.get("fixture_id") is not None else fixture_summary(row)
+        fixture_id = summary.get("fixture_id")
+        league_id = summary.get("league_id")
+        kickoff = fixture_datetime_utc(summary)
+        reason = None
+        if league_id not in LEARNING_MAJOR_LEAGUES:
+            reason = "competition_not_in_major_learning_registry"
+        elif summary.get("status") != "NS":
+            reason = "fixture_not_not_started"
+        elif not fixture_id or not kickoff:
+            reason = "fixture_identity_or_kickoff_missing"
+        elif not now_ts < int(kickoff.timestamp()) <= horizon_ts:
+            reason = "outside_learning_discovery_horizon"
+        elif str(fixture_id) in seen:
+            reason = "duplicate_fixture"
+        if reason:
+            excluded_row = {"fixture_id": fixture_id, "league_id": league_id, "reason": reason}
+            if reason == "competition_not_in_major_learning_registry":
+                excluded_row.update({
+                    "learning_eligibility": "MODEL_LEARNING_EXCLUDED",
+                    "allowed_modes": ["MARKET_LANGUAGE_ONLY", "SETTLEMENT_ONLY"],
+                })
+                if (
+                    fixture_id and kickoff and summary.get("status") == "NS"
+                    and now_ts < int(kickoff.timestamp()) <= horizon_ts
+                    and str(fixture_id) not in seen
+                ):
+                    seen.add(str(fixture_id))
+                    observation_candidates.append({
+                        **summary,
+                        "scope": {
+                            "competition_id": league_id,
+                            "competition_name": str(summary.get("league") or "Unknown competition"),
+                            "country": str(summary.get("country") or ""),
+                            "competition_type": "unclassified_non_learning_competition",
+                            "tier": None,
+                            "gender": "men",
+                            "professional": True,
+                            "team_level": "first_team",
+                            "season": str(summary.get("season") or ""),
+                            "phase": str(summary.get("league_round") or "unknown"),
+                            "verification_status": "identification_only",
+                        },
+                        "learning_eligibility": "MODEL_LEARNING_EXCLUDED",
+                        "allowed_modes": ["MARKET_LANGUAGE_ONLY", "SETTLEMENT_ONLY"],
+                        "routing_reason": reason,
+                    })
+            excluded.append(excluded_row)
+            continue
+        seen.add(str(fixture_id))
+        registry = LEARNING_MAJOR_LEAGUES[league_id]
+        candidates.append({
+            **summary,
+            "scope": {
+                "competition_id": league_id, "competition_name": registry["name"],
+                "country": registry["country"], "competition_type": "domestic_league",
+                "tier": 1, "gender": "men", "professional": True,
+                "team_level": "first_team", "season": str(summary.get("season") or ""),
+                "phase": str(summary.get("league_round") or "unknown"),
+                "verification_status": "verified",
+            },
+            "learning_scope_verified": True,
+            "major_league_registry_version": registry_manifest["version"],
+            "major_league_registry_hash": registry_manifest["registry_hash"],
+        })
+    candidates.sort(key=lambda row: (int(row.get("timestamp") or 0), str(row.get("fixture_id"))))
+    observation_candidates.sort(key=lambda row: (int(row.get("timestamp") or 0), str(row.get("fixture_id"))))
+    excluded_counts = {reason: sum(row["reason"] == reason for row in excluded) for reason in sorted({row["reason"] for row in excluded})}
+    return {
+        "ok": all(row.get("ok") for row in source_audit) if source_audit else False,
+        "generated_at": now_ts, "window_start": now_ts, "window_end": horizon_ts,
+        "horizon_hours": LEARNING_DISCOVERY_HORIZON_HOURS,
+        "candidate_count": len(candidates), "candidates": candidates,
+        "observation_candidate_count": len(observation_candidates),
+        "observation_candidates": observation_candidates,
+        "excluded_count": len(excluded), "excluded_counts": excluded_counts,
+        "excluded_sample": excluded[:50], "excluded_sample_truncated": len(excluded) > 50,
+        "source_audit": source_audit,
+        "major_league_registry": {
+            "version": registry_manifest["version"],
+            "registry_hash": registry_manifest["registry_hash"],
+            "league_count": registry_manifest["league_count"],
+        },
+        "policy": "only user-approved major men's professional domestic tier-one first-team leagues are eligible; non-registry competitions are market-language/settlement only",
+    }
+
+
+def scheduled_learning_analysis_node(now_ts: int, kickoff_at: int) -> Optional[str]:
+    """Return the latest fixed learning node due by clock; Opening requires real evidence."""
+    seconds_before = int(kickoff_at) - int(now_ts)
+    if seconds_before <= 0 or seconds_before > LEARNING_DISCOVERY_HORIZON_HOURS * 3600:
+        return None
+    if seconds_before <= 3600:
+        return "T-1h"
+    if seconds_before <= 6 * 3600:
+        return "T-6h"
+    if seconds_before <= 12 * 3600:
+        return "T-12h"
+    return None
+
+
+def admit_learning_candidate(candidate: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Persist daily governance admission even when no analysis clock node is due yet."""
+    now_ts = int(now_ts or time.time())
+    candidate = candidate if isinstance(candidate, dict) else {}
+    fixture = str(candidate.get("fixture_id") or "").strip()
+    kickoff_at = _parse_timestamp(candidate.get("timestamp"))
+    if not fixture or kickoff_at is None:
+        raise HTTPException(status_code=422, detail="learning_admission_identity_or_kickoff_missing")
+    if str(candidate.get("status") or "").upper() != "NS" or now_ts >= kickoff_at:
+        raise HTTPException(status_code=409, detail="learning_admission_requires_not_started_fixture")
+    scope_audit = audit_learning_scope(candidate.get("scope"))
+    if not scope_audit["eligible"]:
+        raise HTTPException(status_code=422, detail={"error": "major_league_scope_not_eligible", "reasons": scope_audit["reasons"]})
+    registry = learning_major_league_registry_manifest()
+    immutable_content = {
+        "fixture": fixture,
+        "kickoff_at": kickoff_at,
+        "scope": scope_audit["normalized"],
+        "major_league_registry_version": registry["version"],
+        "major_league_registry_hash": registry["registry_hash"],
+        "admission_source": "daily_1430_governance_cycle",
+        "learning_eligibility": "MODEL_LEARNING_ELIGIBLE",
+    }
+    admission_hash = _content_hash(immutable_content)
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        admissions = store.setdefault("learning_admissions", {})
+        existing = admissions.get(fixture)
+        if existing:
+            if existing.get("admission_hash") == admission_hash:
+                return {**existing, "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="learning_admission_identity_already_recorded")
+        record = {
+            **immutable_content,
+            "admitted_at": now_ts,
+            "admission_hash": admission_hash,
+            "immutable": True,
+            "champion_effect": False,
+            "status": "admitted_waiting_for_due_node",
+        }
+        admissions[fixture] = record
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return {**record, "action": "admitted"}
+
+
+def _learning_snapshot_marker(store: Dict[str, Any], fixture: str, now_ts: int) -> Optional[Dict[str, Any]]:
+    rows = (store.get("fixtures") or {}).get(str(fixture), []) or []
+    available = [
+        row for row in complete_prematch_timeline(rows)
+        if row.get("timeline_status") == "available"
+        and row.get("stage") in LEARNING_PREMATCH_STAGE_ORDER
+        and int(row.get("snapshot_at") or 0) <= int(now_ts)
+    ]
+    latest = latest_prematch_snapshot(available)
+    if not latest:
+        return None
+    evidence_hash = str(latest.get("source_content_hash") or "").strip() or _content_hash({
+        "stage": latest.get("stage"),
+        "snapshot_at": latest.get("snapshot_at"),
+        "market_snapshot": latest.get("market_snapshot"),
+        "market_dynamics": latest.get("market_dynamics"),
+        "team_news_snapshot": latest.get("team_news_snapshot"),
+    })
+    return {
+        "stage": latest.get("stage"),
+        "snapshot_at": int(latest.get("snapshot_at") or 0),
+        "evidence_hash": evidence_hash,
+    }
+
+
+def _learning_freeze_analysis_node(row: Dict[str, Any]) -> Optional[str]:
+    node = get_nested(row, ["analysis", "analysis_node"])
+    if node in LEARNING_PREMATCH_STAGE_ORDER:
+        return node
+    captured_at = int(row.get("captured_at") or 0)
+    kickoff_at = int(row.get("kickoff_at") or 0)
+    return scheduled_learning_analysis_node(captured_at, kickoff_at)
+
+
+def learning_candidate_analysis_state(
+    candidate: Dict[str, Any],
+    store: Dict[str, Any],
+    now_ts: int,
+) -> Dict[str, Any]:
+    """Decide whether one new PIT analysis version is due, without fetching new facts."""
+    fixture = str(candidate.get("fixture_id") or "").strip()
+    kickoff_at = _parse_timestamp(candidate.get("timestamp"))
+    scheduled_node = scheduled_learning_analysis_node(now_ts, kickoff_at or 0)
+    rows = [row for row in ((store.get("learning_frozen") or {}).get(fixture) or []) if isinstance(row, dict)]
+    latest_freeze = max(rows, key=lambda row: int(row.get("version_number") or 0), default=None)
+    marker = _learning_snapshot_marker(store, fixture, now_ts)
+    target_node = scheduled_node
+    if marker and marker.get("stage") in LEARNING_PREMATCH_STAGE_ORDER:
+        marker_stage = marker["stage"]
+        if target_node not in LEARNING_PREMATCH_STAGE_ORDER or (
+            LEARNING_PREMATCH_STAGE_ORDER.index(marker_stage) > LEARNING_PREMATCH_STAGE_ORDER.index(target_node)
+        ):
+            target_node = marker_stage
+    latest_node = _learning_freeze_analysis_node(latest_freeze or {})
+    due_reason = None
+    if target_node is None:
+        due_reason = "analysis_clock_node_not_due"
+    elif latest_freeze is None:
+        due_reason = "initial_analysis_node_due"
+    elif latest_node not in LEARNING_PREMATCH_STAGE_ORDER:
+        due_reason = "legacy_freeze_missing_analysis_node"
+    elif LEARNING_PREMATCH_STAGE_ORDER.index(target_node) > LEARNING_PREMATCH_STAGE_ORDER.index(latest_node):
+        due_reason = "analysis_node_advanced"
+    else:
+        last_source_hash = str(get_nested(latest_freeze, ["analysis", "source_snapshot_hash"]) or "").strip()
+        marker_hash = str((marker or {}).get("evidence_hash") or "").strip()
+        marker_stage = (marker or {}).get("stage")
+        if marker_hash and marker_hash != last_source_hash and marker_stage == target_node:
+            due_reason = "new_snapshot_evidence_at_current_node"
+        else:
+            latest_capture = int(latest_freeze.get("captured_at") or 0)
+            pending = [
+                task for task in (store.get("fundamental_revalidation_queue") or {}).values()
+                if isinstance(task, dict)
+                and str(task.get("fixture") or "") == fixture
+                and task.get("status") == "pending"
+                and int(task.get("created_at") or 0) > latest_capture
+                and task.get("stage") in LEARNING_PREMATCH_STAGE_ORDER
+                and LEARNING_PREMATCH_STAGE_ORDER.index(task["stage"]) <= LEARNING_PREMATCH_STAGE_ORDER.index(target_node)
+            ]
+            if pending:
+                due_reason = "material_revalidation_trigger"
+    analysis_due = due_reason not in {None, "analysis_clock_node_not_due"}
+    return {
+        "already_frozen": latest_freeze is not None,
+        "latest_freeze_id": (latest_freeze or {}).get("freeze_id"),
+        "latest_freeze_version": (latest_freeze or {}).get("version_number"),
+        "latest_analysis_node": latest_node,
+        "scheduled_analysis_node": scheduled_node,
+        "target_analysis_node": target_node,
+        "source_snapshot_stage": (marker or {}).get("stage"),
+        "source_snapshot_at": (marker or {}).get("snapshot_at"),
+        "source_snapshot_hash": (marker or {}).get("evidence_hash"),
+        "analysis_due": analysis_due,
+        "analysis_due_reason": due_reason or "no_new_node_or_material_evidence",
+    }
+
+
+def learning_cycle_plan(
+    now_ts: Optional[int] = None,
+    fixture_rows: Optional[List[Dict[str, Any]]] = None,
+    include_discovery: bool = True,
+) -> Dict[str, Any]:
+    """Build a non-mutating daily work plan; never invent analysis or process classifications."""
+    now_ts = int(now_ts or time.time())
+    discovery = discover_learning_fixtures(now_ts=now_ts, fixture_rows=fixture_rows) if include_discovery else {
+        "ok": True, "generated_at": now_ts, "window_start": now_ts,
+        "window_end": now_ts + LEARNING_DISCOVERY_HORIZON_HOURS * 3600,
+        "horizon_hours": LEARNING_DISCOVERY_HORIZON_HOURS,
+        "candidate_count": 0, "candidates": [], "excluded_count": 0,
+        "excluded_counts": {}, "source_audit": [{"source": "deferred_until_postmatch_phase", "ok": True}],
+        "policy": "future fixture discovery is deferred until postmatch processing completes",
+    }
+    store = load_snapshot_store()
+    frozen = store.get("learning_frozen") or {}
+    postmatches = store.get("learning_postmatch") or {}
+    settlement_due = []
+    for fixture, versions in frozen.items():
+        latest = max((row for row in versions or [] if isinstance(row, dict)), key=lambda row: int(row.get("version_number") or 0), default=None)
+        if not latest or latest.get("freeze_id") in postmatches:
+            continue
+        kickoff_at = int(latest.get("kickoff_at") or 0)
+        age = now_ts - kickoff_at
+        if 2 * 3600 <= age <= LEARNING_POSTMATCH_LOOKBACK_HOURS * 3600:
+            settlement_due.append({
+                "fixture": fixture, "freeze_id": latest.get("freeze_id"),
+                "kickoff_at": kickoff_at, "hours_since_kickoff": round(age / 3600, 2),
+                "required_action": "verify_result_and_events_then_classify_process_without_result_backfit",
+            })
+    existing_fact_versions = store.get("learning_postmatch_facts") or {}
+    fact_collection_due = [
+        row for row in settlement_due
+        if not (existing_fact_versions.get(str(row.get("freeze_id"))) or [])
+    ]
+    existing_draft_versions = store.get("learning_postmatch_drafts") or {}
+    review_draft_due = []
+    for row in settlement_due:
+        freeze_id = str(row.get("freeze_id") or "")
+        fact_versions = existing_fact_versions.get(freeze_id) or []
+        if not fact_versions:
+            continue
+        latest_fact = max(fact_versions, key=lambda item: int(item.get("version_number") or 0))
+        if get_nested(latest_fact, ["verification", "settlement_eligible"]) is not True:
+            continue
+        draft_versions = existing_draft_versions.get(freeze_id) or []
+        latest_draft = max(draft_versions, key=lambda item: int(item.get("version_number") or 0), default=None)
+        if not latest_draft or latest_draft.get("fact_hash") != latest_fact.get("fact_hash"):
+            review_draft_due.append({**row, "fact_hash": latest_fact.get("fact_hash")})
+    local_date = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(ZoneInfo("Asia/Shanghai")).date()
+    frozen_today = [
+        row for versions in frozen.values() for row in versions or []
+        if datetime.fromtimestamp(int(row.get("captured_at") or 0), tz=timezone.utc).astimezone(ZoneInfo("Asia/Shanghai")).date() == local_date
+    ]
+    admitted_today = [row for row in frozen_today if int(row.get("version_number") or 0) == 1]
+    reanalyses_today = [row for row in frozen_today if int(row.get("version_number") or 0) > 1]
+    discovery_candidates = []
+    for row in discovery["candidates"]:
+        discovery_candidates.append({**row, **learning_candidate_analysis_state(row, store, now_ts)})
+    return {
+        "version": VERSION, "generated_at": now_ts,
+        "settlement_due_count": len(settlement_due), "settlement_due": sorted(settlement_due, key=lambda row: row["kickoff_at"]),
+        "postmatch_fact_collection_due_count": len(fact_collection_due),
+        "postmatch_fact_collection_due": sorted(fact_collection_due, key=lambda row: row["kickoff_at"]),
+        "postmatch_review_draft_due_count": len(review_draft_due),
+        "postmatch_review_draft_due": sorted(review_draft_due, key=lambda row: row["kickoff_at"]),
+        "discovery": {**discovery, "candidates": discovery_candidates},
+        "learning_prematch_stages": LEARNING_PREMATCH_STAGE_ORDER,
+        "daily_freeze_cap": None,
+        "daily_new_fixture_cap": None,
+        "daily_reanalysis_cap": None,
+        "match_limit": None,
+        "full_historical_odds_sample_limit": None,
+        "frozen_today_count": len(frozen_today),
+        "admitted_today_count": len(admitted_today),
+        "reanalysis_today_count": len(reanalyses_today),
+        "remaining_freeze_capacity": None,
+        "remaining_new_fixture_capacity": None,
+        "remaining_reanalysis_capacity": None,
+        "mutation_policy": "plan_only; freezing requires a complete PIT analysis and settlement requires verified facts plus an explicit process classification",
+        "automatic_champion_promotion": False,
+    }
+
+
+def build_learning_freeze_payload(candidate: Dict[str, Any], packet: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Convert one PIT prematch packet into the immutable learning schema without inventing missing fields."""
+    now_ts = int(now_ts or time.time())
+    candidate = candidate if isinstance(candidate, dict) else {}
+    packet = packet if isinstance(packet, dict) else {}
+    fixture = str(candidate.get("fixture_id") or "").strip()
+    kickoff_at = _parse_timestamp(candidate.get("timestamp"))
+    if not fixture or kickoff_at is None:
+        raise HTTPException(status_code=422, detail="learning_candidate_identity_or_kickoff_missing")
+    if str(candidate.get("status") or "").upper() != "NS" or now_ts >= kickoff_at:
+        raise HTTPException(status_code=409, detail="automatic_learning_freeze_requires_not_started_fixture")
+    if packet.get("ok") is not True:
+        raise HTTPException(status_code=422, detail="prematch_packet_not_ready")
+    if get_nested(packet, ["analysis_rules", "prematch_only"]) is not True:
+        raise HTTPException(status_code=422, detail="prematch_only_packet_required")
+    packet_fixture = packet.get("fixture") if isinstance(packet.get("fixture"), dict) else {}
+    packet_fixture_id = str(packet_fixture.get("fixture_id") or packet_fixture.get("id") or packet.get("fixture_id") or "").strip()
+    if packet_fixture_id and packet_fixture_id != fixture:
+        raise HTTPException(status_code=409, detail="prematch_packet_fixture_mismatch")
+    generated_at = _parse_timestamp(packet.get("generated_at")) or now_ts
+    if generated_at > now_ts + 60:
+        raise HTTPException(status_code=409, detail="prematch_packet_timestamp_in_future")
+    if generated_at >= kickoff_at:
+        raise HTTPException(status_code=409, detail="prematch_packet_generated_after_kickoff")
+    decision = copy.deepcopy(packet.get("decision_layer")) if isinstance(packet.get("decision_layer"), dict) else {}
+    if not decision:
+        decision = {"decision": "PASS", "pass_reasons": ["decision_layer_data_missing"]}
+    probability_replay = packet.get("probability_replay") if isinstance(packet.get("probability_replay"), dict) else {
+        "schema": "learning_probability_replay_v1",
+        "status": "data_missing",
+        "decision_eligible": False,
+        "blockers": ["learning_probability_replay_inputs_missing"],
+    }
+    replay_audit = audit_learning_probability_replay(
+        probability_replay,
+        expected_fixture=fixture,
+        data_cutoff_at=generated_at,
+        kickoff_at=kickoff_at,
+    )
+    if replay_audit.get("status") == "invalid":
+        raise HTTPException(status_code=422, detail={"error": "learning_probability_replay_invalid", "audit": replay_audit})
+    if replay_audit.get("decision_eligible") is not True:
+        reasons = decision.get("pass_reasons") if isinstance(decision.get("pass_reasons"), list) else []
+        decision["pass_reasons"] = list(dict.fromkeys([*reasons, "learning_probability_replay_inputs_missing"]))
+        decision["decision"] = "PASS"
+        decision["execution_action"] = "PASS"
+        decision["best_market"] = None
+    elif decision.get("model_probability") != get_nested(probability_replay, ["model", "probabilities"]):
+        raise HTTPException(status_code=422, detail="decision_model_probability_not_bound_to_replay_contract")
+    elif decision.get("probability_replay_hash") != probability_replay.get("replay_hash"):
+        raise HTTPException(status_code=422, detail="decision_probability_replay_hash_mismatch")
+    packet_timeline = get_nested(packet, ["market", "timeline"], []) or []
+    available_packet_rows = []
+    for row in packet_timeline:
+        if not isinstance(row, dict) or row.get("status") != "available" or row.get("stage") not in LEARNING_PREMATCH_STAGE_ORDER:
+            continue
+        snapshot_at = _parse_timestamp(row.get("snapshot_at"))
+        if snapshot_at is None or snapshot_at > generated_at:
+            continue
+        if audit_stage_timing(row["stage"], snapshot_at, kickoff_at).get("status") == "invalid":
+            continue
+        available_packet_rows.append(row)
+    latest_packet_row = max(
+        available_packet_rows,
+        key=lambda row: (LEARNING_PREMATCH_STAGE_ORDER.index(row["stage"]), int(row.get("snapshot_at") or 0)),
+        default=None,
+    )
+    actionable_decision = (
+        decision.get("decision") != "PASS"
+        or decision.get("execution_action") in {"BET", "WAIT", "PENDING_MARKET_LANGUAGE"}
+        or isinstance(decision.get("best_market"), dict)
+    )
+    if replay_audit.get("decision_eligible") is True:
+        market_binding = decision.get("market_evidence_binding") if isinstance(decision.get("market_evidence_binding"), dict) else {}
+        if market_binding.get("current_unpersisted_quote_used") is not False:
+            raise HTTPException(status_code=422, detail="unpersisted_current_quote_cannot_drive_learning_decision")
+        if actionable_decision and (
+            not latest_packet_row
+            or market_binding.get("source") != "persisted_timing_audited_snapshot"
+            or market_binding.get("stage") != latest_packet_row.get("stage")
+            or _parse_timestamp(market_binding.get("snapshot_at")) != _parse_timestamp(latest_packet_row.get("snapshot_at"))
+            or market_binding.get("source_content_hash") != latest_packet_row.get("source_content_hash")
+        ):
+            raise HTTPException(status_code=422, detail="actionable_decision_market_snapshot_not_hash_bound")
+    target_node = candidate.get("target_analysis_node")
+    if latest_packet_row and (
+        target_node not in LEARNING_PREMATCH_STAGE_ORDER
+        or LEARNING_PREMATCH_STAGE_ORDER.index(latest_packet_row["stage"]) > LEARNING_PREMATCH_STAGE_ORDER.index(target_node)
+    ):
+        target_node = latest_packet_row["stage"]
+    if target_node not in LEARNING_PREMATCH_STAGE_ORDER:
+        target_node = scheduled_learning_analysis_node(generated_at, kickoff_at)
+    if target_node not in LEARNING_PREMATCH_STAGE_ORDER:
+        raise HTTPException(status_code=409, detail="learning_analysis_node_not_due")
+    if target_node == "Opening" and (not latest_packet_row or latest_packet_row.get("stage") != "Opening"):
+        raise HTTPException(status_code=409, detail="verified_opening_snapshot_required_for_learning_node")
+    packet_source_hash = str((latest_packet_row or {}).get("source_content_hash") or "").strip()
+    if not packet_source_hash and latest_packet_row:
+        packet_source_hash = _content_hash(latest_packet_row)
+    analysis = {
+        "prematch_only": True,
+        "packet_generated_at": generated_at,
+        "analysis_node": target_node,
+        "required_learning_timeline": LEARNING_PREMATCH_STAGE_ORDER,
+        "analysis_trigger": candidate.get("analysis_due_reason") or "explicit_prematch_packet",
+        "source_snapshot_stage": (latest_packet_row or {}).get("stage") or candidate.get("source_snapshot_stage"),
+        "source_snapshot_at": (latest_packet_row or {}).get("snapshot_at") or candidate.get("source_snapshot_at"),
+        "source_snapshot_hash": packet_source_hash or candidate.get("source_snapshot_hash"),
+        "data_quality": packet.get("data_quality"),
+        "coverage": packet.get("coverage"),
+        "probability_replay": probability_replay,
+        "probability_replay_audit": replay_audit,
+        "fundamental_chain": packet.get("pure_fundamental_script") or packet.get("fundamentals") or {"status": "data_missing"},
+        "state_tree": get_nested(packet, ["pure_fundamental_script", "chain", "game_state_elasticity"], {"status": "data_missing"}),
+        "market_timeline": packet.get("market") or {"status": "data_missing"},
+        "market_language": decision.get("market_language") or get_nested(packet, ["market", "latest_dynamics"], {"status": "data_missing"}),
+        "expression_optimizer": decision.get("expression_optimizer") or {"action": "PASS", "reason": "data_missing"},
+        "analysis_rules": packet.get("analysis_rules") or {},
+        "missing_data_policy": "preserve_data_missing; never backfill from post-kickoff information",
+    }
+    scope = candidate.get("scope") if isinstance(candidate.get("scope"), dict) else {}
+    provider_identity = packet.get("provider_identity") if isinstance(packet.get("provider_identity"), dict) else {}
+    provider_identities = [row for row in (packet.get("provider_identities") or []) if isinstance(row, dict)]
+    if provider_identity and not any(row.get("source") == provider_identity.get("source") for row in provider_identities):
+        provider_identities.append(provider_identity)
+    frozen_source_refs = [
+        {"source": "api_football", "fixture_id": fixture, "captured_at": generated_at},
+        {"source": str(packet.get("source") or "shadow_ai_packet"), "packet_version": str(packet.get("version") or VERSION)},
+    ]
+    for identity in provider_identities:
+        if identity.get("source") == "the_odds_api":
+            canonical = {
+                "source": "the_odds_api",
+                "sport_key": str(identity.get("sport_key") or "").strip().lower(),
+                "event_id": str(identity.get("event_id") or "").strip().lower(),
+                "home_team": str(identity.get("home_team") or "").strip(),
+                "away_team": str(identity.get("away_team") or "").strip(),
+            }
+            required = ("sport_key", "event_id", "home_team", "away_team")
+        elif identity.get("source") == "thestats":
+            canonical = {
+                "source": "thestats",
+                "match_id": str(identity.get("match_id") or "").strip(),
+                "kickoff_at": _parse_timestamp(identity.get("kickoff_at")),
+                "home_team": str(identity.get("home_team") or "").strip(),
+                "away_team": str(identity.get("away_team") or "").strip(),
+            }
+            required = ("match_id", "kickoff_at", "home_team", "away_team")
+        else:
+            continue
+        if all(canonical[key] not in (None, "") for key in required) and identity.get("source_hash") == _content_hash(canonical):
+            frozen_source_refs.append({
+                **canonical,
+                "identity_bound_at": generated_at,
+                "identity_source_hash": identity["source_hash"],
+            })
+    return {
+        "fixture": fixture,
+        "scope": scope,
+        "captured_at": generated_at,
+        "data_cutoff_at": generated_at,
+        "kickoff_at": kickoff_at,
+        "versions": {
+            "service": VERSION,
+            "model": str(packet.get("version") or VERSION),
+            "rules": LEARNING_RULES_VERSION,
+            "league_dna": "candidate_only" if league_dna_model_view(scope).get("candidate_tag_count") else "data_missing",
+        },
+        "analysis": analysis,
+        "decision": decision,
+        "source_refs": frozen_source_refs,
+    }
+
+
+def learning_node_execution_key(candidate: Dict[str, Any]) -> str:
+    """Identify one retryable node job without using mutable wall-clock fields."""
+    candidate = candidate if isinstance(candidate, dict) else {}
+    identity = {
+        "fixture": str(candidate.get("fixture_id") or candidate.get("fixture") or ""),
+        "target_analysis_node": candidate.get("target_analysis_node"),
+        "latest_freeze_id": candidate.get("latest_freeze_id"),
+        "latest_freeze_version": candidate.get("latest_freeze_version"),
+        "source_snapshot_hash": candidate.get("source_snapshot_hash"),
+        "analysis_due_reason": candidate.get("analysis_due_reason"),
+    }
+    return "node:" + _content_hash(identity)
+
+
+def _learning_node_attempt_gate(
+    execution_key: str, now_ts: int, store: Dict[str, Any],
+) -> Optional[str]:
+    attempt = (store.get("learning_node_attempts") or {}).get(execution_key)
+    if not isinstance(attempt, dict):
+        return None
+    status = str(attempt.get("status") or "")
+    if status == "completed":
+        return "node_attempt_already_completed"
+    if status == "running" and int(attempt.get("lease_expires_at") or 0) > now_ts:
+        return "node_execution_lease_active"
+    if status == "failed" and int(attempt.get("retry_after_at") or 0) > now_ts:
+        return "node_retry_backoff_active"
+    return None
+
+
+def claim_learning_node_execution(candidate: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Acquire an in-store lease so one worker owns one node/evidence job at a time."""
+    now_ts = int(now_ts or time.time())
+    execution_key = str(candidate.get("execution_key") or learning_node_execution_key(candidate))
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        attempts = store.setdefault("learning_node_attempts", {})
+        existing = attempts.get(execution_key) if isinstance(attempts.get(execution_key), dict) else {}
+        gate = _learning_node_attempt_gate(execution_key, now_ts, store)
+        if gate:
+            return {
+                "claimed": False, "execution_key": execution_key, "reason": gate,
+                "status": existing.get("status"), "attempt_count": int(existing.get("attempt_count") or 0),
+                "retry_after_at": existing.get("retry_after_at"),
+                "lease_expires_at": existing.get("lease_expires_at"),
+            }
+        attempt_count = int(existing.get("attempt_count") or 0) + 1
+        claim_token = _content_hash({
+            "execution_key": execution_key, "attempt_count": attempt_count,
+            "claimed_at": now_ts, "thread": threading.get_ident(),
+        })
+        record = {
+            "execution_key": execution_key,
+            "fixture": str(candidate.get("fixture_id") or candidate.get("fixture") or ""),
+            "target_analysis_node": candidate.get("target_analysis_node"),
+            "analysis_due_reason": candidate.get("analysis_due_reason"),
+            "source_snapshot_hash": candidate.get("source_snapshot_hash"),
+            "latest_freeze_id": candidate.get("latest_freeze_id"),
+            "attempt_count": attempt_count,
+            "first_attempt_at": int(existing.get("first_attempt_at") or now_ts),
+            "last_attempt_at": now_ts,
+            "status": "running",
+            "claim_token": claim_token,
+            "lease_expires_at": now_ts + LEARNING_NODE_LEASE_SECONDS,
+            "retry_after_at": None,
+            "last_error_type": None,
+            "last_error": None,
+            "completed_at": None,
+            "freeze_id": None,
+            "immutable_job_identity": True,
+            "champion_effect": False,
+        }
+        attempts[execution_key] = record
+        if len(attempts) > LEARNING_NODE_ATTEMPT_RETENTION:
+            removable = sorted(
+                (
+                    (key, row) for key, row in attempts.items()
+                    if key != execution_key and isinstance(row, dict) and row.get("status") != "running"
+                ),
+                key=lambda item: int(item[1].get("last_attempt_at") or 0),
+            )
+            for key, _ in removable[:max(0, len(attempts) - LEARNING_NODE_ATTEMPT_RETENTION)]:
+                attempts.pop(key, None)
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return {**record, "claimed": True}
+
+
+def complete_learning_node_execution(
+    execution_key: str, claim_token: str, outcome: str,
+    now_ts: Optional[int] = None, freeze_id: Optional[str] = None,
+    error_type: Optional[str] = None, error: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Close a claimed job and persist bounded retry timing without storing exception bodies."""
+    now_ts = int(now_ts or time.time())
+    if outcome not in {"completed", "failed"}:
+        raise ValueError("learning_node_outcome_must_be_completed_or_failed")
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        attempts = store.setdefault("learning_node_attempts", {})
+        record = attempts.get(str(execution_key))
+        if not isinstance(record, dict):
+            raise HTTPException(status_code=404, detail="learning_node_attempt_not_found")
+        if not hmac.compare_digest(str(record.get("claim_token") or ""), str(claim_token or "")):
+            raise HTTPException(status_code=409, detail="learning_node_claim_superseded")
+        updated = {**record, "status": outcome, "lease_expires_at": None}
+        if outcome == "completed":
+            updated.update({
+                "completed_at": now_ts, "freeze_id": str(freeze_id or "") or None,
+                "retry_after_at": None, "last_error_type": None, "last_error": None,
+            })
+        else:
+            attempt_count = max(1, int(record.get("attempt_count") or 1))
+            retry_seconds = min(
+                LEARNING_NODE_RETRY_MAX_SECONDS,
+                LEARNING_NODE_RETRY_BASE_SECONDS * (2 ** min(attempt_count - 1, 8)),
+            )
+            updated.update({
+                "completed_at": None, "freeze_id": None,
+                "retry_after_at": now_ts + retry_seconds,
+                "last_error_type": str(error_type or "NodeExecutionError")[:100],
+                "last_error": str(error or "node_execution_failed")[:300],
+            })
+        attempts[str(execution_key)] = updated
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return updated
+
+
+def learning_node_execution_plan(now_ts: Optional[int] = None, store_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Plan node updates only for fixtures already admitted by the daily governance cycle."""
+    now_ts = int(now_ts or time.time())
+    store = store_override if isinstance(store_override, dict) else load_snapshot_store()
+    postmatches = store.get("learning_postmatch") or {}
+    frozen = store.get("learning_frozen") or {}
+    admissions = dict(store.get("learning_admissions") or {})
+    # Compatibility for already frozen fixtures created before the admission
+    # ledger existed. They remain eligible for node continuation only.
+    for fixture, versions in frozen.items():
+        latest = max(
+            (row for row in versions or [] if isinstance(row, dict)),
+            key=lambda row: int(row.get("version_number") or 0),
+            default=None,
+        )
+        if latest and str(fixture) not in admissions:
+            admissions[str(fixture)] = {
+                "fixture": str(fixture), "kickoff_at": latest.get("kickoff_at"),
+                "scope": latest.get("scope"), "admitted_at": latest.get("captured_at"),
+                "admission_hash": None, "legacy_from_freeze": True,
+            }
+    due, skipped = [], []
+    for fixture, admission in admissions.items():
+        versions = frozen.get(str(fixture)) or []
+        latest = max(
+            (row for row in versions if isinstance(row, dict)),
+            key=lambda row: int(row.get("version_number") or 0),
+            default=None,
+        )
+        freeze_id = str((latest or {}).get("freeze_id") or "")
+        kickoff_at = int(admission.get("kickoff_at") or (latest or {}).get("kickoff_at") or 0)
+        if (freeze_id and freeze_id in postmatches) or now_ts >= kickoff_at:
+            skipped.append({"fixture": str(fixture), "reason": "already_settled_or_kicked_off"})
+            continue
+        scope_audit = audit_learning_scope(admission.get("scope") or (latest or {}).get("scope"))
+        if not scope_audit["eligible"]:
+            skipped.append({
+                "fixture": str(fixture), "reason": "major_league_registry_no_longer_eligible",
+                "scope_reasons": scope_audit["reasons"],
+            })
+            continue
+        candidate = {
+            "fixture_id": str(fixture),
+            "timestamp": kickoff_at,
+            "date": datetime.fromtimestamp(kickoff_at, tz=timezone.utc).isoformat(),
+            "status": "NS",
+            "scope": scope_audit["normalized"],
+            "admission_freeze_id": freeze_id or None,
+            "admission_hash": admission.get("admission_hash"),
+            "admission_registry_version": admission.get("major_league_registry_version")
+                or get_nested(admission, ["scope", "major_league_registry_version"]),
+        }
+        state = learning_candidate_analysis_state(candidate, store, now_ts)
+        row = {**candidate, **state}
+        row["execution_key"] = learning_node_execution_key(row)
+        if state["analysis_due"]:
+            attempt_gate = _learning_node_attempt_gate(row["execution_key"], now_ts, store)
+            if attempt_gate:
+                attempt = (store.get("learning_node_attempts") or {}).get(row["execution_key"]) or {}
+                skipped.append({
+                    "fixture": str(fixture), "reason": attempt_gate,
+                    "target_analysis_node": state["target_analysis_node"],
+                    "execution_key": row["execution_key"],
+                    "attempt_count": int(attempt.get("attempt_count") or 0),
+                    "retry_after_at": attempt.get("retry_after_at"),
+                    "lease_expires_at": attempt.get("lease_expires_at"),
+                })
+            else:
+                due.append(row)
+        else:
+            skipped.append({
+                "fixture": str(fixture),
+                "reason": state["analysis_due_reason"],
+                "latest_analysis_node": state["latest_analysis_node"],
+                "target_analysis_node": state["target_analysis_node"],
+            })
+    due.sort(key=lambda row: (int(row.get("timestamp") or 0), str(row.get("fixture_id"))))
+    return {
+        "version": VERSION,
+        "generated_at": now_ts,
+        "due_count": len(due),
+        "due": due,
+        "skipped_count": len(skipped),
+        "skipped": skipped[:100],
+        "discovery_performed": False,
+        "scope_expansion_allowed": False,
+        "allowed_nodes": LEARNING_PREMATCH_STAGE_ORDER,
+        "policy": "node executor may only version fixtures previously admitted by the daily governance cycle; it cannot discover or expand scope",
+    }
+
+
+def run_learning_node_executor(
+    now_ts: Optional[int] = None,
+    apply_changes: bool = True,
+    prematch_packet_builder: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Advance PIT analysis nodes without rediscovering fixtures or running postmatch learning."""
+    now_ts = int(now_ts or time.time())
+    if not isinstance(apply_changes, bool):
+        raise HTTPException(status_code=400, detail="apply_changes_must_be_boolean")
+    plan = learning_node_execution_plan(now_ts=now_ts)
+    builder = prematch_packet_builder or build_shadow_ai_packet
+    results = []
+    for candidate in plan["due"]:
+        fixture = str(candidate.get("fixture_id") or "")
+        if not apply_changes:
+            results.append({
+                "fixture": fixture,
+                "action": "would_advance_node",
+                "target_analysis_node": candidate.get("target_analysis_node"),
+                "reason": candidate.get("analysis_due_reason"),
+            })
+            continue
+        claim = claim_learning_node_execution(candidate, now_ts=now_ts)
+        if not claim.get("claimed"):
+            results.append({
+                "fixture": fixture, "action": "skipped", "reason": claim.get("reason"),
+                "execution_key": claim.get("execution_key"),
+                "attempt_count": claim.get("attempt_count"),
+                "retry_after_at": claim.get("retry_after_at"),
+                "lease_expires_at": claim.get("lease_expires_at"),
+            })
+            continue
+        execution_key = str(claim.get("execution_key") or "")
+        claim_token = str(claim.get("claim_token") or "")
+        try:
+            packet = builder(int(fixture))
+            freeze_payload = build_learning_freeze_payload(candidate, packet, now_ts=now_ts)
+            record = freeze_learning_sample(freeze_payload, now_ts=now_ts)
+            complete_learning_node_execution(
+                execution_key, claim_token, "completed", now_ts=now_ts,
+                freeze_id=record.get("freeze_id"),
+            )
+            results.append({
+                "fixture": fixture,
+                "freeze_id": record.get("freeze_id"),
+                "action": record.get("action"),
+                "analysis_node": get_nested(record, ["analysis", "analysis_node"]),
+                "reason": candidate.get("analysis_due_reason"),
+                "source_snapshot_hash": get_nested(record, ["analysis", "source_snapshot_hash"]),
+                "execution_key": execution_key,
+                "attempt_count": claim.get("attempt_count"),
+            })
+        except HTTPException as exc:
+            try:
+                complete_learning_node_execution(
+                    execution_key, claim_token, "failed", now_ts=now_ts,
+                    error_type="HTTPException", error=exc.detail,
+                )
+            except HTTPException:
+                pass
+            results.append({
+                "fixture": fixture, "action": "rejected",
+                "status_code": exc.status_code, "reason": exc.detail,
+                "execution_key": execution_key, "attempt_count": claim.get("attempt_count"),
+            })
+        except Exception as exc:
+            try:
+                complete_learning_node_execution(
+                    execution_key, claim_token, "failed", now_ts=now_ts,
+                    error_type=type(exc).__name__, error="prematch_node_packet_build_failed",
+                )
+            except HTTPException:
+                pass
+            results.append({
+                "fixture": fixture, "action": "rejected",
+                "reason": "prematch_node_packet_build_failed", "error_type": type(exc).__name__,
+                "execution_key": execution_key, "attempt_count": claim.get("attempt_count"),
+            })
+    return {
+        "version": VERSION,
+        "generated_at": now_ts,
+        "plan": plan,
+        "results": results,
+        "advanced_count": sum(row.get("action") == "frozen" for row in results),
+        "unchanged_count": sum(row.get("action") == "unchanged" for row in results),
+        "lease_skipped_count": sum(row.get("action") == "skipped" for row in results),
+        "rejected_count": sum(row.get("action") == "rejected" for row in results),
+        "discovery_performed": False,
+        "postmatch_learning_performed": False,
+        "automatic_champion_change": False,
+    }
+
+
+def automatic_learning_data_health(
+    now_ts: Optional[int] = None, store_override: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Audit admitted-fixture progress and retry state without calling providers."""
+    now_ts = int(now_ts or time.time())
+    store = store_override if isinstance(store_override, dict) else load_snapshot_store()
+    admissions = store.get("learning_admissions") or {}
+    frozen = store.get("learning_frozen") or {}
+    postmatches = store.get("learning_postmatch") or {}
+    attempts = store.get("learning_node_attempts") or {}
+    grace_seconds = max(AUTO_SNAPSHOT_POLL_SECONDS * 2, 600)
+    records = []
+    expired_unfrozen_count = 0
+    overdue_node_count = 0
+    postmatch_overdue_count = 0
+    missing_checkpoint_count = 0
+    active_execution_keys = set()
+    for fixture, admission in admissions.items():
+        if not isinstance(admission, dict):
+            continue
+        kickoff_at = int(admission.get("kickoff_at") or 0)
+        versions = [row for row in (frozen.get(str(fixture)) or []) if isinstance(row, dict)]
+        latest = max(versions, key=lambda row: int(row.get("version_number") or 0), default=None)
+        latest_node = _learning_freeze_analysis_node(latest or {})
+        present_nodes = {
+            node for node in (_learning_freeze_analysis_node(row) for row in versions)
+            if node in LEARNING_PREMATCH_STAGE_ORDER
+        }
+        missing_checkpoints = []
+        if kickoff_at > 0:
+            seconds_before = kickoff_at - now_ts
+            for node, threshold in (("T-12h", 12 * 3600), ("T-6h", 6 * 3600), ("T-1h", 3600)):
+                if seconds_before <= threshold and node not in present_nodes:
+                    missing_checkpoints.append(node)
+        missing_checkpoint_count += len(missing_checkpoints)
+        state = "waiting_for_first_node"
+        execution_key = None
+        retry_after_at = None
+        if kickoff_at <= 0:
+            state = "invalid_admission"
+        elif now_ts >= kickoff_at:
+            if not latest:
+                state = "expired_without_freeze"
+                expired_unfrozen_count += 1
+            elif latest.get("freeze_id") in postmatches:
+                state = "postmatch_completed"
+            elif now_ts - kickoff_at > LEARNING_POSTMATCH_LOOKBACK_HOURS * 3600:
+                state = "postmatch_window_overdue"
+                postmatch_overdue_count += 1
+            elif now_ts - kickoff_at >= 2 * 3600:
+                state = "postmatch_due"
+            else:
+                state = "awaiting_postmatch_window"
+        else:
+            candidate = {
+                "fixture_id": str(fixture), "timestamp": kickoff_at, "status": "NS",
+                "scope": admission.get("scope") or (latest or {}).get("scope"),
+            }
+            scope_audit = audit_learning_scope(candidate["scope"])
+            if not scope_audit["eligible"]:
+                state = "registry_ineligible"
+            else:
+                analysis_state = learning_candidate_analysis_state(candidate, store, now_ts)
+                if analysis_state["analysis_due"]:
+                    node_job = {**candidate, **analysis_state}
+                    execution_key = learning_node_execution_key(node_job)
+                    active_execution_keys.add(execution_key)
+                    attempt = attempts.get(execution_key) if isinstance(attempts.get(execution_key), dict) else {}
+                    gate = _learning_node_attempt_gate(execution_key, now_ts, store)
+                    retry_after_at = attempt.get("retry_after_at")
+                    state = {
+                        "node_execution_lease_active": "node_running",
+                        "node_retry_backoff_active": "node_retry_backoff",
+                        "node_attempt_already_completed": "node_completed_pending_state_refresh",
+                    }.get(gate, "node_due")
+                    target_node = analysis_state.get("target_analysis_node")
+                    threshold = {"T-12h": 12 * 3600, "T-6h": 6 * 3600, "T-1h": 3600}.get(target_node)
+                    due_at = kickoff_at - threshold if threshold is not None else int(analysis_state.get("source_snapshot_at") or now_ts)
+                    if now_ts > due_at + grace_seconds and state in {"node_due", "node_retry_backoff"}:
+                        overdue_node_count += 1
+                elif latest:
+                    state = "node_current"
+        records.append({
+            "fixture": str(fixture), "kickoff_at": kickoff_at, "state": state,
+            "latest_analysis_node": latest_node, "frozen_version_count": len(versions),
+            "missing_checkpoints": missing_checkpoints,
+            "execution_key": execution_key, "retry_after_at": retry_after_at,
+        })
+    records.sort(key=lambda row: (row["kickoff_at"], row["fixture"]))
+    attempt_rows = [row for row in attempts.values() if isinstance(row, dict)]
+    attempt_status_counts = {
+        status: sum(row.get("status") == status for row in attempt_rows)
+        for status in ("running", "failed", "completed")
+    }
+    unresolved_failed_attempt_count = sum(
+        row.get("status") == "failed" and row.get("execution_key") in active_execution_keys
+        for row in attempt_rows
+    )
+    stale_lease_count = sum(
+        row.get("status") == "running" and int(row.get("lease_expires_at") or 0) <= now_ts
+        and row.get("execution_key") in active_execution_keys for row in attempt_rows
+    )
+    observation_plan = market_language_settlement_plan(now_ts=now_ts, store_override=store)
+    observation_due_count = observation_plan["due_count"]
+    postmatch_recovery = learning_postmatch_recovery_queue(now_ts=now_ts, store_override=store)
+    postmatch_overdue_count = postmatch_recovery["manual_recovery_required_count"]
+    critical = expired_unfrozen_count > 0
+    warning = overdue_node_count > 0 or postmatch_overdue_count > 0 or unresolved_failed_attempt_count > 0 or stale_lease_count > 0
+    return {
+        "version": VERSION, "generated_at": now_ts,
+        "status": "critical" if critical else ("warning" if warning else "healthy"),
+        "admitted_fixture_count": len(admissions),
+        "state_counts": {
+            state: sum(row["state"] == state for row in records)
+            for state in sorted({row["state"] for row in records})
+        },
+        "expired_unfrozen_count": expired_unfrozen_count,
+        "overdue_node_count": overdue_node_count,
+        "postmatch_overdue_count": postmatch_overdue_count,
+        "postmatch_recovery_queue_count": postmatch_recovery["queue_count"],
+        "postmatch_verified_facts_awaiting_review_count": postmatch_recovery["verified_facts_awaiting_review_count"],
+        "missing_checkpoint_count": missing_checkpoint_count,
+        "node_attempt_count": len(attempt_rows),
+        "node_attempt_status_counts": attempt_status_counts,
+        "unresolved_failed_node_attempt_count": unresolved_failed_attempt_count,
+        "stale_node_lease_count": stale_lease_count,
+        "market_language_settlement_due_count": observation_due_count,
+        "market_language_settlement_ready_count": observation_plan["settlement_ready_count"],
+        "records": records[:100], "records_truncated": len(records) > 100,
+        "provider_calls_performed": False,
+        "result_backfit_used": False,
+        "automatic_champion_change": False,
+    }
+
+
+def _thestats_payload_data(response: Dict[str, Any]) -> Any:
+    payload = response.get("data")
+    return payload.get("data") if isinstance(payload, dict) and "data" in payload else payload
+
+
+def _provider_team_name(value: Any) -> str:
+    if isinstance(value, dict):
+        value = value.get("name") or value.get("team_name") or value.get("label")
+    return str(value or "").strip()
+
+
+def _thestats_match_identity(row: Any) -> Dict[str, Any]:
+    row = row if isinstance(row, dict) else {}
+    home = row.get("home_team") if row.get("home_team") is not None else row.get("home")
+    away = row.get("away_team") if row.get("away_team") is not None else row.get("away")
+    return {
+        "match_id": str(row.get("id") or row.get("match_id") or "").strip(),
+        "kickoff_at": _parse_timestamp(row.get("utc_date") or row.get("kickoff_utc") or row.get("date")),
+        "home_team": _provider_team_name(home),
+        "away_team": _provider_team_name(away),
+        "status": str(row.get("status") or "").strip().casefold(),
+    }
+
+
+def _thestats_matches_for_utc_date(date_utc: str) -> Dict[str, Any]:
+    """Fetch one complete UTC match day once per short-lived process cache window."""
+    credential_fingerprint = hashlib.sha256(THESTATS_API_KEY.encode("utf-8")).hexdigest()[:12] if THESTATS_API_KEY else "missing"
+    cache_key = f"{THESTATS_BASE_URL}|{credential_fingerprint}|{date_utc}"
+    now_ts = int(time.time())
+    with THESTATS_FIXTURE_DAY_CACHE_LOCK:
+        cached = THESTATS_FIXTURE_DAY_CACHE.get(cache_key)
+        if cached and now_ts - int(cached.get("fetched_at") or 0) <= THESTATS_FIXTURE_DAY_CACHE_TTL_SECONDS:
+            return {"ok": True, "rows": copy.deepcopy(cached.get("rows") or []), "cache_hit": True, "page_count": cached.get("page_count")}
+        rows = []
+        total_pages = 1
+        for page in range(1, 11):
+            if page > total_pages:
+                break
+            response = call_thestats("/football/matches", {
+                "date_from": date_utc, "date_to": date_utc, "per_page": 100, "page": page,
+            })
+            if response.get("ok") is not True:
+                return {"ok": False, "error": "thestats_fixture_lookup_failed", "status_code": response.get("status_code"), "cache_hit": False}
+            payload = response.get("data") if isinstance(response.get("data"), dict) else {}
+            page_rows = _thestats_payload_data(response)
+            if not isinstance(page_rows, list):
+                return {"ok": False, "error": "thestats_fixture_lookup_schema_invalid", "status_code": response.get("status_code"), "cache_hit": False}
+            rows.extend(row for row in page_rows if isinstance(row, dict))
+            meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+            try:
+                total_pages = max(1, int(meta.get("total_pages") or 1))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "thestats_fixture_pagination_invalid", "cache_hit": False}
+            if total_pages > 10:
+                return {"ok": False, "error": "thestats_fixture_pagination_exceeds_safe_bound", "page_count": total_pages, "cache_hit": False}
+        record = {"fetched_at": now_ts, "rows": copy.deepcopy(rows), "page_count": total_pages}
+        THESTATS_FIXTURE_DAY_CACHE[cache_key] = record
+        if len(THESTATS_FIXTURE_DAY_CACHE) > 16:
+            evictable = [key for key in THESTATS_FIXTURE_DAY_CACHE if key != cache_key]
+            oldest = min(evictable, key=lambda key: int(THESTATS_FIXTURE_DAY_CACHE[key].get("fetched_at") or 0))
+            THESTATS_FIXTURE_DAY_CACHE.pop(oldest, None)
+        return {"ok": True, "rows": rows, "cache_hit": False, "page_count": total_pages}
+
+
+def _resolve_thestats_prematch_identity(fixture: Dict[str, Any], observed_at: Any) -> Dict[str, Any]:
+    """Bind a unique TheStats match id before kickoff; ambiguity always fails closed."""
+    if not THESTATS_API_KEY:
+        return {"ok": False, "error": "thestats_not_configured"}
+    kickoff_at = _parse_timestamp(fixture.get("timestamp") or fixture.get("date"))
+    observed_at = _parse_timestamp(observed_at)
+    home_team = str(fixture.get("home") or "").strip()
+    away_team = str(fixture.get("away") or "").strip()
+    if (
+        kickoff_at is None or observed_at is None or observed_at >= kickoff_at
+        or not home_team or not away_team
+    ):
+        return {"ok": False, "error": "thestats_prematch_identity_inputs_invalid"}
+    date_utc = datetime.fromtimestamp(kickoff_at, tz=timezone.utc).date().isoformat()
+    candidates = []
+    day = _thestats_matches_for_utc_date(date_utc)
+    if day.get("ok") is not True:
+        return day
+    for row in day.get("rows") or []:
+        identity = _thestats_match_identity(row)
+        if (
+            identity["match_id"]
+            and identity["status"] not in {"live", "finished", "cancelled", "canceled", "abandoned", "forfeit"}
+            and identity["kickoff_at"] is not None
+            and abs(identity["kickoff_at"] - kickoff_at) <= 900
+            and normalize_fixture_identity_name(identity["home_team"]) == normalize_fixture_identity_name(home_team)
+            and normalize_fixture_identity_name(identity["away_team"]) == normalize_fixture_identity_name(away_team)
+        ):
+            candidates.append(identity)
+    unique = {row["match_id"]: row for row in candidates}
+    if len(unique) != 1:
+        return {"ok": False, "error": "thestats_fixture_identity_not_unique", "match_count": len(unique)}
+    match = next(iter(unique.values()))
+    content = {
+        "source": "thestats", "match_id": match["match_id"],
+        "kickoff_at": kickoff_at, "home_team": home_team, "away_team": away_team,
+    }
+    return {
+        "ok": True, **content, "source_hash": _content_hash(content),
+        "lookup_cache_hit": day.get("cache_hit"), "lookup_page_count": day.get("page_count"),
+    }
+
+
+def _parse_event_minute(value: Any, offset: Any = None) -> Tuple[int, Optional[int]]:
+    raw = str(value or "0").strip()
+    base, plus = raw, None
+    if "+" in raw:
+        base, plus = raw.split("+", 1)
+    try:
+        minute = max(0, int(float(base)))
+    except (TypeError, ValueError):
+        minute = 0
+    if offset is not None:
+        plus = offset
+    try:
+        extra = max(0, int(float(plus))) if plus not in (None, "") else None
+    except (TypeError, ValueError):
+        extra = None
+    return minute, extra
+
+
+def _normalize_thestats_events(value: Any) -> List[Dict[str, Any]]:
+    if isinstance(value, dict):
+        value = value.get("events") if isinstance(value.get("events"), list) else value.get("timeline")
+    rows = value if isinstance(value, list) else []
+    normalized = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        event_type = str(row.get("type") or row.get("event_type") or "").strip()
+        raw_detail = row.get("detail") or row.get("subtype") or row.get("card_type") or row.get("outcome") or ""
+        detail = str(raw_detail).strip()
+        lowered = f"{event_type} {detail}".casefold().replace("_", " ").replace("-", " ")
+        if "goal" in lowered:
+            event_type = "Goal"
+        elif "card" in lowered:
+            event_type = "Card"
+        elif "penalty" in lowered:
+            event_type = "Penalty"
+        elif "substitution" in lowered or "substitute" in lowered:
+            event_type = "Substitution"
+        elif "var" in lowered:
+            event_type = "VAR"
+        if row.get("own_goal") is True or "own goal" in lowered:
+            detail = "Own Goal"
+        elif row.get("penalty") is True or "penalty" in lowered:
+            detail = "Penalty"
+        elif "red" in lowered and "card" in lowered:
+            detail = "Red Card"
+        minute, extra = _parse_event_minute(row.get("minute") or row.get("elapsed"), row.get("offset") or row.get("extra"))
+        team = _provider_team_name(row.get("team") or row.get("team_name"))
+        player = _provider_team_name(row.get("player") or row.get("scorer") or row.get("shooter"))
+        normalized.append({
+            "elapsed": minute, "extra": extra, "team": team or None,
+            "player": player or None, "type": event_type or None, "detail": detail or None,
+        })
+    return normalized
+
+
+def _material_event_signature(events: Any, home_team: Any = None, away_team: Any = None) -> List[Dict[str, Any]]:
+    home_key = normalize_fixture_identity_name(home_team)
+    away_key = normalize_fixture_identity_name(away_team)
+    signature = []
+    for row in events if isinstance(events, list) else []:
+        if not isinstance(row, dict):
+            continue
+        event_type = str(row.get("type") or "").strip().casefold()
+        detail = str(row.get("detail") or "").strip().casefold()
+        minute, extra = _parse_event_minute(row.get("elapsed") or row.get("minute"), row.get("extra") or row.get("offset"))
+        team_key = normalize_fixture_identity_name(row.get("team"))
+        side = "home" if home_key and team_key == home_key else ("away" if away_key and team_key == away_key else team_key or "unknown")
+        categories = []
+        if event_type == "goal":
+            categories.append("goal")
+        if event_type == "card" and ("red" in detail or "second yellow" in detail):
+            categories.append("red_card")
+        if "penalty" in event_type or "penalty" in detail:
+            categories.append("penalty_event")
+        if "own goal" in detail:
+            categories.append("own_goal")
+        for category in categories:
+            signature.append({"category": category, "side": side, "minute": minute, "extra": extra})
+    return sorted(signature, key=lambda row: (row["category"], row["side"], row["minute"], row.get("extra") or 0))
+
+
+def _material_event_sequences_match(left: List[Dict[str, Any]], right: List[Dict[str, Any]], total_goals: int) -> bool:
+    if sum(row["category"] == "goal" for row in left) != total_goals or sum(row["category"] == "goal" for row in right) != total_goals:
+        return False
+    if len(left) != len(right):
+        return False
+    return all(
+        a["category"] == b["category"] and a["side"] == b["side"]
+        and abs((a["minute"] + (a.get("extra") or 0)) - (b["minute"] + (b.get("extra") or 0))) <= 2
+        for a, b in zip(left, right)
+    )
+
+
+def _the_odds_api_frozen_result_evidence(freeze: Dict[str, Any]) -> Dict[str, Any]:
+    """Corroborate a result only through a The Odds API identity frozen before kickoff."""
+    identity = next((
+        row for row in (freeze.get("source_refs") or [])
+        if isinstance(row, dict) and row.get("source") == "the_odds_api"
+    ), None)
+    if not identity:
+        return {"ok": False, "error": "frozen_the_odds_api_identity_missing"}
+    sport_key = str(identity.get("sport_key") or "").strip().lower()
+    event_id = str(identity.get("event_id") or "").strip().lower()
+    home_team = str(identity.get("home_team") or "").strip()
+    away_team = str(identity.get("away_team") or "").strip()
+    bound_at = _parse_timestamp(identity.get("identity_bound_at"))
+    identity_content = {
+        "source": "the_odds_api", "sport_key": sport_key, "event_id": event_id,
+        "home_team": home_team, "away_team": away_team,
+    }
+    if (
+        not sport_key or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789_" for char in sport_key)
+        or len(event_id) != 32 or any(char not in "0123456789abcdef" for char in event_id)
+        or not home_team or not away_team
+        or bound_at is None or bound_at >= int(freeze.get("kickoff_at") or 0)
+        or identity.get("identity_source_hash") != _content_hash(identity_content)
+    ):
+        return {"ok": False, "error": "frozen_the_odds_api_identity_invalid"}
+    response = call_the_odds_api(
+        f"/sports/{sport_key}/scores", {"daysFrom": 3, "dateFormat": "iso", "eventIds": event_id},
+    )
+    if response.get("ok") is not True:
+        return {
+            "ok": False, "error": "the_odds_api_score_request_failed",
+            "status_code": response.get("status_code"),
+        }
+    rows = response.get("data") if isinstance(response.get("data"), list) else []
+    matches = [row for row in rows if isinstance(row, dict) and str(row.get("id") or "").strip().lower() == event_id]
+    if len(matches) != 1:
+        return {"ok": False, "error": "the_odds_api_bound_event_score_missing", "status_code": response.get("status_code")}
+    event = matches[0]
+    if event.get("completed") is not True:
+        return {"ok": False, "error": "the_odds_api_bound_event_not_completed", "status_code": response.get("status_code")}
+    if str(event.get("sport_key") or "").strip().lower() != sport_key:
+        return {"ok": False, "error": "the_odds_api_bound_event_sport_mismatch", "status_code": response.get("status_code")}
+    if (
+        normalize_fixture_identity_name(event.get("home_team")) != normalize_fixture_identity_name(home_team)
+        or normalize_fixture_identity_name(event.get("away_team")) != normalize_fixture_identity_name(away_team)
+    ):
+        return {"ok": False, "error": "the_odds_api_bound_event_team_mismatch", "status_code": response.get("status_code")}
+    scores = event.get("scores") if isinstance(event.get("scores"), list) else []
+    normalized_score_rows = [
+        (normalize_fixture_identity_name(row.get("name")), row.get("score"))
+        for row in scores if isinstance(row, dict) and str(row.get("name") or "").strip()
+    ]
+    expected_score_names = {
+        normalize_fixture_identity_name(home_team), normalize_fixture_identity_name(away_team),
+    }
+    if (
+        len(normalized_score_rows) != 2
+        or len({name for name, _ in normalized_score_rows}) != 2
+        or {name for name, _ in normalized_score_rows} != expected_score_names
+    ):
+        return {"ok": False, "error": "the_odds_api_bound_event_score_incomplete", "status_code": response.get("status_code")}
+    score_by_team = dict(normalized_score_rows)
+    try:
+        home_goals = int(score_by_team[normalize_fixture_identity_name(home_team)])
+        away_goals = int(score_by_team[normalize_fixture_identity_name(away_team)])
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "error": "the_odds_api_bound_event_score_incomplete", "status_code": response.get("status_code")}
+    if min(home_goals, away_goals) < 0:
+        return {"ok": False, "error": "the_odds_api_bound_event_score_invalid", "status_code": response.get("status_code")}
+    return {
+        "ok": True, "source": "the_odds_api", "component": "result",
+        "home_goals": home_goals, "away_goals": away_goals,
+        "evidence_ref": f"https://api.the-odds-api.com/v4/sports/{sport_key}/scores?eventIds={event_id}",
+        "status_code": response.get("status_code"), "event_id": event_id,
+        "identity_source_hash": identity.get("identity_source_hash"),
+    }
+
+
+def _thestats_frozen_postmatch_evidence(
+    freeze: Dict[str, Any], api_events: List[Dict[str, Any]], expected_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Verify a frozen TheStats result and material event sequence against API-Football."""
+    identity = next((
+        row for row in (freeze.get("source_refs") or [])
+        if isinstance(row, dict) and row.get("source") == "thestats"
+    ), None)
+    if not identity:
+        return {"ok": False, "error": "frozen_thestats_identity_missing"}
+    match_id = str(identity.get("match_id") or "").strip()
+    home_team = str(identity.get("home_team") or "").strip()
+    away_team = str(identity.get("away_team") or "").strip()
+    kickoff_at = _parse_timestamp(identity.get("kickoff_at"))
+    bound_at = _parse_timestamp(identity.get("identity_bound_at"))
+    identity_content = {
+        "source": "thestats", "match_id": match_id, "kickoff_at": kickoff_at,
+        "home_team": home_team, "away_team": away_team,
+    }
+    if (
+        not match_id or len(match_id) > 128 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for char in match_id)
+        or not home_team or not away_team or kickoff_at is None or bound_at is None
+        or bound_at >= int(freeze.get("kickoff_at") or 0)
+        or identity.get("identity_source_hash") != _content_hash(identity_content)
+    ):
+        return {"ok": False, "error": "frozen_thestats_identity_invalid"}
+    detail_response = call_thestats(f"/football/matches/{match_id}")
+    if detail_response.get("ok") is not True:
+        return {"ok": False, "error": "thestats_match_detail_failed", "status_code": detail_response.get("status_code")}
+    match = _thestats_payload_data(detail_response)
+    match = match if isinstance(match, dict) else {}
+    parsed = _thestats_match_identity(match)
+    if (
+        parsed["match_id"] != match_id
+        or parsed["status"] not in {"finished", "ft", "aet", "pen"}
+        or parsed["kickoff_at"] is None or abs(parsed["kickoff_at"] - kickoff_at) > 900
+        or normalize_fixture_identity_name(parsed["home_team"]) != normalize_fixture_identity_name(home_team)
+        or normalize_fixture_identity_name(parsed["away_team"]) != normalize_fixture_identity_name(away_team)
+    ):
+        return {"ok": False, "error": "thestats_bound_match_identity_mismatch", "status_code": detail_response.get("status_code")}
+    score = match.get("score") if isinstance(match.get("score"), dict) else {}
+    home_score_value = score.get("home")
+    away_score_value = score.get("away")
+    if home_score_value is None and isinstance(match.get("home_team"), dict):
+        home_score_value = match["home_team"].get("score")
+    if away_score_value is None and isinstance(match.get("away_team"), dict):
+        away_score_value = match["away_team"].get("score")
+    try:
+        home_goals, away_goals = int(home_score_value), int(away_score_value)
+        expected_home = int(expected_result.get("home_goals"))
+        expected_away = int(expected_result.get("away_goals"))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "thestats_bound_match_score_incomplete", "status_code": detail_response.get("status_code")}
+    if min(home_goals, away_goals) < 0 or (home_goals, away_goals) != (expected_home, expected_away):
+        return {"ok": False, "error": "thestats_bound_match_score_mismatch", "status_code": detail_response.get("status_code")}
+    timeline_response = call_thestats(f"/football/matches/{match_id}/timeline")
+    timeline_data = _thestats_payload_data(timeline_response) if timeline_response.get("ok") is True else None
+    thestats_events = _normalize_thestats_events(timeline_data)
+    api_signature = _material_event_signature(api_events, home_team, away_team)
+    thestats_signature = _material_event_signature(thestats_events, home_team, away_team)
+    sequence_matches = bool(timeline_response.get("ok") is True) and _material_event_sequences_match(
+        api_signature, thestats_signature, home_goals + away_goals,
+    )
+    signature_hash = _content_hash(api_signature) if sequence_matches else None
+    return {
+        "ok": True,
+        "result_audit": {
+            "source": "thestats", "component": "result", "ok": True,
+            "home_goals": home_goals, "away_goals": away_goals,
+            "evidence_ref": f"https://api.thestatsapi.com/api/football/matches/{match_id}",
+            "status_code": detail_response.get("status_code"), "match_id": match_id,
+        },
+        "event_audit": {
+            "source": "thestats", "component": "events", "ok": sequence_matches,
+            "evidence_ref": f"https://api.thestatsapi.com/api/football/matches/{match_id}/timeline",
+            "status_code": timeline_response.get("status_code"),
+            "event_signature_hash": signature_hash,
+            "error": None if sequence_matches else "thestats_material_event_sequence_mismatch_or_unavailable",
+        },
+        "events": thestats_events,
+    }
+
+
+def _learning_postmatch_fact_fetch(freeze: Dict[str, Any]) -> Dict[str, Any]:
+    """Fetch API-Football facts and independently corroborate the frozen result when possible."""
+    fixture_id = int(freeze.get("fixture"))
+    detail = call_api_football("/fixtures", {"id": fixture_id})
+    row = response_first(detail)
+    if not row:
+        return {
+            "ok": False,
+            "error": "fixture_result_unavailable",
+            "source_audit": [{"source": "api_football", "ok": False, "status_code": detail.get("status_code")}],
+        }
+    summary = fixture_summary(row)
+    status = str(summary.get("status") or "").upper()
+    goals = summary.get("goals") if isinstance(summary.get("goals"), dict) else {}
+    if status not in {"FT", "AET", "PEN"} or goals.get("home") is None or goals.get("away") is None:
+        return {
+            "ok": False, "error": "verified_final_result_not_available", "fixture": summary,
+            "source_audit": [{"source": "api_football", "ok": bool(detail.get("ok")), "status_code": detail.get("status_code")}],
+        }
+    events_response = call_api_football("/fixtures/events", {"fixture": fixture_id})
+    statistics_response = call_api_football("/fixtures/statistics", {"fixture": fixture_id})
+    events = []
+    for event in response_list(events_response)[:200]:
+        if not isinstance(event, dict):
+            continue
+        events.append({
+            "elapsed": get_nested(event, ["time", "elapsed"]), "extra": get_nested(event, ["time", "extra"]),
+            "team_id": get_nested(event, ["team", "id"]), "team": get_nested(event, ["team", "name"]),
+            "player": get_nested(event, ["player", "name"]), "assist": get_nested(event, ["assist", "name"]),
+            "type": event.get("type"), "detail": event.get("detail"), "comments": event.get("comments"),
+        })
+    allowed_statistics = {
+        "Shots on Goal", "Shots off Goal", "Total Shots", "Blocked Shots", "Shots insidebox", "Shots outsidebox",
+        "Fouls", "Corner Kicks", "Offsides", "Ball Possession", "Yellow Cards", "Red Cards", "Goalkeeper Saves",
+        "Total passes", "Passes accurate", "Passes %", "expected_goals", "goals_prevented",
+    }
+    statistics = []
+    for team_row in response_list(statistics_response):
+        if not isinstance(team_row, dict):
+            continue
+        values = {
+            str(item.get("type")): item.get("value")
+            for item in (team_row.get("statistics") or [])
+            if isinstance(item, dict) and str(item.get("type")) in allowed_statistics
+        }
+        statistics.append({"team_id": get_nested(team_row, ["team", "id"]), "team": get_nested(team_row, ["team", "name"]), "statistics": values})
+    home_team_name = str(get_nested(row, ["teams", "home", "name"]) or "").strip()
+    away_team_name = str(get_nested(row, ["teams", "away", "name"]) or "").strip()
+    api_event_signature = _material_event_signature(events, home_team_name, away_team_name)
+    api_event_signature_hash = _content_hash(api_event_signature)
+    source_audit = [
+        {"source": "api_football", "component": "result", "ok": bool(detail.get("ok")), "status_code": detail.get("status_code"), "evidence_ref": f"api_football:/fixtures?id={fixture_id}", "home_goals": int(goals["home"]), "away_goals": int(goals["away"])},
+        {"source": "api_football", "component": "events", "ok": bool(events_response.get("ok")), "status_code": events_response.get("status_code"), "evidence_ref": f"api_football:/fixtures/events?fixture={fixture_id}", "event_signature_hash": api_event_signature_hash if events_response.get("ok") else None},
+        {"source": "api_football", "component": "statistics", "ok": bool(statistics_response.get("ok")), "status_code": statistics_response.get("status_code"), "evidence_ref": f"api_football:/fixtures/statistics?fixture={fixture_id}"},
+    ]
+    odds_result = _the_odds_api_frozen_result_evidence(freeze)
+    source_audit.append(odds_result if odds_result.get("ok") else {
+        "source": "the_odds_api", "component": "result", "ok": False,
+        "error": odds_result.get("error"), "status_code": odds_result.get("status_code"),
+    })
+    thestats = _thestats_frozen_postmatch_evidence(
+        freeze, events, {"home_goals": int(goals["home"]), "away_goals": int(goals["away"])},
+    )
+    if thestats.get("ok") is True:
+        source_audit.extend([thestats["result_audit"], thestats["event_audit"]])
+    else:
+        source_audit.extend([
+            {"source": "thestats", "component": "result", "ok": False, "error": thestats.get("error"), "status_code": thestats.get("status_code")},
+            {"source": "thestats", "component": "events", "ok": False, "error": thestats.get("error"), "status_code": thestats.get("status_code")},
+        ])
+    return {
+        "ok": True,
+        "result": {"status": status, "home_goals": int(goals["home"]), "away_goals": int(goals["away"])},
+        "fixture": summary,
+        "events": events,
+        "statistics": statistics,
+        "source_audit": source_audit,
+    }
+
+
+def collect_learning_postmatch_facts(freeze_id: Any, now_ts: Optional[int] = None, fact_fetcher: Optional[Any] = None) -> Dict[str, Any]:
+    """Version postmatch facts without assigning process correctness or settling the sample."""
+    freeze_id = str(freeze_id or "").strip()
+    if not freeze_id:
+        raise HTTPException(status_code=400, detail="freeze_id_required")
     now_ts = int(now_ts or time.time())
     store = load_snapshot_store()
+    freeze = _learning_freeze_by_id(store, freeze_id)
+    if not freeze:
+        raise HTTPException(status_code=404, detail="frozen_learning_sample_not_found")
+    if now_ts < int(freeze.get("kickoff_at") or 0) + 2 * 3600:
+        raise HTTPException(status_code=409, detail="postmatch_fact_collection_not_due")
+    raw_fixture_id = freeze.get("fixture")
+    if fact_fetcher is None:
+        try:
+            int(raw_fixture_id)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="provider_fixture_id_required_for_automatic_fact_collection") from exc
+        fetched = _learning_postmatch_fact_fetch(freeze)
+    else:
+        fetched = fact_fetcher(raw_fixture_id)
+    if not isinstance(fetched, dict) or fetched.get("ok") is not True:
+        raise HTTPException(status_code=422, detail={"error": "postmatch_fact_fetch_incomplete", "reason": (fetched or {}).get("error") if isinstance(fetched, dict) else "invalid_fetcher_response"})
+    result = fetched.get("result") if isinstance(fetched.get("result"), dict) else {}
+    try:
+        home_goals, away_goals = int(result.get("home_goals")), int(result.get("away_goals"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="postmatch_fact_result_incomplete") from exc
+    if str(result.get("status") or "").upper() not in {"FT", "AET", "PEN"} or min(home_goals, away_goals) < 0:
+        raise HTTPException(status_code=422, detail="postmatch_fact_result_not_final")
+    verified_result_sources = []
+    verified_result_authorities = []
+    verified_evidence_refs = set()
+    for row in fetched.get("source_audit") or []:
+        if not isinstance(row, dict) or row.get("ok") is not True or str(row.get("component") or "").strip().lower() != "result":
+            continue
+        source = str(row.get("source") or "").strip().casefold()
+        evidence_ref = str(row.get("evidence_ref") or row.get("url") or row.get("id") or "").strip()
+        try:
+            source_home, source_away = int(row.get("home_goals")), int(row.get("away_goals"))
+        except (TypeError, ValueError):
+            continue
+        if source and evidence_ref and source_home == home_goals and source_away == away_goals:
+            parsed = urlparse(evidence_ref)
+            authority = str(parsed.hostname or source).strip().casefold()
+            normalized_ref = evidence_ref.strip().casefold()
+            if normalized_ref in verified_evidence_refs:
+                continue
+            verified_evidence_refs.add(normalized_ref)
+            verified_result_sources.append(source)
+            verified_result_authorities.append(authority)
+    source_names = set(verified_result_sources)
+    independent_authorities = set(verified_result_authorities)
+    immutable_content = {
+        "freeze_id": freeze_id,
+        "fixture": freeze.get("fixture"),
+        "freeze_hash": freeze.get("content_hash"),
+        "result": {**result, "home_goals": home_goals, "away_goals": away_goals},
+        "events": fetched.get("events") if isinstance(fetched.get("events"), list) else [],
+        "statistics": fetched.get("statistics") if isinstance(fetched.get("statistics"), list) else [],
+        "source_audit": fetched.get("source_audit") if isinstance(fetched.get("source_audit"), list) else [],
+        "verification": {
+            "independent_source_count": len(independent_authorities),
+            "verified_source_names": sorted(source_names),
+            "verified_source_authorities": sorted(independent_authorities),
+            "unique_evidence_ref_count": len(verified_evidence_refs),
+            "status": "verified" if len(independent_authorities) >= 2 else "single_source_pending",
+            "settlement_eligible": len(independent_authorities) >= 2,
+            "required_independent_sources": 2,
+        },
+        "process_classification": None,
+        "result_backfit_used": False,
+        "champion_effect": False,
+    }
+    fact_hash = _content_hash(immutable_content)
+    with SNAPSHOT_STORE_LOCK:
+        latest_store = load_snapshot_store()
+        rows = latest_store.setdefault("learning_postmatch_facts", {}).setdefault(freeze_id, [])
+        duplicate = next((row for row in rows if row.get("fact_hash") == fact_hash), None)
+        if duplicate:
+            return {**duplicate, "action": "unchanged"}
+        version_number = max([int(row.get("version_number") or 0) for row in rows] + [0]) + 1
+        record = {
+            **immutable_content, "fact_hash": fact_hash, "version_number": version_number,
+            "collected_at": now_ts, "action": "facts_collected", "immutable": True,
+        }
+        rows.append(record)
+        latest_store["version"] = VERSION
+        write_snapshot_store(latest_store)
+        return record
+
+
+def learning_postmatch_recovery_queue(
+    now_ts: Optional[int] = None, store_override: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Expose unresolved frozen samples, including those beyond the automatic 36-hour window."""
+    now_ts = int(now_ts or time.time())
+    store = store_override if isinstance(store_override, dict) else load_snapshot_store()
+    postmatches = store.get("learning_postmatch") or {}
+    facts = store.get("learning_postmatch_facts") or {}
+    rows = []
+    for fixture, versions in (store.get("learning_frozen") or {}).items():
+        latest = max((row for row in versions or [] if isinstance(row, dict)), key=lambda row: int(row.get("version_number") or 0), default=None)
+        if not latest or latest.get("freeze_id") in postmatches:
+            continue
+        kickoff_at = int(latest.get("kickoff_at") or 0)
+        age_seconds = now_ts - kickoff_at
+        if age_seconds < 2 * 3600:
+            continue
+        freeze_id = str(latest.get("freeze_id") or "")
+        fact_versions = [row for row in (facts.get(freeze_id) or []) if isinstance(row, dict)]
+        latest_fact = max(fact_versions, key=lambda row: int(row.get("version_number") or 0), default=None)
+        verified = get_nested(latest_fact or {}, ["verification", "settlement_eligible"]) is True
+        in_automatic_window = age_seconds <= LEARNING_POSTMATCH_LOOKBACK_HOURS * 3600
+        if verified:
+            state, required_action = "verified_facts_awaiting_review", "build_or_complete_hash_bound_review"
+        elif in_automatic_window:
+            state, required_action = "automatic_fact_collection_pending", "await_next_1430_cycle_or_collect_facts_now"
+        else:
+            state, required_action = "manual_fact_recovery_required", "invoke_protected_fact_collection_without_rebuilding_prematch"
+        rows.append({
+            "fixture": str(fixture), "freeze_id": freeze_id, "kickoff_at": kickoff_at,
+            "hours_since_kickoff": round(age_seconds / 3600, 2),
+            "state": state, "required_action": required_action,
+            "automatic_window": in_automatic_window,
+            "fact_hash": (latest_fact or {}).get("fact_hash"),
+            "fact_verification_status": get_nested(latest_fact or {}, ["verification", "status"]) or "data_missing",
+            "prematch_rebuild_allowed": False, "result_backfit_allowed": False,
+        })
+    rows.sort(key=lambda row: (row["kickoff_at"], row["fixture"]))
+    return {
+        "version": VERSION, "generated_at": now_ts,
+        "queue_count": len(rows),
+        "manual_recovery_required_count": sum(row["state"] == "manual_fact_recovery_required" for row in rows),
+        "automatic_fact_collection_pending_count": sum(row["state"] == "automatic_fact_collection_pending" for row in rows),
+        "verified_facts_awaiting_review_count": sum(row["state"] == "verified_facts_awaiting_review" for row in rows),
+        "items": rows, "prematch_rebuild_allowed": False,
+        "result_backfit_allowed": False, "automatic_champion_change": False,
+    }
+
+
+def _postmatch_event_evidence(facts: Dict[str, Any]) -> Dict[str, Any]:
+    """Describe the realised state path and pollution flags without grading the prematch model."""
+    events = [row for row in (facts.get("events") or []) if isinstance(row, dict)]
+    goals, red_cards, penalties, own_goals = [], [], [], []
+    for row in events:
+        event_type = str(row.get("type") or "").strip().casefold()
+        detail = str(row.get("detail") or "").strip().casefold()
+        minute = int(as_float(row.get("elapsed")) or 0)
+        normalized = {
+            "minute": minute, "extra": row.get("extra"),
+            "team_id": row.get("team_id"), "team": row.get("team"),
+            "player": row.get("player"), "type": row.get("type"), "detail": row.get("detail"),
+        }
+        if event_type == "goal":
+            goals.append(normalized)
+        if event_type == "card" and ("red" in detail or "second yellow" in detail):
+            red_cards.append(normalized)
+        if "penalty" in detail:
+            penalties.append(normalized)
+        if "own goal" in detail:
+            own_goals.append(normalized)
+    fixture = facts.get("fixture") if isinstance(facts.get("fixture"), dict) else {}
+    expected_event_signature_hash = _content_hash(_material_event_signature(
+        events, fixture.get("home") or fixture.get("home_team_name"), fixture.get("away") or fixture.get("away_team_name"),
+    ))
+    event_sources, event_authorities, event_evidence_refs = set(), set(), set()
+    for row in facts.get("source_audit") or []:
+        if (
+            not isinstance(row, dict) or row.get("ok") is not True
+            or str(row.get("component") or "").strip().casefold() != "events"
+        ):
+            continue
+        source = str(row.get("source") or "").strip().casefold()
+        evidence_ref = str(row.get("evidence_ref") or "").strip()
+        if not source or not evidence_ref or row.get("event_signature_hash") != expected_event_signature_hash:
+            continue
+        normalized_ref = evidence_ref.casefold()
+        if normalized_ref in event_evidence_refs:
+            continue
+        parsed = urlparse(evidence_ref)
+        event_evidence_refs.add(normalized_ref)
+        event_sources.add(source)
+        event_authorities.add(str(parsed.hostname or source).strip().casefold())
+    pollution_flags = []
+    if red_cards:
+        pollution_flags.append("red_card")
+    if penalties:
+        pollution_flags.append("penalty_event")
+    if own_goals:
+        pollution_flags.append("own_goal")
+    first_goal = min(goals, key=lambda row: (row["minute"], int(row.get("extra") or 0)), default=None)
+    result = facts.get("result") if isinstance(facts.get("result"), dict) else {}
+    return {
+        "event_count": len(events),
+        "event_source_count": len(event_authorities),
+        "event_sources": sorted(event_sources),
+        "event_source_authorities": sorted(event_authorities),
+        "event_unique_evidence_ref_count": len(event_evidence_refs),
+        "event_signature_hash": expected_event_signature_hash,
+        "event_verification": "verified" if len(event_authorities) >= 2 else ("single_source" if event_authorities else "data_missing"),
+        "first_goal": first_goal,
+        "goal_count_in_event_feed": len(goals),
+        "red_cards": red_cards,
+        "penalties": penalties,
+        "own_goals": own_goals,
+        "pollution_flags": pollution_flags,
+        "pollution_status": "requires_human_review" if pollution_flags else ("clean_verified" if len(event_authorities) >= 2 else "clean_unverified"),
+        "actual_state_path": {
+            "first_goal_side_or_team": (first_goal or {}).get("team"),
+            "first_goal_minute": (first_goal or {}).get("minute"),
+            "final_home_goals": result.get("home_goals"),
+            "final_away_goals": result.get("away_goals"),
+            "red_card_count": len(red_cards),
+            "penalty_event_count": len(penalties),
+            "own_goal_count": len(own_goals),
+        },
+        "policy": "events describe the realised path only; final score and incidents do not grade the frozen process",
+    }
+
+
+def build_learning_postmatch_review_draft(freeze_id: Any, now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Create an immutable evidence draft; never settle, classify correctness, or create theory."""
+    freeze_id = str(freeze_id or "").strip()
+    if not freeze_id:
+        raise HTTPException(status_code=400, detail="freeze_id_required")
+    now_ts = int(now_ts or time.time())
+    store = load_snapshot_store()
+    freeze = _learning_freeze_by_id(store, freeze_id)
+    if not freeze:
+        raise HTTPException(status_code=404, detail="frozen_learning_sample_not_found")
+    if freeze_id in (store.get("learning_postmatch") or {}):
+        raise HTTPException(status_code=409, detail="learning_sample_already_settled")
+    fact_versions = (store.get("learning_postmatch_facts") or {}).get(freeze_id) or []
+    if not fact_versions:
+        raise HTTPException(status_code=409, detail="verified_postmatch_fact_packet_required")
+    facts = max(fact_versions, key=lambda row: int(row.get("version_number") or 0))
+    if get_nested(facts, ["verification", "settlement_eligible"]) is not True:
+        raise HTTPException(status_code=409, detail="independent_result_verification_required_for_review_draft")
+
+    analysis = freeze.get("analysis") if isinstance(freeze.get("analysis"), dict) else {}
+    decision = freeze.get("decision") if isinstance(freeze.get("decision"), dict) else {}
+    is_pass = str(decision.get("decision") or "").strip().upper() == "PASS"
+    fundamental = analysis.get("fundamental_chain") if isinstance(analysis.get("fundamental_chain"), dict) else {}
+    chain_audit = audit_fundamental_chain(fundamental)
+    if chain_audit.get("decision_eligible") is True:
+        fundamental_status, fundamental_reason = "passed", "frozen_fundamental_chain_was_decision_eligible"
+    elif is_pass:
+        fundamental_status, fundamental_reason = "passed", "incomplete_chain_was_preserved_as_safe_pass"
+    else:
+        fundamental_status, fundamental_reason = "failed", "non_pass_decision_used_an_ineligible_fundamental_chain"
+
+    market = analysis.get("market_timeline") if isinstance(analysis.get("market_timeline"), dict) else {}
+    available_stage_count = int(market.get("available_prematch_stage_count") or 0)
+    latest_dynamics = market.get("latest_dynamics") if isinstance(market.get("latest_dynamics"), dict) else {}
+    line_path_ready = available_stage_count >= 2 and latest_dynamics.get("comparison_status") == "compared"
+    frozen_market_language = analysis.get("market_language") if isinstance(analysis.get("market_language"), dict) else {}
+    proxy_labeled = frozen_market_language.get("capital_pressure_is_proxy_only") is True
+    real_money_status = get_nested(frozen_market_language, ["real_money_data", "status"]) or "data_missing"
+    real_money_contract_ready = (
+        (real_money_status == "data_missing" and proxy_labeled)
+        or (
+            real_money_status == "available"
+            and get_nested(frozen_market_language, ["real_money_data", "decision_eligible"]) is True
+            and bool(get_nested(frozen_market_language, ["real_money_data", "evidence_hash"]))
+        )
+    )
+    four_axes_present = all(axis in (frozen_market_language.get("axes") or {}) for axis in ("Home", "Away", "Over", "Under"))
+    market_language_ready = real_money_contract_ready and four_axes_present
+    market_language_contract_applicable = version_at_least(get_nested(freeze, ["versions", "service"]), (1, 95, 0))
+    if line_path_ready and (market_language_ready or not market_language_contract_applicable):
+        market_status = "passed"
+        market_reason = "frozen_market_path_and_v1_95_language_contract_were_complete" if market_language_contract_applicable else "legacy_freeze_market_path_was_complete; v1_95_contract_not_applied_retroactively"
+    elif is_pass:
+        market_status, market_reason = "passed", "insufficient_market_path_was_preserved_as_safe_pass"
+    else:
+        market_status, market_reason = "failed", "non_pass_decision_lacked_a_comparable_market_path"
+
+    state_tree = analysis.get("state_tree") if isinstance(analysis.get("state_tree"), dict) else {}
+    states = state_tree.get("states") if isinstance(state_tree.get("states"), dict) else {}
+    populated_states = sorted(key for key, value in states.items() if value not in (None, "", [], {}))
+    event_evidence = _postmatch_event_evidence(facts)
+    if not populated_states:
+        state_status, state_reason = "data_missing", "frozen_state_tree_had_no_testable_state_predictions"
+    elif event_evidence["event_verification"] == "data_missing":
+        state_status, state_reason = "data_missing", "event_sequence_evidence_is_missing"
+    else:
+        state_status, state_reason = "inconclusive", "state_predictions_exist_but_tactical_response_requires_human_event_review"
+
+    selected_expression = _learning_selected_expression(decision)
+    decision_contract = audit_decision_output(decision)
+    if decision_contract.get("decision_eligible") is True:
+        expression_status, expression_reason = "passed", "frozen_decision_output_contract_was_complete"
+    elif is_pass and decision.get("pass_reasons"):
+        expression_status, expression_reason = "passed", "safe_pass_has_explicit_reasons_and_no_actionable_expression"
+    else:
+        expression_status, expression_reason = "data_missing", "frozen_expression_contract_is_not_complete_enough_for_automatic_audit"
+    entry_price = as_float(selected_expression.get("price"))
+    price_status = "inconclusive" if entry_price is not None else "data_missing"
+    price_reason = "entry_price_present_pending_server_verified_t1h_reference" if entry_price is not None else "entry_or_t1h_price_evidence_missing"
+    match_rating = decision.get("match_rating")
+    match_status = "inconclusive" if match_rating is not None else "data_missing"
+    match_reason = "frozen_match_rating_present_but_selection_quality_requires_cross_match_comparison" if match_rating is not None else "frozen_match_rating_missing"
+
+    draft_review = {
+        "match_selection_quality": {"status": match_status, "reason": match_reason, "frozen_match_rating": match_rating},
+        "fundamental_chain_audit": {"status": fundamental_status, "reason": fundamental_reason, "audit": chain_audit},
+        "state_tree_coverage": {
+            "status": state_status, "reason": state_reason,
+            "populated_frozen_states": populated_states,
+            "actual_state_path": event_evidence["actual_state_path"],
+        },
+        "market_language_audit": {
+            "status": market_status, "reason": market_reason,
+            "available_stage_count": available_stage_count,
+            "latest_comparison_status": latest_dynamics.get("comparison_status"),
+            "frozen_market_classification": latest_dynamics.get("classification"),
+            "capital_pressure_proxy_only": proxy_labeled,
+            "real_money_data_status": real_money_status,
+            "real_money_contract_ready": real_money_contract_ready,
+            "four_axis_language_present": four_axes_present,
+            "selected_acceptance": frozen_market_language.get("selected_acceptance"),
+            "v1_95_contract_applicable": market_language_contract_applicable,
+        },
+        "expression_audit": {
+            "status": expression_status, "reason": expression_reason,
+            "selected_expression": selected_expression,
+            "decision_contract": decision_contract,
+        },
+        "price_execution_audit": {"status": price_status, "reason": price_reason, "entry_price": entry_price},
+        "process_reasoning": "System draft audits only frozen PIT completeness, decision-rule execution and verified event evidence; it does not infer process correctness from the final score.",
+        "learning_disposition": {
+            "result_backfit_used": False,
+            "champion_change_requested": False,
+            "new_theory_status": "none",
+            "existing_rule_implementation_gap": False,
+        },
+    }
+    review_audit = audit_learning_postmatch_review(draft_review)
+    immutable_content = {
+        "freeze_id": freeze_id,
+        "fixture": freeze.get("fixture"),
+        "freeze_hash": freeze.get("content_hash"),
+        "fact_hash": facts.get("fact_hash"),
+        "fact_version_number": facts.get("version_number"),
+        "event_evidence": event_evidence,
+        "review": review_audit["normalized"],
+        "review_audit": {"eligible": review_audit["eligible"], "reasons": review_audit["reasons"]},
+        "suggested_process_classification": "DATA_INSUFFICIENT",
+        "manual_review_required": True,
+        "automatic_settlement_eligible": False,
+        "result_outcome_used_to_grade_process": False,
+        "automatic_hypothesis_registration": False,
+        "automatic_champion_change": False,
+    }
+    draft_hash = _content_hash(immutable_content)
+    with SNAPSHOT_STORE_LOCK:
+        latest_store = load_snapshot_store()
+        latest_fact_versions = (latest_store.get("learning_postmatch_facts") or {}).get(freeze_id) or []
+        if not latest_fact_versions:
+            raise HTTPException(status_code=409, detail="verified_postmatch_fact_packet_required")
+        latest_facts = max(latest_fact_versions, key=lambda row: int(row.get("version_number") or 0))
+        if latest_facts.get("fact_hash") != facts.get("fact_hash"):
+            raise HTTPException(status_code=409, detail="postmatch_facts_changed_during_review_draft")
+        rows = latest_store.setdefault("learning_postmatch_drafts", {}).setdefault(freeze_id, [])
+        duplicate = next((row for row in rows if row.get("draft_hash") == draft_hash), None)
+        if duplicate:
+            return {**duplicate, "action": "unchanged"}
+        version_number = max([int(row.get("version_number") or 0) for row in rows] + [0]) + 1
+        record = {
+            **immutable_content,
+            "version_number": version_number,
+            "draft_hash": draft_hash,
+            "drafted_at": now_ts,
+            "immutable": True,
+            "action": "drafted",
+        }
+        rows.append(record)
+        latest_store["version"] = VERSION
+        write_snapshot_store(latest_store)
+        return record
+
+
+def _derive_frozen_selection_outcome(freeze: Dict[str, Any], facts: Dict[str, Any]) -> Dict[str, Any]:
+    """Derive only unambiguous settlement outcomes after process quality has been graded."""
+    frozen_decision = freeze.get("decision") if isinstance(freeze.get("decision"), dict) else {}
+    execution_action = str(frozen_decision.get("execution_action") or ("PASS" if str(frozen_decision.get("decision") or "").upper() == "PASS" else "BET")).upper()
+    if execution_action in {"WAIT", "PASS"}:
+        return {
+            "status": "not_executed", "outcome": None,
+            "reason": "frozen_execution_action_was_not_bet",
+            "execution_action": execution_action,
+            "result_used_only_after_process_grade": True,
+        }
+    expression = _learning_selected_expression(frozen_decision)
+    market = str(expression.get("market") or "").strip().casefold()
+    selection = str(expression.get("selection") or "").strip().casefold()
+    line = as_float(expression.get("line"))
+    result = facts.get("result") if isinstance(facts.get("result"), dict) else {}
+    try:
+        home_goals, away_goals = int(result.get("home_goals")), int(result.get("away_goals"))
+    except (TypeError, ValueError):
+        return {"status": "data_missing", "outcome": None, "reason": "verified_goals_missing"}
+    outcome = None
+    method = None
+    if market in {"1x2", "match_winner", "moneyline"}:
+        actual = "home" if home_goals > away_goals else ("away" if away_goals > home_goals else "draw")
+        aliases = {"主胜": "home", "home": "home", "draw": "draw", "平": "draw", "客胜": "away", "away": "away"}
+        normalized = aliases.get(selection)
+        if normalized:
+            outcome, method = ("win" if normalized == actual else "loss"), "verified_1x2_result"
+    elif market in {"over_under", "total", "goals"} and line is not None:
+        total = home_goals + away_goals
+        if total == line:
+            return {"status": "push", "outcome": None, "reason": "total_goals_equal_line", "market": market, "line": line}
+        if selection in {"over", "大", "o"}:
+            outcome, method = ("win" if total > line else "loss"), "verified_total_goals_vs_line"
+        elif selection in {"under", "小", "u"}:
+            outcome, method = ("win" if total < line else "loss"), "verified_total_goals_vs_line"
+    elif market in {"btts", "both_teams_to_score"}:
+        actual_yes = home_goals > 0 and away_goals > 0
+        if selection in {"yes", "是", "btts yes"}:
+            outcome, method = ("win" if actual_yes else "loss"), "verified_btts_result"
+        elif selection in {"no", "否", "btts no"}:
+            outcome, method = ("win" if not actual_yes else "loss"), "verified_btts_result"
+    elif market in {"home_team_total", "away_team_total"} and line is not None:
+        goals = home_goals if market == "home_team_total" else away_goals
+        if goals == line:
+            return {"status": "push", "outcome": None, "reason": "team_goals_equal_line", "market": market, "line": line}
+        if selection in {"over", "大", "o"}:
+            outcome, method = ("win" if goals > line else "loss"), "verified_team_goals_vs_line"
+        elif selection in {"under", "小", "u"}:
+            outcome, method = ("win" if goals < line else "loss"), "verified_team_goals_vs_line"
+    if outcome is None:
+        return {
+            "status": "unsupported", "outcome": None,
+            "reason": "frozen_expression_not_unambiguously_settleable",
+            "market": market or None, "selection": selection or None, "line": line,
+        }
+    return {
+        "status": "derived", "outcome": outcome, "method": method,
+        "market": market, "selection": selection, "line": line,
+        "result_used_only_after_process_grade": True,
+    }
+
+
+def complete_learning_postmatch_review(payload: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Settle from a hash-bound evidence review while deriving, never accepting, Process classification."""
+    payload = payload if isinstance(payload, dict) else {}
+    freeze_id = str(payload.get("freeze_id") or "").strip()
+    draft_hash = str(payload.get("draft_hash") or "").strip()
+    if not freeze_id or not draft_hash:
+        raise HTTPException(status_code=400, detail="freeze_id_and_draft_hash_required")
+    now_ts = int(now_ts or time.time())
+    store = load_snapshot_store()
+    freeze = _learning_freeze_by_id(store, freeze_id)
+    if not freeze:
+        raise HTTPException(status_code=404, detail="frozen_learning_sample_not_found")
+    fact_versions = (store.get("learning_postmatch_facts") or {}).get(freeze_id) or []
+    draft_versions = (store.get("learning_postmatch_drafts") or {}).get(freeze_id) or []
+    facts = max(fact_versions, key=lambda row: int(row.get("version_number") or 0), default=None)
+    draft = max(draft_versions, key=lambda row: int(row.get("version_number") or 0), default=None)
+    if not facts or get_nested(facts, ["verification", "settlement_eligible"]) is not True:
+        raise HTTPException(status_code=409, detail="latest_independently_verified_facts_required")
+    if not draft or draft.get("draft_hash") != draft_hash or draft.get("fact_hash") != facts.get("fact_hash"):
+        raise HTTPException(status_code=409, detail="latest_matching_review_draft_hash_required")
+    review = payload.get("review") if isinstance(payload.get("review"), dict) else {}
+    review_audit = audit_learning_postmatch_review(review)
+    if not review_audit["eligible"]:
+        raise HTTPException(status_code=422, detail={"error": "postmatch_review_incomplete_or_backfit_risk", "reasons": review_audit["reasons"]})
+    normalized = review_audit["normalized"]
+    if normalized.get("review_mode") not in {"scheduled_agent", "automatic_evidence_review"}:
+        raise HTTPException(status_code=422, detail="evidence_review_mode_required")
+    if normalized.get("outcome_not_used_for_process_grade") is not True:
+        raise HTTPException(status_code=422, detail="outcome_non_use_attestation_required")
+    freeze_hash = str(freeze.get("content_hash") or "")
+    fact_hash = str(facts.get("fact_hash") or "")
+    evidence_failures = []
+    for section in LEARNING_REVIEW_SECTIONS:
+        row = normalized.get(section) if isinstance(normalized.get(section), dict) else {}
+        if row.get("status") not in {"passed", "failed"}:
+            continue
+        refs = [str(value) for value in (row.get("evidence_refs") or []) if str(value)] if isinstance(row.get("evidence_refs"), list) else []
+        required_hashes = {freeze_hash}
+        if section == "state_tree_coverage":
+            required_hashes.add(fact_hash)
+        if not refs or not any(any(hash_value and hash_value in ref for hash_value in required_hashes) for ref in refs):
+            evidence_failures.append(f"{section}_hash_bound_evidence_required")
+        if len(str(row.get("reason") or "").strip()) < 20:
+            evidence_failures.append(f"{section}_reason_too_short")
+    if evidence_failures:
+        raise HTTPException(status_code=422, detail={"error": "automatic_review_evidence_incomplete", "reasons": evidence_failures})
+    event_audit = payload.get("event_audit") if isinstance(payload.get("event_audit"), dict) else {}
+    event_status = str(event_audit.get("status") or "data_missing").strip().lower()
+    if event_status not in {"clean", "contaminated", "data_missing"}:
+        raise HTTPException(status_code=422, detail="invalid_automatic_event_audit_status")
+    event_refs = [str(value) for value in (event_audit.get("evidence_refs") or []) if str(value)] if isinstance(event_audit.get("evidence_refs"), list) else []
+    if event_status in {"clean", "contaminated"} and not any(fact_hash in ref or draft_hash in ref for ref in event_refs):
+        raise HTTPException(status_code=422, detail="event_audit_hash_bound_evidence_required")
+    event_evidence = draft.get("event_evidence") if isinstance(draft.get("event_evidence"), dict) else {}
+    if event_evidence.get("pollution_flags") and event_status == "clean" and len(str(event_audit.get("pollution_reasoning") or "").strip()) < 20:
+        raise HTTPException(status_code=422, detail="pollution_flags_require_explicit_reasoning")
+
+    statuses = [get_nested(normalized, [section, "status"]) for section in LEARNING_REVIEW_SECTIONS]
+    if event_status == "contaminated":
+        classification = "EVENT_CONTAMINATED"
+        process_grade = "not_graded_event_contaminated"
+        outcome_audit = {"status": "not_used", "reason": "event_contamination_precedes_process_grade"}
+    elif event_status == "data_missing":
+        classification = "DATA_INSUFFICIENT"
+        process_grade = "not_graded_event_pollution_unknown"
+        outcome_audit = {"status": "not_used", "reason": "event_pollution_could_not_be_verified"}
+    elif any(status in {"inconclusive", "data_missing", None} for status in statuses):
+        classification = "DATA_INSUFFICIENT"
+        process_grade = "not_graded_incomplete_review"
+        outcome_audit = {"status": "not_used", "reason": "review_evidence_incomplete"}
+    elif get_nested(event_evidence, ["event_verification"]) != "verified" and get_nested(normalized, ["state_tree_coverage", "status"]) in {"passed", "failed"}:
+        classification = "DATA_INSUFFICIENT"
+        process_grade = "not_graded_event_sequence_unverified"
+        outcome_audit = {"status": "not_used", "reason": "event_sequence_not_independently_verified"}
+    else:
+        process_grade = "error" if "failed" in statuses else "correct"
+        outcome_audit = _derive_frozen_selection_outcome(freeze, facts)
+        if outcome_audit.get("outcome") not in {"win", "loss"}:
+            classification = "DATA_INSUFFICIENT"
+        else:
+            classification = f"PROCESS_{process_grade.upper()}_RESULT_{str(outcome_audit['outcome']).upper()}"
+    derived_audit = {
+        "classification": classification,
+        "process_grade": process_grade,
+        "process_grade_derived_before_outcome": True,
+        "section_statuses": dict(zip(LEARNING_REVIEW_SECTIONS, statuses)),
+        "selection_outcome_audit": outcome_audit,
+        "freeze_hash": freeze_hash, "fact_hash": fact_hash, "draft_hash": draft_hash,
+        "caller_supplied_process_classification_used": False,
+        "result_backfit_used": False,
+    }
+    enriched_event_audit = {**event_audit, "automatic_review_derivation": derived_audit}
+    return settle_learning_sample(
+        freeze_id, facts.get("result"), classification, enriched_event_audit,
+        payload.get("settled_at") or now_ts, review, fact_hash,
+    )
+
+
+def _learning_match_rating_at_least_b(value: Any) -> Optional[bool]:
+    """Grade only an explicitly frozen rating; never infer one from the result."""
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return None
+    normalized = str(value).strip().upper().replace("级", "")
+    if not normalized:
+        return None
+    grade = normalized[0]
+    if grade not in {"A", "B", "C", "D", "E", "F"}:
+        return None
+    return grade in {"A", "B"}
+
+
+def complete_automatic_learning_postmatch_review(freeze_id: Any, now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Complete a deterministic evidence-contract review without using the realised score to grade process."""
+    freeze_id = str(freeze_id or "").strip()
+    now_ts = int(now_ts or time.time())
+    store = load_snapshot_store()
+    freeze = _learning_freeze_by_id(store, freeze_id)
+    facts = max(
+        ((store.get("learning_postmatch_facts") or {}).get(freeze_id) or []),
+        key=lambda row: int(row.get("version_number") or 0), default=None,
+    )
+    draft = max(
+        ((store.get("learning_postmatch_drafts") or {}).get(freeze_id) or []),
+        key=lambda row: int(row.get("version_number") or 0), default=None,
+    )
+    if not freeze or not facts or get_nested(facts, ["verification", "settlement_eligible"]) is not True:
+        raise HTTPException(status_code=409, detail="latest_independently_verified_facts_required")
+    if not draft or draft.get("fact_hash") != facts.get("fact_hash"):
+        raise HTTPException(status_code=409, detail="latest_matching_review_draft_hash_required")
+    freeze_ref = f"freeze:{freeze.get('content_hash')}"
+    fact_ref = f"fact:{facts.get('fact_hash')}"
+    draft_ref = f"draft:{draft.get('draft_hash')}"
+    frozen_decision = freeze.get("decision") if isinstance(freeze.get("decision"), dict) else {}
+    decision_contract = audit_decision_output(frozen_decision)
+    is_pass = str(frozen_decision.get("decision") or "").upper() == "PASS"
+    frozen_match_rating = _learning_frozen_rating(frozen_decision, "match_rating")
+    rating_at_least_b = _learning_match_rating_at_least_b(frozen_match_rating)
+    if is_pass and bool(frozen_decision.get("pass_reasons")):
+        match_status = "passed"
+        match_reason = "The frozen safe PASS has explicit reasons and is auditable without consulting the final score."
+    elif decision_contract.get("decision_eligible") is True and rating_at_least_b is True:
+        match_status = "passed"
+        match_reason = "The actionable decision satisfied the frozen contract and the preregistered B-or-better match threshold."
+    elif decision_contract.get("decision_eligible") is True and rating_at_least_b is False:
+        match_status = "failed"
+        match_reason = "The actionable decision was taken below the preregistered B match threshold."
+    elif decision_contract.get("decision_eligible") is True:
+        match_status = "data_missing"
+        match_reason = "The actionable decision has no parseable frozen match rating."
+    else:
+        match_status = "failed"
+        match_reason = "The frozen actionable decision did not satisfy the prematch decision contract."
+    event_evidence = draft.get("event_evidence") if isinstance(draft.get("event_evidence"), dict) else {}
+    event_verified = event_evidence.get("event_verification") == "verified"
+    populated_states = get_nested(draft, ["review", "state_tree_coverage", "populated_frozen_states"], []) or []
+    if not populated_states:
+        state_status, state_reason = "not_applicable", "No frozen state prediction was available, so state coverage is not graded."
+    elif event_verified:
+        state_status, state_reason = "inconclusive", "Frozen state predictions and independently verified events are present, but no deterministic state-path comparison proves coverage automatically."
+    else:
+        state_status, state_reason = "data_missing", "Frozen state predictions exist but the event sequence lacks independent verification."
+    frozen_expression = _learning_selected_expression(frozen_decision)
+    entry_price = as_float(frozen_expression.get("price"))
+    if is_pass:
+        price_status = "not_applicable"
+        price_reason = "The frozen decision was PASS, so no price execution was attempted."
+        price_evidence_refs = []
+        price_details = {"entry_price": entry_price, "reference_stage": "T-1h"}
+    elif entry_price is None:
+        price_status = "failed"
+        price_reason = "The actionable frozen expression omitted its entry price."
+        price_evidence_refs = [freeze_ref]
+        price_details = {"entry_price": None, "reference_stage": "T-1h"}
+    else:
+        price_reference = _learning_t1h_price_evidence_for_expression(freeze, frozen_expression, store)
+        if price_reference.get("ok") is not True:
+            price_status = "data_missing"
+            price_reason = str(price_reference.get("reason") or "verified_learning_t1h_snapshot_required")
+            price_evidence_refs = [freeze_ref]
+            price_details = {"entry_price": entry_price, "reference_stage": "T-1h"}
+        else:
+            reference_price = float(price_reference["reference_decimal_price"])
+            price_probability_delta = round(1.0 / reference_price - 1.0 / entry_price, 8)
+            price_status = "passed" if price_probability_delta >= 0.0 else "failed"
+            price_reason = (
+                "The frozen entry held or improved versus the exact-line T-1h consensus."
+                if price_status == "passed"
+                else "The frozen entry deteriorated versus the exact-line T-1h consensus."
+            )
+            price_evidence_refs = [freeze_ref, str(price_reference["price_reference_evidence_ref"])]
+            price_details = {
+                "entry_price": entry_price, "reference_stage": "T-1h",
+                "reference_price": reference_price,
+                "t1h_price_probability_delta": price_probability_delta,
+                "reference_snapshot_at": price_reference.get("snapshot_at"),
+                "caller_supplied_price_reference_used": False,
+            }
+    review = copy.deepcopy(draft.get("review") if isinstance(draft.get("review"), dict) else {})
+    section_overrides = {
+        "match_selection_quality": {
+            "status": match_status,
+            "reason": match_reason,
+            "frozen_match_rating": frozen_match_rating,
+            "required_minimum_rating": "B",
+            "rating_derived_from_result": False,
+            "evidence_refs": [freeze_ref] if match_status in {"passed", "failed"} else [],
+        },
+        "state_tree_coverage": {
+            "status": state_status, "reason": state_reason,
+            "evidence_refs": [freeze_ref, fact_ref] if state_status in {"passed", "failed"} else [],
+        },
+        "price_execution_audit": {
+            "status": price_status,
+            "reason": price_reason,
+            **price_details,
+            "evidence_refs": price_evidence_refs,
+        },
+    }
+    for section in LEARNING_REVIEW_SECTIONS:
+        if section in section_overrides:
+            review[section] = section_overrides[section]
+            continue
+        row = review.get(section) if isinstance(review.get(section), dict) else {}
+        status = str(row.get("status") or "data_missing").lower()
+        reason = str(row.get("reason") or "Frozen evidence was insufficient for this process section.")
+        review[section] = {
+            **row, "status": status, "reason": reason,
+            "evidence_refs": [freeze_ref] if status in {"passed", "failed"} else [],
+        }
+    review.update({
+        "review_mode": "automatic_evidence_review",
+        "outcome_not_used_for_process_grade": True,
+        "process_reasoning": "The automatic process grade uses only the immutable prematch contract and hash-bound event evidence; the verified final score is consulted afterward solely to settle the frozen selection.",
+        "learning_disposition": {
+            "result_backfit_used": False, "champion_change_requested": False,
+            "new_theory_status": "none", "existing_rule_implementation_gap": False,
+        },
+    })
+    pollution_flags = list(event_evidence.get("pollution_flags") or [])
+    if not event_verified:
+        event_status = "data_missing"
+    elif pollution_flags:
+        event_status = "contaminated"
+    else:
+        event_status = "clean"
+    event_audit = {
+        "status": event_status,
+        "evidence_refs": [fact_ref, draft_ref] if event_status != "data_missing" else [],
+        "pollution_flags": pollution_flags,
+        "pollution_reasoning": (
+            "Independently verified event evidence contains a listed material incident."
+            if event_status == "contaminated"
+            else "Independently verified event evidence contains no listed pollution incident."
+            if event_status == "clean"
+            else "Event pollution remains unknown because the event sequence lacks two-source verification."
+        ),
+    }
+    return complete_learning_postmatch_review({
+        "freeze_id": freeze_id, "draft_hash": draft.get("draft_hash"),
+        "review": review, "event_audit": event_audit, "settled_at": now_ts,
+    }, now_ts=now_ts)
+
+
+def learning_review_queue() -> Dict[str, Any]:
+    """Expose frozen context plus versioned facts for evidence-led postmatch review."""
+    store = load_snapshot_store()
+    postmatches = store.get("learning_postmatch") or {}
+    rows = []
+    for freeze_id, fact_versions in (store.get("learning_postmatch_facts") or {}).items():
+        if freeze_id in postmatches or not fact_versions:
+            continue
+        freeze = _learning_freeze_by_id(store, freeze_id)
+        if not freeze:
+            continue
+        latest = max(fact_versions, key=lambda row: int(row.get("version_number") or 0))
+        verification = latest.get("verification") if isinstance(latest.get("verification"), dict) else {}
+        draft_versions = (store.get("learning_postmatch_drafts") or {}).get(freeze_id) or []
+        latest_draft = max(draft_versions, key=lambda row: int(row.get("version_number") or 0), default=None)
+        draft_matches_facts = bool(latest_draft and latest_draft.get("fact_hash") == latest.get("fact_hash"))
+        rows.append({
+            "freeze_id": freeze_id,
+            "fixture": freeze.get("fixture"),
+            "kickoff_at": freeze.get("kickoff_at"),
+            "freeze_hash": freeze.get("content_hash"),
+            "frozen_analysis": freeze.get("analysis"),
+            "frozen_decision": freeze.get("decision"),
+            "postmatch_facts": {
+                "fact_hash": latest.get("fact_hash"), "version_number": latest.get("version_number"),
+                "result": latest.get("result"), "events": latest.get("events"), "statistics": latest.get("statistics"),
+                "source_audit": latest.get("source_audit"), "verification": verification,
+            },
+            "review_ready": verification.get("settlement_eligible") is True,
+            "automatic_review_draft": latest_draft if draft_matches_facts else None,
+            "automatic_review_draft_ready": draft_matches_facts,
+            "required_next_action": "compare_process_to_frozen_prematch_without_result_backfit" if verification.get("settlement_eligible") is True else "obtain_independent_result_verification",
+            "allowed_process_classes": sorted(LEARNING_PROCESS_CLASSES),
+            "automatic_champion_change": False,
+        })
+    rows.sort(key=lambda row: (not row["review_ready"], int(row.get("kickoff_at") or 0), str(row.get("fixture"))))
+    return {
+        "version": VERSION,
+        "queue_count": len(rows),
+        "review_ready_count": sum(row["review_ready"] for row in rows),
+        "automatic_review_draft_ready_count": sum(row["automatic_review_draft_ready"] for row in rows),
+        "waiting_for_verification_count": sum(not row["review_ready"] for row in rows),
+        "items": rows,
+        "result_backfit_allowed": False,
+        "automatic_process_classification": False,
+        "automatic_hypothesis_registration": False,
+        "automatic_champion_change": False,
+    }
+
+
+def run_learning_cycle(
+    payload: Optional[Dict[str, Any]] = None,
+    now_ts: Optional[int] = None,
+    fixture_rows: Optional[List[Dict[str, Any]]] = None,
+    prematch_packet_builder: Optional[Any] = None,
+    postmatch_fact_fetcher: Optional[Any] = None,
+    market_language_fact_fetcher: Optional[Any] = None,
+    shadow_model_runner: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Execute one bounded cycle; only preregistered templates may create Hypotheses, never Champion changes."""
+    payload = payload if isinstance(payload, dict) else {}
+    now_ts = int(now_ts or time.time())
+    apply_changes = payload.get("apply") is True
+    auto_prepare = payload.get("auto_prepare_prematch", True)
+    if not isinstance(auto_prepare, bool):
+        raise HTTPException(status_code=400, detail="auto_prepare_prematch_must_be_boolean")
+    auto_collect_facts = payload.get("auto_collect_postmatch_facts", True)
+    if not isinstance(auto_collect_facts, bool):
+        raise HTTPException(status_code=400, detail="auto_collect_postmatch_facts_must_be_boolean")
+    auto_collect_observation_facts = payload.get("auto_collect_market_language_facts", True)
+    if not isinstance(auto_collect_observation_facts, bool):
+        raise HTTPException(status_code=400, detail="auto_collect_market_language_facts_must_be_boolean")
+    auto_build_review_drafts = payload.get("auto_build_postmatch_review_drafts", True)
+    if not isinstance(auto_build_review_drafts, bool):
+        raise HTTPException(status_code=400, detail="auto_build_postmatch_review_drafts_must_be_boolean")
+    auto_complete_reviews = payload.get("auto_complete_postmatch_reviews", True)
+    if not isinstance(auto_complete_reviews, bool):
+        raise HTTPException(status_code=400, detail="auto_complete_postmatch_reviews_must_be_boolean")
+    auto_refresh_research_proposals = payload.get("auto_refresh_research_proposals", True)
+    if not isinstance(auto_refresh_research_proposals, bool):
+        raise HTTPException(status_code=400, detail="auto_refresh_research_proposals_must_be_boolean")
+    auto_register_preregistered_hypotheses = payload.get("auto_register_preregistered_hypotheses", True)
+    if not isinstance(auto_register_preregistered_hypotheses, bool):
+        raise HTTPException(status_code=400, detail="auto_register_preregistered_hypotheses_must_be_boolean")
+    auto_refresh_quality_cards = payload.get("auto_refresh_quality_cards", True)
+    if not isinstance(auto_refresh_quality_cards, bool):
+        raise HTTPException(status_code=400, detail="auto_refresh_quality_cards_must_be_boolean")
+    auto_lock_forward_validation = payload.get("auto_lock_forward_validation", True)
+    if not isinstance(auto_lock_forward_validation, bool):
+        raise HTTPException(status_code=400, detail="auto_lock_forward_validation_must_be_boolean")
+    auto_record_forward_validation = payload.get("auto_record_forward_validation", True)
+    if not isinstance(auto_record_forward_validation, bool):
+        raise HTTPException(status_code=400, detail="auto_record_forward_validation_must_be_boolean")
+    auto_create_promotion_candidates = payload.get("auto_create_promotion_candidates", True)
+    if not isinstance(auto_create_promotion_candidates, bool):
+        raise HTTPException(status_code=400, detail="auto_create_promotion_candidates_must_be_boolean")
+    supplied_run_id = str(payload.get("run_id") or "").strip()
+    safe_run_id = supplied_run_id and len(supplied_run_id) <= 100 and all(char in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in supplied_run_id)
+    if apply_changes and not safe_run_id:
+        raise HTTPException(status_code=400, detail="safe_run_id_required_when_apply_is_true")
+    postmatch_plan = learning_cycle_plan(now_ts=now_ts, fixture_rows=[], include_discovery=False)
+    observation_postmatch_plan = market_language_settlement_plan(now_ts=now_ts)
+    if apply_changes:
+        existing = (load_snapshot_store().get("learning_runs") or {}).get(supplied_run_id)
+        if existing:
+            if learning_run_record_integrity(existing).get("valid") is not True:
+                raise HTTPException(status_code=409, detail="learning_run_integrity_invalid")
+            return {**existing, "action": "unchanged"}
+    prematch_packets = payload.get("prematch_packets") if isinstance(payload.get("prematch_packets"), dict) else {}
+    postmatch_fact_packets = payload.get("postmatch_fact_packets") if isinstance(payload.get("postmatch_fact_packets"), dict) else {}
+    settlement_packets = payload.get("settlement_packets") if isinstance(payload.get("settlement_packets"), list) else []
+    review_completion_packets = payload.get("review_completion_packets") if isinstance(payload.get("review_completion_packets"), list) else []
+    due_ids = {str(row.get("freeze_id")) for row in postmatch_plan.get("settlement_due") or []}
+    settlement_results = []
+    for row in settlement_packets:
+        row = row if isinstance(row, dict) else {}
+        freeze_id = str(row.get("freeze_id") or "").strip()
+        if freeze_id not in due_ids:
+            settlement_results.append({"freeze_id": freeze_id or None, "action": "skipped", "reason": "freeze_not_due_in_current_cycle"})
+            continue
+        if not apply_changes:
+            review_audit = audit_learning_postmatch_review(row.get("review"))
+            settlement_results.append({
+                "freeze_id": freeze_id, "action": "would_settle" if review_audit["eligible"] else "would_reject",
+                "review_eligible": review_audit["eligible"], "reasons": review_audit["reasons"],
+            })
+            continue
+        try:
+            record = settle_learning_sample(
+                freeze_id, row.get("result"), row.get("process_classification"), row.get("event_audit"),
+                row.get("settled_at") or now_ts, row.get("review"), row.get("fact_hash"),
+            )
+            settlement_results.append({"freeze_id": freeze_id, "action": record.get("action"), "postmatch_hash": record.get("postmatch_hash")})
+        except HTTPException as exc:
+            settlement_results.append({"freeze_id": freeze_id, "action": "rejected", "status_code": exc.status_code, "reason": exc.detail})
+    settled_or_existing = {
+        str(row.get("freeze_id")) for row in settlement_results if row.get("action") in {"settled", "unchanged"}
+    }
+    fact_results = []
+    if auto_collect_facts:
+        current_store = load_snapshot_store()
+        existing_facts = current_store.get("learning_postmatch_facts") or {}
+        existing_postmatches = current_store.get("learning_postmatch") or {}
+        for freeze_id in sorted(due_ids):
+            if freeze_id in settled_or_existing or freeze_id in existing_postmatches:
+                fact_results.append({"freeze_id": freeze_id, "action": "skipped", "reason": "postmatch_already_settled"})
+                continue
+            supplied_facts = postmatch_fact_packets.get(freeze_id)
+            versions = existing_facts.get(freeze_id) or []
+            if versions and supplied_facts is None:
+                latest = max(versions, key=lambda row: int(row.get("version_number") or 0))
+                verified = get_nested(latest, ["verification", "settlement_eligible"]) is True
+                if verified or postmatch_fact_fetcher is not None:
+                    fact_results.append({
+                        "freeze_id": freeze_id, "action": "facts_verified_awaiting_review" if verified else "awaiting_independent_verification",
+                        "verification": latest.get("verification"), "fact_hash": latest.get("fact_hash"),
+                    })
+                    continue
+            if not apply_changes:
+                fact_results.append({"freeze_id": freeze_id, "action": "would_collect_facts", "supplied_fact_packet": supplied_facts is not None})
+                continue
+            try:
+                active_fact_fetcher = (lambda fixture_id, packet=supplied_facts: packet) if supplied_facts is not None else postmatch_fact_fetcher
+                fact_record = collect_learning_postmatch_facts(freeze_id, now_ts=now_ts, fact_fetcher=active_fact_fetcher)
+                fact_results.append({
+                    "freeze_id": freeze_id, "action": fact_record.get("action"),
+                    "verification": fact_record.get("verification"), "fact_hash": fact_record.get("fact_hash"),
+                })
+            except HTTPException as exc:
+                fact_results.append({"freeze_id": freeze_id, "action": "rejected", "status_code": exc.status_code, "reason": exc.detail})
+    observation_fact_packets = payload.get("market_language_postmatch_fact_packets") if isinstance(payload.get("market_language_postmatch_fact_packets"), dict) else {}
+    observation_fact_results = []
+    if auto_collect_observation_facts:
+        for item in observation_postmatch_plan.get("items") or []:
+            observation_id = str(item.get("observation_id") or "")
+            if item.get("settlement_ready"):
+                observation_fact_results.append({
+                    "observation_id": observation_id, "action": "facts_verified_awaiting_settlement",
+                    "fact_hash": item.get("fact_hash"),
+                })
+                continue
+            if item.get("automatic_fact_collection_eligible") is not True:
+                observation_fact_results.append({
+                    "observation_id": observation_id, "action": "skipped",
+                    "reason": "outside_automatic_observation_fact_window",
+                })
+                continue
+            supplied_facts = observation_fact_packets.get(observation_id)
+            if not apply_changes:
+                observation_fact_results.append({
+                    "observation_id": observation_id, "action": "would_collect_facts",
+                    "supplied_fact_packet": supplied_facts is not None,
+                })
+                continue
+            try:
+                active_fetcher = (
+                    (lambda fixture_id, packet=supplied_facts: packet)
+                    if supplied_facts is not None else market_language_fact_fetcher
+                )
+                record = collect_market_language_postmatch_facts(
+                    observation_id, now_ts=now_ts, fact_fetcher=active_fetcher,
+                )
+                observation_fact_results.append({
+                    "observation_id": observation_id, "action": record.get("action"),
+                    "fact_hash": record.get("fact_hash"), "verification": record.get("verification"),
+                })
+            except HTTPException as exc:
+                observation_fact_results.append({
+                    "observation_id": observation_id, "action": "rejected",
+                    "status_code": exc.status_code, "reason": exc.detail,
+                })
+    draft_results = []
+    if auto_build_review_drafts:
+        current_store = load_snapshot_store()
+        for freeze_id in sorted(due_ids):
+            if freeze_id in settled_or_existing or freeze_id in (current_store.get("learning_postmatch") or {}):
+                draft_results.append({"freeze_id": freeze_id, "action": "skipped", "reason": "postmatch_already_settled"})
+                continue
+            fact_versions = (current_store.get("learning_postmatch_facts") or {}).get(freeze_id) or []
+            latest_fact = max(fact_versions, key=lambda row: int(row.get("version_number") or 0), default=None)
+            if not latest_fact or get_nested(latest_fact, ["verification", "settlement_eligible"]) is not True:
+                draft_results.append({"freeze_id": freeze_id, "action": "skipped", "reason": "independent_result_verification_required"})
+                continue
+            if not apply_changes:
+                draft_results.append({"freeze_id": freeze_id, "action": "would_build_review_draft", "fact_hash": latest_fact.get("fact_hash")})
+                continue
+            try:
+                draft = build_learning_postmatch_review_draft(freeze_id, now_ts=now_ts)
+                draft_results.append({
+                    "freeze_id": freeze_id, "action": draft.get("action"),
+                    "draft_hash": draft.get("draft_hash"),
+                    "suggested_process_classification": draft.get("suggested_process_classification"),
+                    "manual_review_required": draft.get("manual_review_required"),
+                })
+            except HTTPException as exc:
+                draft_results.append({"freeze_id": freeze_id, "action": "rejected", "status_code": exc.status_code, "reason": exc.detail})
+    review_completion_results = []
+    explicit_review_freeze_ids = set()
+    for row in review_completion_packets:
+        row = row if isinstance(row, dict) else {}
+        freeze_id = str(row.get("freeze_id") or "").strip()
+        if freeze_id:
+            explicit_review_freeze_ids.add(freeze_id)
+        if freeze_id not in due_ids:
+            review_completion_results.append({"freeze_id": freeze_id or None, "action": "skipped", "reason": "freeze_not_due_in_current_cycle"})
+            continue
+        if not apply_changes:
+            review_completion_results.append({"freeze_id": freeze_id, "action": "would_complete_evidence_review"})
+            continue
+        try:
+            completed = complete_learning_postmatch_review(row, now_ts=now_ts)
+            review_completion_results.append({
+                "freeze_id": freeze_id, "action": completed.get("action"),
+                "postmatch_hash": completed.get("postmatch_hash"),
+                "process_classification": completed.get("process_classification"),
+                "caller_supplied_process_classification_used": False,
+            })
+        except HTTPException as exc:
+            review_completion_results.append({
+                "freeze_id": freeze_id, "action": "rejected",
+                "status_code": exc.status_code, "reason": exc.detail,
+            })
+    if auto_complete_reviews:
+        current_store = load_snapshot_store()
+        current_postmatches = current_store.get("learning_postmatch") or {}
+        for freeze_id in sorted(due_ids - explicit_review_freeze_ids):
+            if freeze_id in current_postmatches:
+                continue
+            facts = max(
+                ((current_store.get("learning_postmatch_facts") or {}).get(freeze_id) or []),
+                key=lambda row: int(row.get("version_number") or 0), default=None,
+            )
+            draft = max(
+                ((current_store.get("learning_postmatch_drafts") or {}).get(freeze_id) or []),
+                key=lambda row: int(row.get("version_number") or 0), default=None,
+            )
+            if (
+                not facts or get_nested(facts, ["verification", "settlement_eligible"]) is not True
+                or not draft or draft.get("fact_hash") != facts.get("fact_hash")
+            ):
+                continue
+            if not apply_changes:
+                review_completion_results.append({
+                    "freeze_id": freeze_id, "action": "would_complete_automatic_evidence_review",
+                    "draft_hash": draft.get("draft_hash"), "fact_hash": facts.get("fact_hash"),
+                })
+                continue
+            try:
+                completed = complete_automatic_learning_postmatch_review(freeze_id, now_ts=now_ts)
+                review_completion_results.append({
+                    "freeze_id": freeze_id, "action": completed.get("action"),
+                    "postmatch_hash": completed.get("postmatch_hash"),
+                    "process_classification": completed.get("process_classification"),
+                    "review_mode": "automatic_evidence_review",
+                    "caller_supplied_process_classification_used": False,
+                })
+            except HTTPException as exc:
+                review_completion_results.append({
+                    "freeze_id": freeze_id, "action": "rejected",
+                    "status_code": exc.status_code, "reason": exc.detail,
+                    "review_mode": "automatic_evidence_review",
+                })
+    quality_card_results = []
+    if auto_refresh_quality_cards:
+        if apply_changes:
+            quality_refresh = refresh_learning_quality_cards(now_ts=now_ts)
+            quality_card_results = quality_refresh.get("results") or []
+        else:
+            quality_preview = learning_quality_card_candidates()
+            quality_card_results = [
+                {
+                    "card_id": row.get("card_id"), "freeze_id": row.get("freeze_id"),
+                    "action": "would_create", "card_hash": row.get("card_hash"),
+                }
+                for row in quality_preview.get("candidates") or []
+            ]
+    forward_validation_evidence_results = []
+    if auto_record_forward_validation:
+        evidence_refresh = refresh_learning_forward_validation_evidence(
+            now_ts=now_ts, apply_changes=apply_changes,
+        )
+        forward_validation_evidence_results = evidence_refresh.get("results") or []
+    promotion_candidate_results = []
+    if auto_create_promotion_candidates:
+        promotion_refresh = refresh_learning_promotion_candidates(
+            now_ts=now_ts, apply_changes=apply_changes,
+        )
+        promotion_candidate_results = promotion_refresh.get("results") or []
+    research_proposal_results = []
+    if auto_refresh_research_proposals:
+        if apply_changes:
+            proposal_refresh = refresh_learning_research_proposals(now_ts=now_ts)
+            research_proposal_results = proposal_refresh.get("results") or []
+        else:
+            proposal_preview = learning_research_proposal_candidates()
+            research_proposal_results = [
+                {
+                    "proposal_id": row.get("proposal_id"), "action": "would_propose",
+                    "proposal_hash": row.get("proposal_hash"),
+                    "scope": row.get("scope"), "signal_dimension": row.get("signal_dimension"),
+                }
+                for row in proposal_preview.get("candidates") or []
+            ]
+    hypothesis_registration_results = []
+    if auto_register_preregistered_hypotheses:
+        hypothesis_refresh = instantiate_preregistered_learning_hypotheses(
+            now_ts=now_ts, apply_changes=apply_changes,
+        )
+        hypothesis_registration_results = hypothesis_refresh.get("results") or []
+    prematch_plan = learning_cycle_plan(now_ts=now_ts, fixture_rows=fixture_rows, include_discovery=True)
+    admission_results = []
+    for candidate in prematch_plan.get("discovery", {}).get("candidates") or []:
+        fixture = str(candidate.get("fixture_id") or "")
+        if not apply_changes:
+            admission_results.append({
+                "fixture": fixture, "action": "would_admit",
+                "major_league_registry_version": candidate.get("major_league_registry_version"),
+                "major_league_registry_hash": candidate.get("major_league_registry_hash"),
+            })
+            continue
+        try:
+            admission = admit_learning_candidate(candidate, now_ts=now_ts)
+            admission_results.append({
+                "fixture": fixture, "action": admission.get("action"),
+                "admission_hash": admission.get("admission_hash"),
+                "major_league_registry_version": admission.get("major_league_registry_version"),
+            })
+        except HTTPException as exc:
+            admission_results.append({
+                "fixture": fixture, "action": "rejected",
+                "status_code": exc.status_code, "reason": exc.detail,
+            })
+    freeze_results = []
+    builder = prematch_packet_builder or build_shadow_ai_packet
+    for candidate in prematch_plan.get("discovery", {}).get("candidates") or []:
+        fixture = str(candidate.get("fixture_id") or "")
+        if not candidate.get("analysis_due"):
+            freeze_results.append({
+                "fixture": fixture, "action": "skipped", "reason": candidate.get("analysis_due_reason") or "analysis_not_due",
+                "latest_analysis_node": candidate.get("latest_analysis_node"),
+                "target_analysis_node": candidate.get("target_analysis_node"),
+            })
+            continue
+        packet = prematch_packets.get(fixture)
+        if packet is None and auto_prepare and apply_changes:
+            try:
+                packet = builder(int(fixture))
+            except Exception as exc:
+                freeze_results.append({"fixture": fixture, "action": "rejected", "reason": "prematch_packet_build_failed", "error_type": type(exc).__name__})
+                continue
+        if packet is None:
+            freeze_results.append({"fixture": fixture, "action": "would_prepare" if auto_prepare else "skipped", "reason": "prematch_packet_not_supplied"})
+            continue
+        try:
+            freeze_payload = build_learning_freeze_payload(candidate, packet, now_ts=now_ts)
+            if not apply_changes:
+                freeze_results.append({
+                    "fixture": fixture, "action": "would_reanalyze" if candidate.get("already_frozen") else "would_freeze",
+                    "analysis_node": get_nested(freeze_payload, ["analysis", "analysis_node"]),
+                    "reason": candidate.get("analysis_due_reason"),
+                    "decision": get_nested(freeze_payload, ["decision", "decision"]),
+                    "probability_replay_status": get_nested(freeze_payload, ["analysis", "probability_replay_audit", "status"]),
+                    "probability_replay_decision_eligible": get_nested(freeze_payload, ["analysis", "probability_replay_audit", "decision_eligible"]) is True,
+                })
+                continue
+            record = freeze_learning_sample(freeze_payload, now_ts=now_ts)
+            freeze_results.append({
+                "fixture": fixture, "freeze_id": record.get("freeze_id"), "action": record.get("action"),
+                "analysis_node": get_nested(record, ["analysis", "analysis_node"]),
+                "reason": candidate.get("analysis_due_reason"),
+                "decision": get_nested(record, ["decision", "decision"]),
+                "probability_replay_status": get_nested(record, ["analysis", "probability_replay_audit", "status"]),
+                "probability_replay_decision_eligible": get_nested(record, ["analysis", "probability_replay_audit", "decision_eligible"]) is True,
+                "probability_replay_hash": get_nested(record, ["analysis", "probability_replay", "replay_hash"]),
+            })
+        except HTTPException as exc:
+            freeze_results.append({"fixture": fixture, "action": "rejected", "status_code": exc.status_code, "reason": exc.detail})
+    if auto_prepare or not apply_changes:
+        observation_routing = route_market_language_observations(
+            prematch_plan.get("discovery") or {},
+            now_ts=now_ts,
+            apply_changes=apply_changes,
+            prematch_packet_builder=builder,
+        )
+    else:
+        observation_routing = {
+            "version": VERSION, "generated_at": now_ts,
+            "results": [
+                {"fixture": str(row.get("fixture_id") or ""), "action": "skipped", "reason": "auto_prepare_prematch_disabled"}
+                for row in (prematch_plan.get("discovery", {}).get("observation_candidates") or [])
+            ],
+            "frozen_count": 0, "rejected_count": 0,
+            "model_learning_effect": False, "automatic_scope_expansion": False,
+        }
+    forward_validation_queue_before_lock = learning_forward_validation_queue(now_ts=now_ts)
+    shadow_lock_results = []
+    if auto_lock_forward_validation:
+        active_shadow_runner = shadow_model_runner or LEARNING_SHADOW_MODEL_RUNNER
+        for item in forward_validation_queue_before_lock.get("items") or []:
+            if not callable(active_shadow_runner):
+                shadow_lock_results.append({
+                    "hypothesis_id": item.get("hypothesis_id"), "freeze_id": item.get("freeze_id"),
+                    "action": "blocked", "reason": "internal_shadow_model_runner_not_configured",
+                })
+                continue
+            if not apply_changes:
+                shadow_lock_results.append({
+                    "hypothesis_id": item.get("hypothesis_id"), "freeze_id": item.get("freeze_id"),
+                    "action": "would_compute_and_lock",
+                })
+                continue
+            try:
+                locked = generate_internal_shadow_lock(
+                    item.get("hypothesis_id"), item.get("freeze_id"),
+                    model_runner=active_shadow_runner, now_ts=now_ts,
+                )
+                shadow_lock_results.append({
+                    "hypothesis_id": item.get("hypothesis_id"), "freeze_id": item.get("freeze_id"),
+                    "action": locked.get("action"), "lock_hash": locked.get("lock_hash"),
+                    "calculator_provenance": locked.get("calculator_provenance"),
+                })
+            except HTTPException as exc:
+                shadow_lock_results.append({
+                    "hypothesis_id": item.get("hypothesis_id"), "freeze_id": item.get("freeze_id"),
+                    "action": "rejected", "status_code": exc.status_code, "reason": exc.detail,
+                })
+    forward_validation_queue = learning_forward_validation_queue(now_ts=now_ts) if apply_changes else forward_validation_queue_before_lock
+    immutable_summary = {
+        "run_id": supplied_run_id or None,
+        "mode": "apply" if apply_changes else "dry_run",
+        "started_at": now_ts,
+        "postmatch_plan_generated_at": postmatch_plan.get("generated_at"),
+        "prematch_plan_generated_at": prematch_plan.get("generated_at"),
+        "execution_order": ["past_36h_postmatch", "future_24h_prematch"],
+        "settlement_results": settlement_results,
+        "postmatch_fact_results": fact_results,
+        "market_language_postmatch_fact_results": observation_fact_results,
+        "postmatch_review_draft_results": draft_results,
+        "review_completion_results": review_completion_results,
+        "quality_card_results": quality_card_results,
+        "forward_validation_evidence_results": forward_validation_evidence_results,
+        "promotion_candidate_results": promotion_candidate_results,
+        "research_proposal_results": research_proposal_results,
+        "hypothesis_registration_results": hypothesis_registration_results,
+        "learning_admission_results": admission_results,
+        "freeze_results": freeze_results,
+        "market_language_observation_results": observation_routing.get("results") or [],
+        "shadow_lock_results": shadow_lock_results,
+        "forward_validation_queue": forward_validation_queue,
+        "automatic_hypothesis_registration": any(
+            row.get("action") in {"registered", "would_register"} for row in hypothesis_registration_results
+        ),
+        "automatic_hypothesis_registration_policy": "preregistered_templates_only",
+        "automatic_champion_change": False,
+        "automatic_promotion_candidate_creation": True,
+        "explicit_user_confirmation_required_for_champion": True,
+        "result_backfit_allowed": False,
+    }
+    result = {
+        **immutable_summary,
+        "settled_count": sum(row.get("action") == "settled" for row in settlement_results + review_completion_results),
+        "admitted_count": sum(row.get("action") == "admitted" for row in admission_results),
+        "frozen_count": sum(row.get("action") == "frozen" for row in freeze_results),
+        "market_language_observation_frozen_count": observation_routing.get("frozen_count", 0),
+        "market_language_postmatch_fact_collected_count": sum(
+            row.get("action") == "facts_collected" for row in observation_fact_results
+        ),
+        "probability_replay_ready_count": sum(row.get("probability_replay_status") == "ready" for row in freeze_results),
+        "probability_replay_missing_count": sum(row.get("probability_replay_status") == "data_missing" for row in freeze_results),
+        "review_draft_count": sum(row.get("action") == "drafted" for row in draft_results),
+        "quality_card_created_count": sum(row.get("action") == "created" for row in quality_card_results),
+        "forward_validation_evidence_recorded_count": sum(row.get("action") == "recorded" for row in forward_validation_evidence_results),
+        "promotion_candidate_created_count": sum(row.get("action") == "candidate_created" for row in promotion_candidate_results),
+        "shadow_lock_created_count": sum(row.get("action") == "locked" for row in shadow_lock_results),
+        "research_proposal_version_count": sum(row.get("action") == "proposed" for row in research_proposal_results),
+        "hypothesis_registered_count": sum(row.get("action") == "registered" for row in hypothesis_registration_results),
+        "rejected_count": sum(row.get("action") in {"rejected", "would_reject"} for row in settlement_results + fact_results + observation_fact_results + draft_results + review_completion_results + admission_results + freeze_results + (observation_routing.get("results") or []) + shadow_lock_results + forward_validation_evidence_results + promotion_candidate_results),
+        "action": "completed" if apply_changes else "previewed",
+    }
+    if apply_changes:
+        with SNAPSHOT_STORE_LOCK:
+            store = load_snapshot_store()
+            runs = store.setdefault("learning_runs", {})
+            if supplied_run_id in runs:
+                if learning_run_record_integrity(runs[supplied_run_id]).get("valid") is not True:
+                    raise HTTPException(status_code=409, detail="learning_run_integrity_invalid")
+                return {**runs[supplied_run_id], "action": "unchanged"}
+            record = {**result, "run_hash": _content_hash(immutable_summary), "immutable": True}
+            runs[supplied_run_id] = record
+            store["version"] = VERSION
+            write_snapshot_store(store)
+            result = record
+    return result
+
+
+def _learning_freeze_by_id(store: Dict[str, Any], freeze_id: str) -> Optional[Dict[str, Any]]:
+    for rows in (store.get("learning_frozen") or {}).values():
+        for row in rows or []:
+            if row.get("freeze_id") == freeze_id:
+                return row
+    return None
+
+
+def _market_language_observation_by_id(store: Dict[str, Any], observation_id: str) -> Optional[Dict[str, Any]]:
+    for rows in (store.get("market_language_frozen") or {}).values():
+        for row in rows or []:
+            if row.get("observation_id") == observation_id:
+                return row
+    return None
+
+
+def build_market_language_observation_payload(
+    candidate: Dict[str, Any], packet: Dict[str, Any], now_ts: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Build an observation-only prematch record without any learning contract."""
+    now_ts = int(now_ts or time.time())
+    candidate = candidate if isinstance(candidate, dict) else {}
+    packet = packet if isinstance(packet, dict) else {}
+    fixture = str(candidate.get("fixture_id") or "").strip()
+    kickoff_at = _parse_timestamp(candidate.get("timestamp"))
+    if not fixture or kickoff_at is None:
+        raise HTTPException(status_code=422, detail="observation_candidate_identity_or_kickoff_missing")
+    if str(candidate.get("status") or "").upper() != "NS" or now_ts >= kickoff_at:
+        raise HTTPException(status_code=409, detail="observation_freeze_requires_not_started_fixture")
+    if packet.get("ok") is not True or get_nested(packet, ["analysis_rules", "prematch_only"]) is not True:
+        raise HTTPException(status_code=422, detail="prematch_only_observation_packet_required")
+    generated_at = _parse_timestamp(packet.get("generated_at")) or now_ts
+    if generated_at > now_ts + 60 or generated_at >= kickoff_at:
+        raise HTTPException(status_code=409, detail="observation_packet_timestamp_invalid")
+    decision = copy.deepcopy(packet.get("decision_layer")) if isinstance(packet.get("decision_layer"), dict) else {
+        "decision": "PASS", "execution_action": "PASS", "pass_reasons": ["decision_layer_data_missing"],
+    }
+    market = packet.get("market") if isinstance(packet.get("market"), dict) else {"status": "data_missing"}
+    analysis = {
+        "prematch_only": True,
+        "observation_mode": "MARKET_LANGUAGE_ONLY",
+        "packet_generated_at": generated_at,
+        "market_timeline": market,
+        "market_language": decision.get("market_language") or market.get("latest_dynamics") or {"status": "data_missing"},
+        "expression_optimizer": decision.get("expression_optimizer") or {"action": "PASS", "reason": "data_missing"},
+        "fundamental_context": packet.get("pure_fundamental_script") or packet.get("fundamentals") or {"status": "data_missing"},
+        "result_backfit_allowed": False,
+        "model_learning_allowed": False,
+    }
+    provider_identity = packet.get("provider_identity") if isinstance(packet.get("provider_identity"), dict) else {}
+    provider_identities = [row for row in (packet.get("provider_identities") or []) if isinstance(row, dict)]
+    if provider_identity and not any(row.get("source") == provider_identity.get("source") for row in provider_identities):
+        provider_identities.append(provider_identity)
+    source_refs = [
+        {"source": "api_football", "fixture_id": fixture, "captured_at": generated_at},
+        {"source": str(packet.get("source") or "shadow_ai_packet"), "packet_version": str(packet.get("version") or VERSION)},
+    ]
+    for identity in provider_identities:
+        if identity.get("source") == "the_odds_api":
+            canonical = {
+                "source": "the_odds_api",
+                "sport_key": str(identity.get("sport_key") or "").strip().lower(),
+                "event_id": str(identity.get("event_id") or "").strip().lower(),
+                "home_team": str(identity.get("home_team") or "").strip(),
+                "away_team": str(identity.get("away_team") or "").strip(),
+            }
+            required = ("sport_key", "event_id", "home_team", "away_team")
+        elif identity.get("source") == "thestats":
+            canonical = {
+                "source": "thestats",
+                "match_id": str(identity.get("match_id") or "").strip(),
+                "kickoff_at": _parse_timestamp(identity.get("kickoff_at")),
+                "home_team": str(identity.get("home_team") or "").strip(),
+                "away_team": str(identity.get("away_team") or "").strip(),
+            }
+            required = ("match_id", "kickoff_at", "home_team", "away_team")
+        else:
+            continue
+        if all(canonical[key] not in (None, "") for key in required) and identity.get("source_hash") == _content_hash(canonical):
+            source_refs.append({
+                **canonical, "identity_bound_at": generated_at,
+                "identity_source_hash": identity["source_hash"],
+            })
+    return {
+        "fixture": fixture,
+        "captured_at": generated_at,
+        "data_cutoff_at": generated_at,
+        "kickoff_at": kickoff_at,
+        "scope": candidate.get("scope") if isinstance(candidate.get("scope"), dict) else {},
+        "versions": {"service": VERSION, "model": str(packet.get("version") or VERSION), "rules": LEARNING_RULES_VERSION},
+        "analysis": analysis,
+        "decision": decision,
+        "source_refs": source_refs,
+    }
+
+
+def freeze_market_language_observation(payload: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Freeze a non-learning prematch record for market-language audit and later settlement only."""
+    payload = payload if isinstance(payload, dict) else {}
+    fixture = str(payload.get("fixture") or "").strip()
+    if not fixture:
+        raise HTTPException(status_code=400, detail="fixture_required")
+    scope_audit = audit_learning_scope(payload.get("scope"))
+    if scope_audit["eligible"]:
+        raise HTTPException(status_code=409, detail="major_league_sample_requires_learning_pipeline")
+    captured_at = _parse_timestamp(payload.get("captured_at")) or int(now_ts or time.time())
+    data_cutoff_at = _parse_timestamp(payload.get("data_cutoff_at")) or captured_at
+    kickoff_at = _parse_timestamp(payload.get("kickoff_at"))
+    if kickoff_at is None:
+        raise HTTPException(status_code=400, detail="valid_kickoff_at_required")
+    if data_cutoff_at > captured_at:
+        raise HTTPException(status_code=409, detail="data_cutoff_cannot_follow_capture")
+    if captured_at >= kickoff_at or data_cutoff_at >= kickoff_at:
+        raise HTTPException(status_code=409, detail="market_language_observation_must_be_frozen_before_kickoff")
+    analysis = payload.get("analysis")
+    decision = payload.get("decision")
+    if not isinstance(analysis, dict) or not isinstance(decision, dict):
+        raise HTTPException(status_code=400, detail="analysis_and_decision_objects_required")
+    versions = payload.get("versions") if isinstance(payload.get("versions"), dict) else {}
+    if not str(versions.get("rules") or "").strip():
+        raise HTTPException(status_code=400, detail="rules_version_required")
+    immutable_content = {
+        "fixture": fixture,
+        "kickoff_at": kickoff_at,
+        "data_cutoff_at": data_cutoff_at,
+        "scope": scope_audit["normalized"],
+        "versions": {
+            "service": str(versions.get("service") or VERSION),
+            "model": str(versions.get("model") or VERSION),
+            "rules": str(versions.get("rules")),
+        },
+        "analysis": analysis,
+        "decision": decision,
+        "source_refs": payload.get("source_refs") if isinstance(payload.get("source_refs"), list) else [],
+        "learning_eligibility": "MODEL_LEARNING_EXCLUDED",
+        "allowed_modes": ["MARKET_LANGUAGE_ONLY", "SETTLEMENT_ONLY"],
+        "model_learning_effect": False,
+        "hypothesis_effect": False,
+        "league_dna_effect": False,
+    }
+    content_hash = _content_hash(immutable_content)
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        rows = store.setdefault("market_language_frozen", {}).setdefault(fixture, [])
+        duplicate = next((row for row in rows if row.get("content_hash") == content_hash), None)
+        if duplicate:
+            return {**duplicate, "action": "unchanged"}
+        if rows and captured_at <= max(int(row.get("captured_at") or 0) for row in rows):
+            raise HTTPException(status_code=409, detail="market_language_freeze_time_must_increase")
+        version_number = max([int(row.get("version_number") or 0) for row in rows] + [0]) + 1
+        observation_id = f"market:{fixture}:v{version_number}"
+        record = {
+            **immutable_content,
+            "observation_id": observation_id,
+            "version_number": version_number,
+            "captured_at": captured_at,
+            "content_hash": content_hash,
+            "scope_audit": scope_audit,
+            "status": "frozen",
+            "immutable": True,
+            "champion_effect": False,
+        }
+        rows.append(record)
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return {**record, "action": "frozen"}
+
+
+def collect_market_language_postmatch_facts(
+    observation_id: Any, now_ts: Optional[int] = None, fact_fetcher: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Collect independently verifiable result facts without grading or learning from the observation."""
+    observation_id = str(observation_id or "").strip()
+    if not observation_id:
+        raise HTTPException(status_code=400, detail="observation_id_required")
+    now_ts = int(now_ts or time.time())
+    store = load_snapshot_store()
+    freeze = _market_language_observation_by_id(store, observation_id)
+    if not freeze:
+        raise HTTPException(status_code=404, detail="market_language_observation_not_found")
+    if now_ts < int(freeze.get("kickoff_at") or 0) + 2 * 3600:
+        raise HTTPException(status_code=409, detail="market_language_fact_collection_not_due")
+    raw_fixture_id = freeze.get("fixture")
+    if fact_fetcher is None:
+        try:
+            int(raw_fixture_id)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="provider_fixture_id_required_for_observation_fact_collection") from exc
+        fetched = _learning_postmatch_fact_fetch(freeze)
+    else:
+        fetched = fact_fetcher(raw_fixture_id)
+    if not isinstance(fetched, dict) or fetched.get("ok") is not True:
+        raise HTTPException(status_code=422, detail={
+            "error": "market_language_postmatch_fact_fetch_incomplete",
+            "reason": (fetched or {}).get("error") if isinstance(fetched, dict) else "invalid_fetcher_response",
+        })
+    result = fetched.get("result") if isinstance(fetched.get("result"), dict) else {}
+    try:
+        home_goals, away_goals = int(result.get("home_goals")), int(result.get("away_goals"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="market_language_postmatch_result_incomplete") from exc
+    if str(result.get("status") or "").upper() not in {"FT", "AET", "PEN"} or min(home_goals, away_goals) < 0:
+        raise HTTPException(status_code=422, detail="market_language_postmatch_result_not_final")
+    verified_sources, verified_authorities, evidence_refs = set(), set(), set()
+    for row in fetched.get("source_audit") or []:
+        if not isinstance(row, dict) or row.get("ok") is not True or str(row.get("component") or "").strip().lower() != "result":
+            continue
+        source = str(row.get("source") or "").strip().casefold()
+        evidence_ref = str(row.get("evidence_ref") or row.get("url") or row.get("id") or "").strip()
+        try:
+            source_home, source_away = int(row.get("home_goals")), int(row.get("away_goals"))
+        except (TypeError, ValueError):
+            continue
+        if not source or not evidence_ref or source_home != home_goals or source_away != away_goals:
+            continue
+        normalized_ref = evidence_ref.casefold()
+        if normalized_ref in evidence_refs:
+            continue
+        evidence_refs.add(normalized_ref)
+        parsed = urlparse(evidence_ref)
+        verified_sources.add(source)
+        verified_authorities.add(str(parsed.hostname or source).strip().casefold())
+    immutable_content = {
+        "observation_id": observation_id,
+        "fixture": freeze.get("fixture"),
+        "freeze_hash": freeze.get("content_hash"),
+        "result": {**result, "home_goals": home_goals, "away_goals": away_goals},
+        "events": fetched.get("events") if isinstance(fetched.get("events"), list) else [],
+        "statistics": fetched.get("statistics") if isinstance(fetched.get("statistics"), list) else [],
+        "source_audit": fetched.get("source_audit") if isinstance(fetched.get("source_audit"), list) else [],
+        "verification": {
+            "independent_source_count": len(verified_authorities),
+            "verified_source_names": sorted(verified_sources),
+            "verified_source_authorities": sorted(verified_authorities),
+            "unique_evidence_ref_count": len(evidence_refs),
+            "status": "verified" if len(verified_authorities) >= 2 else "single_source_pending",
+            "settlement_eligible": len(verified_authorities) >= 2,
+            "required_independent_sources": 2,
+        },
+        "market_read_evaluation": None,
+        "model_learning_effect": False,
+        "hypothesis_effect": False,
+        "league_dna_effect": False,
+        "champion_effect": False,
+    }
+    fact_hash = _content_hash(immutable_content)
+    with SNAPSHOT_STORE_LOCK:
+        latest_store = load_snapshot_store()
+        rows = latest_store.setdefault("market_language_postmatch_facts", {}).setdefault(observation_id, [])
+        duplicate = next((row for row in rows if row.get("fact_hash") == fact_hash), None)
+        if duplicate:
+            return {**duplicate, "action": "unchanged"}
+        version_number = max([int(row.get("version_number") or 0) for row in rows] + [0]) + 1
+        record = {
+            **immutable_content, "fact_hash": fact_hash, "version_number": version_number,
+            "collected_at": now_ts, "immutable": True, "action": "facts_collected",
+        }
+        rows.append(record)
+        latest_store["version"] = VERSION
+        write_snapshot_store(latest_store)
+        return record
+
+
+def market_language_settlement_plan(
+    now_ts: Optional[int] = None, store_override: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    now_ts = int(now_ts or time.time())
+    store = store_override if isinstance(store_override, dict) else load_snapshot_store()
+    settlements = store.get("market_language_settlements") or {}
+    fact_store = store.get("market_language_postmatch_facts") or {}
+    rows = []
+    for fixture, versions in (store.get("market_language_frozen") or {}).items():
+        latest = max((row for row in versions or [] if isinstance(row, dict)), key=lambda row: int(row.get("version_number") or 0), default=None)
+        if not latest:
+            continue
+        observation_id = str(latest.get("observation_id") or "")
+        kickoff_at = int(latest.get("kickoff_at") or 0)
+        if observation_id in settlements or now_ts < kickoff_at + 2 * 3600:
+            continue
+        fact_versions = [row for row in (fact_store.get(observation_id) or []) if isinstance(row, dict)]
+        latest_fact = max(fact_versions, key=lambda row: int(row.get("version_number") or 0), default=None)
+        verified = get_nested(latest_fact or {}, ["verification", "settlement_eligible"]) is True
+        age_seconds = now_ts - kickoff_at
+        rows.append({
+            "fixture": str(fixture), "observation_id": observation_id,
+            "kickoff_at": kickoff_at, "hours_since_kickoff": round(age_seconds / 3600, 2),
+            "fact_hash": (latest_fact or {}).get("fact_hash"),
+            "fact_verification_status": get_nested(latest_fact or {}, ["verification", "status"]) or "data_missing",
+            "required_action": "review_market_language_against_verified_facts" if verified else "collect_or_verify_result_facts",
+            "settlement_ready": verified,
+            "automatic_fact_collection_eligible": (
+                not verified and age_seconds <= LEARNING_POSTMATCH_LOOKBACK_HOURS * 3600
+            ),
+            "model_learning_effect": False,
+        })
+    rows.sort(key=lambda row: (row["kickoff_at"], row["fixture"]))
+    return {
+        "version": VERSION, "generated_at": now_ts,
+        "due_count": len(rows), "settlement_ready_count": sum(row["settlement_ready"] for row in rows),
+        "fact_collection_due_count": sum(row["fact_verification_status"] != "verified" for row in rows),
+        "automatic_fact_collection_due_count": sum(row["automatic_fact_collection_eligible"] for row in rows),
+        "items": rows, "automatic_market_read_grade": False,
+        "model_learning_effect": False, "automatic_champion_change": False,
+    }
+
+
+def settle_market_language_observation(observation_id: Any, payload: Any, now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Settle an observation without creating any model-learning or league-DNA evidence."""
+    observation_id = str(observation_id or "").strip()
+    if not observation_id:
+        raise HTTPException(status_code=400, detail="observation_id_required")
+    payload = payload if isinstance(payload, dict) else {}
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    try:
+        home_goals, away_goals = int(result.get("home_goals")), int(result.get("away_goals"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="final_goals_required")
+    if home_goals < 0 or away_goals < 0 or str(result.get("status") or "").upper() not in ("FT", "AET", "PEN"):
+        raise HTTPException(status_code=400, detail="verified_final_result_required")
+    pre_store = load_snapshot_store()
+    pre_freeze = _market_language_observation_by_id(pre_store, observation_id)
+    if not pre_freeze:
+        raise HTTPException(status_code=404, detail="market_language_observation_not_found")
+    fact_versions = [
+        row for row in ((pre_store.get("market_language_postmatch_facts") or {}).get(observation_id) or [])
+        if isinstance(row, dict)
+    ]
+    latest_fact = max(fact_versions, key=lambda row: int(row.get("version_number") or 0), default=None)
+    verification_refs = payload.get("verification_refs") if isinstance(payload.get("verification_refs"), list) else []
+    fact_hash = str(payload.get("fact_hash") or "").strip()
+    if latest_fact:
+        if get_nested(latest_fact, ["verification", "settlement_eligible"]) is not True:
+            raise HTTPException(status_code=409, detail="verified_market_language_fact_packet_required")
+        if not fact_hash or fact_hash != latest_fact.get("fact_hash"):
+            raise HTTPException(status_code=409, detail="latest_market_language_fact_hash_required")
+        fact_result = latest_fact.get("result") if isinstance(latest_fact.get("result"), dict) else {}
+        if (
+            int(fact_result.get("home_goals", -1)) != home_goals
+            or int(fact_result.get("away_goals", -1)) != away_goals
+            or str(fact_result.get("status") or "").upper() != str(result.get("status") or "").upper()
+        ):
+            raise HTTPException(status_code=409, detail="market_language_result_must_match_verified_facts")
+        verification_refs = [
+            {
+                "source": str(row.get("source") or ""),
+                "id": str(row.get("evidence_ref") or row.get("url") or row.get("id") or ""),
+            }
+            for row in (latest_fact.get("source_audit") or [])
+            if isinstance(row, dict) and row.get("ok") is True
+            and str(row.get("component") or "").strip().lower() == "result"
+        ]
+    valid_refs = [
+        ref for ref in verification_refs
+        if isinstance(ref, dict)
+        and str(ref.get("source") or "").strip()
+        and str(ref.get("url") or ref.get("id") or ref.get("title") or "").strip()
+    ]
+    unique_refs, independent_authorities = set(), set()
+    for ref in valid_refs:
+        evidence_ref = str(ref.get("url") or ref.get("id") or ref.get("title") or "").strip()
+        normalized_ref = evidence_ref.casefold()
+        if normalized_ref in unique_refs:
+            continue
+        unique_refs.add(normalized_ref)
+        parsed = urlparse(evidence_ref)
+        independent_authorities.add(str(parsed.hostname or ref.get("source") or "").strip().casefold())
+    if len(independent_authorities) < 2:
+        raise HTTPException(status_code=409, detail="two_independent_result_sources_required")
+    settlement = payload.get("settlement") if isinstance(payload.get("settlement"), dict) else {}
+    payout_outcome = str(settlement.get("payout_outcome") or "").strip().upper()
+    if payout_outcome not in {"WIN", "HALF_WIN", "PUSH", "HALF_LOSS", "LOSS", "VOID", "PASS"}:
+        raise HTTPException(status_code=400, detail="valid_payout_outcome_required")
+    market_read = str(payload.get("market_read_evaluation") or "").strip().upper()
+    if market_read not in {"CONFIRMED", "PARTIAL", "REJECTED", "INCONCLUSIVE"}:
+        raise HTTPException(status_code=400, detail="valid_market_read_evaluation_required")
+    settled_at = _parse_timestamp(payload.get("settled_at")) or int(now_ts or time.time())
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        freeze = _market_language_observation_by_id(store, observation_id)
+        if not freeze:
+            raise HTTPException(status_code=404, detail="market_language_observation_not_found")
+        if settled_at < int(freeze.get("kickoff_at") or 0):
+            raise HTTPException(status_code=409, detail="settlement_cannot_precede_kickoff")
+        immutable_content = {
+            "observation_id": observation_id,
+            "fixture": freeze.get("fixture"),
+            "freeze_hash": freeze.get("content_hash"),
+            "fact_hash": latest_fact.get("fact_hash") if latest_fact else None,
+            "result": {**result, "home_goals": home_goals, "away_goals": away_goals},
+            "verification_refs": valid_refs[:10],
+            "result_verification": {
+                "independent_authority_count": len(independent_authorities),
+                "independent_authorities": sorted(independent_authorities),
+                "unique_evidence_ref_count": len(unique_refs),
+                "required_independent_sources": 2,
+                "status": "verified",
+            },
+            "market_read_evaluation": market_read,
+            "settlement": {**settlement, "payout_outcome": payout_outcome},
+            "event_audit": payload.get("event_audit") if isinstance(payload.get("event_audit"), dict) else {"status": "data_missing"},
+            "learning_eligibility": "MODEL_LEARNING_EXCLUDED",
+            "model_learning_effect": False,
+            "hypothesis_effect": False,
+            "league_dna_effect": False,
+        }
+        settlement_hash = _content_hash(immutable_content)
+        settlements = store.setdefault("market_language_settlements", {})
+        existing = settlements.get(observation_id)
+        if existing:
+            if existing.get("settlement_hash") == settlement_hash:
+                return {**existing, "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="market_language_settlement_already_recorded")
+        record = {
+            **immutable_content,
+            "settled_at": settled_at,
+            "settlement_hash": settlement_hash,
+            "immutable": True,
+            "champion_effect": False,
+            "action": "settled",
+        }
+        settlements[observation_id] = record
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return record
+
+
+def market_language_observation_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
+    now_ts = int(now_ts or time.time())
+    store = load_snapshot_store()
+    settlements = store.get("market_language_settlements") or {}
+    facts = store.get("market_language_postmatch_facts") or {}
+    latest_rows = []
+    for fixture, versions in (store.get("market_language_frozen") or {}).items():
+        latest = max(
+            (row for row in versions or [] if isinstance(row, dict)),
+            key=lambda row: int(row.get("version_number") or 0),
+            default=None,
+        )
+        if not latest:
+            continue
+        observation_id = str(latest.get("observation_id") or "")
+        settled = observation_id in settlements
+        kickoff_at = int(latest.get("kickoff_at") or 0)
+        fact_versions = [row for row in (facts.get(observation_id) or []) if isinstance(row, dict)]
+        latest_fact = max(fact_versions, key=lambda row: int(row.get("version_number") or 0), default=None)
+        facts_verified = get_nested(latest_fact or {}, ["verification", "settlement_eligible"]) is True
+        if settled:
+            state = "settled"
+        elif now_ts < kickoff_at:
+            state = "prematch_frozen"
+        elif now_ts < kickoff_at + 2 * 3600:
+            state = "awaiting_result_window"
+        elif not latest_fact:
+            state = "fact_collection_due"
+        elif not facts_verified:
+            state = "result_verification_pending"
+        else:
+            state = "settlement_ready"
+        latest_rows.append({
+            "fixture": str(fixture),
+            "observation_id": observation_id,
+            "kickoff_at": kickoff_at,
+            "state": state,
+            "competition_id": get_nested(latest, ["scope", "competition_id"]),
+            "competition_name": get_nested(latest, ["scope", "competition_name"]),
+            "fact_hash": (latest_fact or {}).get("fact_hash"),
+            "fact_verification_status": get_nested(latest_fact or {}, ["verification", "status"]) or "data_missing",
+            "learning_eligibility": "MODEL_LEARNING_EXCLUDED",
+            "allowed_modes": ["MARKET_LANGUAGE_ONLY", "SETTLEMENT_ONLY"],
+        })
+    latest_rows.sort(key=lambda row: (row["kickoff_at"], row["fixture"]))
+    state_counts = {
+        state: sum(row["state"] == state for row in latest_rows)
+        for state in (
+            "prematch_frozen", "awaiting_result_window", "fact_collection_due",
+            "result_verification_pending", "settlement_ready", "settled",
+        )
+    }
+    return {
+        "version": VERSION,
+        "generated_at": now_ts,
+        "fixture_count": len(latest_rows),
+        "frozen_version_count": sum(len(rows or []) for rows in (store.get("market_language_frozen") or {}).values()),
+        "postmatch_fact_version_count": sum(len(rows or []) for rows in facts.values()),
+        "settlement_count": len(settlements),
+        "state_counts": state_counts,
+        "fact_collection_due": [row for row in latest_rows if row["state"] == "fact_collection_due"],
+        "settlement_ready": [row for row in latest_rows if row["state"] == "settlement_ready"],
+        "records": latest_rows[:100],
+        "records_truncated": len(latest_rows) > 100,
+        "model_learning_effect": False,
+        "hypothesis_effect": False,
+        "league_dna_effect": False,
+        "champion_effect": False,
+        "policy": "observation records are isolated from every model-learning and promotion namespace",
+    }
+
+
+def route_market_language_observations(
+    discovery: Dict[str, Any], now_ts: Optional[int] = None, apply_changes: bool = True,
+    prematch_packet_builder: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Route non-registry prematch fixtures into the isolated observation namespace."""
+    now_ts = int(now_ts or time.time())
+    builder = prematch_packet_builder or build_shadow_ai_packet
+    results = []
+    candidates = discovery.get("observation_candidates") if isinstance(discovery, dict) else []
+    for candidate in candidates or []:
+        fixture = str(candidate.get("fixture_id") or "")
+        if not apply_changes:
+            results.append({"fixture": fixture, "action": "would_observe", "reason": candidate.get("routing_reason")})
+            continue
+        try:
+            packet = builder(int(fixture))
+            payload = build_market_language_observation_payload(candidate, packet, now_ts=now_ts)
+            record = freeze_market_language_observation(payload, now_ts=now_ts)
+            results.append({
+                "fixture": fixture,
+                "observation_id": record.get("observation_id"),
+                "action": record.get("action"),
+                "learning_eligibility": "MODEL_LEARNING_EXCLUDED",
+            })
+        except HTTPException as exc:
+            results.append({"fixture": fixture, "action": "rejected", "status_code": exc.status_code, "reason": exc.detail})
+        except Exception as exc:
+            results.append({
+                "fixture": fixture, "action": "rejected",
+                "reason": "observation_packet_build_failed", "error_type": type(exc).__name__,
+            })
+    return {
+        "version": VERSION,
+        "generated_at": now_ts,
+        "results": results,
+        "frozen_count": sum(row.get("action") == "frozen" for row in results),
+        "rejected_count": sum(row.get("action") == "rejected" for row in results),
+        "model_learning_effect": False,
+        "automatic_scope_expansion": False,
+    }
+
+
+def freeze_learning_sample(payload: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    fixture = str(payload.get("fixture") or "").strip()
+    if not fixture:
+        raise HTTPException(status_code=400, detail="fixture_required")
+    scope_audit = audit_learning_scope(payload.get("scope"))
+    if not scope_audit["eligible"]:
+        raise HTTPException(status_code=422, detail={"error": "top_flight_scope_not_verified", "reasons": scope_audit["reasons"]})
+    captured_at = _parse_timestamp(payload.get("captured_at")) or int(now_ts or time.time())
+    data_cutoff_at = _parse_timestamp(payload.get("data_cutoff_at")) or captured_at
+    kickoff_at = _parse_timestamp(payload.get("kickoff_at"))
+    if kickoff_at is None:
+        raise HTTPException(status_code=400, detail="valid_kickoff_at_required")
+    if data_cutoff_at > captured_at:
+        raise HTTPException(status_code=409, detail="data_cutoff_cannot_follow_capture")
+    if captured_at >= kickoff_at or data_cutoff_at >= kickoff_at:
+        raise HTTPException(status_code=409, detail="learning_sample_must_be_frozen_before_kickoff")
+    analysis = payload.get("analysis")
+    decision = payload.get("decision")
+    if not isinstance(analysis, dict) or not isinstance(decision, dict):
+        raise HTTPException(status_code=400, detail="analysis_and_decision_objects_required")
+    versions = payload.get("versions") if isinstance(payload.get("versions"), dict) else {}
+    if not str(versions.get("rules") or "").strip():
+        raise HTTPException(status_code=400, detail="rules_version_required")
+    league_dna_view = league_dna_model_view(scope_audit["normalized"])
+    requested_league_dna = str(versions.get("league_dna") or "data_missing").strip()
+    if league_dna_view["status"] == "VERIFIED_ACTIVE":
+        if requested_league_dna != league_dna_view["version"]:
+            raise HTTPException(status_code=409, detail={"error": "league_dna_version_mismatch", "required_version": league_dna_view["version"]})
+    elif requested_league_dna not in {"data_missing", "candidate_only"}:
+        raise HTTPException(status_code=409, detail="unverified_league_dna_cannot_enter_prematch_freeze")
+    immutable_content = {
+        "fixture": fixture,
+        "kickoff_at": kickoff_at,
+        "data_cutoff_at": data_cutoff_at,
+        "scope": scope_audit["normalized"],
+        "versions": {
+            "service": str(versions.get("service") or VERSION),
+            "model": str(versions.get("model") or VERSION),
+            "rules": str(versions.get("rules")),
+            "league_dna": league_dna_view["version"] or league_dna_view["status"],
+        },
+        "league_dna_audit": {
+            "status": league_dna_view["status"], "version": league_dna_view["version"],
+            "active_tag_count": league_dna_view["active_tag_count"],
+            "candidate_tag_count": league_dna_view["candidate_tag_count"],
+            "champion_effect": league_dna_view["champion_effect"],
+        },
+        "analysis": analysis,
+        "decision": decision,
+        "source_refs": payload.get("source_refs") if isinstance(payload.get("source_refs"), list) else [],
+    }
+    content_hash = _content_hash(immutable_content)
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        rows = store.setdefault("learning_frozen", {}).setdefault(fixture, [])
+        duplicate = next((row for row in rows if row.get("content_hash") == content_hash), None)
+        if duplicate:
+            return {**duplicate, "action": "unchanged"}
+        if rows and captured_at <= max(int(row.get("captured_at") or 0) for row in rows):
+            raise HTTPException(status_code=409, detail="learning_freeze_time_must_increase")
+        version_number = max([int(row.get("version_number") or 0) for row in rows] + [0]) + 1
+        freeze_id = f"{fixture}:v{version_number}"
+        record = {
+            **immutable_content,
+            "freeze_id": freeze_id,
+            "version_number": version_number,
+            "captured_at": captured_at,
+            "content_hash": content_hash,
+            "scope_audit": scope_audit,
+            "status": "frozen",
+            "immutable": True,
+            "champion_effect": False,
+        }
+        rows.append(record)
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return {**record, "action": "frozen"}
+
+
+def audit_learning_postmatch_review(review: Any) -> Dict[str, Any]:
+    review = review if isinstance(review, dict) else {}
+    reasons = []
+    normalized_sections = {}
+    for section in LEARNING_REVIEW_SECTIONS:
+        row = review.get(section) if isinstance(review.get(section), dict) else {}
+        status = str(row.get("status") or "").strip().lower()
+        if status not in LEARNING_REVIEW_STATUSES:
+            reasons.append(f"{section}_status_required")
+            status = "data_missing"
+        normalized_sections[section] = {**row, "status": status}
+    process_reasoning = str(review.get("process_reasoning") or "").strip()
+    if len(process_reasoning) < 20:
+        reasons.append("process_reasoning_too_short")
+    disposition = review.get("learning_disposition") if isinstance(review.get("learning_disposition"), dict) else {}
+    result_backfit_used = disposition.get("result_backfit_used")
+    champion_change_requested = disposition.get("champion_change_requested")
+    new_theory_status = str(disposition.get("new_theory_status") or "none").strip()
+    if result_backfit_used is not False:
+        reasons.append("result_backfit_must_be_explicitly_false")
+    if champion_change_requested is not False:
+        reasons.append("single_match_champion_change_forbidden")
+    if new_theory_status not in {"none", *LEARNING_HYPOTHESIS_TYPES}:
+        reasons.append("invalid_single_match_theory_disposition")
+    implementation_gap = disposition.get("existing_rule_implementation_gap") is True
+    existing_rule_ref = str(disposition.get("existing_rule_ref") or "").strip()
+    if implementation_gap and not existing_rule_ref:
+        reasons.append("implementation_gap_requires_existing_rule_reference")
+    normalized_disposition = {
+        "result_backfit_used": result_backfit_used,
+        "champion_change_requested": champion_change_requested,
+        "new_theory_status": new_theory_status,
+        "existing_rule_implementation_gap": implementation_gap,
+        "existing_rule_ref": existing_rule_ref or None,
+        "regression_test_required": bool(disposition.get("regression_test_required")) if implementation_gap else False,
+    }
+    if implementation_gap and not normalized_disposition["regression_test_required"]:
+        reasons.append("implementation_gap_requires_regression_test")
+    review_mode = str(review.get("review_mode") or "manual").strip().lower()
+    outcome_not_used_for_process_grade = review.get("outcome_not_used_for_process_grade")
+    return {
+        "eligible": not reasons,
+        "reasons": reasons,
+        "normalized": {
+            **normalized_sections,
+            "process_reasoning": process_reasoning,
+            "review_mode": review_mode,
+            "outcome_not_used_for_process_grade": outcome_not_used_for_process_grade,
+            "learning_disposition": normalized_disposition,
+        },
+        "policy": "review process and expression against the immutable prematch freeze; never infer a rule from the final score",
+    }
+
+
+def settle_learning_sample(freeze_id: Any, result: Any, process_classification: Any, event_audit: Any = None, settled_at: Any = None, review: Any = None, fact_hash: Any = None) -> Dict[str, Any]:
+    freeze_id = str(freeze_id or "").strip()
+    if not freeze_id:
+        raise HTTPException(status_code=400, detail="freeze_id_required")
+    if process_classification not in LEARNING_PROCESS_CLASSES:
+        raise HTTPException(status_code=400, detail="invalid_process_classification")
+    result = result if isinstance(result, dict) else {}
+    try:
+        home_goals, away_goals = int(result.get("home_goals")), int(result.get("away_goals"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="final_goals_required")
+    if home_goals < 0 or away_goals < 0 or str(result.get("status") or "").upper() not in ("FT", "AET", "PEN"):
+        raise HTTPException(status_code=400, detail="verified_final_result_required")
+    event_audit = event_audit if isinstance(event_audit, dict) else {"status": "data_missing"}
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        freeze = _learning_freeze_by_id(store, freeze_id)
+        if not freeze:
+            raise HTTPException(status_code=404, detail="frozen_learning_sample_not_found")
+        review_audit = audit_learning_postmatch_review(review)
+        if not review_audit["eligible"]:
+            raise HTTPException(status_code=422, detail={"error": "postmatch_review_incomplete_or_backfit_risk", "reasons": review_audit["reasons"]})
+        fact_versions = (store.get("learning_postmatch_facts") or {}).get(freeze_id) or []
+        if not fact_versions:
+            raise HTTPException(status_code=409, detail="verified_postmatch_fact_packet_required")
+        verified_facts = max(fact_versions, key=lambda row: int(row.get("version_number") or 0))
+        if get_nested(verified_facts, ["verification", "settlement_eligible"]) is not True:
+            raise HTTPException(status_code=409, detail="independent_result_verification_required")
+        supplied_fact_hash = str(fact_hash or "").strip()
+        if not supplied_fact_hash or supplied_fact_hash != str(verified_facts.get("fact_hash") or ""):
+            raise HTTPException(status_code=409, detail="latest_verified_fact_hash_required")
+        verified_result = verified_facts.get("result") if isinstance(verified_facts.get("result"), dict) else {}
+        if (
+            str(verified_result.get("status") or "").upper() != str(result.get("status") or "").upper()
+            or int(verified_result.get("home_goals")) != home_goals
+            or int(verified_result.get("away_goals")) != away_goals
+        ):
+            raise HTTPException(status_code=409, detail="submitted_result_does_not_match_verified_facts")
+        settled_ts = _parse_timestamp(settled_at) or int(time.time())
+        if settled_ts < int(freeze.get("kickoff_at") or 0):
+            raise HTTPException(status_code=409, detail="postmatch_settlement_cannot_precede_kickoff")
+        immutable_content = {
+            "freeze_id": freeze_id,
+            "fixture": freeze.get("fixture"),
+            "freeze_hash": freeze.get("content_hash"),
+            "fact_hash": verified_facts.get("fact_hash"),
+            "fact_version_number": verified_facts.get("version_number"),
+            "result": {**result, "home_goals": home_goals, "away_goals": away_goals},
+            "process_classification": process_classification,
+            "event_audit": event_audit,
+            "review": review_audit["normalized"],
+        }
+        postmatch_hash = _content_hash(immutable_content)
+        postmatches = store.setdefault("learning_postmatch", {})
+        existing = postmatches.get(freeze_id)
+        if existing:
+            if existing.get("postmatch_hash") == postmatch_hash:
+                return {**existing, "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="postmatch_already_recorded")
+        record = {
+            **immutable_content,
+            "settled_at": settled_ts,
+            "postmatch_hash": postmatch_hash,
+            "review_audit": {"eligible": True, "policy": review_audit["policy"]},
+            "immutable": True,
+            "champion_effect": False,
+            "action": "settled",
+        }
+        postmatches[freeze_id] = record
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return record
+
+
+def _normalize_learning_ablation_plan(value: Any) -> Dict[str, Any]:
+    value = value if isinstance(value, dict) else {}
+    primary_module = str(value.get("primary_module") or "").strip().upper()
+    raw_modules = value.get("required_modules") if isinstance(value.get("required_modules"), list) else []
+    required_modules = list(dict.fromkeys(str(module).strip().upper() for module in raw_modules if str(module).strip()))
+    if not required_modules:
+        raise HTTPException(status_code=422, detail="ablation_plan_required_modules_required")
+    invalid = [module for module in required_modules if module not in LEARNING_ABLATION_INTERVENTIONS]
+    if invalid:
+        raise HTTPException(status_code=422, detail={"error": "unsupported_ablation_module", "modules": invalid})
+    if primary_module not in required_modules:
+        raise HTTPException(status_code=422, detail="ablation_primary_module_must_be_required")
+    raw_interventions = value.get("module_interventions") if isinstance(value.get("module_interventions"), dict) else {}
+    module_interventions = {}
+    for module in required_modules:
+        row = raw_interventions.get(module) if isinstance(raw_interventions.get(module), dict) else {}
+        expected = LEARNING_ABLATION_INTERVENTIONS[module]
+        if str(row.get("intervention") or "").strip() != expected:
+            raise HTTPException(status_code=422, detail={
+                "error": "exact_module_ablation_intervention_required",
+                "module": module, "required_intervention": expected,
+            })
+        minimum_gain = as_float(row.get("minimum_brier_gain"))
+        if minimum_gain is None or not 0 <= minimum_gain <= 1:
+            raise HTTPException(status_code=422, detail={"error": "valid_module_minimum_brier_gain_required", "module": module})
+        module_interventions[module] = {
+            "intervention": expected,
+            "minimum_brier_gain": minimum_gain,
+            "expected_direction": "challenger_brier_lower_than_module_ablated_brier",
+        }
+    minimum_champion_gain = as_float(value.get("minimum_challenger_brier_gain_over_champion"))
+    if minimum_champion_gain is None or not 0 <= minimum_champion_gain <= 1:
+        raise HTTPException(status_code=422, detail="valid_minimum_challenger_brier_gain_over_champion_required")
+    return {
+        "schema_version": "module_ablation_v1",
+        "primary_module": primary_module,
+        "required_modules": required_modules,
+        "module_interventions": module_interventions,
+        "minimum_challenger_brier_gain_over_champion": minimum_champion_gain,
+        "caller_supplied_validation_outcome_allowed": False,
+    }
+
+
+def _normalize_learning_challenger_spec(value: Any, required_modules: List[str]) -> Dict[str, Any]:
+    """Validate a bounded, executable and entirely preregistered Poisson intervention."""
+    value = value if isinstance(value, dict) else {}
+    if value.get("schema_version") != "poisson_log_rate_adjustment_v1":
+        raise HTTPException(status_code=422, detail="executable_challenger_spec_required")
+    if value.get("uses_market_odds") is not False:
+        raise HTTPException(status_code=422, detail="challenger_spec_must_be_odds_independent")
+    raw = value.get("module_log_rate_deltas") if isinstance(value.get("module_log_rate_deltas"), dict) else {}
+    if set(raw) != set(required_modules):
+        raise HTTPException(status_code=422, detail={
+            "error": "challenger_spec_modules_must_match_ablation_plan",
+            "required_modules": required_modules,
+            "submitted_modules": sorted(str(module) for module in raw),
+        })
+    normalized = {}
+    for module in required_modules:
+        row = raw.get(module) if isinstance(raw.get(module), dict) else {}
+        home_delta, away_delta = as_float(row.get("home")), as_float(row.get("away"))
+        if any(delta is None or abs(delta) > LEARNING_CHALLENGER_MAX_MODULE_LOG_RATE_DELTA for delta in (home_delta, away_delta)):
+            raise HTTPException(status_code=422, detail={
+                "error": "challenger_module_log_rate_delta_out_of_range", "module": module,
+                "maximum_absolute_delta": LEARNING_CHALLENGER_MAX_MODULE_LOG_RATE_DELTA,
+            })
+        if abs(home_delta) < 1e-12 and abs(away_delta) < 1e-12:
+            raise HTTPException(status_code=422, detail={"error": "challenger_module_intervention_cannot_be_zero", "module": module})
+        normalized[module] = {"home": round(home_delta, 8), "away": round(away_delta, 8)}
+    combined_home = round(sum(row["home"] for row in normalized.values()), 8)
+    combined_away = round(sum(row["away"] for row in normalized.values()), 8)
+    if any(abs(delta) > LEARNING_CHALLENGER_MAX_COMBINED_LOG_RATE_DELTA for delta in (combined_home, combined_away)):
+        raise HTTPException(status_code=422, detail={
+            "error": "challenger_combined_log_rate_delta_out_of_range",
+            "maximum_absolute_delta": LEARNING_CHALLENGER_MAX_COMBINED_LOG_RATE_DELTA,
+        })
+    normalized_spec = {
+        "schema_version": "poisson_log_rate_adjustment_v1",
+        "runner_id": "builtin_preregistered_poisson_challenger",
+        "runner_version": "1",
+        "uses_market_odds": False,
+        "expression_policy": "preserve_frozen_market_selection_and_line",
+        "module_log_rate_deltas": normalized,
+        "combined_log_rate_delta": {"home": combined_home, "away": combined_away},
+    }
+    return {**normalized_spec, "spec_hash": _content_hash(normalized_spec)}
+
+
+def _normalize_learning_validation_plan(value: Any) -> Dict[str, Any]:
+    value = value if isinstance(value, dict) else {}
+    normalized_ablation_plan = _normalize_learning_ablation_plan(value.get("ablation_plan"))
+    structured_scope = value.get("structured_scope") if isinstance(value.get("structured_scope"), dict) else {}
+    raw_competition_ids = structured_scope.get("competition_ids") if isinstance(structured_scope.get("competition_ids"), list) else []
+    try:
+        competition_ids = sorted(set(int(item) for item in raw_competition_ids if not isinstance(item, bool)))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="structured_scope_competition_ids_invalid") from exc
+    markets = sorted(set(
+        str(item).strip() for item in (structured_scope.get("markets") or []) if str(item).strip()
+    )) if isinstance(structured_scope.get("markets"), list) else []
+    if not competition_ids or not markets:
+        raise HTTPException(status_code=422, detail="structured_validation_scope_required")
+    invalid_markets = [market for market in markets if market not in LEAGUE_DNA_MARKETS]
+    if invalid_markets:
+        raise HTTPException(status_code=422, detail={"error": "unsupported_structured_scope_market", "markets": invalid_markets})
+    challenger_spec = _normalize_learning_challenger_spec(
+        value.get("challenger_spec"), normalized_ablation_plan["required_modules"],
+    )
+    return {
+        **value,
+        "structured_scope": {"competition_ids": competition_ids, "markets": markets},
+        "ablation_plan": normalized_ablation_plan,
+        "challenger_spec": challenger_spec,
+        "calculator_policy": {
+            "required_origin": "internal_shadow_runner",
+            "runner_schema": "learning_shadow_model_run_v1",
+            "required_runner_id": "builtin_preregistered_poisson_challenger",
+            "required_runner_version": "1",
+            "external_submitted_outputs_promotion_eligible": False,
+        },
+    }
+
+
+def register_learning_hypothesis(payload: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    hypothesis_type = str(payload.get("type") or "").strip()
+    if hypothesis_type not in LEARNING_HYPOTHESIS_TYPES:
+        raise HTTPException(status_code=400, detail="invalid_hypothesis_type")
+    required_text = ("title", "definition", "applicable_scope", "expected_direction", "failure_conditions", "falsification_criteria")
+    missing = [key for key in required_text if not str(payload.get(key) or "").strip()]
+    if missing:
+        raise HTTPException(status_code=400, detail={"error": "hypothesis_fields_required", "missing": missing})
+    discovery = [str(value).strip() for value in (payload.get("discovery_freeze_ids") or []) if str(value).strip()]
+    if not discovery:
+        raise HTTPException(status_code=400, detail="discovery_freeze_ids_required")
+    base = {key: str(payload.get(key)).strip() for key in required_text}
+    hypothesis_id = str(payload.get("hypothesis_id") or f"hyp-{_content_hash({**base, 'type': hypothesis_type})[:16]}").strip()
+    source_proposal_id = str(payload.get("source_proposal_id") or "").strip()
+    source_proposal_hash = str(payload.get("source_proposal_hash") or "").strip()
+    validation_plan = _normalize_learning_validation_plan(payload.get("validation_plan"))
+    registration_provenance = payload.get("registration_provenance") if isinstance(payload.get("registration_provenance"), dict) else None
+    if registration_provenance is not None:
+        if registration_provenance.get("mode") != "automatic_from_preregistered_template":
+            raise HTTPException(status_code=422, detail="unsupported_hypothesis_registration_provenance")
+        if not all(str(registration_provenance.get(key) or "").strip() for key in ("template_id", "template_hash", "proposal_id", "proposal_hash")):
+            raise HTTPException(status_code=422, detail="complete_hypothesis_registration_provenance_required")
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        unknown = [freeze_id for freeze_id in discovery if not _learning_freeze_by_id(store, freeze_id)]
+        unsettled = [freeze_id for freeze_id in discovery if freeze_id not in (store.get("learning_postmatch") or {})]
+        if unknown:
+            raise HTTPException(status_code=404, detail={"error": "discovery_freeze_not_found", "freeze_ids": unknown})
+        if unsettled:
+            raise HTTPException(status_code=409, detail={"error": "discovery_sample_not_settled", "freeze_ids": unsettled})
+        source_proposal = None
+        if source_proposal_id:
+            proposal_versions = (store.get("learning_research_proposals") or {}).get(source_proposal_id) or []
+            source_proposal = max(
+                (row for row in proposal_versions if isinstance(row, dict)),
+                key=lambda row: int(row.get("version_number") or 0), default=None,
+            )
+            if not source_proposal:
+                raise HTTPException(status_code=404, detail="source_research_proposal_not_found")
+            if not source_proposal_hash or source_proposal_hash != source_proposal.get("proposal_hash"):
+                raise HTTPException(status_code=409, detail="latest_source_research_proposal_hash_required")
+            required_discovery = set(get_nested(source_proposal, ["evidence", "supporting_freeze_ids"], []) or [])
+            if set(discovery) != required_discovery:
+                raise HTTPException(status_code=409, detail="hypothesis_must_bind_all_and_only_supporting_proposal_samples")
+            try:
+                minimum_samples = int(validation_plan.get("minimum_samples") or 0)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=422, detail="proposal_hypothesis_validation_minimum_invalid") from exc
+            if minimum_samples < LEARNING_MIN_VALIDATION_SAMPLES:
+                raise HTTPException(status_code=422, detail="proposal_hypothesis_validation_minimum_below_governance_floor")
+            structured_scope = validation_plan.get("structured_scope") if isinstance(validation_plan.get("structured_scope"), dict) else {}
+            competition_ids = structured_scope.get("competition_ids") if isinstance(structured_scope.get("competition_ids"), list) else []
+            markets = structured_scope.get("markets") if isinstance(structured_scope.get("markets"), list) else []
+            proposal_competition_id = get_nested(source_proposal, ["scope", "competition_id"])
+            proposal_market = str(get_nested(source_proposal, ["scope", "market"]) or "")
+            if proposal_competition_id not in competition_ids or proposal_market not in {str(value) for value in markets}:
+                raise HTTPException(status_code=422, detail="proposal_hypothesis_structured_scope_must_cover_source_signal")
+        if registration_provenance is not None:
+            if not source_proposal:
+                raise HTTPException(status_code=422, detail="automatic_template_registration_requires_source_proposal")
+            template_id = str(registration_provenance.get("template_id") or "")
+            template = (store.get("learning_hypothesis_templates") or {}).get(template_id)
+            if not isinstance(template, dict):
+                raise HTTPException(status_code=404, detail="preregistered_hypothesis_template_not_found")
+            if str(registration_provenance.get("template_hash") or "") != str(template.get("template_hash") or ""):
+                raise HTTPException(status_code=409, detail="preregistered_hypothesis_template_hash_mismatch")
+            if (
+                str(registration_provenance.get("proposal_id") or "") != source_proposal_id
+                or str(registration_provenance.get("proposal_hash") or "") != source_proposal_hash
+            ):
+                raise HTTPException(status_code=409, detail="automatic_registration_proposal_provenance_mismatch")
+            postmatches = store.get("learning_postmatch") or {}
+            support_settled_at = [
+                int(get_nested(postmatches.get(str(freeze_id)) or {}, ["settled_at"]) or 0)
+                for freeze_id in discovery
+            ]
+            if not support_settled_at or any(value <= 0 for value in support_settled_at):
+                raise HTTPException(status_code=409, detail="automatic_registration_settled_discovery_evidence_required")
+            if int(template.get("registered_at") or 0) >= min(support_settled_at):
+                raise HTTPException(status_code=409, detail="hypothesis_template_must_predate_all_discovery_samples")
+            if hypothesis_type != template.get("type") or any(base[key] != str(template.get(key) or "") for key in required_text):
+                raise HTTPException(status_code=409, detail="hypothesis_must_exactly_instantiate_preregistered_template")
+            if _content_hash(validation_plan) != _content_hash(template.get("pre_registered_validation_plan") or {}):
+                raise HTTPException(status_code=409, detail="hypothesis_validation_plan_must_match_preregistered_template")
+            proposal_dimension = str(source_proposal.get("signal_dimension") or "")
+            if proposal_dimension not in (template.get("signal_dimensions") or []):
+                raise HTTPException(status_code=409, detail="hypothesis_template_signal_dimension_mismatch")
+            registration_provenance = {
+                "mode": "automatic_from_preregistered_template",
+                "template_id": template_id, "template_hash": template.get("template_hash"),
+                "template_registered_at": template.get("registered_at"),
+                "proposal_id": source_proposal_id, "proposal_hash": source_proposal_hash,
+                "all_supporting_samples_postdate_template": True,
+                "result_outcome_used": False,
+            }
+        content = {
+            "hypothesis_id": hypothesis_id,
+            "type": hypothesis_type,
+            **base,
+            "discovery_freeze_ids": sorted(set(discovery)),
+            "pre_registered_validation_plan": validation_plan,
+        }
+        if registration_provenance is not None:
+            content["registration_provenance"] = copy.deepcopy(registration_provenance)
+        if source_proposal:
+            content["source_research_proposal"] = {
+                "proposal_id": source_proposal_id,
+                "proposal_hash": source_proposal_hash,
+            }
+        content_hash = _content_hash(content)
+        hypotheses = store.setdefault("learning_hypotheses", {})
+        existing = hypotheses.get(hypothesis_id)
+        if existing:
+            if existing.get("content_hash") == content_hash:
+                return {**existing, "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="hypothesis_id_already_registered")
+        record = {
+            **content,
+            "registered_at": int(now_ts or time.time()),
+            "content_hash": content_hash,
+            "status": hypothesis_type,
+            "validation_evidence": [],
+            "champion_effect": False,
+            "action": "registered",
+        }
+        hypotheses[hypothesis_id] = record
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return record
+
+
+def register_learning_hypothesis_template(payload: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Register an immutable causal/Challenger template before its discovery samples exist."""
+    payload = payload if isinstance(payload, dict) else {}
+    hypothesis_type = str(payload.get("type") or "HYPOTHESIS_ONLY").strip()
+    if hypothesis_type not in LEARNING_HYPOTHESIS_TYPES:
+        raise HTTPException(status_code=400, detail="invalid_hypothesis_type")
+    required_text = ("title", "definition", "applicable_scope", "expected_direction", "failure_conditions", "falsification_criteria")
+    missing = [key for key in required_text if not str(payload.get(key) or "").strip()]
+    if missing:
+        raise HTTPException(status_code=400, detail={"error": "hypothesis_template_fields_required", "missing": missing})
+    allowed_dimensions = {"process_error", "match_selection", "expression", "price_execution"}
+    signal_dimensions = sorted(set(
+        str(value).strip() for value in (payload.get("signal_dimensions") or []) if str(value).strip()
+    )) if isinstance(payload.get("signal_dimensions"), list) else []
+    if not signal_dimensions or any(value not in allowed_dimensions for value in signal_dimensions):
+        raise HTTPException(status_code=422, detail="valid_hypothesis_template_signal_dimensions_required")
+    validation_plan = _normalize_learning_validation_plan(payload.get("validation_plan"))
+    try:
+        minimum_samples = int(validation_plan.get("minimum_samples") or 0)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="hypothesis_template_validation_minimum_invalid") from exc
+    if minimum_samples < LEARNING_MIN_VALIDATION_SAMPLES:
+        raise HTTPException(status_code=422, detail="hypothesis_template_validation_minimum_below_governance_floor")
+    base = {key: str(payload.get(key)).strip() for key in required_text}
+    immutable = {
+        "type": hypothesis_type, **base,
+        "signal_dimensions": signal_dimensions,
+        "pre_registered_validation_plan": validation_plan,
+        "automatic_instantiation_allowed": True,
+        "result_outcome_used": False,
+        "champion_effect": False,
+    }
+    template_id = str(payload.get("template_id") or f"hyp-template-{_content_hash(immutable)[:16]}").strip()
+    if not template_id or len(template_id) > 100 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in template_id):
+        raise HTTPException(status_code=400, detail="safe_hypothesis_template_id_required")
+    content = {"template_id": template_id, **immutable}
+    template_hash = _content_hash(content)
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        templates = store.setdefault("learning_hypothesis_templates", {})
+        existing = templates.get(template_id)
+        if existing:
+            if existing.get("template_hash") == template_hash:
+                return {**existing, "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="hypothesis_template_id_already_registered")
+        record = {
+            **content, "template_hash": template_hash,
+            "registered_at": int(now_ts or time.time()),
+            "immutable": True, "action": "registered",
+        }
+        templates[template_id] = record
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return record
+
+
+def learning_hypothesis_template_report() -> Dict[str, Any]:
+    templates = [
+        row for row in (load_snapshot_store().get("learning_hypothesis_templates") or {}).values()
+        if isinstance(row, dict)
+    ]
+    templates.sort(key=lambda row: str(row.get("template_id")))
+    return {
+        "version": VERSION, "template_count": len(templates), "templates": templates,
+        "automatic_instantiation_policy": "template_must_preexist_every_supporting_discovery_sample",
+        "automatic_champion_change": False,
+    }
+
+
+def instantiate_preregistered_learning_hypotheses(now_ts: Optional[int] = None, apply_changes: bool = True) -> Dict[str, Any]:
+    """Turn a repeated proposal into a Hypothesis only when one unique causal template predates all evidence."""
+    now_ts = int(now_ts or time.time())
+    store = load_snapshot_store()
+    templates = [row for row in (store.get("learning_hypothesis_templates") or {}).values() if isinstance(row, dict)]
+    existing_proposals = {
+        str(get_nested(row, ["source_research_proposal", "proposal_id"]) or "")
+        for row in (store.get("learning_hypotheses") or {}).values() if isinstance(row, dict)
+    }
+    proposals = []
+    for versions in (store.get("learning_research_proposals") or {}).values():
+        latest = max((row for row in versions or [] if isinstance(row, dict)), key=lambda row: int(row.get("version_number") or 0), default=None)
+        if latest:
+            proposals.append(latest)
+    results = []
+    for proposal in proposals:
+        proposal_id = str(proposal.get("proposal_id") or "")
+        if proposal_id in existing_proposals:
+            results.append({"proposal_id": proposal_id, "action": "skipped", "reason": "proposal_already_has_registered_hypothesis"})
+            continue
+        support_ids = sorted(set(get_nested(proposal, ["evidence", "supporting_freeze_ids"], []) or []))
+        postmatches = store.get("learning_postmatch") or {}
+        settled_times = [int(get_nested(postmatches.get(str(freeze_id)) or {}, ["settled_at"]) or 0) for freeze_id in support_ids]
+        if not support_ids or any(value <= 0 for value in settled_times):
+            results.append({"proposal_id": proposal_id, "action": "blocked", "reason": "complete_settled_discovery_evidence_required"})
+            continue
+        competition_id = get_nested(proposal, ["scope", "competition_id"])
+        market = str(get_nested(proposal, ["scope", "market"]) or "")
+        dimension = str(proposal.get("signal_dimension") or "")
+        matching = []
+        for template in templates:
+            scope = get_nested(template, ["pre_registered_validation_plan", "structured_scope"], {}) or {}
+            if (
+                dimension in (template.get("signal_dimensions") or [])
+                and competition_id in (scope.get("competition_ids") or [])
+                and market in (scope.get("markets") or [])
+                and int(template.get("registered_at") or 0) < min(settled_times)
+            ):
+                matching.append(template)
+        if len(matching) != 1:
+            results.append({
+                "proposal_id": proposal_id, "action": "blocked",
+                "reason": "no_preregistered_template" if not matching else "ambiguous_preregistered_templates",
+                "matching_template_count": len(matching),
+            })
+            continue
+        template = matching[0]
+        hypothesis_id = "auto-hyp-" + _content_hash({
+            "template_hash": template.get("template_hash"), "proposal_id": proposal_id,
+        })[:16]
+        payload = {
+            "hypothesis_id": hypothesis_id,
+            "type": template.get("type"),
+            **{key: template.get(key) for key in ("title", "definition", "applicable_scope", "expected_direction", "failure_conditions", "falsification_criteria")},
+            "discovery_freeze_ids": support_ids,
+            "source_proposal_id": proposal_id,
+            "source_proposal_hash": proposal.get("proposal_hash"),
+            "validation_plan": copy.deepcopy(template.get("pre_registered_validation_plan") or {}),
+            "registration_provenance": {
+                "mode": "automatic_from_preregistered_template",
+                "template_id": template.get("template_id"), "template_hash": template.get("template_hash"),
+                "template_registered_at": template.get("registered_at"),
+                "proposal_id": proposal_id, "proposal_hash": proposal.get("proposal_hash"),
+                "all_supporting_samples_postdate_template": True,
+                "result_outcome_used": False,
+            },
+        }
+        if not apply_changes:
+            results.append({
+                "proposal_id": proposal_id, "hypothesis_id": hypothesis_id,
+                "template_id": template.get("template_id"), "action": "would_register",
+            })
+            continue
+        try:
+            hypothesis = register_learning_hypothesis(payload, now_ts=now_ts)
+            results.append({
+                "proposal_id": proposal_id, "hypothesis_id": hypothesis.get("hypothesis_id"),
+                "template_id": template.get("template_id"), "action": hypothesis.get("action"),
+                "champion_effect": False,
+            })
+        except HTTPException as exc:
+            results.append({
+                "proposal_id": proposal_id, "hypothesis_id": hypothesis_id,
+                "template_id": template.get("template_id"), "action": "rejected",
+                "status_code": exc.status_code, "reason": exc.detail,
+            })
+    return {
+        "version": VERSION, "result_count": len(results), "results": results,
+        "registered_count": sum(row.get("action") == "registered" for row in results),
+        "automatic_registration_scope": "preregistered_templates_only",
+        "single_match_registration_allowed": False,
+        "automatic_champion_change": False,
+    }
+
+
+def learning_forward_validation_queue(now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """List only independent post-registration frozen matches eligible for a future Shadow lock."""
+    now_ts = int(now_ts or time.time())
+    store = load_snapshot_store()
+    items = []
+    blocked_hypotheses = []
+    latest_freezes = []
+    for fixture, versions in (store.get("learning_frozen") or {}).items():
+        latest = max(
+            (row for row in versions or [] if isinstance(row, dict)),
+            key=lambda row: int(row.get("version_number") or 0), default=None,
+        )
+        if latest:
+            latest_freezes.append(latest)
+    for hypothesis_id, hypothesis in (store.get("learning_hypotheses") or {}).items():
+        if hypothesis.get("status") not in (*LEARNING_HYPOTHESIS_TYPES, "SHADOW_VALIDATION"):
+            continue
+        plan = hypothesis.get("pre_registered_validation_plan") if isinstance(hypothesis.get("pre_registered_validation_plan"), dict) else {}
+        structured_scope = plan.get("structured_scope") if isinstance(plan.get("structured_scope"), dict) else {}
+        ablation_plan = plan.get("ablation_plan") if isinstance(plan.get("ablation_plan"), dict) else {}
+        challenger_spec = plan.get("challenger_spec") if isinstance(plan.get("challenger_spec"), dict) else {}
+        competition_ids = set(structured_scope.get("competition_ids") or []) if isinstance(structured_scope.get("competition_ids"), list) else set()
+        markets = {str(value) for value in (structured_scope.get("markets") or [])} if isinstance(structured_scope.get("markets"), list) else set()
+        if not competition_ids or not markets:
+            blocked_hypotheses.append({
+                "hypothesis_id": hypothesis_id,
+                "reason": "structured_validation_scope_missing",
+                "required_fields": ["validation_plan.structured_scope.competition_ids", "validation_plan.structured_scope.markets"],
+            })
+            continue
+        discovery_ids = set(hypothesis.get("discovery_freeze_ids") or [])
+        locks = (store.get("learning_shadow_locks") or {}).get(hypothesis_id) or {}
+        locked_fixture_ids = {
+            str(((_learning_freeze_by_id(store, freeze_id) or {}).get("fixture")) or "")
+            for freeze_id in locks
+        }
+        for freeze in latest_freezes:
+            freeze_id = str(freeze.get("freeze_id") or "")
+            fixture = str(freeze.get("fixture") or "")
+            if freeze_id in discovery_ids or fixture in locked_fixture_ids:
+                continue
+            if freeze_id in (store.get("learning_postmatch") or {}):
+                continue
+            if int(freeze.get("captured_at") or 0) < int(hypothesis.get("registered_at") or 0):
+                continue
+            if int(freeze.get("kickoff_at") or 0) <= now_ts:
+                continue
+            competition_id = get_nested(freeze, ["scope", "competition_id"])
+            expression = _learning_selected_expression(freeze.get("decision"))
+            if competition_id not in competition_ids or expression.get("market") not in markets:
+                continue
+            items.append({
+                "hypothesis_id": hypothesis_id,
+                "hypothesis_hash": hypothesis.get("content_hash"),
+                "freeze_id": freeze_id,
+                "freeze_hash": freeze.get("content_hash"),
+                "fixture": freeze.get("fixture"),
+                "kickoff_at": freeze.get("kickoff_at"),
+                "competition_id": competition_id,
+                "market": expression.get("market"),
+                "required_action": "compute_champion_challenger_and_ablation_outputs_then_lock_before_kickoff",
+                "required_ablation_modules": ablation_plan.get("required_modules") or [],
+                "challenger_spec_hash": challenger_spec.get("spec_hash"),
+                "automatic_shadow_lock": bool(challenger_spec.get("spec_hash")) and callable(LEARNING_SHADOW_MODEL_RUNNER),
+                "champion_effect": False,
+            })
+    items.sort(key=lambda row: (int(row.get("kickoff_at") or 0), str(row.get("hypothesis_id")), str(row.get("fixture"))))
+    return {
+        "version": VERSION, "generated_at": now_ts,
+        "queue_count": len(items), "items": items,
+        "blocked_hypothesis_count": len(blocked_hypotheses),
+        "blocked_hypotheses": blocked_hypotheses,
+        "automatic_shadow_lock": callable(LEARNING_SHADOW_MODEL_RUNNER),
+        "automatic_champion_change": False,
+        "policy": "only post-registration, non-discovery, distinct future matches enter the forward queue; model outputs must be computed and locked before kickoff",
+    }
+
+
+def _normalize_1x2_probabilities(value: Any, field_name: str) -> Dict[str, float]:
+    value = value if isinstance(value, dict) else {}
+    probabilities = {key: as_float(value.get(key)) for key in ("home", "draw", "away")}
+    if any(probability is None or not 0 <= probability <= 1 for probability in probabilities.values()):
+        raise HTTPException(status_code=422, detail=f"{field_name}_must_contain_valid_1x2_probabilities")
+    total = sum(probabilities.values())
+    if abs(total - 1.0) > 0.01:
+        raise HTTPException(status_code=422, detail=f"{field_name}_probabilities_must_sum_to_one")
+    return {key: round(probability / total, 8) for key, probability in probabilities.items()}
+
+
+LINE_SETTLEMENT_CATEGORIES = ("full_win", "half_win", "push", "half_loss", "full_loss")
+
+
+def _learning_forecast_categories(market: str) -> Tuple[str, ...]:
+    if market == "1x2":
+        return ("home", "draw", "away")
+    if market == "btts":
+        return ("yes", "no")
+    if market in {"asian_handicap", "over_under", "home_team_total", "away_team_total"}:
+        return LINE_SETTLEMENT_CATEGORIES
+    raise HTTPException(status_code=422, detail="unsupported_learning_forecast_market")
+
+
+def _line_settlement_category(outcome: float, line: float, selection: str, market: str) -> Optional[str]:
+    split = _split_asian_line(line)
+    if not split:
+        return None
+    signs = []
+    for component in split:
+        if market == "asian_handicap":
+            settled = outcome + component if selection == "home" else -outcome - component
+        else:
+            settled = outcome - component if selection == "over" else component - outcome
+        signs.append(1 if settled > 1e-9 else (-1 if settled < -1e-9 else 0))
+    if all(sign > 0 for sign in signs):
+        return "full_win"
+    if all(sign < 0 for sign in signs):
+        return "full_loss"
+    if all(sign == 0 for sign in signs):
+        return "push"
+    if all(sign >= 0 for sign in signs) and any(sign > 0 for sign in signs):
+        return "half_win"
+    if all(sign <= 0 for sign in signs) and any(sign < 0 for sign in signs):
+        return "half_loss"
+    return None
+
+
+def market_forecast_from_probability_replay(replay: Dict[str, Any], expression: Dict[str, Any]) -> Dict[str, Any]:
+    """Project the frozen Poisson output onto the exact selected market settlement space."""
+    market = str(expression.get("market") or "").strip()
+    selection = str(expression.get("selection") or "").strip()
+    line = as_float(expression.get("line"))
+    probabilities = get_nested(replay, ["model", "probabilities"], {}) or {}
+    categories = _learning_forecast_categories(market)
+    if market == "1x2":
+        raw = probabilities.get("1x2") if isinstance(probabilities.get("1x2"), dict) else {}
+    elif market == "btts":
+        raw = probabilities.get("btts") if isinstance(probabilities.get("btts"), dict) else {}
+    else:
+        if line is None or selection not in ({"home", "away"} if market == "asian_handicap" else {"over", "under"}):
+            raise HTTPException(status_code=422, detail="valid_line_market_expression_required_for_forecast")
+        distribution_name = {
+            "asian_handicap": "goal_difference",
+            "over_under": "total_goals",
+            "home_team_total": "home_goals",
+            "away_team_total": "away_goals",
+        }[market]
+        distribution = get_nested(probabilities, ["settlement_distributions", distribution_name], {}) or {}
+        raw = {category: 0.0 for category in categories}
+        for raw_outcome, raw_probability in distribution.items():
+            outcome, probability = as_float(raw_outcome), as_float(raw_probability)
+            if outcome is None or probability is None or probability < 0:
+                continue
+            category = _line_settlement_category(outcome, line, selection, market)
+            if category is None:
+                raise HTTPException(status_code=422, detail="unsupported_line_settlement_shape")
+            raw[category] += probability
+    values = {category: as_float(raw.get(category)) for category in categories}
+    if any(value is None or value < 0 for value in values.values()):
+        raise HTTPException(status_code=422, detail="frozen_replay_missing_selected_market_probabilities")
+    total = sum(values.values())
+    if total <= 0 or abs(total - 1.0) > 0.02:
+        raise HTTPException(status_code=422, detail="selected_market_probabilities_must_sum_to_one")
+    normalized = {category: round(values[category] / total, 8) for category in categories}
+    return {
+        "schema": "learning_market_forecast_v1",
+        "market": market,
+        "selection": selection,
+        "line": line,
+        "categories": list(categories),
+        "probabilities": normalized,
+        "source": "frozen_probability_replay",
+        "probability_replay_hash": replay.get("replay_hash"),
+    }
+
+
+def _normalize_learning_market_forecast(value: Any, expression: Dict[str, Any], field_name: str) -> Dict[str, Any]:
+    value = value if isinstance(value, dict) else {}
+    market = str(expression.get("market") or "").strip()
+    selection = str(expression.get("selection") or "").strip()
+    line = as_float(expression.get("line"))
+    categories = _learning_forecast_categories(market)
+    if value.get("schema") != "learning_market_forecast_v1":
+        raise HTTPException(status_code=422, detail=f"{field_name}_forecast_schema_required")
+    if str(value.get("market") or "").strip() != market or str(value.get("selection") or "").strip() != selection:
+        raise HTTPException(status_code=422, detail=f"{field_name}_forecast_expression_mismatch")
+    if market in {"asian_handicap", "over_under", "home_team_total", "away_team_total"} and as_float(value.get("line")) != line:
+        raise HTTPException(status_code=422, detail=f"{field_name}_forecast_line_mismatch")
+    supplied_categories = value.get("categories") if isinstance(value.get("categories"), list) else []
+    if supplied_categories != list(categories):
+        raise HTTPException(status_code=422, detail=f"{field_name}_forecast_categories_mismatch")
+    raw = value.get("probabilities") if isinstance(value.get("probabilities"), dict) else {}
+    if set(raw) != set(categories):
+        raise HTTPException(status_code=422, detail=f"{field_name}_forecast_probability_categories_mismatch")
+    probabilities = {category: as_float(raw.get(category)) for category in categories}
+    if any(probability is None or not 0 <= probability <= 1 for probability in probabilities.values()):
+        raise HTTPException(status_code=422, detail=f"{field_name}_forecast_probabilities_invalid")
+    total = sum(probabilities.values())
+    if abs(total - 1.0) > 0.01:
+        raise HTTPException(status_code=422, detail=f"{field_name}_forecast_probabilities_must_sum_to_one")
+    return {
+        "schema": "learning_market_forecast_v1",
+        "market": market, "selection": selection, "line": line,
+        "categories": list(categories),
+        "probabilities": {category: round(probabilities[category] / total, 8) for category in categories},
+    }
+
+
+def _learning_market_outcome_category(expression: Dict[str, Any], result: Dict[str, Any]) -> str:
+    market = str(expression.get("market") or "").strip()
+    selection = str(expression.get("selection") or "").strip()
+    home_goals, away_goals = int(result.get("home_goals")), int(result.get("away_goals"))
+    if market == "1x2":
+        return "home" if home_goals > away_goals else ("away" if home_goals < away_goals else "draw")
+    if market == "btts":
+        return "yes" if home_goals > 0 and away_goals > 0 else "no"
+    line = as_float(expression.get("line"))
+    if line is None:
+        raise HTTPException(status_code=422, detail="settlement_line_required")
+    outcome = {
+        "asian_handicap": home_goals - away_goals,
+        "over_under": home_goals + away_goals,
+        "home_team_total": home_goals,
+        "away_team_total": away_goals,
+    }.get(market)
+    if outcome is None:
+        raise HTTPException(status_code=422, detail="unsupported_learning_forecast_market")
+    category = _line_settlement_category(float(outcome), line, selection, market)
+    if category is None:
+        raise HTTPException(status_code=422, detail="unsupported_line_settlement_shape")
+    return category
+
+
+def _brier_market_forecast(forecast: Dict[str, Any], expression: Dict[str, Any], result: Dict[str, Any]) -> float:
+    normalized = _normalize_learning_market_forecast(forecast, expression, "locked")
+    actual = _learning_market_outcome_category(expression, result)
+    probabilities = normalized["probabilities"]
+    return round(sum((probabilities[key] - (1.0 if key == actual else 0.0)) ** 2 for key in normalized["categories"]) / len(normalized["categories"]), 8)
+
+
+def _brier_1x2(probabilities: Dict[str, float], result: Dict[str, Any]) -> float:
+    home_goals, away_goals = int(result.get("home_goals")), int(result.get("away_goals"))
+    actual = "home" if home_goals > away_goals else ("away" if home_goals < away_goals else "draw")
+    return round(sum((probabilities[key] - (1.0 if key == actual else 0.0)) ** 2 for key in ("home", "draw", "away")) / 3.0, 8)
+
+
+def _learning_poisson_tail_risk(model: Dict[str, Any]) -> float:
+    """Use the model's high-total mass as a stable distribution-tail diagnostic."""
+    distribution = get_nested(model, ["probabilities", "settlement_distributions", "total_goals"], {}) or {}
+    risk = sum(
+        float(probability)
+        for raw_total, probability in distribution.items()
+        if as_float(raw_total) is not None and float(raw_total) >= 5 and as_float(probability) is not None
+    )
+    return round(min(1.0, max(0.0, risk)), 8)
+
+
+def _learning_adjusted_poisson_model(replay: Dict[str, Any], home_delta: float, away_delta: float) -> Dict[str, Any]:
+    base_inputs = get_nested(replay, ["model", "inputs"], {}) or {}
+    home_xg, away_xg = as_float(base_inputs.get("home_expected_goals")), as_float(base_inputs.get("away_expected_goals"))
+    confidence = as_float(base_inputs.get("input_confidence"))
+    provenance = base_inputs.get("provenance") if isinstance(base_inputs.get("provenance"), dict) else {}
+    if home_xg is None or away_xg is None or confidence is None:
+        raise HTTPException(status_code=422, detail="frozen_poisson_inputs_required_for_challenger")
+    model = poisson_probability_model(
+        home_xg * math.exp(home_delta), away_xg * math.exp(away_delta), confidence, provenance,
+    )
+    if model.get("ok") is not True:
+        raise HTTPException(status_code=422, detail={"error": "challenger_poisson_model_invalid", "reasons": model.get("errors")})
+    return model
+
+
+def builtin_preregistered_poisson_challenger(request: Dict[str, Any]) -> Dict[str, Any]:
+    """Execute only the bounded module deltas frozen in the registered hypothesis."""
+    request = request if isinstance(request, dict) else {}
+    freeze = request.get("freeze") if isinstance(request.get("freeze"), dict) else {}
+    hypothesis = request.get("hypothesis") if isinstance(request.get("hypothesis"), dict) else {}
+    replay = get_nested(freeze, ["analysis", "probability_replay"], {}) or {}
+    ablation_plan = hypothesis.get("ablation_plan") if isinstance(hypothesis.get("ablation_plan"), dict) else {}
+    required_modules = list(ablation_plan.get("required_modules") or [])
+    spec = _normalize_learning_challenger_spec(hypothesis.get("challenger_spec"), required_modules)
+    expression = request.get("frozen_selected_expression") if isinstance(request.get("frozen_selected_expression"), dict) else {}
+    generated_at = int(request.get("requested_at") or 0)
+    combined = spec["combined_log_rate_delta"]
+    challenger_model = _learning_adjusted_poisson_model(replay, combined["home"], combined["away"])
+    challenger_replay = {
+        "model": challenger_model,
+        "replay_hash": _content_hash({"base_replay_hash": replay.get("replay_hash"), "spec_hash": spec["spec_hash"]}),
+    }
+    module_ablations = {}
+    for module in required_modules:
+        contribution = spec["module_log_rate_deltas"][module]
+        ablated_model = _learning_adjusted_poisson_model(
+            replay,
+            combined["home"] - contribution["home"],
+            combined["away"] - contribution["away"],
+        )
+        ablated_replay = {
+            "model": ablated_model,
+            "replay_hash": _content_hash({
+                "base_replay_hash": replay.get("replay_hash"), "spec_hash": spec["spec_hash"], "ablated_module": module,
+            }),
+        }
+        module_ablations[module] = {
+            "probabilities": get_nested(ablated_model, ["probabilities", "1x2"]),
+            "forecast": market_forecast_from_probability_replay(ablated_replay, expression),
+        }
+    entry_price = as_float(expression.get("price"))
+    content = {
+        "schema": "learning_shadow_model_run_v1",
+        "runner_id": "builtin_preregistered_poisson_challenger",
+        "runner_version": "1",
+        "challenger_spec_hash": spec["spec_hash"],
+        "generated_at": generated_at,
+        "input_hash": request.get("input_hash"),
+        "freeze_hash": freeze.get("content_hash"),
+        "hypothesis_hash": hypothesis.get("hypothesis_hash"),
+        "champion_probabilities": request.get("frozen_champion_probabilities"),
+        "challenger_probabilities": get_nested(challenger_model, ["probabilities", "1x2"]),
+        "champion_forecast": request.get("frozen_champion_forecast"),
+        "challenger_forecast": market_forecast_from_probability_replay(challenger_replay, expression),
+        "module_ablations": module_ablations,
+        "selected_expression": {
+            "market": expression.get("market"), "selection": expression.get("selection"),
+            "line": expression.get("line"), "entry_decimal_price": entry_price,
+            "entry_price_evidence_ref": f"freeze:{freeze.get('content_hash')}:decision.selected_expression",
+        },
+        "risk": {
+            "champion_tail_risk": _learning_poisson_tail_risk(replay.get("model") or {}),
+            "challenger_tail_risk": _learning_poisson_tail_risk(challenger_model),
+        },
+    }
+    return {**content, "run_hash": _content_hash(content)}
+
+
+LEARNING_SHADOW_MODEL_RUNNER = builtin_preregistered_poisson_challenger
+
+
+def lock_hypothesis_shadow_prediction(
+    hypothesis_id: Any,
+    payload: Dict[str, Any],
+    now_ts: Optional[int] = None,
+    calculator_provenance: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Lock Champion, Challenger and ablation outputs before kickoff for later OOS scoring."""
+    hypothesis_id = str(hypothesis_id or "").strip()
+    payload = payload if isinstance(payload, dict) else {}
+    freeze_id = str(payload.get("freeze_id") or "").strip()
+    if not hypothesis_id or not freeze_id:
+        raise HTTPException(status_code=400, detail="hypothesis_id_and_freeze_id_required")
+    champion_probabilities = _normalize_1x2_probabilities(payload.get("champion_probabilities"), "champion")
+    challenger_probabilities = _normalize_1x2_probabilities(payload.get("challenger_probabilities"), "challenger")
+    selected_expression = payload.get("selected_expression") if isinstance(payload.get("selected_expression"), dict) else {}
+    market = str(selected_expression.get("market") or "").strip()
+    selection = str(selected_expression.get("selection") or "").strip()
+    entry_decimal_price = as_float(selected_expression.get("entry_decimal_price"))
+    entry_price_evidence_ref = str(selected_expression.get("entry_price_evidence_ref") or "").strip()
+    if not market or not selection or entry_decimal_price is None or not 1.01 <= entry_decimal_price <= 1000:
+        raise HTTPException(status_code=422, detail="valid_shadow_selected_expression_required")
+    if not entry_price_evidence_ref:
+        raise HTTPException(status_code=422, detail="entry_price_evidence_ref_required")
+    raw_champion_forecast = payload.get("champion_forecast")
+    raw_challenger_forecast = payload.get("challenger_forecast")
+    market_forecast_mode = raw_champion_forecast is not None or raw_challenger_forecast is not None
+    champion_forecast = _normalize_learning_market_forecast(raw_champion_forecast, selected_expression, "champion") if market_forecast_mode else None
+    challenger_forecast = _normalize_learning_market_forecast(raw_challenger_forecast, selected_expression, "challenger") if market_forecast_mode else None
+    risk = payload.get("risk") if isinstance(payload.get("risk"), dict) else {}
+    champion_tail_risk = as_float(risk.get("champion_tail_risk"))
+    challenger_tail_risk = as_float(risk.get("challenger_tail_risk"))
+    if any(value is None or not 0 <= value <= 1 for value in (champion_tail_risk, challenger_tail_risk)):
+        raise HTTPException(status_code=422, detail="valid_champion_and_challenger_tail_risk_required")
+    locked_at = int(now_ts or time.time())
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        hypothesis = (store.get("learning_hypotheses") or {}).get(hypothesis_id)
+        if not hypothesis:
+            raise HTTPException(status_code=404, detail="hypothesis_not_found")
+        validation_plan = hypothesis.get("pre_registered_validation_plan") if isinstance(hypothesis.get("pre_registered_validation_plan"), dict) else {}
+        ablation_plan = validation_plan.get("ablation_plan") if isinstance(validation_plan.get("ablation_plan"), dict) else {}
+        challenger_spec = validation_plan.get("challenger_spec") if isinstance(validation_plan.get("challenger_spec"), dict) else {}
+        calculator_policy = validation_plan.get("calculator_policy") if isinstance(validation_plan.get("calculator_policy"), dict) else {}
+        required_modules = list(ablation_plan.get("required_modules") or [])
+        submitted_ablations = payload.get("module_ablation_outputs") if isinstance(payload.get("module_ablation_outputs"), dict) else {}
+        if set(submitted_ablations) != set(required_modules):
+            raise HTTPException(status_code=422, detail={
+                "error": "exact_preregistered_module_ablation_outputs_required",
+                "required_modules": required_modules,
+                "submitted_modules": sorted(submitted_ablations),
+            })
+        if freeze_id in (hypothesis.get("discovery_freeze_ids") or []):
+            raise HTTPException(status_code=409, detail="discovery_sample_cannot_be_shadow_validation_sample")
+        freeze = _learning_freeze_by_id(store, freeze_id)
+        if not freeze:
+            raise HTTPException(status_code=404, detail="frozen_learning_sample_not_found")
+        if freeze_id in (store.get("learning_postmatch") or {}):
+            raise HTTPException(status_code=409, detail="shadow_prediction_must_be_locked_before_postmatch_settlement")
+        if locked_at >= int(freeze.get("kickoff_at") or 0):
+            raise HTTPException(status_code=409, detail="shadow_prediction_must_be_locked_before_kickoff")
+        if locked_at < int(freeze.get("captured_at") or 0):
+            raise HTTPException(status_code=409, detail="shadow_prediction_cannot_precede_frozen_sample")
+        if int(freeze.get("captured_at") or 0) < int(hypothesis.get("registered_at") or 0):
+            raise HTTPException(status_code=409, detail="validation_sample_predates_hypothesis_registration")
+        structured_scope = get_nested(hypothesis, ["pre_registered_validation_plan", "structured_scope"], {}) or {}
+        if get_nested(freeze, ["scope", "competition_id"]) not in set(structured_scope.get("competition_ids") or []):
+            raise HTTPException(status_code=409, detail="validation_fixture_outside_preregistered_competition_scope")
+        if market not in set(structured_scope.get("markets") or []):
+            raise HTTPException(status_code=409, detail="validation_market_outside_preregistered_scope")
+        module_ablations = {}
+        for module in required_modules:
+            row = submitted_ablations.get(module) if isinstance(submitted_ablations.get(module), dict) else {}
+            probabilities = _normalize_1x2_probabilities(row.get("probabilities"), f"ablation_{module.lower()}")
+            module_forecast = _normalize_learning_market_forecast(
+                row.get("forecast"), selected_expression, f"ablation_{module.lower()}"
+            ) if market_forecast_mode else None
+            output_reference = str(row.get("output_reference") or "").strip()
+            computed_at = _parse_timestamp(row.get("computed_at"))
+            if not output_reference:
+                raise HTTPException(status_code=422, detail={"error": "module_ablation_output_reference_required", "module": module})
+            if computed_at is None or not int(freeze.get("captured_at") or 0) <= computed_at <= locked_at:
+                raise HTTPException(status_code=422, detail={"error": "module_ablation_computed_at_must_be_pit", "module": module})
+            intervention = get_nested(ablation_plan, ["module_interventions", module, "intervention"])
+            module_content = {
+                "module": module, "intervention": intervention,
+                "probabilities": probabilities, "output_reference": output_reference,
+                "computed_at": computed_at, "freeze_hash": freeze.get("content_hash"),
+            }
+            if module_forecast is not None:
+                module_content["forecast"] = module_forecast
+            module_ablations[module] = {**module_content, "output_hash": _content_hash(module_content)}
+        expected_calculator_input_hash = _content_hash({
+            "freeze_hash": freeze.get("content_hash"),
+            "hypothesis_hash": hypothesis.get("content_hash"),
+            "ablation_plan_hash": _content_hash(ablation_plan),
+            "probability_replay_hash": get_nested(freeze, ["analysis", "probability_replay", "replay_hash"]),
+        })
+        if calculator_provenance is None:
+            normalized_calculator_provenance = {
+                "origin": "external_submitted",
+                "promotion_eligible": False,
+                "reason": "not_generated_by_internal_shadow_runner",
+            }
+        else:
+            calculator_provenance = calculator_provenance if isinstance(calculator_provenance, dict) else {}
+            generated_at = _parse_timestamp(calculator_provenance.get("generated_at"))
+            runner_id = str(calculator_provenance.get("runner_id") or "").strip()
+            runner_version = str(calculator_provenance.get("runner_version") or "").strip()
+            run_hash = str(calculator_provenance.get("run_hash") or "").strip()
+            challenger_spec_hash = str(calculator_provenance.get("challenger_spec_hash") or "").strip()
+            if (
+                calculator_provenance.get("schema") != "learning_shadow_model_run_v1"
+                or not runner_id or not runner_version or len(run_hash) != 64
+                or calculator_provenance.get("input_hash") != expected_calculator_input_hash
+                or runner_id != calculator_policy.get("required_runner_id")
+                or runner_version != calculator_policy.get("required_runner_version")
+                or challenger_spec_hash != challenger_spec.get("spec_hash")
+                or generated_at is None
+                or not int(freeze.get("captured_at") or 0) <= generated_at <= locked_at
+            ):
+                raise HTTPException(status_code=422, detail="invalid_internal_shadow_runner_provenance")
+            if not market_forecast_mode:
+                raise HTTPException(status_code=422, detail="internal_shadow_runner_requires_market_forecast_contract")
+            normalized_calculator_provenance = {
+                "origin": "internal_shadow_runner", "promotion_eligible": True,
+                "schema": "learning_shadow_model_run_v1",
+                "runner_id": runner_id, "runner_version": runner_version,
+                "generated_at": generated_at, "input_hash": expected_calculator_input_hash,
+                "run_hash": run_hash, "challenger_spec_hash": challenger_spec_hash,
+            }
+        content = {
+            "hypothesis_id": hypothesis_id,
+            "hypothesis_hash": hypothesis.get("content_hash"),
+            "freeze_id": freeze_id,
+            "freeze_hash": freeze.get("content_hash"),
+            "champion_decision_hash": _content_hash(freeze.get("decision") or {}),
+            "probability_replay_hash": get_nested(freeze, ["analysis", "probability_replay", "replay_hash"]),
+            "champion_probabilities": champion_probabilities,
+            "challenger_probabilities": challenger_probabilities,
+            "scoring_contract": "learning_market_forecast_v1" if market_forecast_mode else "legacy_1x2_brier",
+            "champion_forecast": champion_forecast,
+            "challenger_forecast": challenger_forecast,
+            "ablation_plan_hash": _content_hash(ablation_plan),
+            "challenger_spec_hash": challenger_spec.get("spec_hash"),
+            "module_ablations": module_ablations,
+            "calculator_provenance": normalized_calculator_provenance,
+            "selected_expression": {
+                "market": market, "selection": selection,
+                "line": selected_expression.get("line"), "entry_decimal_price": entry_decimal_price,
+                "entry_price_evidence_ref": entry_price_evidence_ref,
+            },
+            "risk": {
+                "champion_tail_risk": champion_tail_risk,
+                "challenger_tail_risk": challenger_tail_risk,
+            },
+            "locked_at": locked_at,
+        }
+        lock_hash = _content_hash(content)
+        locks = store.setdefault("learning_shadow_locks", {}).setdefault(hypothesis_id, {})
+        duplicate_fixture_lock = next((
+            existing_lock for existing_freeze_id, existing_lock in locks.items()
+            if str(((_learning_freeze_by_id(store, existing_freeze_id) or {}).get("fixture")) or "") == str(freeze.get("fixture") or "")
+            and existing_freeze_id != freeze_id
+        ), None)
+        if duplicate_fixture_lock:
+            raise HTTPException(status_code=409, detail="validation_fixture_already_locked_for_hypothesis")
+        existing = locks.get(freeze_id)
+        if existing:
+            if existing.get("lock_hash") == lock_hash:
+                return {**existing, "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="shadow_prediction_already_locked")
+        record = {
+            **content, "lock_hash": lock_hash, "immutable": True,
+            "champion_effect": False, "action": "locked",
+        }
+        locks[freeze_id] = record
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return record
+
+
+def generate_internal_shadow_lock(
+    hypothesis_id: Any,
+    freeze_id: Any,
+    model_runner: Optional[Any] = None,
+    now_ts: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Run a trusted in-process PIT calculator and lock its outputs; never synthesize missing variants."""
+    hypothesis_id = str(hypothesis_id or "").strip()
+    freeze_id = str(freeze_id or "").strip()
+    runner = model_runner or LEARNING_SHADOW_MODEL_RUNNER
+    if not callable(runner):
+        raise HTTPException(status_code=503, detail="internal_shadow_model_runner_not_configured")
+    now_ts = int(now_ts or time.time())
+    store = load_snapshot_store()
+    hypothesis = (store.get("learning_hypotheses") or {}).get(hypothesis_id)
+    freeze = _learning_freeze_by_id(store, freeze_id)
+    if not hypothesis:
+        raise HTTPException(status_code=404, detail="hypothesis_not_found")
+    if not freeze:
+        raise HTTPException(status_code=404, detail="frozen_learning_sample_not_found")
+    probability_replay = get_nested(freeze, ["analysis", "probability_replay"], {}) or {}
+    replay_audit = audit_learning_probability_replay(
+        probability_replay,
+        expected_fixture=freeze.get("fixture"),
+        data_cutoff_at=freeze.get("data_cutoff_at"),
+        kickoff_at=freeze.get("kickoff_at"),
+    )
+    if replay_audit.get("status") != "ready" or replay_audit.get("decision_eligible") is not True:
+        raise HTTPException(status_code=409, detail={
+            "error": "forward_shadow_requires_replayable_pit_probability_inputs",
+            "replay_audit": replay_audit,
+        })
+    frozen_champion_probabilities = _normalize_1x2_probabilities(
+        get_nested(probability_replay, ["model", "probabilities", "1x2"]),
+        "frozen_champion",
+    )
+    frozen_expression = _learning_selected_expression(freeze.get("decision"))
+    if not frozen_expression.get("market") or not frozen_expression.get("selection"):
+        raise HTTPException(status_code=409, detail="forward_shadow_requires_frozen_selected_expression")
+    frozen_champion_forecast = market_forecast_from_probability_replay(probability_replay, frozen_expression)
+    validation_plan = hypothesis.get("pre_registered_validation_plan") if isinstance(hypothesis.get("pre_registered_validation_plan"), dict) else {}
+    ablation_plan = validation_plan.get("ablation_plan") if isinstance(validation_plan.get("ablation_plan"), dict) else {}
+    challenger_spec = validation_plan.get("challenger_spec") if isinstance(validation_plan.get("challenger_spec"), dict) else {}
+    input_hash = _content_hash({
+        "freeze_hash": freeze.get("content_hash"),
+        "hypothesis_hash": hypothesis.get("content_hash"),
+        "ablation_plan_hash": _content_hash(ablation_plan),
+        "probability_replay_hash": probability_replay.get("replay_hash"),
+    })
+    request_content = {
+        "schema": "learning_shadow_model_request_v1",
+        "requested_at": now_ts,
+        "input_hash": input_hash,
+        "probability_replay_hash": probability_replay.get("replay_hash"),
+        "frozen_champion_probabilities": frozen_champion_probabilities,
+        "frozen_selected_expression": frozen_expression,
+        "frozen_champion_forecast": frozen_champion_forecast,
+        "freeze": freeze,
+        "hypothesis": {
+            "hypothesis_id": hypothesis_id,
+            "hypothesis_hash": hypothesis.get("content_hash"),
+            "definition": hypothesis.get("definition"),
+            "expected_direction": hypothesis.get("expected_direction"),
+            "structured_scope": get_nested(hypothesis, ["pre_registered_validation_plan", "structured_scope"], {}),
+            "ablation_plan": ablation_plan,
+            "challenger_spec": challenger_spec,
+        },
+    }
+    try:
+        result = runner(request_content)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail={"error": "internal_shadow_model_runner_failed", "error_type": type(exc).__name__}) from exc
+    result = result if isinstance(result, dict) else {}
+    supplied_run_hash = str(result.get("run_hash") or "").strip()
+    run_content = {key: value for key, value in result.items() if key != "run_hash"}
+    if supplied_run_hash != _content_hash(run_content):
+        raise HTTPException(status_code=422, detail="internal_shadow_model_run_hash_mismatch")
+    generated_at = _parse_timestamp(result.get("generated_at"))
+    if (
+        result.get("schema") != "learning_shadow_model_run_v1"
+        or result.get("input_hash") != input_hash
+        or result.get("freeze_hash") != freeze.get("content_hash")
+        or result.get("hypothesis_hash") != hypothesis.get("content_hash")
+        or generated_at is None
+        or not int(freeze.get("captured_at") or 0) <= generated_at <= now_ts
+        or now_ts >= int(freeze.get("kickoff_at") or 0)
+    ):
+        raise HTTPException(status_code=422, detail="internal_shadow_model_run_identity_or_pit_invalid")
+    runner_id = str(result.get("runner_id") or "").strip()
+    runner_version = str(result.get("runner_version") or "").strip()
+    calculator_policy = validation_plan.get("calculator_policy") if isinstance(validation_plan.get("calculator_policy"), dict) else {}
+    if not runner_id or not runner_version:
+        raise HTTPException(status_code=422, detail="internal_shadow_model_runner_identity_required")
+    if (
+        runner_id != calculator_policy.get("required_runner_id")
+        or runner_version != calculator_policy.get("required_runner_version")
+        or result.get("challenger_spec_hash") != challenger_spec.get("spec_hash")
+    ):
+        raise HTTPException(status_code=422, detail="internal_shadow_model_runner_or_spec_mismatch")
+    if _normalize_1x2_probabilities(result.get("champion_probabilities"), "champion") != frozen_champion_probabilities:
+        raise HTTPException(status_code=422, detail="internal_shadow_champion_must_match_frozen_probability_replay")
+    selected_expression = result.get("selected_expression") if isinstance(result.get("selected_expression"), dict) else {}
+    if (
+        str(selected_expression.get("market") or "") != str(frozen_expression.get("market") or "")
+        or str(selected_expression.get("selection") or "") != str(frozen_expression.get("selection") or "")
+        or as_float(selected_expression.get("line")) != as_float(frozen_expression.get("line"))
+    ):
+        raise HTTPException(status_code=422, detail="internal_shadow_expression_must_match_frozen_selection")
+    normalized_champion_forecast = _normalize_learning_market_forecast(
+        result.get("champion_forecast"), frozen_expression, "champion",
+    )
+    expected_champion_forecast = _normalize_learning_market_forecast(
+        frozen_champion_forecast, frozen_expression, "frozen_champion",
+    )
+    if normalized_champion_forecast != expected_champion_forecast:
+        raise HTTPException(status_code=422, detail="internal_shadow_champion_forecast_must_match_frozen_probability_replay")
+    normalized_challenger_forecast = _normalize_learning_market_forecast(
+        result.get("challenger_forecast"), frozen_expression, "challenger",
+    )
+    required_modules = list(ablation_plan.get("required_modules") or [])
+    raw_modules = result.get("module_ablations") if isinstance(result.get("module_ablations"), dict) else {}
+    if set(raw_modules) != set(required_modules):
+        raise HTTPException(status_code=422, detail="internal_shadow_model_run_module_set_mismatch")
+    module_outputs = {}
+    for module in required_modules:
+        row = raw_modules.get(module) if isinstance(raw_modules.get(module), dict) else {}
+        module_outputs[module] = {
+            "probabilities": row.get("probabilities"),
+            "forecast": row.get("forecast"),
+            "computed_at": generated_at,
+            "output_reference": f"internal-run:{supplied_run_hash}:{module}",
+        }
+    payload = {
+        "freeze_id": freeze_id,
+        "champion_probabilities": result.get("champion_probabilities"),
+        "challenger_probabilities": result.get("challenger_probabilities"),
+        "champion_forecast": normalized_champion_forecast,
+        "challenger_forecast": normalized_challenger_forecast,
+        "module_ablation_outputs": module_outputs,
+        "selected_expression": selected_expression,
+        "risk": result.get("risk"),
+    }
+    provenance = {
+        "schema": "learning_shadow_model_run_v1",
+        "runner_id": runner_id, "runner_version": runner_version,
+        "generated_at": generated_at, "input_hash": input_hash,
+        "run_hash": supplied_run_hash, "challenger_spec_hash": challenger_spec.get("spec_hash"),
+    }
+    return lock_hypothesis_shadow_prediction(
+        hypothesis_id, payload, now_ts=now_ts, calculator_provenance=provenance,
+    )
+
+
+def _learning_t1h_price_evidence_for_expression(
+    freeze: Dict[str, Any], expression: Dict[str, Any], store: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return the exact-line T-1h consensus for one frozen market expression."""
+    fixture = str(freeze.get("fixture") or "")
+    kickoff_at = int(freeze.get("kickoff_at") or 0)
+    rows = [
+        row for row in ((store.get("fixtures") or {}).get(fixture) or [])
+        if isinstance(row, dict) and row.get("stage") == "T-1h"
+        and 0 < int(row.get("snapshot_at") or 0) < kickoff_at
+        and get_nested(row, ["stage_timing_audit", "status"]) != "invalid"
+        and get_nested(row, ["sequence_timing_audit", "status"]) != "invalid"
+    ]
+    terminal = max(rows, key=lambda row: int(row.get("snapshot_at") or 0), default=None)
+    if not terminal:
+        return {"ok": False, "reason": "verified_learning_t1h_snapshot_required"}
+    market_snapshot = terminal.get("market_snapshot") if isinstance(terminal.get("market_snapshot"), dict) else {}
+    if market_snapshot.get("available") is not True:
+        return {"ok": False, "reason": "learning_t1h_market_snapshot_unavailable"}
+    expression = expression if isinstance(expression, dict) else {}
+    market = str(expression.get("market") or "").strip()
+    selection = str(expression.get("selection") or "").strip().casefold()
+    line = as_float(expression.get("line"))
+    aliases = {
+        "match_winner": "1x2", "moneyline": "1x2", "total": "over_under", "goals": "over_under",
+        "both_teams_to_score": "btts",
+    }
+    market = aliases.get(market, market)
+    selection_aliases = {"主胜": "home", "客胜": "away", "平": "draw", "大": "over", "小": "under", "是": "yes", "否": "no"}
+    selection = selection_aliases.get(selection, selection)
+    main_line = get_nested(market_snapshot, ["consensus_main_line", market], {}) or get_nested(market_snapshot, ["primary", market], {}) or {}
+    if market in {"asian_handicap", "over_under", "home_team_total", "away_team_total"}:
+        reference_line = as_float(main_line.get("line"))
+        if line is None or reference_line is None or abs(line - reference_line) > 1e-9:
+            return {"ok": False, "reason": "learning_t1h_consensus_same_line_required", "market": market, "entry_line": line, "reference_line": reference_line}
+    price = as_float(main_line.get(selection))
+    bookmaker_count = int(as_float(main_line.get("bookmaker_count")) or 0)
+    if price is None or not 1.01 <= price <= 1000 or bookmaker_count < MIN_CONSENSUS_BOOKMAKERS:
+        return {"ok": False, "reason": "learning_t1h_consensus_price_or_coverage_missing", "market": market, "selection": selection}
+    evidence_hash = _content_hash({
+        "fixture": fixture, "stage": "T-1h", "snapshot_at": terminal.get("snapshot_at"),
+        "market": market, "selection": selection, "line": line,
+        "price": price, "bookmaker_count": bookmaker_count, "market_snapshot": market_snapshot,
+    })
+    return {
+        "ok": True, "reference_stage": "T-1h", "reference_decimal_price": price,
+        "price_reference_evidence_ref": f"snapshot:{evidence_hash}:T-1h:{market}:{selection}",
+        "snapshot_at": terminal.get("snapshot_at"), "evidence_hash": evidence_hash,
+    }
+
+
+def _learning_terminal_price_evidence(
+    freeze: Dict[str, Any], shadow_lock: Dict[str, Any], store: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return the exact-line T-1h consensus used by forward Shadow validation."""
+    expression = shadow_lock.get("selected_expression") if isinstance(shadow_lock.get("selected_expression"), dict) else {}
+    return _learning_t1h_price_evidence_for_expression(freeze, expression, store)
+
+
+def record_hypothesis_validation(hypothesis_id: Any, payload: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
+    hypothesis_id = str(hypothesis_id or "").strip()
+    payload = payload if isinstance(payload, dict) else {}
+    freeze_id = str(payload.get("freeze_id") or "").strip()
+    if not freeze_id:
+        raise HTTPException(status_code=400, detail="valid_freeze_id_required")
+    if not str(payload.get("evidence_summary") or "").strip():
+        raise HTTPException(status_code=400, detail="evidence_summary_required")
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        hypothesis = (store.get("learning_hypotheses") or {}).get(hypothesis_id)
+        if not hypothesis:
+            raise HTTPException(status_code=404, detail="hypothesis_not_found")
+        if freeze_id in (hypothesis.get("discovery_freeze_ids") or []):
+            raise HTTPException(status_code=409, detail="discovery_sample_cannot_validate_same_hypothesis")
+        freeze = _learning_freeze_by_id(store, freeze_id)
+        if not freeze or freeze_id not in (store.get("learning_postmatch") or {}):
+            raise HTTPException(status_code=409, detail="independent_settled_frozen_sample_required")
+        shadow_lock = ((store.get("learning_shadow_locks") or {}).get(hypothesis_id) or {}).get(freeze_id)
+        if not shadow_lock:
+            raise HTTPException(status_code=409, detail="pre_kickoff_shadow_lock_required")
+        if str(payload.get("shadow_lock_hash") or "").strip() != str(shadow_lock.get("lock_hash") or ""):
+            raise HTTPException(status_code=409, detail="matching_shadow_lock_hash_required")
+        caller_price_fields = {
+            "price_reference_stage", "reference_decimal_price", "price_reference_evidence_ref",
+            "closing_decimal_price", "closing_price_evidence_ref",
+        }
+        if any(key in payload for key in caller_price_fields):
+            raise HTTPException(status_code=400, detail="caller_supplied_price_reference_forbidden")
+        reference = _learning_terminal_price_evidence(freeze, shadow_lock, store)
+        if reference.get("ok") is not True:
+            raise HTTPException(status_code=409, detail=reference.get("reason"))
+        reference_stage = str(reference.get("reference_stage") or "")
+        reference_decimal_price = float(reference["reference_decimal_price"])
+        price_reference_evidence_ref = str(reference.get("price_reference_evidence_ref") or "")
+        postmatch = store["learning_postmatch"][freeze_id]
+        final_result = postmatch.get("result") if isinstance(postmatch.get("result"), dict) else {}
+        locked_expression = shadow_lock.get("selected_expression") if isinstance(shadow_lock.get("selected_expression"), dict) else {}
+        market_forecast_scoring = shadow_lock.get("scoring_contract") == "learning_market_forecast_v1"
+        if market_forecast_scoring:
+            champion_brier = _brier_market_forecast(shadow_lock["champion_forecast"], locked_expression, final_result)
+            challenger_brier = _brier_market_forecast(shadow_lock["challenger_forecast"], locked_expression, final_result)
+            realized_forecast_category = _learning_market_outcome_category(locked_expression, final_result)
+        else:
+            champion_brier = _brier_1x2(shadow_lock["champion_probabilities"], final_result)
+            challenger_brier = _brier_1x2(shadow_lock["challenger_probabilities"], final_result)
+            realized_forecast_category = "legacy_1x2"
+        ablation_plan = get_nested(hypothesis, ["pre_registered_validation_plan", "ablation_plan"], {}) or {}
+        module_briers = {
+            module: (
+                _brier_market_forecast(row["forecast"], locked_expression, final_result)
+                if market_forecast_scoring
+                else _brier_1x2(row["probabilities"], final_result)
+            )
+            for module, row in (shadow_lock.get("module_ablations") or {}).items()
+        }
+        module_brier_gains = {
+            module: round(value - challenger_brier, 8) for module, value in module_briers.items()
+        }
+        entry_decimal_price = float(get_nested(shadow_lock, ["selected_expression", "entry_decimal_price"]))
+        t1h_price_probability_delta = round(1.0 / reference_decimal_price - 1.0 / entry_decimal_price, 8)
+        risk_delta = round(float(get_nested(shadow_lock, ["risk", "challenger_tail_risk"])) - float(get_nested(shadow_lock, ["risk", "champion_tail_risk"])), 8)
+        champion_brier_gain = round(champion_brier - challenger_brier, 8)
+        minimum_champion_gain = float(ablation_plan.get("minimum_challenger_brier_gain_over_champion") or 0.0)
+        maximum_risk_increase = as_float(get_nested(hypothesis, ["pre_registered_validation_plan", "maximum_mean_tail_risk_increase"]))
+        maximum_risk_increase = 0.0 if maximum_risk_increase is None else maximum_risk_increase
+        module_thresholds = {
+            module: float(get_nested(ablation_plan, ["module_interventions", module, "minimum_brier_gain"], 0.0) or 0.0)
+            for module in ablation_plan.get("required_modules") or []
+        }
+        metric_failures = []
+        if champion_brier_gain < minimum_champion_gain:
+            metric_failures.append("challenger_brier_gain_below_preregistered_minimum")
+        for module, threshold in module_thresholds.items():
+            if module not in module_brier_gains or module_brier_gains[module] < threshold:
+                metric_failures.append(f"{module}_ablation_gain_below_preregistered_minimum")
+        if risk_delta > maximum_risk_increase:
+            metric_failures.append("tail_risk_increase_above_preregistered_maximum")
+        outcome = "support" if not metric_failures else "counterexample"
+        process_classification = str(postmatch.get("process_classification") or "")
+        process_event_clean = process_classification in {
+            "PROCESS_CORRECT_RESULT_WIN", "PROCESS_CORRECT_RESULT_LOSS",
+            "PROCESS_ERROR_RESULT_WIN", "PROCESS_ERROR_RESULT_LOSS",
+        }
+        evidence_content = {
+            "freeze_id": freeze_id,
+            "freeze_hash": freeze.get("content_hash"),
+            "postmatch_hash": store["learning_postmatch"][freeze_id].get("postmatch_hash"),
+            "outcome": outcome,
+            "outcome_derivation": {
+                "method": "preregistered_forward_metric_thresholds_v1",
+                "metric_failures": metric_failures,
+                "caller_supplied_outcome": payload.get("outcome"),
+                "caller_supplied_outcome_used": False,
+            },
+            "evidence_summary": str(payload.get("evidence_summary")).strip(),
+            "pit_audit": {
+                "status": "passed",
+                "derived_from_freeze": True,
+                "freeze_hash": freeze.get("content_hash"),
+                "captured_before_kickoff": int(freeze.get("captured_at") or 0) < int(freeze.get("kickoff_at") or 0),
+                "data_cutoff_before_kickoff": int(freeze.get("data_cutoff_at") or 0) < int(freeze.get("kickoff_at") or 0),
+                "caller_status_used": False,
+            },
+            "event_pollution_audit": {
+                "status": "passed" if process_event_clean else "failed",
+                "derived_from_process_classification": process_classification,
+                "postmatch_event_audit_hash": _content_hash(postmatch.get("event_audit") or {}),
+                "caller_status_used": False,
+            },
+            "shadow_lock_hash": shadow_lock.get("lock_hash"),
+            "price_reference": {
+                "stage": reference_stage,
+                "decimal_price": reference_decimal_price,
+                "evidence_ref": price_reference_evidence_ref,
+            },
+            "derived_metrics": {
+                "scoring_contract": shadow_lock.get("scoring_contract"),
+                "forecast_market": locked_expression.get("market"),
+                "forecast_selection": locked_expression.get("selection"),
+                "forecast_line": locked_expression.get("line"),
+                "realized_forecast_category": realized_forecast_category,
+                "champion_brier": champion_brier,
+                "challenger_brier": challenger_brier,
+                "champion_brier_1x2": champion_brier if locked_expression.get("market") == "1x2" else None,
+                "challenger_brier_1x2": challenger_brier if locked_expression.get("market") == "1x2" else None,
+                "challenger_brier_gain_over_champion": champion_brier_gain,
+                "module_ablation_brier": module_briers,
+                "module_ablation_brier_1x2": module_briers if locked_expression.get("market") == "1x2" else None,
+                "module_ablation_brier_gain": module_brier_gains,
+                "t1h_price_probability_delta": t1h_price_probability_delta,
+                "champion_tail_risk": get_nested(shadow_lock, ["risk", "champion_tail_risk"]),
+                "challenger_tail_risk": get_nested(shadow_lock, ["risk", "challenger_tail_risk"]),
+                "tail_risk_delta": risk_delta,
+                "process_classification": process_classification,
+                "result_outcome_used_as_rule_label": False,
+            },
+        }
+        evidence_hash = _content_hash(evidence_content)
+        rows = hypothesis.setdefault("validation_evidence", [])
+        existing = next((row for row in rows if row.get("freeze_id") == freeze_id), None)
+        if existing:
+            if existing.get("evidence_hash") == evidence_hash:
+                return {**existing, "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="validation_sample_already_recorded")
+        evidence = {**evidence_content, "evidence_hash": evidence_hash, "recorded_at": int(now_ts or time.time()), "action": "recorded"}
+        rows.append(evidence)
+        hypothesis["status"] = "SHADOW_VALIDATION"
+        hypothesis["champion_effect"] = False
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return evidence
+
+
+def refresh_learning_forward_validation_evidence(now_ts: Optional[int] = None, apply_changes: bool = True) -> Dict[str, Any]:
+    """Settle locked forward samples from verified postmatch and exact-line T-1h evidence."""
+    now_ts = int(now_ts or time.time())
+    store = load_snapshot_store()
+    results = []
+    for hypothesis_id, locks in (store.get("learning_shadow_locks") or {}).items():
+        hypothesis = (store.get("learning_hypotheses") or {}).get(hypothesis_id)
+        if not isinstance(hypothesis, dict):
+            continue
+        recorded = {str(row.get("freeze_id")) for row in (hypothesis.get("validation_evidence") or []) if isinstance(row, dict)}
+        for freeze_id, shadow_lock in (locks or {}).items():
+            if freeze_id in recorded:
+                results.append({"hypothesis_id": hypothesis_id, "freeze_id": freeze_id, "action": "skipped", "reason": "validation_evidence_already_recorded"})
+                continue
+            postmatch = (store.get("learning_postmatch") or {}).get(freeze_id)
+            freeze = _learning_freeze_by_id(store, freeze_id)
+            if not isinstance(postmatch, dict) or not isinstance(freeze, dict):
+                results.append({"hypothesis_id": hypothesis_id, "freeze_id": freeze_id, "action": "blocked", "reason": "independent_settled_frozen_sample_required"})
+                continue
+            reference = _learning_terminal_price_evidence(freeze, shadow_lock, store)
+            if reference.get("ok") is not True:
+                results.append({
+                    "hypothesis_id": hypothesis_id, "freeze_id": freeze_id,
+                    "action": "blocked", "reason": reference.get("reason"),
+                })
+                continue
+            if not apply_changes:
+                results.append({"hypothesis_id": hypothesis_id, "freeze_id": freeze_id, "action": "would_record", "price_reference_evidence_hash": reference.get("evidence_hash")})
+                continue
+            try:
+                evidence = record_hypothesis_validation(hypothesis_id, {
+                    "freeze_id": freeze_id,
+                    "evidence_summary": "Automatically derived from the immutable Shadow lock, verified postmatch record and exact-line T-1h learning snapshot.",
+                    "shadow_lock_hash": shadow_lock.get("lock_hash"),
+                }, now_ts=now_ts)
+                results.append({
+                    "hypothesis_id": hypothesis_id, "freeze_id": freeze_id,
+                    "action": evidence.get("action"), "evidence_hash": evidence.get("evidence_hash"),
+                    "outcome": evidence.get("outcome"), "champion_effect": False,
+                })
+            except HTTPException as exc:
+                results.append({
+                    "hypothesis_id": hypothesis_id, "freeze_id": freeze_id,
+                    "action": "rejected", "status_code": exc.status_code, "reason": exc.detail,
+                })
+    return {
+        "version": VERSION, "result_count": len(results), "results": results,
+        "recorded_count": sum(row.get("action") == "recorded" for row in results),
+        "caller_supplied_validation_outcome_used": False,
+        "automatic_champion_change": False,
+    }
+
+
+def promotion_evidence_report(hypothesis_id: Any, store_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    hypothesis_id = str(hypothesis_id or "").strip()
+    store = store_override if isinstance(store_override, dict) else load_snapshot_store()
+    hypothesis = (store.get("learning_hypotheses") or {}).get(hypothesis_id)
+    if not hypothesis:
+        raise HTTPException(status_code=404, detail="hypothesis_not_found")
+    evidence = hypothesis.get("validation_evidence") or []
+    plan = hypothesis.get("pre_registered_validation_plan") if isinstance(hypothesis.get("pre_registered_validation_plan"), dict) else {}
+    try:
+        planned_minimum = int(plan.get("minimum_samples") or LEARNING_MIN_VALIDATION_SAMPLES)
+    except (TypeError, ValueError):
+        planned_minimum = LEARNING_MIN_VALIDATION_SAMPLES
+    required = max(LEARNING_MIN_VALIDATION_SAMPLES, planned_minimum, 2)
+    support_count = sum(row.get("outcome") == "support" for row in evidence)
+    counterexamples = [row for row in evidence if row.get("outcome") == "counterexample"]
+    metrics = [row.get("derived_metrics") for row in evidence if isinstance(row.get("derived_metrics"), dict)]
+    locks = (store.get("learning_shadow_locks") or {}).get(hypothesis_id) or {}
+    def mean(key: str) -> Optional[float]:
+        values = [as_float(row.get(key)) for row in metrics]
+        valid = [value for value in values if value is not None]
+        return round(sum(valid) / len(valid), 8) if len(valid) == len(evidence) and valid else None
+    def gate(status: str, refs: List[str], **values: Any) -> Dict[str, Any]:
+        return {"status": status, "evidence_refs": refs, **values}
+    enough = len(evidence) >= required and support_count >= required
+    all_hashes = [str(row.get("evidence_hash")) for row in evidence if row.get("evidence_hash")]
+    preregistered = bool(plan) and bool(evidence) and all(
+        (locks.get(row.get("freeze_id")) or {}).get("lock_hash") == row.get("shadow_lock_hash")
+        and int((locks.get(row.get("freeze_id")) or {}).get("locked_at") or 0) >= int(hypothesis.get("registered_at") or 0)
+        and get_nested(locks.get(row.get("freeze_id")) or {}, ["calculator_provenance", "origin"]) == "internal_shadow_runner"
+        and get_nested(locks.get(row.get("freeze_id")) or {}, ["calculator_provenance", "promotion_eligible"]) is True
+        and (locks.get(row.get("freeze_id")) or {}).get("scoring_contract") == "learning_market_forecast_v1"
+        and get_nested(locks.get(row.get("freeze_id")) or {}, ["calculator_provenance", "runner_id"]) == "builtin_preregistered_poisson_challenger"
+        and (locks.get(row.get("freeze_id")) or {}).get("challenger_spec_hash") == get_nested(plan, ["challenger_spec", "spec_hash"])
+        for row in evidence
+    )
+    pit_passed = enough and all(get_nested(row, ["pit_audit", "status"]) == "passed" for row in evidence)
+    clean_process_classes = {"PROCESS_CORRECT_RESULT_WIN", "PROCESS_CORRECT_RESULT_LOSS", "PROCESS_ERROR_RESULT_WIN", "PROCESS_ERROR_RESULT_LOSS"}
+    event_passed = enough and all(
+        get_nested(row, ["event_pollution_audit", "status"]) == "passed"
+        and get_nested(row, ["derived_metrics", "process_classification"]) in clean_process_classes
+        for row in evidence
+    )
+    champion_brier = mean("champion_brier")
+    challenger_brier = mean("challenger_brier")
+    ablation_plan = plan.get("ablation_plan") if isinstance(plan.get("ablation_plan"), dict) else {}
+    required_ablation_modules = list(ablation_plan.get("required_modules") or [])
+    module_ablation_metrics = {}
+    for module in required_ablation_modules:
+        brier_values = [as_float(get_nested(row, ["module_ablation_brier", module])) for row in metrics]
+        gain_values = [as_float(get_nested(row, ["module_ablation_brier_gain", module])) for row in metrics]
+        complete = bool(evidence) and len(brier_values) == len(evidence) and all(value is not None for value in brier_values + gain_values)
+        module_ablation_metrics[module] = {
+            "sample_count": len(gain_values) if complete else 0,
+            "mean_ablated_brier": round(sum(brier_values) / len(brier_values), 8) if complete else None,
+            "mean_challenger_gain_over_ablation": round(sum(gain_values) / len(gain_values), 8) if complete else None,
+            "minimum_required_gain": as_float(get_nested(ablation_plan, ["module_interventions", module, "minimum_brier_gain"])),
+        }
+    mean_t1h_price_delta = mean("t1h_price_probability_delta")
+    mean_risk_delta = mean("tail_risk_delta")
+    process_eligible = [get_nested(row, ["derived_metrics", "process_classification"]) for row in evidence]
+    process_accuracy = round(sum(str(value).startswith("PROCESS_CORRECT_") for value in process_eligible) / len(process_eligible), 8) if process_eligible else None
+    max_brier = as_float(plan.get("maximum_challenger_brier"))
+    max_brier = 0.34 if max_brier is None else max_brier
+    min_t1h_price_delta = as_float(plan.get("minimum_mean_t1h_price_probability_delta"))
+    min_t1h_price_delta = 0.0 if min_t1h_price_delta is None else min_t1h_price_delta
+    min_process_accuracy = as_float(plan.get("minimum_process_accuracy"))
+    min_process_accuracy = 0.6 if min_process_accuracy is None else min_process_accuracy
+    max_risk_increase = as_float(plan.get("maximum_mean_tail_risk_increase"))
+    max_risk_increase = 0.0 if max_risk_increase is None else max_risk_increase
+    module_ablation_passed = bool(required_ablation_modules) and all(
+        row["sample_count"] == len(evidence)
+        and row["mean_challenger_gain_over_ablation"] is not None
+        and row["minimum_required_gain"] is not None
+        and row["mean_challenger_gain_over_ablation"] >= row["minimum_required_gain"]
+        for row in module_ablation_metrics.values()
+    )
+    sample_status = "passed" if enough and not counterexamples else ("failed" if counterexamples else "missing")
+    gates = {
+        "pre_registration": gate(
+            "passed" if preregistered and enough else "missing",
+            all_hashes,
+            registered_at=hypothesis.get("registered_at"),
+            required_calculator_origin="internal_shadow_runner",
+        ),
+        "pit_integrity": gate("passed" if pit_passed else ("failed" if enough else "missing"), all_hashes),
+        "event_pollution_audit": gate("passed" if event_passed else ("failed" if enough else "missing"), all_hashes),
+        "out_of_sample_shadow": gate(sample_status, all_hashes, support_count=support_count, required_support_count=required, counterexample_count=len(counterexamples)),
+        "ablation": gate(
+            "passed" if enough and module_ablation_passed else ("failed" if enough else "missing"),
+            all_hashes,
+            schema_version=ablation_plan.get("schema_version"),
+            required_modules=required_ablation_modules,
+            module_metrics=module_ablation_metrics,
+        ),
+        "calibration": gate("passed" if enough and challenger_brier is not None and champion_brier is not None and challenger_brier <= champion_brier and challenger_brier <= max_brier else ("failed" if enough else "missing"), all_hashes, champion_brier=champion_brier, challenger_brier=challenger_brier, maximum_challenger_brier=max_brier),
+        "clv_or_price_quality": gate(
+            "passed" if enough and mean_t1h_price_delta is not None and mean_t1h_price_delta >= min_t1h_price_delta else ("failed" if enough else "missing"),
+            all_hashes,
+            reference_stage="T-1h",
+            mean_t1h_price_probability_delta=mean_t1h_price_delta,
+            minimum_mean_t1h_price_probability_delta=min_t1h_price_delta,
+        ),
+        "process_accuracy": gate("passed" if enough and process_accuracy is not None and process_accuracy >= min_process_accuracy else ("failed" if enough else "missing"), all_hashes, process_accuracy=process_accuracy, minimum_process_accuracy=min_process_accuracy),
+        "risk_review": gate("passed" if enough and mean_risk_delta is not None and mean_risk_delta <= max_risk_increase else ("failed" if enough else "missing"), all_hashes, mean_tail_risk_delta=mean_risk_delta, maximum_mean_tail_risk_increase=max_risk_increase),
+    }
+    missing_or_failed = [name for name in LEARNING_PROMOTION_REQUIRED_GATES if gates[name]["status"] != "passed"]
+    report_content = {
+        "hypothesis_id": hypothesis_id, "hypothesis_hash": hypothesis.get("content_hash"),
+        "ablation_plan_hash": _content_hash(ablation_plan),
+        "required_samples": required, "validation_sample_count": len(evidence), "support_count": support_count,
+        "counterexample_count": len(counterexamples), "gates": gates,
+    }
+    return {
+        **report_content, "report_hash": _content_hash(report_content),
+        "promotion_ready": not missing_or_failed,
+        "incomplete_gates": missing_or_failed,
+        "caller_supplied_gate_status_used": False,
+        "caller_supplied_validation_outcome_used": False,
+        "result_outcome_used_as_optimization_target": False,
+        "automatic_champion_change": False,
+    }
+
+
+def create_promotion_candidate(hypothesis_id: Any, gate_audit: Any = None, now_ts: Optional[int] = None) -> Dict[str, Any]:
+    hypothesis_id = str(hypothesis_id or "").strip()
+    if isinstance(gate_audit, dict) and gate_audit:
+        raise HTTPException(status_code=400, detail="caller_supplied_promotion_gate_audit_forbidden")
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        hypothesis = (store.get("learning_hypotheses") or {}).get(hypothesis_id)
+        if not hypothesis:
+            raise HTTPException(status_code=404, detail="hypothesis_not_found")
+        evidence = hypothesis.get("validation_evidence") or []
+        evidence_report = promotion_evidence_report(hypothesis_id, store_override=store)
+        if not evidence_report["promotion_ready"]:
+            blockers = []
+            if evidence_report["support_count"] < evidence_report["required_samples"]:
+                blockers.append("independent_support_sample_minimum_not_reached")
+            if evidence_report["counterexample_count"]:
+                blockers.append("unresolved_counterexamples_present")
+            if evidence_report["incomplete_gates"]:
+                blockers.append("derived_promotion_evidence_incomplete")
+            raise HTTPException(status_code=409, detail={
+                "error": "promotion_candidate_not_ready",
+                "blockers": blockers,
+                "support_count": evidence_report["support_count"],
+                "required_support_count": evidence_report["required_samples"],
+                "counterexample_count": evidence_report["counterexample_count"],
+                "missing_gates": evidence_report["incomplete_gates"],
+                "evidence_report_hash": evidence_report["report_hash"],
+            })
+        candidate_content = {
+            "hypothesis_id": hypothesis_id,
+            "hypothesis_hash": hypothesis.get("content_hash"),
+            "support_count": evidence_report["support_count"],
+            "validation_evidence_hashes": [row.get("evidence_hash") for row in evidence],
+            "gate_audit": evidence_report["gates"],
+            "promotion_evidence_report_hash": evidence_report["report_hash"],
+        }
+        candidate_hash = _content_hash(candidate_content)
+        promotions = store.setdefault("learning_promotions", {})
+        existing = promotions.get(hypothesis_id)
+        if existing:
+            if existing.get("candidate_hash") == candidate_hash:
+                return {**existing, "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="promotion_candidate_already_exists")
+        record = {
+            **candidate_content,
+            "candidate_hash": candidate_hash,
+            "created_at": int(now_ts or time.time()),
+            "status": "AWAITING_EXPLICIT_USER_CONFIRMATION",
+            "champion_effect": False,
+            "automatic_promotion": False,
+            "action": "candidate_created",
+        }
+        promotions[hypothesis_id] = record
+        hypothesis["status"] = "PROMOTION_CANDIDATE"
+        hypothesis["champion_effect"] = False
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return record
+
+
+def refresh_learning_promotion_candidates(now_ts: Optional[int] = None, apply_changes: bool = True) -> Dict[str, Any]:
+    """Create confirmation-only candidates when all derived gates pass; never activate Champion."""
+    now_ts = int(now_ts or time.time())
+    store = load_snapshot_store()
+    results = []
+    for hypothesis_id in sorted((store.get("learning_hypotheses") or {})):
+        existing = (store.get("learning_promotions") or {}).get(hypothesis_id)
+        if isinstance(existing, dict):
+            results.append({
+                "hypothesis_id": hypothesis_id, "action": "skipped",
+                "reason": "promotion_candidate_already_exists", "candidate_hash": existing.get("candidate_hash"),
+            })
+            continue
+        report = promotion_evidence_report(hypothesis_id, store_override=store)
+        if report.get("promotion_ready") is not True:
+            results.append({
+                "hypothesis_id": hypothesis_id, "action": "blocked",
+                "reason": "derived_promotion_evidence_incomplete",
+                "incomplete_gates": report.get("incomplete_gates"),
+                "report_hash": report.get("report_hash"),
+            })
+            continue
+        if not apply_changes:
+            results.append({"hypothesis_id": hypothesis_id, "action": "would_create", "report_hash": report.get("report_hash")})
+            continue
+        try:
+            candidate = create_promotion_candidate(hypothesis_id, None, now_ts=now_ts)
+            results.append({
+                "hypothesis_id": hypothesis_id, "action": candidate.get("action"),
+                "candidate_hash": candidate.get("candidate_hash"),
+                "status": candidate.get("status"), "champion_effect": False,
+            })
+        except HTTPException as exc:
+            results.append({
+                "hypothesis_id": hypothesis_id, "action": "rejected",
+                "status_code": exc.status_code, "reason": exc.detail,
+            })
+    return {
+        "version": VERSION, "result_count": len(results), "results": results,
+        "candidate_created_count": sum(row.get("action") == "candidate_created" for row in results),
+        "automatic_champion_change": False,
+        "explicit_user_confirmation_required": True,
+    }
+
+
+def _league_dna_candidate_status(candidate: Dict[str, Any], store: Dict[str, Any]) -> Dict[str, Any]:
+    hypothesis = (store.get("learning_hypotheses") or {}).get(candidate.get("hypothesis_id")) or {}
+    evidence = hypothesis.get("validation_evidence") or []
+    support_count = sum(row.get("outcome") == "support" for row in evidence)
+    counterexample_count = sum(row.get("outcome") == "counterexample" for row in evidence)
+    required = LEARNING_MIN_VALIDATION_SAMPLES
+    activation = (store.get("league_dna_activation_candidates") or {}).get(candidate.get("tag_id"))
+    active = (store.get("league_dna_active") or {}).get(candidate.get("tag_id"))
+    if (
+        active and active.get("status") == "VERIFIED_ACTIVE"
+        and active.get("evidence_confidence") == 100
+        and get_nested(active, ["user_confirmation", "confirmed"]) is True
+    ):
+        status, confidence = "VERIFIED_ACTIVE", 100
+    elif activation:
+        status, confidence = "AWAITING_EXPLICIT_USER_CONFIRMATION", 99
+    elif evidence:
+        status = "SHADOW_VALIDATION"
+        confidence = min(90, int(90 * min(support_count, required) / required))
+    else:
+        status, confidence = "LEAGUE_TAG_CANDIDATE", 0
+    return {
+        "status": status, "evidence_confidence": confidence,
+        "independent_support_count": support_count,
+        "counterexample_count": counterexample_count,
+        "required_independent_support_count": required,
+        "champion_effect": status == "VERIFIED_ACTIVE",
+    }
+
+
+def register_league_dna_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    hypothesis_id = str(payload.get("hypothesis_id") or "").strip()
+    tag_id = str(payload.get("tag_id") or "").strip()
+    if not hypothesis_id or not tag_id or len(tag_id) > 120 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in tag_id):
+        raise HTTPException(status_code=400, detail="safe_tag_id_and_hypothesis_id_required")
+    category = str(payload.get("category") or "").strip().lower()
+    market = str(payload.get("market") or "").strip().lower()
+    if category not in LEAGUE_DNA_CATEGORIES or market not in LEAGUE_DNA_MARKETS:
+        raise HTTPException(status_code=400, detail="invalid_league_dna_category_or_market")
+    magnitude = as_float(payload.get("magnitude_score"))
+    if magnitude is None or not -3 <= magnitude <= 3:
+        raise HTTPException(status_code=400, detail="magnitude_score_must_be_between_minus_3_and_plus_3")
+    scope_audit = audit_learning_scope(payload.get("scope"))
+    if not scope_audit["eligible"]:
+        raise HTTPException(status_code=422, detail={"error": "league_dna_scope_not_verified", "reasons": scope_audit["reasons"]})
+    sample_window = payload.get("sample_window") if isinstance(payload.get("sample_window"), dict) else {}
+    required_window_fields = ("training_start", "training_end", "validation_start", "validation_end", "minimum_independent_samples")
+    missing_window = [key for key in required_window_fields if sample_window.get(key) in (None, "")]
+    try:
+        planned_minimum = int(sample_window.get("minimum_independent_samples"))
+    except (TypeError, ValueError):
+        planned_minimum = 0
+    if missing_window or planned_minimum < LEARNING_MIN_VALIDATION_SAMPLES:
+        raise HTTPException(status_code=400, detail={
+            "error": "complete_league_dna_sample_window_required",
+            "missing": missing_window,
+            "minimum_independent_samples": LEARNING_MIN_VALIDATION_SAMPLES,
+        })
+    required_text = ("label", "metric_definition", "baseline_definition", "expected_model_effect", "anti_double_counting_rule")
+    missing_text = [key for key in required_text if not str(payload.get(key) or "").strip()]
+    if missing_text:
+        raise HTTPException(status_code=400, detail={"error": "league_dna_fields_required", "missing": missing_text})
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        hypothesis = (store.get("learning_hypotheses") or {}).get(hypothesis_id)
+        if not hypothesis:
+            raise HTTPException(status_code=404, detail="linked_hypothesis_not_found")
+        if hypothesis.get("type") != "LEAGUE_TAG_CANDIDATE":
+            raise HTTPException(status_code=409, detail="league_dna_requires_league_tag_candidate_hypothesis")
+        content = {
+            "tag_id": tag_id, "hypothesis_id": hypothesis_id,
+            "scope": scope_audit["normalized"], "category": category, "market": market,
+            "label": str(payload.get("label")).strip(), "magnitude_score": magnitude,
+            "metric_definition": str(payload.get("metric_definition")).strip(),
+            "baseline_definition": str(payload.get("baseline_definition")).strip(),
+            "expected_model_effect": str(payload.get("expected_model_effect")).strip(),
+            "anti_double_counting_rule": str(payload.get("anti_double_counting_rule")).strip(),
+            "sample_window": {**sample_window, "minimum_independent_samples": planned_minimum},
+        }
+        content_hash = _content_hash(content)
+        candidates = store.setdefault("league_dna_candidates", {})
+        existing = candidates.get(tag_id)
+        if existing:
+            if existing.get("content_hash") == content_hash:
+                return {**existing, **_league_dna_candidate_status(existing, store), "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="league_dna_tag_id_already_registered")
+        record = {
+            **content, "content_hash": content_hash, "registered_at": int(time.time()),
+            "status": "LEAGUE_TAG_CANDIDATE", "evidence_confidence": 0,
+            "champion_effect": False, "immutable": True,
+        }
+        candidates[tag_id] = record
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return {**record, "action": "registered"}
+
+
+def create_league_dna_activation_candidate(tag_id: Any) -> Dict[str, Any]:
+    tag_id = str(tag_id or "").strip()
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        candidate = (store.get("league_dna_candidates") or {}).get(tag_id)
+        if not candidate:
+            raise HTTPException(status_code=404, detail="league_dna_candidate_not_found")
+        promotion = (store.get("learning_promotions") or {}).get(candidate.get("hypothesis_id"))
+        if not promotion or promotion.get("status") != "AWAITING_EXPLICIT_USER_CONFIRMATION":
+            raise HTTPException(status_code=409, detail="validated_hypothesis_promotion_candidate_required")
+        content = {
+            "tag_id": tag_id, "tag_hash": candidate.get("content_hash"),
+            "hypothesis_id": candidate.get("hypothesis_id"),
+            "promotion_candidate_hash": promotion.get("candidate_hash"),
+            "proposed_magnitude_score": candidate.get("magnitude_score"),
+            "proposed_scope": candidate.get("scope"),
+            "rollback_conditions": [
+                "new_season_or_format_change", "unresolved_counterexample",
+                "out_of_sample_decay", "bookmaker_coverage_regime_change",
+            ],
+        }
+        activation_hash = _content_hash(content)
+        activations = store.setdefault("league_dna_activation_candidates", {})
+        existing = activations.get(tag_id)
+        if existing:
+            if existing.get("activation_hash") == activation_hash:
+                return {**existing, "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="league_dna_activation_candidate_already_exists")
+        record = {
+            **content, "activation_hash": activation_hash, "created_at": int(time.time()),
+            "status": "AWAITING_EXPLICIT_USER_CONFIRMATION", "evidence_confidence": 99,
+            "champion_effect": False, "automatic_activation": False,
+        }
+        activations[tag_id] = record
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return {**record, "action": "activation_candidate_created"}
+
+
+def confirm_league_dna_activation(tag_id: Any, payload: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Activate one fully validated League DNA tag only from an explicit hash-bound user confirmation."""
+    tag_id = str(tag_id or "").strip()
+    payload = payload if isinstance(payload, dict) else {}
+    activation_hash = str(payload.get("activation_hash") or "").strip()
+    actor = str(payload.get("confirmed_by") or "").strip()
+    reference = str(payload.get("confirmation_reference") or "").strip()
+    statement = str(payload.get("confirmation_statement") or "").strip()
+    expected_statement = f"CONFIRM LEAGUE_DNA {tag_id} {activation_hash}"
+    if payload.get("confirmed") is not True:
+        raise HTTPException(status_code=422, detail="explicit_confirmation_true_required")
+    if not activation_hash or not actor or not reference:
+        raise HTTPException(status_code=422, detail="activation_hash_actor_and_confirmation_reference_required")
+    if not hmac.compare_digest(statement, expected_statement):
+        raise HTTPException(status_code=422, detail={"error": "exact_confirmation_statement_required", "expected": expected_statement})
+    now_ts = int(now_ts or time.time())
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        candidate = (store.get("league_dna_candidates") or {}).get(tag_id)
+        activation = (store.get("league_dna_activation_candidates") or {}).get(tag_id)
+        if not candidate or not activation:
+            raise HTTPException(status_code=404, detail="league_dna_activation_candidate_not_found")
+        if activation.get("status") != "AWAITING_EXPLICIT_USER_CONFIRMATION":
+            raise HTTPException(status_code=409, detail="league_dna_activation_not_waiting_for_confirmation")
+        if activation_hash != activation.get("activation_hash"):
+            raise HTTPException(status_code=409, detail="latest_activation_candidate_hash_required")
+        promotion = (store.get("learning_promotions") or {}).get(candidate.get("hypothesis_id"))
+        if not promotion or promotion.get("candidate_hash") != activation.get("promotion_candidate_hash"):
+            raise HTTPException(status_code=409, detail="matching_validated_promotion_candidate_required")
+        active_rows = store.setdefault("league_dna_active", {})
+        existing = active_rows.get(tag_id)
+        if existing:
+            existing_confirmation = existing.get("user_confirmation") if isinstance(existing.get("user_confirmation"), dict) else {}
+            same_confirmation = (
+                existing.get("activation_candidate_hash") == activation_hash
+                and existing_confirmation.get("confirmed_by") == actor
+                and existing_confirmation.get("confirmation_reference") == reference
+                and existing_confirmation.get("confirmation_statement_hash") == _content_hash(statement)
+            )
+            if same_confirmation:
+                return {**existing, "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="league_dna_tag_already_active")
+        confirmation = {
+            "confirmed": True, "confirmed_by": actor,
+            "confirmation_reference": reference,
+            "confirmation_statement_hash": _content_hash(statement),
+            "confirmed_at": now_ts,
+            "activation_hash": activation_hash,
+        }
+        immutable_content = {
+            "tag_id": tag_id,
+            "tag_hash": candidate.get("content_hash"),
+            "hypothesis_id": candidate.get("hypothesis_id"),
+            "promotion_candidate_hash": promotion.get("candidate_hash"),
+            "activation_candidate_hash": activation_hash,
+            "scope": candidate.get("scope"),
+            "category": candidate.get("category"),
+            "market": candidate.get("market"),
+            "label": candidate.get("label"),
+            "magnitude_score": candidate.get("magnitude_score"),
+            "metric_definition": candidate.get("metric_definition"),
+            "baseline_definition": candidate.get("baseline_definition"),
+            "expected_model_effect": candidate.get("expected_model_effect"),
+            "anti_double_counting_rule": candidate.get("anti_double_counting_rule"),
+            "rollback_conditions": activation.get("rollback_conditions"),
+            "user_confirmation": confirmation,
+        }
+        active_hash = _content_hash(immutable_content)
+        record = {
+            **immutable_content,
+            "active_hash": active_hash,
+            "version": "league-dna-active-" + active_hash[:16],
+            "activated_at": now_ts,
+            "status": "VERIFIED_ACTIVE",
+            "evidence_confidence": 100,
+            "champion_effect": True,
+            "automatic_activation": False,
+            "immutable": True,
+            "action": "activated",
+        }
+        active_rows[tag_id] = record
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return record
+
+
+def league_dna_model_view(scope: Dict[str, Any], store_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Return only explicitly confirmed VERIFIED_ACTIVE priors to prematch callers."""
+    store = store_override if store_override is not None else load_snapshot_store()
+    try:
+        competition_id = int((scope or {}).get("competition_id"))
+    except (TypeError, ValueError):
+        competition_id = None
+    season = str((scope or {}).get("season") or "").strip()
+    phase = str((scope or {}).get("phase") or "unknown").strip()
+    active = []
+    rejected_active = []
+    for row in (store.get("league_dna_active") or {}).values():
+        row_scope = row.get("scope") if isinstance(row.get("scope"), dict) else {}
+        matches = (
+            row_scope.get("competition_id") == competition_id
+            and str(row_scope.get("season") or "") == season
+            and str(row_scope.get("phase") or "all") in {"all", phase}
+        )
+        if not matches:
+            continue
+        confirmed = get_nested(row, ["user_confirmation", "confirmed"]) is True
+        eligible = row.get("status") == "VERIFIED_ACTIVE" and row.get("evidence_confidence") == 100 and confirmed
+        if eligible:
+            active.append(row)
+        else:
+            rejected_active.append({"tag_id": row.get("tag_id"), "reason": "verified_active_confirmation_invariant_failed"})
+    active.sort(key=lambda row: str(row.get("tag_id")))
+    matching_candidates = [
+        row for row in (store.get("league_dna_candidates") or {}).values()
+        if get_nested(row, ["scope", "competition_id"]) == competition_id
+        and str(get_nested(row, ["scope", "season"]) or "") == season
+    ]
+    version = "league-dna-" + _content_hash([{"tag_id": row.get("tag_id"), "version": row.get("version"), "hash": row.get("content_hash")} for row in active])[:16] if active else None
+    return {
+        "status": "VERIFIED_ACTIVE" if active else ("candidate_only" if matching_candidates else "data_missing"),
+        "version": version, "active_tags": active,
+        "active_tag_count": len(active), "candidate_tag_count": len(matching_candidates),
+        "rejected_active_records": rejected_active,
+        "champion_effect": bool(active),
+        "policy": "only evidence_confidence=100 VERIFIED_ACTIVE records with explicit user confirmation enter the prematch prior",
+    }
+
+
+def league_dna_status_report(competition_id: Optional[int] = None) -> Dict[str, Any]:
+    store = load_snapshot_store()
+    candidates = []
+    for row in (store.get("league_dna_candidates") or {}).values():
+        if competition_id is not None and get_nested(row, ["scope", "competition_id"]) != int(competition_id):
+            continue
+        candidates.append({**row, **_league_dna_candidate_status(row, store)})
+    active_rows = [row for row in (store.get("league_dna_active") or {}).values() if competition_id is None or get_nested(row, ["scope", "competition_id"]) == int(competition_id)]
+    valid_active = [row for row in active_rows if row.get("status") == "VERIFIED_ACTIVE" and row.get("evidence_confidence") == 100 and get_nested(row, ["user_confirmation", "confirmed"]) is True]
+    return {
+        "version": VERSION, "competition_id": competition_id,
+        "candidate_count": len(candidates), "candidates": sorted(candidates, key=lambda row: str(row.get("tag_id"))),
+        "activation_candidate_count": sum(row.get("tag_id") in {candidate.get("tag_id") for candidate in candidates} for row in (store.get("league_dna_activation_candidates") or {}).values()),
+        "verified_active_count": len(valid_active), "verified_active": valid_active,
+        "automatic_activation": False,
+        "policy": "candidate and shadow tags never affect Champion; activation requires a separately recorded explicit user confirmation",
+    }
+
+
+def _learning_selected_expression(decision: Any) -> Dict[str, Any]:
+    decision = decision if isinstance(decision, dict) else {}
+    for candidate in (
+        decision.get("selected_expression"), decision.get("best_market"),
+        get_nested(decision, ["recommendation_tiers", "first_choice_high_consistency"]),
+    ):
+        if isinstance(candidate, dict):
+            return {
+                "market": str(candidate.get("market") or "data_missing"),
+                "selection": candidate.get("selection"), "line": candidate.get("line"),
+                "price": candidate.get("price"),
+            }
+    return {"market": "data_missing", "selection": None, "line": None, "price": None}
+
+
+def _learning_frozen_rating(decision: Dict[str, Any], rating_name: str) -> Any:
+    """Read an explicitly frozen rating without translating or inventing a score."""
+    candidates = [decision.get(rating_name)]
+    if rating_name == "market_rating":
+        selected = decision.get("selected_expression") if isinstance(decision.get("selected_expression"), dict) else {}
+        candidates.extend((selected.get("market_rating"), selected.get("rating")))
+    for value in candidates:
+        if isinstance(value, bool) or value in (None, ""):
+            continue
+        if isinstance(value, (int, float)):
+            return value
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _learning_quality_label(statuses: List[Any], required_count: int) -> Dict[str, Any]:
+    normalized = [str(value or "data_missing").strip().lower() for value in statuses]
+    if any(value == "failed" for value in normalized):
+        label = "failed"
+    elif len(normalized) == required_count and all(value == "passed" for value in normalized):
+        label = "passed"
+    else:
+        label = "ungraded"
+    return {
+        "label": label,
+        "calibration_eligible": label in {"passed", "failed"},
+        "component_statuses": normalized,
+    }
+
+
+def _learning_quality_card_candidate(freeze: Dict[str, Any], postmatch: Dict[str, Any]) -> Dict[str, Any]:
+    """Derive one immutable process card; result direction never assigns a quality label."""
+    decision = freeze.get("decision") if isinstance(freeze.get("decision"), dict) else {}
+    review = postmatch.get("review") if isinstance(postmatch.get("review"), dict) else {}
+    expression = _learning_selected_expression(decision)
+    priority_quality = _learning_quality_label([get_nested(review, ["match_selection_quality", "status"])], 1)
+    selection_quality = _learning_quality_label([
+        get_nested(review, ["expression_audit", "status"]),
+        get_nested(review, ["price_execution_audit", "status"]),
+    ], 2)
+    process_class = str(postmatch.get("process_classification") or "DATA_INSUFFICIENT")
+    outcome_independence_attested = review.get("outcome_not_used_for_process_grade") is True
+    result_backfit_rejected = get_nested(review, ["learning_disposition", "result_backfit_used"]) is False
+    section_evidence_eligible = (
+        process_class != "EVENT_CONTAMINATED"
+        and outcome_independence_attested and result_backfit_rejected
+    )
+    sample_eligible = section_evidence_eligible and process_class != "DATA_INSUFFICIENT"
+    priority_eligible = section_evidence_eligible and priority_quality["calibration_eligible"]
+    selection_eligible = section_evidence_eligible and selection_quality["calibration_eligible"]
+    match_rating = _learning_frozen_rating(decision, "match_rating")
+    market_rating = _learning_frozen_rating(decision, "market_rating")
+    immutable = {
+        "schema_version": "learning_quality_card_v1",
+        "freeze_id": freeze.get("freeze_id"), "fixture": freeze.get("fixture"),
+        "freeze_version_number": freeze.get("version_number"),
+        "freeze_hash": freeze.get("content_hash"), "postmatch_hash": postmatch.get("postmatch_hash"),
+        "fact_hash": postmatch.get("fact_hash"),
+        "scope": freeze.get("scope") if isinstance(freeze.get("scope"), dict) else {},
+        "frozen_decision": {
+            "action": decision.get("decision"), "match_rating": match_rating,
+            "market_rating": market_rating, "selected_expression": expression,
+        },
+        "priority_quality": {
+            **priority_quality, "source_section": "match_selection_quality",
+            "rating_available": match_rating is not None,
+            "label_derived_before_outcome": outcome_independence_attested,
+        },
+        "selection_quality": {
+            **selection_quality, "source_sections": ["expression_audit", "price_execution_audit"],
+            "rating_available": market_rating is not None,
+            "label_derived_before_outcome": outcome_independence_attested,
+        },
+        "diagnostics": {section: get_nested(review, [section, "status"]) for section in LEARNING_REVIEW_SECTIONS},
+        "sample_eligibility": {
+            "eligible": sample_eligible,
+            "priority_calibration_eligible": priority_eligible,
+            "selection_calibration_eligible": selection_eligible,
+            "section_evidence_isolated": True,
+            "reason": (
+                "verified_outcome_independent_process_review" if sample_eligible else
+                "independent_sections_only; overall_process_data_insufficient" if process_class == "DATA_INSUFFICIENT" and section_evidence_eligible else
+                process_class.lower() if process_class in {"EVENT_CONTAMINATED", "DATA_INSUFFICIENT"} else
+                "outcome_independence_attestation_missing"
+            ),
+            "outcome_not_used_for_process_grade": outcome_independence_attested,
+            "result_backfit_explicitly_rejected": result_backfit_rejected,
+        },
+        "outcome_context": {
+            "process_classification": process_class, "result_reference": postmatch.get("postmatch_hash"),
+            "final_score_copied_into_card": False,
+            "excluded_from_priority_quality_label": True,
+            "excluded_from_selection_quality_label": True,
+        },
+        "result_backfit_used": False, "automatic_weight_change": False, "champion_effect": False,
+    }
+    card_hash = _content_hash(immutable)
+    return {**immutable, "card_id": "learning-card-" + card_hash[:16], "card_hash": card_hash, "immutable": True}
+
+
+def learning_quality_card_candidates() -> Dict[str, Any]:
+    store = load_snapshot_store()
+    cards, rejected = [], []
+    for freeze_id, postmatch in (store.get("learning_postmatch") or {}).items():
+        freeze = _learning_freeze_by_id(store, freeze_id)
+        if not freeze:
+            rejected.append({"freeze_id": freeze_id, "reason": "frozen_sample_missing"})
+            continue
+        cards.append(_learning_quality_card_candidate(freeze, postmatch))
+    cards.sort(key=lambda row: (str(row.get("fixture")), int(row.get("freeze_version_number") or 0)))
+    return {
+        "version": VERSION, "candidate_count": len(cards), "candidates": cards, "rejected": rejected,
+        "result_outcome_used_for_labels": False, "automatic_weight_change": False,
+        "automatic_champion_change": False,
+    }
+
+
+def refresh_learning_quality_cards(now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Persist hash-bound Learning Cards; existing cards can never be rewritten."""
+    now_ts = int(now_ts or time.time())
+    derived = learning_quality_card_candidates()
+    results = []
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        saved = store.setdefault("learning_quality_cards", {})
+        for candidate in derived["candidates"]:
+            freeze_id = str(candidate.get("freeze_id") or "")
+            existing = saved.get(freeze_id)
+            if existing:
+                if existing.get("card_hash") != candidate.get("card_hash"):
+                    raise HTTPException(status_code=409, detail="immutable_learning_quality_card_conflict")
+                results.append({**existing, "action": "unchanged"})
+                continue
+            record = {**candidate, "created_at": now_ts, "action": "created"}
+            saved[freeze_id] = record
+            results.append(record)
+        store["version"] = VERSION
+        write_snapshot_store(store)
+    return {
+        "version": VERSION, "created_count": sum(row.get("action") == "created" for row in results),
+        "results": results, "rejected": derived["rejected"],
+        "result_outcome_used_for_labels": False, "automatic_weight_change": False,
+        "automatic_champion_change": False,
+    }
+
+
+def _learning_rating_bucket(value: Any) -> Optional[str]:
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return f"numeric:{float(value):g}"
+    return "categorical:" + str(value).strip().upper()
+
+
+def learning_quality_calibration_report(minimum_samples: Optional[int] = None) -> Dict[str, Any]:
+    """Calibrate frozen ratings against process audits, never result wins."""
+    minimum_samples = max(2, int(minimum_samples or LEARNING_MIN_VALIDATION_SAMPLES))
+    store = load_snapshot_store()
+    cards = [row for row in (store.get("learning_quality_cards") or {}).values() if isinstance(row, dict)]
+    latest_by_fixture: Dict[str, Dict[str, Any]] = {}
+    superseded = 0
+    for card in cards:
+        fixture = str(card.get("fixture") or "")
+        current = latest_by_fixture.get(fixture)
+        if current and int(current.get("freeze_version_number") or 0) >= int(card.get("freeze_version_number") or 0):
+            superseded += 1
+            continue
+        if current:
+            superseded += 1
+        latest_by_fixture[fixture] = card
+    groups: Dict[Tuple[str, Any, str], Dict[str, Any]] = {}
+    excluded = {
+        "superseded_freeze_version": superseded, "sample_ineligible": 0,
+        "priority_sample_ineligible": 0, "selection_sample_ineligible": 0,
+        "priority_rating_missing": 0, "priority_label_ungraded": 0,
+        "selection_rating_missing": 0, "selection_label_ungraded": 0,
+    }
+    for card in latest_by_fixture.values():
+        any_dimension_eligible = False
+        competition_id = get_nested(card, ["scope", "competition_id"])
+        competition_name = get_nested(card, ["scope", "competition_name"])
+        for dimension, rating_field, prefix in (
+            ("priority_quality", "match_rating", "priority"),
+            ("selection_quality", "market_rating", "selection"),
+        ):
+            eligibility_key = f"{prefix}_calibration_eligible"
+            dimension_eligible = get_nested(card, ["sample_eligibility", eligibility_key])
+            if dimension_eligible is None:
+                dimension_eligible = get_nested(card, ["sample_eligibility", "eligible"])
+            if dimension_eligible is not True:
+                excluded[f"{prefix}_sample_ineligible"] += 1
+                continue
+            any_dimension_eligible = True
+            rating = get_nested(card, ["frozen_decision", rating_field])
+            bucket = _learning_rating_bucket(rating)
+            label = get_nested(card, [dimension, "label"])
+            if bucket is None:
+                excluded[f"{prefix}_rating_missing"] += 1
+                continue
+            if label not in {"passed", "failed"}:
+                excluded[f"{prefix}_label_ungraded"] += 1
+                continue
+            key = (dimension, competition_id, bucket)
+            group = groups.setdefault(key, {
+                "dimension": dimension, "competition_id": competition_id,
+                "competition_name": competition_name, "rating_bucket": bucket,
+                "frozen_rating": rating, "eligible_sample_count": 0,
+                "passed_count": 0, "failed_count": 0, "card_ids": [], "freeze_ids": [], "fixture_ids": [],
+            })
+            group["eligible_sample_count"] += 1
+            group[f"{label}_count"] += 1
+            group["card_ids"].append(card.get("card_id"))
+            group["freeze_ids"].append(card.get("freeze_id"))
+            group["fixture_ids"].append(card.get("fixture"))
+        if not any_dimension_eligible:
+            excluded["sample_ineligible"] += 1
+    calibration_groups = []
+    for group in groups.values():
+        count = group["eligible_sample_count"]
+        calibration_groups.append({
+            **group, "minimum_samples": minimum_samples, "sample_ready": count >= minimum_samples,
+            "observed_process_pass_rate": round(group["passed_count"] / count, 6),
+            "interpretation": "internal_process_calibration_only", "result_win_rate_used": False,
+            "automatic_weight_change": False, "champion_effect": False,
+        })
+    calibration_groups.sort(key=lambda row: (str(row.get("competition_name")), row["dimension"], row["rating_bucket"]))
+    return {
+        "version": VERSION, "minimum_samples": minimum_samples, "stored_card_count": len(cards),
+        "latest_fixture_card_count": len(latest_by_fixture), "calibration_group_count": len(calibration_groups),
+        "sample_ready_group_count": sum(row["sample_ready"] for row in calibration_groups),
+        "groups": calibration_groups, "excluded_counts": excluded,
+        "result_outcome_used_for_calibration": False, "automatic_weight_change": False,
+        "automatic_champion_change": False,
+        "policy": "calibrate only explicitly frozen ratings against hash-bound process audits; missing ratings are excluded rather than inferred",
+    }
+
+
+def learning_selection_quality_report(minimum_samples: Optional[int] = None) -> Dict[str, Any]:
+    """Aggregate process quality without using win/loss as a model-change signal."""
+    minimum_samples = max(2, int(minimum_samples or LEARNING_MIN_VALIDATION_SAMPLES))
+    store = load_snapshot_store()
+    groups: Dict[str, Dict[str, Any]] = {}
+    excluded_counts = {
+        "event_contaminated": 0, "data_insufficient": 0,
+        "frozen_sample_missing": 0, "superseded_freeze_version": 0,
+    }
+    latest_by_fixture: Dict[str, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
+    for freeze_id, postmatch in (store.get("learning_postmatch") or {}).items():
+        freeze = _learning_freeze_by_id(store, freeze_id)
+        if not freeze:
+            excluded_counts["frozen_sample_missing"] += 1
+            continue
+        fixture = str(freeze.get("fixture") or "")
+        existing = latest_by_fixture.get(fixture)
+        if existing and int(existing[0].get("version_number") or 0) >= int(freeze.get("version_number") or 0):
+            excluded_counts["superseded_freeze_version"] += 1
+            continue
+        if existing:
+            excluded_counts["superseded_freeze_version"] += 1
+        latest_by_fixture[fixture] = (freeze, postmatch)
+    for freeze, postmatch in latest_by_fixture.values():
+        freeze_id = str(freeze.get("freeze_id") or "")
+        fixture = str(freeze.get("fixture") or "")
+        process_class = str(postmatch.get("process_classification") or "")
+        if process_class == "EVENT_CONTAMINATED":
+            excluded_counts["event_contaminated"] += 1
+            continue
+        if process_class == "DATA_INSUFFICIENT":
+            excluded_counts["data_insufficient"] += 1
+            continue
+        expression = _learning_selected_expression(freeze.get("decision"))
+        competition_id = get_nested(freeze, ["scope", "competition_id"])
+        competition_name = get_nested(freeze, ["scope", "competition_name"])
+        group_key = f"{competition_id}:{expression['market']}"
+        group = groups.setdefault(group_key, {
+            "competition_id": competition_id, "competition_name": competition_name,
+            "market": expression["market"], "eligible_sample_count": 0,
+            "process_correct_count": 0, "process_error_count": 0,
+            "match_selection_failed_count": 0, "expression_failed_count": 0,
+            "price_execution_failed_count": 0, "inconclusive_review_count": 0,
+            "freeze_ids": [], "fixture_ids": [],
+            "failure_freeze_ids": {
+                "process_error": [], "match_selection": [],
+                "expression": [], "price_execution": [],
+            },
+        })
+        group["eligible_sample_count"] += 1
+        group["freeze_ids"].append(freeze_id)
+        group["fixture_ids"].append(fixture)
+        if process_class.startswith("PROCESS_CORRECT_"):
+            group["process_correct_count"] += 1
+        elif process_class.startswith("PROCESS_ERROR_"):
+            group["process_error_count"] += 1
+            group["failure_freeze_ids"]["process_error"].append(freeze_id)
+        review = postmatch.get("review") if isinstance(postmatch.get("review"), dict) else {}
+        section_statuses = {
+            "match_selection": get_nested(review, ["match_selection_quality", "status"]),
+            "expression": get_nested(review, ["expression_audit", "status"]),
+            "price_execution": get_nested(review, ["price_execution_audit", "status"]),
+        }
+        if section_statuses["match_selection"] == "failed":
+            group["match_selection_failed_count"] += 1
+            group["failure_freeze_ids"]["match_selection"].append(freeze_id)
+        if section_statuses["expression"] == "failed":
+            group["expression_failed_count"] += 1
+            group["failure_freeze_ids"]["expression"].append(freeze_id)
+        if section_statuses["price_execution"] == "failed":
+            group["price_execution_failed_count"] += 1
+            group["failure_freeze_ids"]["price_execution"].append(freeze_id)
+        if any(status in {"inconclusive", "data_missing", None} for status in section_statuses.values()):
+            group["inconclusive_review_count"] += 1
+    cards = []
+    for group in groups.values():
+        count = group["eligible_sample_count"]
+        sample_ready = count >= minimum_samples
+        rates = {
+            "process_accuracy": round(group["process_correct_count"] / count, 6) if count else None,
+            "match_selection_failure_rate": round(group["match_selection_failed_count"] / count, 6) if count else None,
+            "expression_failure_rate": round(group["expression_failed_count"] / count, 6) if count else None,
+            "price_execution_failure_rate": round(group["price_execution_failed_count"] / count, 6) if count else None,
+        }
+        has_failure_evidence = any(group[key] > 0 for key in ("match_selection_failed_count", "expression_failed_count", "price_execution_failed_count", "process_error_count"))
+        cards.append({
+            **group,
+            "freeze_ids": group["freeze_ids"],
+            "fixture_ids": group["fixture_ids"],
+            "failure_freeze_ids": group["failure_freeze_ids"],
+            "freeze_ids_truncated": False,
+            "minimum_samples": minimum_samples, "sample_ready": sample_ready, "rates": rates,
+            "research_signal": "HYPOTHESIS_ONLY_REVIEW_ALLOWED" if sample_ready and has_failure_evidence else "COLLECT_MORE_INDEPENDENT_SAMPLES",
+            "champion_effect": False, "automatic_weight_change": False,
+            "result_outcome_used_for_optimization": False,
+        })
+    cards.sort(key=lambda row: (str(row.get("competition_name")), str(row.get("market"))))
+    return {
+        "version": VERSION, "minimum_samples": minimum_samples,
+        "card_count": len(cards), "sample_ready_card_count": sum(row["sample_ready"] for row in cards),
+        "cards": cards, "excluded_counts": excluded_counts,
+        "automatic_hypothesis_registration": False,
+        "automatic_champion_change": False,
+        "policy": "aggregate frozen process reviews only; final win/loss is not an optimization target and any signal must be preregistered as a new hypothesis",
+    }
+
+
+def learning_research_proposal_candidates(minimum_matches: Optional[int] = None) -> Dict[str, Any]:
+    """Derive repeated multi-match research signals without asserting a causal theory."""
+    minimum_matches = max(3, int(minimum_matches or LEARNING_RESEARCH_PROPOSAL_MIN_MATCHES))
+    quality = learning_selection_quality_report(minimum_samples=minimum_matches)
+    dimensions = (
+        ("process_error", "process_error_count", "process_accuracy"),
+        ("match_selection", "match_selection_failed_count", "match_selection_failure_rate"),
+        ("expression", "expression_failed_count", "expression_failure_rate"),
+        ("price_execution", "price_execution_failed_count", "price_execution_failure_rate"),
+    )
+    candidates = []
+    rejected = []
+    for card in quality.get("cards") or []:
+        if not card.get("sample_ready"):
+            rejected.append({
+                "competition_id": card.get("competition_id"), "market": card.get("market"),
+                "reason": "minimum_distinct_match_sample_not_reached",
+                "eligible_match_count": card.get("eligible_sample_count"),
+            })
+            continue
+        for dimension, count_key, rate_key in dimensions:
+            failure_count = int(card.get(count_key) or 0)
+            if dimension == "process_error":
+                accuracy = get_nested(card, ["rates", rate_key])
+                failure_rate = round(1.0 - float(accuracy), 6) if accuracy is not None else None
+            else:
+                failure_rate = get_nested(card, ["rates", rate_key])
+            supporting_freezes = list(get_nested(card, ["failure_freeze_ids", dimension], []) or [])
+            reasons = []
+            if failure_count < LEARNING_RESEARCH_PROPOSAL_MIN_FAILURES:
+                reasons.append("minimum_repeated_failures_not_reached")
+            if failure_rate is None or float(failure_rate) < LEARNING_RESEARCH_PROPOSAL_MIN_FAILURE_RATE:
+                reasons.append("minimum_failure_rate_not_reached")
+            if len(set(supporting_freezes)) < LEARNING_RESEARCH_PROPOSAL_MIN_FAILURES:
+                reasons.append("independent_supporting_freezes_insufficient")
+            if reasons:
+                rejected.append({
+                    "competition_id": card.get("competition_id"), "market": card.get("market"),
+                    "signal_dimension": dimension, "failure_count": failure_count,
+                    "failure_rate": failure_rate, "reasons": reasons,
+                })
+                continue
+            identity = {
+                "competition_id": card.get("competition_id"),
+                "market": card.get("market"), "signal_dimension": dimension,
+            }
+            proposal_id = "research-" + _content_hash(identity)[:16]
+            evidence = {
+                "eligible_distinct_match_count": int(card.get("eligible_sample_count") or 0),
+                "failure_count": failure_count,
+                "failure_rate": failure_rate,
+                "supporting_freeze_ids": sorted(set(supporting_freezes)),
+                "context_freeze_ids": sorted(set(card.get("freeze_ids") or [])),
+                "context_fixture_ids": sorted(set(card.get("fixture_ids") or [])),
+                "selection_quality_rates": card.get("rates"),
+                "result_outcome_used": False,
+            }
+            immutable = {
+                "proposal_id": proposal_id,
+                "status": "RESEARCH_PROPOSAL",
+                "scope": {
+                    "competition_id": card.get("competition_id"),
+                    "competition_name": card.get("competition_name"),
+                    "market": card.get("market"),
+                },
+                "signal_dimension": dimension,
+                "evidence": evidence,
+                "research_question": f"Why does the frozen {dimension} audit repeatedly fail in this competition and market, and what prematch-observable intervention would reduce that failure?",
+                "causal_claim_status": "not_formulated",
+                "required_next_action": "formulate_a_falsifiable_causal_hypothesis_and_challenger_before_forward_validation",
+                "forward_validation_blueprint": {
+                    "discovery_samples_must_be_excluded": True,
+                    "minimum_independent_validation_samples": LEARNING_MIN_VALIDATION_SAMPLES,
+                    "pre_registration_required": True,
+                    "pre_kickoff_shadow_lock_required": True,
+                    "required_comparators": ["Champion", "Challenger", "Ablation"],
+                    "allowed_ablation_modules": sorted(LEARNING_ABLATION_INTERVENTIONS),
+                    "module_ablation_plan_must_be_preregistered": True,
+                    "required_metrics": ["Brier", "CLV", "Process Accuracy", "Tail Risk"],
+                    "unresolved_counterexample_blocks_promotion": True,
+                    "explicit_user_confirmation_required_for_champion": True,
+                },
+                "automatic_hypothesis_registration": False,
+                "automatic_model_effect": False,
+                "champion_effect": False,
+                "result_backfit_used": False,
+            }
+            candidates.append({**immutable, "proposal_hash": _content_hash(immutable)})
+    candidates.sort(key=lambda row: (
+        str(get_nested(row, ["scope", "competition_name"])),
+        str(get_nested(row, ["scope", "market"])), str(row.get("signal_dimension")),
+    ))
+    return {
+        "version": VERSION, "minimum_distinct_matches": minimum_matches,
+        "minimum_repeated_failures": LEARNING_RESEARCH_PROPOSAL_MIN_FAILURES,
+        "minimum_failure_rate": LEARNING_RESEARCH_PROPOSAL_MIN_FAILURE_RATE,
+        "candidate_count": len(candidates), "candidates": candidates,
+        "rejected_count": len(rejected), "rejected": rejected,
+        "automatic_hypothesis_registration": False,
+        "automatic_champion_change": False,
+        "policy": "multi-match process signals create research proposals only; a proposal is not a causal hypothesis and has no model effect",
+    }
+
+
+def refresh_learning_research_proposals(now_ts: Optional[int] = None, minimum_matches: Optional[int] = None) -> Dict[str, Any]:
+    """Persist immutable versions of repeated-signal proposals; never register hypotheses."""
+    now_ts = int(now_ts or time.time())
+    derived = learning_research_proposal_candidates(minimum_matches=minimum_matches)
+    results = []
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        proposals = store.setdefault("learning_research_proposals", {})
+        for candidate in derived["candidates"]:
+            proposal_id = candidate["proposal_id"]
+            rows = proposals.setdefault(proposal_id, [])
+            duplicate = next((row for row in rows if row.get("proposal_hash") == candidate.get("proposal_hash")), None)
+            if duplicate:
+                results.append({**duplicate, "action": "unchanged"})
+                continue
+            version_number = max([int(row.get("version_number") or 0) for row in rows] + [0]) + 1
+            record = {
+                **candidate, "version_number": version_number,
+                "created_at": now_ts, "immutable": True, "action": "proposed",
+            }
+            rows.append(record)
+            results.append(record)
+        store["version"] = VERSION
+        write_snapshot_store(store)
+    return {
+        "version": VERSION, "generated_at": now_ts,
+        "proposal_result_count": len(results),
+        "new_proposal_version_count": sum(row.get("action") == "proposed" for row in results),
+        "results": results,
+        "automatic_hypothesis_registration": False,
+        "automatic_champion_change": False,
+    }
+
+
+def learning_research_proposal_report() -> Dict[str, Any]:
+    store = load_snapshot_store()
+    rows = []
+    for proposal_id, versions in (store.get("learning_research_proposals") or {}).items():
+        latest = max((row for row in versions or [] if isinstance(row, dict)), key=lambda row: int(row.get("version_number") or 0), default=None)
+        if latest:
+            rows.append(latest)
+    rows.sort(key=lambda row: (
+        str(get_nested(row, ["scope", "competition_name"])),
+        str(get_nested(row, ["scope", "market"])), str(row.get("signal_dimension")),
+    ))
+    return {
+        "version": VERSION, "proposal_count": len(rows), "proposals": rows,
+        "automatic_hypothesis_registration": False,
+        "automatic_champion_change": False,
+        "policy": "research proposals require causal formulation and preregistration before any forward Shadow validation",
+    }
+
+
+def automatic_learning_runtime_readiness(
+    store_integrity: Optional[Dict[str, Any]] = None,
+    worker_alive: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Expose the exact configuration gate for an unattended learning loop without secrets."""
+    integrity = store_integrity if isinstance(store_integrity, dict) else snapshot_store_integrity()
+    if worker_alive is None:
+        worker_alive = bool(AUTO_SNAPSHOT_THREAD and AUTO_SNAPSHOT_THREAD.is_alive())
+    registry_manifest = learning_major_league_registry_manifest()
+    checks = {
+        "api_football_configured": bool(API_FOOTBALL_KEY),
+        "the_odds_api_configured": bool(THE_ODDS_API_KEY),
+        "optional_event_enrichment_configured": bool(THESTATS_API_KEY),
+        "protected_api_configured": bool(SHADOW_ACCESS_TOKEN),
+        "persistent_store_configured": str(SNAPSHOT_STORE_PATH).replace("\\", "/").startswith("/data/"),
+        "persistent_store_operational": integrity.get("operational") is True,
+        "persistent_backup_ready": integrity.get("recovery_ready") is True,
+        "persistent_store_single_writer": SNAPSHOT_STORE_WRITER_WORKERS == 1,
+        "auto_snapshot_enabled": AUTO_SNAPSHOT_ENABLED is True,
+        "auto_snapshot_worker_alive": worker_alive is True,
+        "major_league_registry_configured": bool(LEARNING_MAJOR_LEAGUES),
+        "major_league_registry_versioned": bool(registry_manifest.get("version") and registry_manifest.get("registry_hash")),
+        "node_execution_recovery_configured": (
+            60 <= LEARNING_NODE_LEASE_SECONDS <= 3600
+            and 60 <= LEARNING_NODE_RETRY_BASE_SECONDS <= LEARNING_NODE_RETRY_MAX_SECONDS
+        ),
+        "daily_schedule_configured": True,
+    }
+    required = (
+        "api_football_configured", "the_odds_api_configured",
+        "protected_api_configured", "persistent_store_configured",
+        "persistent_store_operational", "persistent_backup_ready", "persistent_store_single_writer",
+        "auto_snapshot_enabled", "auto_snapshot_worker_alive",
+        "major_league_registry_configured", "major_league_registry_versioned",
+        "node_execution_recovery_configured", "daily_schedule_configured",
+    )
+    blockers = [name for name in required if checks.get(name) is not True]
+    return {
+        "status": "ready" if not blockers else "not_ready",
+        "ready": not blockers,
+        "checks": checks,
+        "blockers": blockers,
+        "provider_contract": {
+            "fixture_and_primary_facts": "api_football",
+            "odds_timeline_and_independent_result": "the_odds_api",
+            "independent_event_timeline": "optional_enrichment_only",
+            "configured_optional_event_provider": "thestats" if THESTATS_API_KEY else None,
+            "missing_secondary_event_policy": "DATA_INSUFFICIENT",
+            "event_dependent_learning_effect": False if not THESTATS_API_KEY else "requires_verified_matching_event_signature",
+        },
+        "major_league_registry": {
+            "version": registry_manifest["version"],
+            "registry_hash": registry_manifest["registry_hash"],
+            "league_count": registry_manifest["league_count"],
+        },
+        "schedule": {"timezone": "Asia/Shanghai", "daily_local_time": "14:30", "same_day_catch_up": True},
+        "node_execution": {
+            "lease_seconds": LEARNING_NODE_LEASE_SECONDS,
+            "retry_base_seconds": LEARNING_NODE_RETRY_BASE_SECONDS,
+            "retry_max_seconds": LEARNING_NODE_RETRY_MAX_SECONDS,
+            "attempt_retention": LEARNING_NODE_ATTEMPT_RETENTION,
+            "persistent_attempt_ledger": True,
+        },
+        "persistence": {
+            "writer_workers": SNAPSHOT_STORE_WRITER_WORKERS,
+            "single_writer_required": True,
+        },
+        "secrets_exposed": False,
+        "policy": "automatic learning is authorized only when every provider, persistence, worker and security gate is ready",
+    }
+
+
+LEARNING_RUN_HASH_FIELDS = (
+    "run_id", "mode", "started_at", "postmatch_plan_generated_at", "prematch_plan_generated_at",
+    "execution_order", "settlement_results", "postmatch_fact_results",
+    "market_language_postmatch_fact_results",
+    "postmatch_review_draft_results", "review_completion_results", "quality_card_results",
+    "forward_validation_evidence_results", "promotion_candidate_results", "research_proposal_results",
+    "hypothesis_registration_results", "learning_admission_results", "freeze_results",
+    "market_language_observation_results", "shadow_lock_results", "forward_validation_queue",
+    "automatic_hypothesis_registration", "automatic_hypothesis_registration_policy",
+    "automatic_champion_change", "automatic_promotion_candidate_creation",
+    "explicit_user_confirmation_required_for_champion", "result_backfit_allowed",
+)
+
+
+def learning_run_hash_content(record: Dict[str, Any]) -> Dict[str, Any]:
+    record = record if isinstance(record, dict) else {}
+    return {field: record.get(field) for field in LEARNING_RUN_HASH_FIELDS}
+
+
+def learning_run_record_integrity(record: Any) -> Dict[str, Any]:
+    record = record if isinstance(record, dict) else {}
+    supplied = str(record.get("run_hash") or "")
+    expected = _content_hash(learning_run_hash_content(record)) if record else ""
+    hash_valid = bool(
+        supplied and len(supplied) == 64
+        and hmac.compare_digest(supplied, expected)
+    )
+    immutable = record.get("immutable") is True
+    return {
+        "valid": bool(record and immutable and hash_valid),
+        "immutable": immutable,
+        "hash_valid": hash_valid,
+        "expected_run_hash": expected or None,
+    }
+
+
+def automatic_learning_schedule_health(
+    now_ts: Optional[int] = None,
+    store_override: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Audit today's persisted 14:30 run instead of trusting in-memory worker state."""
+    now_ts = int(now_ts or time.time())
+    local_now = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(ZoneInfo("Asia/Shanghai"))
+    scheduled_local = local_now.replace(hour=14, minute=30, second=0, microsecond=0)
+    scheduled_at = int(scheduled_local.astimezone(timezone.utc).timestamp())
+    run_id = f"daily-{local_now.date().strftime('%Y%m%d')}-1430"
+    grace_seconds = max(AUTO_SNAPSHOT_POLL_SECONDS * 2, 600)
+    store = store_override if isinstance(store_override, dict) else load_snapshot_store()
+    record = (store.get("learning_runs") or {}).get(run_id)
+    run_integrity = learning_run_record_integrity(record)
+    run_hash_valid = run_integrity["hash_valid"]
+    record_valid = bool(
+        isinstance(record, dict)
+        and run_integrity["valid"] is True
+        and record.get("execution_order") == ["past_36h_postmatch", "future_24h_prematch"]
+        and int(record.get("started_at") or 0) >= scheduled_at
+        and int(record.get("started_at") or 0) <= now_ts + 300
+    )
+    if record_valid:
+        started_at = int(record.get("started_at") or 0)
+        return {
+            "status": "completed", "healthy": True, "run_id": run_id,
+            "scheduled_at": scheduled_at, "started_at": started_at,
+            "trigger_delay_seconds": max(0, started_at - scheduled_at),
+            "run_hash": record.get("run_hash"), "grace_seconds": grace_seconds,
+            "persisted_evidence": True, "run_hash_valid": True,
+        }
+    if isinstance(record, dict):
+        return {
+            "status": "invalid_persisted_run", "healthy": False, "run_id": run_id,
+            "scheduled_at": scheduled_at, "grace_seconds": grace_seconds,
+            "persisted_evidence": False, "run_hash_valid": run_hash_valid,
+        }
+    seconds_until_due = scheduled_at - now_ts
+    if seconds_until_due > 0:
+        status, healthy = "not_due", True
+    elif now_ts - scheduled_at <= grace_seconds:
+        status, healthy = "awaiting_worker_poll", True
+    else:
+        status, healthy = "overdue", False
+    return {
+        "status": status, "healthy": healthy, "run_id": run_id,
+        "scheduled_at": scheduled_at, "grace_seconds": grace_seconds,
+        "seconds_until_due": max(0, seconds_until_due),
+        "overdue_seconds": max(0, now_ts - scheduled_at - grace_seconds),
+        "persisted_evidence": False, "run_hash_valid": False,
+    }
+
+
+def learning_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
+    store = load_snapshot_store()
+    admissions = store.get("learning_admissions") or {}
+    frozen = store.get("learning_frozen") or {}
+    postmatches = store.get("learning_postmatch") or {}
+    postmatch_facts = store.get("learning_postmatch_facts") or {}
+    postmatch_drafts = store.get("learning_postmatch_drafts") or {}
+    research_proposals = store.get("learning_research_proposals") or {}
+    quality_cards = store.get("learning_quality_cards") or {}
+    runs = store.get("learning_runs") or {}
+    hypotheses = store.get("learning_hypotheses") or {}
+    hypothesis_templates = store.get("learning_hypothesis_templates") or {}
+    shadow_locks = store.get("learning_shadow_locks") or {}
+    promotions = store.get("learning_promotions") or {}
+    league_dna_candidates = store.get("league_dna_candidates") or {}
+    league_dna_activations = store.get("league_dna_activation_candidates") or {}
+    verified_active_dna = [
+        row for row in (store.get("league_dna_active") or {}).values()
+        if row.get("status") == "VERIFIED_ACTIVE"
+        and row.get("evidence_confidence") == 100
+        and get_nested(row, ["user_confirmation", "confirmed"]) is True
+    ]
+    frozen_rows = [row for rows in frozen.values() for row in (rows or [])]
+    postmatch_rows = list(postmatches.values())
+    implementation_gap_count = sum(get_nested(row, ["review", "learning_disposition", "existing_rule_implementation_gap"]) is True for row in postmatch_rows)
+    hypothesis_disposition_count = sum(get_nested(row, ["review", "learning_disposition", "new_theory_status"]) in LEARNING_HYPOTHESIS_TYPES for row in postmatch_rows)
+    runtime_readiness = automatic_learning_runtime_readiness()
+    schedule_health = automatic_learning_schedule_health(now_ts=now_ts, store_override=store)
+    node_plan = learning_node_execution_plan(now_ts=now_ts, store_override=store)
+    data_health = automatic_learning_data_health(now_ts=now_ts, store_override=store)
+    registry = learning_major_league_registry_manifest()
+    observation_frozen = store.get("market_language_frozen") or {}
+    observation_settlements = store.get("market_language_settlements") or {}
+    observation_facts = store.get("market_language_postmatch_facts") or {}
+    observation_plan = market_language_settlement_plan(now_ts=now_ts, store_override=store)
+    return {
+        "version": VERSION,
+        "admitted_fixture_count": len(admissions),
+        "frozen_fixture_count": len(frozen),
+        "frozen_version_count": len(frozen_rows),
+        "postmatch_count": len(postmatches),
+        "postmatch_fact_queue_count": len(postmatch_facts),
+        "postmatch_review_draft_queue_count": len(postmatch_drafts),
+        "postmatch_review_draft_version_count": sum(len(rows or []) for rows in postmatch_drafts.values()),
+        "research_proposal_count": len(research_proposals),
+        "research_proposal_version_count": sum(len(rows or []) for rows in research_proposals.values()),
+        "learning_quality_card_count": len(quality_cards),
+        "postmatch_fact_pending_verification_count": sum(
+            bool(rows) and max(rows, key=lambda row: int(row.get("version_number") or 0)).get("verification", {}).get("settlement_eligible") is not True
+            for rows in postmatch_facts.values()
+        ),
+        "cycle_run_count": len(runs),
+        "postmatch_process_class_counts": {status: sum(row.get("process_classification") == status for row in postmatch_rows) for status in sorted(LEARNING_PROCESS_CLASSES)},
+        "implementation_gap_count": implementation_gap_count,
+        "single_match_hypothesis_disposition_count": hypothesis_disposition_count,
+        "hypothesis_count": len(hypotheses),
+        "hypothesis_template_count": len(hypothesis_templates),
+        "shadow_validation_lock_count": sum(len(rows or {}) for rows in shadow_locks.values()),
+        "hypothesis_status_counts": {status: sum(row.get("status") == status for row in hypotheses.values()) for status in (*LEARNING_HYPOTHESIS_TYPES, "SHADOW_VALIDATION", "PROMOTION_CANDIDATE")},
+        "promotion_candidate_count": len(promotions),
+        "league_dna_candidate_count": len(league_dna_candidates),
+        "league_dna_activation_candidate_count": len(league_dna_activations),
+        "league_dna_verified_active_count": len(verified_active_dna),
+        "minimum_independent_support_samples": LEARNING_MIN_VALIDATION_SAMPLES,
+        "schedule": {
+            "timezone": "Asia/Shanghai",
+            "daily_local_time": "14:30",
+            "execution_order": ["past_36h_postmatch", "future_24h_prematch"],
+        },
+        "learning_prematch_stages": LEARNING_PREMATCH_STAGE_ORDER,
+        "match_limit": None,
+        "full_historical_odds_sample_limit": None,
+        "automatic_champion_promotion": False,
+        "automatic_learning_runtime": runtime_readiness,
+        "automatic_learning_schedule": schedule_health,
+        "major_league_registry": {
+            "version": registry["version"],
+            "registry_hash": registry["registry_hash"],
+            "league_count": registry["league_count"],
+        },
+        "node_executor": {
+            "due_count": node_plan["due_count"],
+            "skipped_count": node_plan["skipped_count"],
+            "discovery_performed": False,
+            "scope_expansion_allowed": False,
+        },
+        "data_health": data_health,
+        "market_language_observation": {
+            "fixture_count": len(observation_frozen),
+            "frozen_version_count": sum(len(rows or []) for rows in observation_frozen.values()),
+            "postmatch_fact_version_count": sum(len(rows or []) for rows in observation_facts.values()),
+            "settlement_count": len(observation_settlements),
+            "settlement_ready_count": observation_plan["settlement_ready_count"],
+            "model_learning_effect": False,
+        },
+        "policy": "single matches cannot create model rules; promotion candidates require all gates and explicit user confirmation",
+    }
+
+
+def operations_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
+    now_ts = int(now_ts or time.time())
     integrity = snapshot_store_integrity()
     thread_alive = bool(AUTO_SNAPSHOT_THREAD and AUTO_SNAPSHOT_THREAD.is_alive())
     worker_expected = AUTO_SNAPSHOT_ENABLED
+    if not integrity.get("operational"):
+        alerts = [{"severity": "critical", "code": "snapshot_store_unavailable"}]
+        if integrity.get("manual_recovery_available"):
+            alerts.append({
+                "severity": "critical", "code": "snapshot_store_manual_recovery_available",
+                "action": "use_protected_recovery_preview_then_exact_confirmation",
+            })
+        else:
+            alerts.append({"severity": "critical", "code": "snapshot_store_backup_unavailable"})
+        return {
+            "version": VERSION, "generated_at": now_ts, "status": "blocked", "alerts": alerts,
+            "store": integrity,
+            "auto_snapshot_worker": {
+                "enabled": worker_expected, "started": AUTO_SNAPSHOT_THREAD_STARTED,
+                "alive": thread_alive, "last_cycle_at": AUTO_SNAPSHOT_LAST_CYCLE_AT,
+                "last_cycle_age_seconds": None, "last_error": AUTO_SNAPSHOT_LAST_ERROR,
+            },
+            "auto_learning_cycle": {"status": "blocked", "reason": "snapshot_store_unavailable"},
+            "automatic_learning_schedule": {"status": "blocked", "healthy": False, "reason": "snapshot_store_unavailable"},
+            "automatic_learning_data_health": {"status": "critical", "reason": "snapshot_store_unavailable"},
+            "external_fixture_freshness": {"fixture_count": 0, "state_counts": {}, "status": "data_missing"},
+            "revalidation_queue": {"pending_count": None, "overdue_count": None, "status": "data_missing"},
+            "calibration": {"settled_count": 0, "minimum_sample": CALIBRATION_MIN_SAMPLE, "sample_ready": False, "average_brier_score": None, "roi": None},
+            "learning": {"status": "data_missing", "reason": "snapshot_store_unavailable"},
+        }
+    store = load_snapshot_store()
     fixtures = []
     for fixture, metadata in (store.get("external_prematch") or {}).items():
         fixtures.append({"fixture": fixture, "freshness": imported_fixture_freshness(metadata, get_fixture_snapshots(fixture), now_ts=now_ts)})
@@ -4332,6 +11639,8 @@ def operations_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
     pending = [task for task in queue if task.get("status") == "pending"]
     overdue = [task for task in pending if task.get("overdue")]
     calibration = calibration_report()
+    learning_schedule = automatic_learning_schedule_health(now_ts=now_ts, store_override=store)
+    learning_data_health = automatic_learning_data_health(now_ts=now_ts, store_override=store)
     alerts = []
     if not integrity.get("operational"):
         alerts.append({"severity": "critical", "code": "snapshot_store_unavailable"})
@@ -4339,6 +11648,11 @@ def operations_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         alerts.append({"severity": "warning", "code": "snapshot_backup_unavailable"})
     if not integrity.get("capacity_ok"):
         alerts.append({"severity": "warning", "code": "snapshot_store_capacity_warning"})
+    if SNAPSHOT_STORE_WRITER_WORKERS != 1:
+        alerts.append({
+            "severity": "critical", "code": "snapshot_store_single_writer_required",
+            "configured_writer_workers": SNAPSHOT_STORE_WRITER_WORKERS,
+        })
     if worker_expected and not thread_alive:
         alerts.append({"severity": "critical", "code": "auto_snapshot_worker_not_running"})
     worker_cycle_age = now_ts - AUTO_SNAPSHOT_LAST_CYCLE_AT if AUTO_SNAPSHOT_LAST_CYCLE_AT is not None else None
@@ -4346,6 +11660,40 @@ def operations_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         alerts.append({"severity": "warning", "code": "auto_snapshot_cycle_stale", "age_seconds": worker_cycle_age})
     if AUTO_SNAPSHOT_LAST_ERROR:
         alerts.append({"severity": "warning", "code": "auto_snapshot_last_cycle_failed", "error_type": AUTO_SNAPSHOT_LAST_ERROR})
+    if isinstance(AUTO_LEARNING_LAST_RESULT, dict) and AUTO_LEARNING_LAST_RESULT.get("status") == "error":
+        alerts.append({"severity": "warning", "code": "auto_learning_last_cycle_failed", "error_type": AUTO_LEARNING_LAST_RESULT.get("error_type")})
+    if learning_schedule.get("status") in {"overdue", "invalid_persisted_run"}:
+        alerts.append({
+            "severity": "critical", "code": "auto_learning_daily_cycle_not_completed",
+            "schedule_status": learning_schedule.get("status"),
+            "run_id": learning_schedule.get("run_id"),
+            "overdue_seconds": learning_schedule.get("overdue_seconds"),
+        })
+    if learning_data_health.get("expired_unfrozen_count", 0) > 0:
+        alerts.append({
+            "severity": "critical", "code": "learning_admission_expired_without_freeze",
+            "count": learning_data_health.get("expired_unfrozen_count"),
+        })
+    if learning_data_health.get("overdue_node_count", 0) > 0:
+        alerts.append({
+            "severity": "warning", "code": "learning_node_execution_overdue",
+            "count": learning_data_health.get("overdue_node_count"),
+        })
+    if learning_data_health.get("unresolved_failed_node_attempt_count", 0) > 0:
+        alerts.append({
+            "severity": "warning", "code": "learning_node_attempt_failed",
+            "count": learning_data_health.get("unresolved_failed_node_attempt_count"),
+        })
+    if learning_data_health.get("stale_node_lease_count", 0) > 0:
+        alerts.append({
+            "severity": "warning", "code": "learning_node_lease_stale",
+            "count": learning_data_health.get("stale_node_lease_count"),
+        })
+    if learning_data_health.get("postmatch_overdue_count", 0) > 0:
+        alerts.append({
+            "severity": "warning", "code": "learning_postmatch_manual_recovery_required",
+            "count": learning_data_health.get("postmatch_overdue_count"),
+        })
     if overdue:
         alerts.append({"severity": "warning", "code": "overdue_fundamental_revalidation", "count": len(overdue)})
     unhealthy_freshness = freshness_counts["stale"] + freshness_counts["invalid_timestamp"]
@@ -4359,9 +11707,13 @@ def operations_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         "version": VERSION, "generated_at": now_ts, "status": status, "alerts": alerts,
         "store": integrity,
         "auto_snapshot_worker": {"enabled": worker_expected, "started": AUTO_SNAPSHOT_THREAD_STARTED, "alive": thread_alive, "last_cycle_at": AUTO_SNAPSHOT_LAST_CYCLE_AT, "last_cycle_age_seconds": worker_cycle_age, "last_error": AUTO_SNAPSHOT_LAST_ERROR},
+        "auto_learning_cycle": AUTO_LEARNING_LAST_RESULT or {"status": "not_run"},
+        "automatic_learning_schedule": learning_schedule,
+        "automatic_learning_data_health": learning_data_health,
         "external_fixture_freshness": {"fixture_count": len(fixtures), "state_counts": freshness_counts},
         "revalidation_queue": {"pending_count": len(pending), "overdue_count": len(overdue)},
         "calibration": {"settled_count": calibration["settled_count"], "minimum_sample": CALIBRATION_MIN_SAMPLE, "sample_ready": calibration["settled_count"] >= CALIBRATION_MIN_SAMPLE, "average_brier_score": calibration["average_brier_score"], "roi": calibration["roi"]},
+        "learning": learning_status_report(now_ts=now_ts),
     }
 
 
@@ -4433,10 +11785,28 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
     operations = operations_status_report(now_ts=now_ts)
     fixture_acceptance = fixture_acceptance_summary(now_ts=now_ts)
     self_test = release_candidate_self_test()
+    automatic_learning = automatic_learning_runtime_readiness(
+        store_integrity=operations.get("store"),
+        worker_alive=get_nested(operations, ["auto_snapshot_worker", "alive"]),
+    )
+    automatic_learning_schedule = operations.get("automatic_learning_schedule")
+    if not isinstance(automatic_learning_schedule, dict):
+        automatic_learning_schedule = automatic_learning_schedule_health(now_ts=now_ts)
+    automatic_learning_authorized = (
+        automatic_learning.get("ready") is True
+        and automatic_learning_schedule.get("healthy") is True
+        and operations.get("status") != "blocked"
+        and get_nested(operations, ["automatic_learning_data_health", "status"]) != "critical"
+    )
     available_paths = {route.path for route in app.routes}
     required_paths = {
         "/shadow/readiness/{fixture}", "/shadow/calibration/lock", "/shadow/calibration/settle",
         "/shadow/calibration/report", "/shadow/operations/status", "/shadow/import-prematch-packets",
+        "/shadow/store-health", "/shadow/store-recovery-preview", "/shadow/store-recover",
+        "/shadow/learning/registry", "/shadow/learning/node-plan", "/shadow/learning/node-run",
+        "/shadow/learning/data-health", "/shadow/market-language/status",
+        "/shadow/learning/postmatch-recovery", "/shadow/learning/collect-facts",
+        "/shadow/market-language/collect-facts", "/shadow/market-language/settlement-plan",
     }
     checks = {
         "persistent_store_operational": operations["store"].get("operational") is True,
@@ -4460,6 +11830,8 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         warnings.append("calibration_minimum_sample_not_reached")
     if not checks["real_fixture_shadow_path_validated"]:
         warnings.append("real_fixture_shadow_path_not_yet_validated")
+    if not automatic_learning_authorized:
+        warnings.append("automatic_learning_runtime_not_ready")
     shadow_usable = not blockers
     controlled_decision_candidate = shadow_usable and operations["calibration"].get("sample_ready") is True
     operating_mode = "live_feed_shadow" if fixture_acceptance["shadow_path_validated"] else "manual_or_api_import_shadow"
@@ -4467,6 +11839,7 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         "version": VERSION, "release_channel": RELEASE_CHANNEL,
         "status": "shadow_usable" if shadow_usable else "not_ready",
         "shadow_use_authorized": shadow_usable,
+        "automatic_learning_runtime_authorized": automatic_learning_authorized,
         "real_money_use_authorized": False,
         "controlled_decision_candidate": controlled_decision_candidate,
         "usable_scope": {
@@ -4482,6 +11855,8 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         "operations_status": operations.get("status"),
         "calibration_sample": operations.get("calibration"),
         "fixture_acceptance": fixture_acceptance,
+        "automatic_learning_runtime": automatic_learning,
+        "automatic_learning_schedule": automatic_learning_schedule,
         "release_candidate_self_test": self_test,
         "per_fixture_gate": "/shadow/readiness/{fixture} must return decision_ready before any recommendation is considered",
         "remaining_external_gaps": [
@@ -4545,6 +11920,13 @@ def shadow_data_source_health(probe_nami: bool = False, token: Optional[str] = N
         "ok": True, "version": VERSION, "generated_at": int(time.time()),
         "pang": {"write_policy": "read_only_source_no_remote_tasks", "sync": store.get("import_sync_status") or {"status": "never_imported"}, "fixture_state_counts": state_counts, "fixtures": fixtures},
         "nami": nami, "decision_gate": {"requires_fresh_prematch_data": True, "stale_action": "PASS"},
+        "real_money": {
+            "registered_authority_count": len(REAL_MONEY_SOURCE_REGISTRY),
+            "registered_authorities": sorted(REAL_MONEY_SOURCE_REGISTRY),
+            "maximum_age_seconds": REAL_MONEY_MAX_AGE_SECONDS,
+            "status": "configured" if REAL_MONEY_SOURCE_REGISTRY else "data_missing",
+            "missing_policy": "odds paths remain Capital Pressure Proxy; real Money%/Bet%/turnover stay null",
+        },
         "market_data_route": market_data_route_report(store_override=store),
     })
 
@@ -4553,6 +11935,22 @@ def shadow_data_source_health(probe_nami: bool = False, token: Optional[str] = N
 def shadow_store_health(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     return JSONResponse({"ok": True, "version": VERSION, "integrity": snapshot_store_integrity()})
+
+
+@app.get("/shadow/store-recovery-preview")
+def shadow_store_recovery_preview(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "version": VERSION, "recovery": snapshot_store_recovery_preview()})
+
+
+@app.post("/shadow/store-recover")
+async def shadow_store_recover(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_json_body")
+    return JSONResponse({"ok": True, "version": VERSION, "recovery": restore_snapshot_store_from_backup(payload)})
 
 
 @app.post("/shadow/model/poisson")
@@ -4743,7 +12141,7 @@ def build_imported_ai_packet(fixture: str, include_companies: bool = False, incl
             "timeline": timeline, "latest_dynamics": (latest or {}).get("market_dynamics"),
         },
         "analysis_rules": {
-            "order": ["pure_fundamental_script", *FUNDAMENTAL_CHAIN, "market_timeline", "fundamental_revalidation", "model_probability_vs_market_no_vig_probability", "edge", "ev", "script_coverage", "crowding", "line_movement", "lineup_confidence", "death_path", "bet_or_pass"],
+            "order": ["pure_fundamental_script", *FUNDAMENTAL_CHAIN, "market_timeline", "fundamental_revalidation", "model_probability_vs_market_no_vig_probability", "edge", "ev", "script_coverage", "crowding", "capital_pressure_proxy", "line_response", "market_acceptance", "expression_optimizer", "lineup_confidence", "death_path", "bet_wait_or_pass"],
             "missing_data_rule": "Missing historical checkpoints and facts remain data_missing; never backfill them from current odds.",
             "prematch_only": True, "line_move_is_not_edge": True,
         },
@@ -4785,6 +12183,278 @@ def shadow_calibration_report(token: Optional[str] = None, authorization: Option
     return JSONResponse({"ok": True, "calibration": calibration_report()})
 
 
+@app.post("/shadow/learning/freeze")
+async def shadow_learning_freeze(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    record = freeze_learning_sample(await request.json())
+    return JSONResponse({"ok": True, "record": record})
+
+
+@app.post("/shadow/market-language/freeze")
+async def shadow_market_language_freeze(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    record = freeze_market_language_observation(await request.json())
+    return JSONResponse({"ok": True, "record": record})
+
+
+@app.post("/shadow/market-language/collect-facts")
+async def shadow_market_language_collect_facts(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="json_body_must_be_an_object")
+    record = collect_market_language_postmatch_facts(payload.get("observation_id"))
+    return JSONResponse({"ok": True, "facts": record})
+
+
+@app.get("/shadow/market-language/settlement-plan")
+def shadow_market_language_settlement_plan(now_ts: Optional[int] = None, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "plan": market_language_settlement_plan(now_ts=now_ts)})
+
+
+@app.post("/shadow/market-language/settle")
+async def shadow_market_language_settle(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    payload = await request.json()
+    record = settle_market_language_observation(payload.get("observation_id"), payload)
+    return JSONResponse({"ok": True, "settlement": record})
+
+
+@app.get("/shadow/market-language/status")
+def shadow_market_language_status(now_ts: Optional[int] = None, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "status": market_language_observation_status_report(now_ts=now_ts)})
+
+
+@app.get("/shadow/learning/registry")
+def shadow_learning_registry(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "registry": learning_major_league_registry_manifest()})
+
+
+@app.get("/shadow/learning/node-plan")
+def shadow_learning_node_plan(now_ts: Optional[int] = None, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "plan": learning_node_execution_plan(now_ts=now_ts)})
+
+
+@app.post("/shadow/learning/node-run")
+async def shadow_learning_node_run(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="json_body_must_be_an_object")
+    if payload.get("apply") is True and payload.get("now_ts") is not None:
+        raise HTTPException(status_code=422, detail="apply_node_run_cannot_override_server_time")
+    return JSONResponse({"ok": True, "node_run": run_learning_node_executor(
+        now_ts=payload.get("now_ts"), apply_changes=payload.get("apply", False),
+    )})
+
+
+@app.get("/shadow/learning/data-health")
+def shadow_learning_data_health(now_ts: Optional[int] = None, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "data_health": automatic_learning_data_health(now_ts=now_ts)})
+
+
+@app.get("/shadow/learning/postmatch-recovery")
+def shadow_learning_postmatch_recovery(now_ts: Optional[int] = None, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "recovery": learning_postmatch_recovery_queue(now_ts=now_ts)})
+
+
+@app.post("/shadow/learning/collect-facts")
+async def shadow_learning_collect_facts(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="json_body_must_be_an_object")
+    record = collect_learning_postmatch_facts(payload.get("freeze_id"))
+    return JSONResponse({"ok": True, "facts": record})
+
+
+@app.get("/shadow/learning/cycle-plan")
+def shadow_learning_cycle_plan(now_ts: Optional[int] = None, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "plan": learning_cycle_plan(now_ts=now_ts)})
+
+
+@app.post("/shadow/learning/run")
+async def shadow_learning_run(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    body = await request.body()
+    if len(body) > 256 * 1024:
+        raise HTTPException(status_code=413, detail="request_body_too_large")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="invalid_json_body") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="json_body_must_be_an_object")
+    return JSONResponse({"ok": True, "run": run_learning_cycle(payload)})
+
+
+@app.get("/shadow/learning/review-queue")
+def shadow_learning_review_queue(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "review_queue": learning_review_queue()})
+
+
+@app.post("/shadow/learning/review-draft")
+async def shadow_learning_review_draft(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="json_body_must_be_an_object")
+    draft = build_learning_postmatch_review_draft(payload.get("freeze_id"), payload.get("drafted_at"))
+    return JSONResponse({"ok": True, "draft": draft})
+
+
+@app.post("/shadow/learning/complete-review")
+async def shadow_learning_complete_review(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="json_body_must_be_an_object")
+    postmatch = complete_learning_postmatch_review(payload)
+    return JSONResponse({"ok": True, "postmatch": postmatch})
+
+
+@app.post("/shadow/learning/settle")
+async def shadow_learning_settle(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    payload = await request.json()
+    record = settle_learning_sample(payload.get("freeze_id"), payload.get("result"), payload.get("process_classification"), payload.get("event_audit"), payload.get("settled_at"), payload.get("review"), payload.get("fact_hash"))
+    return JSONResponse({"ok": True, "postmatch": record})
+
+
+@app.post("/shadow/learning/hypotheses")
+async def shadow_learning_hypothesis(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    record = register_learning_hypothesis(await request.json())
+    return JSONResponse({"ok": True, "hypothesis": record})
+
+
+@app.post("/shadow/learning/hypothesis-templates")
+async def shadow_learning_hypothesis_template(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    record = register_learning_hypothesis_template(await request.json())
+    return JSONResponse({"ok": True, "hypothesis_template": record})
+
+
+@app.get("/shadow/learning/hypothesis-templates")
+def shadow_learning_hypothesis_templates(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "hypothesis_templates": learning_hypothesis_template_report()})
+
+
+@app.get("/shadow/learning/validation-queue")
+def shadow_learning_validation_queue(now_ts: Optional[int] = None, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "validation_queue": learning_forward_validation_queue(now_ts=now_ts)})
+
+
+@app.post("/shadow/learning/hypotheses/{hypothesis_id}/validation")
+async def shadow_learning_validation(hypothesis_id: str, request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    record = record_hypothesis_validation(hypothesis_id, await request.json())
+    return JSONResponse({"ok": True, "evidence": record})
+
+
+@app.post("/shadow/learning/hypotheses/{hypothesis_id}/shadow-lock")
+async def shadow_learning_hypothesis_lock(hypothesis_id: str, request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    record = lock_hypothesis_shadow_prediction(hypothesis_id, await request.json())
+    return JSONResponse({"ok": True, "shadow_lock": record})
+
+
+@app.get("/shadow/learning/hypotheses/{hypothesis_id}/promotion-evidence")
+def shadow_learning_promotion_evidence(hypothesis_id: str, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "promotion_evidence": promotion_evidence_report(hypothesis_id)})
+
+
+@app.post("/shadow/learning/hypotheses/{hypothesis_id}/promotion-candidate")
+async def shadow_learning_promotion_candidate(hypothesis_id: str, request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    payload = await request.json()
+    record = create_promotion_candidate(hypothesis_id, payload.get("gate_audit"))
+    return JSONResponse({"ok": True, "promotion_candidate": record})
+
+
+@app.post("/shadow/learning/league-dna")
+async def shadow_learning_league_dna_candidate(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    record = register_league_dna_candidate(await request.json())
+    return JSONResponse({"ok": True, "league_dna_candidate": record})
+
+
+@app.post("/shadow/learning/league-dna/{tag_id}/activation-candidate")
+def shadow_learning_league_dna_activation_candidate(tag_id: str, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    record = create_league_dna_activation_candidate(tag_id)
+    return JSONResponse({"ok": True, "activation_candidate": record})
+
+
+@app.post("/shadow/learning/league-dna/{tag_id}/confirm")
+async def shadow_learning_league_dna_confirm(tag_id: str, request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="json_body_must_be_an_object")
+    record = confirm_league_dna_activation(tag_id, payload)
+    return JSONResponse({"ok": True, "verified_active": record})
+
+
+@app.get("/shadow/learning/league-dna/status")
+def shadow_learning_league_dna_status(competition_id: Optional[int] = None, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "league_dna": league_dna_status_report(competition_id)})
+
+
+@app.get("/shadow/learning/selection-quality")
+def shadow_learning_selection_quality(minimum_samples: Optional[int] = None, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    if minimum_samples is not None and not 2 <= minimum_samples <= 10000:
+        raise HTTPException(status_code=400, detail="minimum_samples_must_be_between_2_and_10000")
+    return JSONResponse({"ok": True, "selection_quality": learning_selection_quality_report(minimum_samples)})
+
+
+@app.get("/shadow/learning/quality-calibration")
+def shadow_learning_quality_calibration(minimum_samples: Optional[int] = None, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    if minimum_samples is not None and not 2 <= minimum_samples <= 10000:
+        raise HTTPException(status_code=400, detail="minimum_samples_must_be_between_2_and_10000")
+    return JSONResponse({"ok": True, "quality_calibration": learning_quality_calibration_report(minimum_samples)})
+
+
+@app.post("/shadow/learning/quality-cards/refresh")
+def shadow_learning_quality_cards_refresh(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "quality_cards": refresh_learning_quality_cards()})
+
+
+@app.get("/shadow/learning/research-proposals")
+def shadow_learning_research_proposals(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "research_proposals": learning_research_proposal_report()})
+
+
+@app.post("/shadow/learning/research-proposals/refresh")
+def shadow_learning_research_proposals_refresh(minimum_matches: Optional[int] = None, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    if minimum_matches is not None and not 3 <= minimum_matches <= 10000:
+        raise HTTPException(status_code=400, detail="minimum_matches_must_be_between_3_and_10000")
+    return JSONResponse({"ok": True, "research_proposals": refresh_learning_research_proposals(minimum_matches=minimum_matches)})
+
+
+@app.get("/shadow/learning/status")
+def shadow_learning_status(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "learning": learning_status_report()})
+
+
 @app.get("/shadow/operations/status")
 def shadow_operations_status(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
@@ -4801,6 +12471,20 @@ def shadow_release_acceptance(token: Optional[str] = None, authorization: Option
 def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
     """Build one AI-ready prematch packet from persisted market history + one current fundamentals fetch."""
     data = collect_prematch_data(fixture, include_raw=False)
+    external_metadata = (load_snapshot_store().get("external_prematch") or {}).get(str(fixture)) or {}
+    external_match = external_metadata.get("match") if isinstance(external_metadata.get("match"), dict) else {}
+    external_provider_ids = external_metadata.get("provider_fixture_ids") if isinstance(external_metadata.get("provider_fixture_ids"), dict) else {}
+    provider_identity = None
+    if external_metadata.get("source") == "the_odds_api" and external_provider_ids.get("the_odds_api"):
+        provider_identity_content = {
+            "source": "the_odds_api",
+            "sport_key": str(external_match.get("the_odds_api_sport_key") or "").strip().lower(),
+            "event_id": str(external_provider_ids.get("the_odds_api") or "").strip().lower(),
+            "home_team": str(external_match.get("home_team_name") or "").strip(),
+            "away_team": str(external_match.get("away_team_name") or "").strip(),
+        }
+        if all(str(provider_identity_content.get(key) or "").strip() for key in ("sport_key", "event_id", "home_team", "away_team")):
+            provider_identity = {**provider_identity_content, "source_hash": _content_hash(provider_identity_content)}
     history = get_fixture_snapshots(fixture)
     complete_timeline = complete_prematch_timeline(history)
     by_stage = {row.get("stage"): row for row in complete_timeline}
@@ -4815,6 +12499,11 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
         timeline.append({
             "stage": row.get("stage"), "status": "available",
             "snapshot_at": row.get("snapshot_at"),
+            "source_content_hash": row.get("source_content_hash") or _content_hash({
+                "stage": row.get("stage"), "snapshot_at": row.get("snapshot_at"),
+                "market_snapshot": row.get("market_snapshot"), "market_dynamics": row.get("market_dynamics"),
+                "team_news_snapshot": row.get("team_news_snapshot"),
+            }),
             "asian_handicap": primary.get("asian_handicap"),
             "over_under": primary.get("over_under"),
             "1x2": primary.get("1x2"),
@@ -4826,6 +12515,12 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
         })
     available_history = [row for row in complete_timeline if row.get("timeline_status") == "available"]
     latest = latest_prematch_snapshot(available_history)
+    available_timeline_rows = [row for row in timeline if row.get("status") == "available"]
+    latest_timeline_row = max(
+        available_timeline_rows,
+        key=lambda row: (PREMATCH_STAGE_ORDER.index(row.get("stage")), int(row.get("snapshot_at") or 0)),
+        default=None,
+    )
     first = min(available_history, key=lambda row: PREMATCH_STAGE_ORDER.index(row.get("stage")), default=None)
     first_ah = line_from_primary(get_nested(first or {}, ["market_snapshot", "primary", "asian_handicap"]))
     latest_ah = line_from_primary(get_nested(latest or {}, ["market_snapshot", "primary", "asian_handicap"]))
@@ -4833,15 +12528,57 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
     si = data.get("structured_inputs") or {}
     script = pure_fundamental_script(data)
     versions = get_fundamental_versions(fixture)
-    decision = decision_layer(si.get("odds_market_snapshot") or empty_market_snapshot())
+    generated_at = int(data.get("generated_at") or time.time())
+    provider_identities = [provider_identity] if provider_identity else []
+    thestats_identity = _resolve_thestats_prematch_identity(data.get("fixture") or {}, generated_at)
+    if thestats_identity.get("ok") is True:
+        provider_identities.append({key: value for key, value in thestats_identity.items() if key != "ok"})
+    probability_replay = build_learning_probability_replay(
+        fixture, si.get("independent_model_inputs"), generated_at=generated_at,
+    )
+    replay_model = probability_replay.get("model") if isinstance(probability_replay.get("model"), dict) else {}
+    replay_inputs = probability_replay.get("inputs") if isinstance(probability_replay.get("inputs"), dict) else {}
+    # Only a persisted, timing-audited snapshot may drive the frozen market decision.
+    # The just-fetched current quote remains observable upstream but cannot silently
+    # masquerade as Opening/T-12h/T-6h/T-1h evidence.
+    decision_market = (latest or {}).get("market_snapshot") or empty_market_snapshot()
+    decision = decision_layer(
+        decision_market,
+        replay_model.get("probabilities") if replay_model.get("ok") is True else None,
+        None,
+        None,
+        as_float(replay_inputs.get("lineup_confidence")),
+        None,
+    )
     decision = apply_line_movement_gate(decision, history)
+    chain_audit = audit_fundamental_chain(script, now_ts=generated_at)
+    decision["fundamental_chain_audit"] = chain_audit
+    decision["probability_replay_hash"] = probability_replay.get("replay_hash")
+    decision["market_evidence_binding"] = {
+        "source": "persisted_timing_audited_snapshot" if latest_timeline_row else "data_missing",
+        "stage": (latest_timeline_row or {}).get("stage"),
+        "snapshot_at": (latest_timeline_row or {}).get("snapshot_at"),
+        "source_content_hash": (latest_timeline_row or {}).get("source_content_hash"),
+        "current_unpersisted_quote_used": False,
+    }
+    if probability_replay.get("decision_eligible") is not True:
+        force_pass_decision(decision, "learning_probability_replay_inputs_missing")
+    if chain_audit.get("decision_eligible") is not True:
+        force_pass_decision(decision, "fundamental_chain_insufficient")
     upstream_ok = bool(data.get("ok")) and bool(data.get("fixture"))
     return {
         "ok": upstream_ok,
         "status": "ready" if upstream_ok else "upstream_unavailable_or_data_missing",
         "version": VERSION,
-        "generated_at": int(time.time()),
+        "generated_at": generated_at,
         "fixture": data.get("fixture"),
+        "provider_identity": provider_identity,
+        "provider_identities": provider_identities,
+        "provider_identity_audit": {
+            "the_odds_api": "bound" if provider_identity else "data_missing",
+            "thestats": "bound" if thestats_identity.get("ok") is True else "data_missing",
+            "thestats_reason": thestats_identity.get("error"),
+        },
         "data_quality": data.get("data_quality"),
         "coverage": data.get("coverage"),
         "fundamentals": {
@@ -4850,8 +12587,10 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
             "season_stats": si.get("season_stats"),
             "injuries": si.get("injuries"),
             "lineups_available": si.get("lineups_available"),
-            "prediction": si.get("prediction")
+            "prediction": si.get("prediction"),
+            "independent_model_inputs": si.get("independent_model_inputs"),
         },
+        "probability_replay": probability_replay,
         "pure_fundamental_script": script,
         "fundamental_versions": versions,
         "market": {
@@ -4867,10 +12606,12 @@ def build_shadow_ai_packet(fixture: int) -> Dict[str, Any]:
             "latest_saturation": get_nested(latest or {}, ["market_dynamics", "market_saturation"])
         },
         "analysis_rules": {
-            "order": ["pure_fundamental_script", *FUNDAMENTAL_CHAIN, "market_timeline", "fundamental_revalidation", "model_probability_vs_market_no_vig_probability", "edge", "ev", "script_coverage", "crowding", "line_movement", "lineup_confidence", "death_path", "bet_or_pass"],
+            "order": ["pure_fundamental_script", *FUNDAMENTAL_CHAIN, "market_timeline", "fundamental_revalidation", "model_probability_vs_market_no_vig_probability", "edge", "ev", "script_coverage", "crowding", "capital_pressure_proxy", "line_response", "market_acceptance", "expression_optimizer", "lineup_confidence", "death_path", "bet_wait_or_pass"],
             "missing_data_rule": "Any unavailable injuries, lineups, odds, standings or other inputs must be marked 数据缺失; never infer missing facts.",
             "prematch_only": True,
-            "line_move_is_not_edge": True
+            "line_move_is_not_edge": True,
+            "probability_source_rule": "builtin odds-independent venue-split standings calculator; full inputs and hashes must replay exactly",
+            "market_binding_rule": "only persisted timing-audited snapshots may drive a frozen learning decision",
         },
         "market_move_classes": MOVE_CLASSES,
         "decision_layer": decision,
@@ -4893,11 +12634,19 @@ async def shadow_evaluate(request: Request, token: Optional[str] = None, authori
     history = get_fixture_snapshots(fixture)
     latest = latest_prematch_snapshot(history)
     current = ((latest or {}).get("market_snapshot")) or empty_market_snapshot()
+    evaluation_cutoff = int(time.time())
+    kickoff_at = get_nested(latest or {}, ["fixture_info", "date"]) or get_nested(latest or {}, ["fixture_info", "kickoff_at"])
+    real_money_audit = audit_real_money_data(
+        payload.get("real_money_data"), expected_fixture=fixture,
+        data_cutoff_at=evaluation_cutoff, kickoff_at=kickoff_at, now_ts=evaluation_cutoff,
+    )
     result = decision_layer(
         current, payload.get("model_probabilities"), payload.get("script_coverage"),
         as_float(payload.get("crowding")), as_float(payload.get("lineup_confidence")), payload.get("death_path") if "death_path" in payload else None
     )
-    result = apply_line_movement_gate(result, history)
+    result = apply_line_movement_gate(result, history, real_money_audit)
+    if payload.get("real_money_data") not in (None, {}) and real_money_audit.get("status") == "rejected":
+        force_pass_decision(result, "real_money_data_rejected")
     return JSONResponse({"ok": True, "version": VERSION, "fixture": fixture, "evaluation": result})
 
 
@@ -4947,8 +12696,109 @@ def completed_auto_snapshot_stages(history: List[Dict[str, Any]]) -> set:
     }
 
 
-def auto_snapshot_cycle() -> None:
-    now = datetime.now(timezone.utc)
+def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Run once after 14:30 Asia/Shanghai; a late worker poll catches up the same day."""
+    now = now.astimezone(timezone.utc)
+    local_now = now.astimezone(ZoneInfo("Asia/Shanghai"))
+    now_ts = int(now.timestamp())
+    scheduled_local = local_now.replace(hour=14, minute=30, second=0, microsecond=0)
+    scheduled_at = int(scheduled_local.astimezone(timezone.utc).timestamp())
+    trigger_delay_seconds = max(0, now_ts - scheduled_at)
+    if local_now < scheduled_local:
+        return {
+            "status": "not_due", "at": now_ts,
+            "schedule_timezone": "Asia/Shanghai", "scheduled_local_time": "14:30",
+            "scheduled_at": scheduled_at,
+        }
+    run_id = f"daily-{local_now.date().strftime('%Y%m%d')}-1430"
+    existing = (load_snapshot_store().get("learning_runs") or {}).get(run_id)
+    if existing:
+        if learning_run_record_integrity(existing).get("valid") is not True:
+            return {
+                "status": "error", "at": now_ts, "run_id": run_id,
+                "scheduled_at": scheduled_at, "trigger_delay_seconds": trigger_delay_seconds,
+                "error_type": "LearningRunIntegrityError",
+                "reason": "persisted_daily_run_integrity_invalid",
+            }
+        return {
+            "status": "already_completed", "at": now_ts, "run_id": run_id,
+            "scheduled_at": scheduled_at, "trigger_delay_seconds": trigger_delay_seconds,
+            "admitted_count": existing.get("admitted_count"),
+            "frozen_count": existing.get("frozen_count"),
+            "market_language_observation_frozen_count": existing.get("market_language_observation_frozen_count"),
+            "market_language_postmatch_fact_collected_count": existing.get("market_language_postmatch_fact_collected_count"),
+            "probability_replay_ready_count": existing.get("probability_replay_ready_count"),
+            "probability_replay_missing_count": existing.get("probability_replay_missing_count"),
+            "review_draft_count": existing.get("review_draft_count"),
+            "research_proposal_version_count": existing.get("research_proposal_version_count"),
+            "hypothesis_registered_count": existing.get("hypothesis_registered_count"),
+            "forward_validation_evidence_recorded_count": existing.get("forward_validation_evidence_recorded_count"),
+            "promotion_candidate_created_count": existing.get("promotion_candidate_created_count"),
+        }
+    try:
+        result = run_learning_cycle(
+            {
+                "apply": True, "run_id": run_id,
+                "auto_prepare_prematch": True,
+                "auto_collect_postmatch_facts": True,
+                "auto_build_postmatch_review_drafts": True,
+                "auto_refresh_research_proposals": True,
+                "auto_register_preregistered_hypotheses": True,
+                "auto_record_forward_validation": True,
+                "auto_create_promotion_candidates": True,
+            },
+            now_ts=now_ts,
+            fixture_rows=fixture_rows,
+        )
+        return {
+            "status": "completed", "at": now_ts, "run_id": run_id,
+            "scheduled_at": scheduled_at, "trigger_delay_seconds": trigger_delay_seconds,
+            "execution_order": result.get("execution_order"),
+            "admitted_count": result.get("admitted_count"),
+            "frozen_count": result.get("frozen_count"),
+            "market_language_observation_frozen_count": result.get("market_language_observation_frozen_count"),
+            "market_language_postmatch_fact_collected_count": result.get("market_language_postmatch_fact_collected_count"),
+            "probability_replay_ready_count": result.get("probability_replay_ready_count"),
+            "probability_replay_missing_count": result.get("probability_replay_missing_count"),
+            "review_draft_count": result.get("review_draft_count"),
+            "quality_card_created_count": result.get("quality_card_created_count"),
+            "shadow_lock_created_count": result.get("shadow_lock_created_count"),
+            "research_proposal_version_count": result.get("research_proposal_version_count"),
+            "hypothesis_registered_count": result.get("hypothesis_registered_count"),
+            "forward_validation_evidence_recorded_count": result.get("forward_validation_evidence_recorded_count"),
+            "promotion_candidate_created_count": result.get("promotion_candidate_created_count"),
+            "settled_count": result.get("settled_count"),
+            "rejected_count": result.get("rejected_count"),
+            "postmatch_fact_results": result.get("postmatch_fact_results"),
+            "market_language_postmatch_fact_results": result.get("market_language_postmatch_fact_results"),
+            "freeze_results": result.get("freeze_results"),
+            "postmatch_review_draft_results": result.get("postmatch_review_draft_results"),
+            "review_completion_results": result.get("review_completion_results"),
+            "quality_card_results": result.get("quality_card_results"),
+            "shadow_lock_results": result.get("shadow_lock_results"),
+            "research_proposal_results": result.get("research_proposal_results"),
+            "hypothesis_registration_results": result.get("hypothesis_registration_results"),
+            "forward_validation_evidence_results": result.get("forward_validation_evidence_results"),
+            "promotion_candidate_results": result.get("promotion_candidate_results"),
+            "forward_validation_queue": result.get("forward_validation_queue"),
+            "automatic_hypothesis_registration": result.get("automatic_hypothesis_registration") is True,
+            "automatic_hypothesis_registration_policy": "preregistered_templates_only",
+            "automatic_champion_change": False,
+            "automatic_promotion_candidate_creation": True,
+            "explicit_user_confirmation_required_for_champion": True,
+        }
+    except Exception as exc:
+        print("[AUTO_LEARNING] daily cycle failed: " + str(exc))
+        return {
+            "status": "error", "at": now_ts, "run_id": run_id,
+            "scheduled_at": scheduled_at, "trigger_delay_seconds": trigger_delay_seconds,
+            "error_type": type(exc).__name__,
+        }
+
+
+def auto_snapshot_cycle(now: Optional[datetime] = None) -> Dict[str, Any]:
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    learning_result = auto_learning_daily_cycle(now)
     dates = sorted({(now + timedelta(days=i)).astimezone(ZoneInfo(AUTO_FETCH_TIMEZONE)).date().isoformat() for i in range(AUTO_SNAPSHOT_DAYS_AHEAD + 1)})
     for date_str in dates:
         try:
@@ -5003,10 +12853,15 @@ def auto_snapshot_cycle() -> None:
                             print("[AUTO_SNAPSHOT] fixture failed: " + str(exc))
         except Exception as exc:
             print("[AUTO_SNAPSHOT] date failed: " + date_str + " " + str(exc))
+    node_result = run_learning_node_executor(now_ts=int(now.timestamp()), apply_changes=True)
+    combined = {**learning_result, "node_execution": node_result}
+    if learning_result.get("status") == "not_due" and node_result.get("advanced_count", 0) > 0:
+        combined["status"] = "node_cycle_completed"
+    return combined
 
 
 def auto_snapshot_worker() -> None:
-    global AUTO_SNAPSHOT_LAST_CYCLE_AT, AUTO_SNAPSHOT_LAST_ERROR, AUTO_RECONCILIATION_LAST_RESULT
+    global AUTO_SNAPSHOT_LAST_CYCLE_AT, AUTO_SNAPSHOT_LAST_ERROR, AUTO_RECONCILIATION_LAST_RESULT, AUTO_LEARNING_LAST_RESULT
     while True:
         try:
             try:
@@ -5014,7 +12869,9 @@ def auto_snapshot_worker() -> None:
             except Exception as exc:
                 AUTO_RECONCILIATION_LAST_RESULT = {"status": "error", "error_type": type(exc).__name__, "at": int(time.time())}
                 print("[AUTO_RECONCILIATION] failed: " + str(exc))
-            auto_snapshot_cycle()
+            learning_result = auto_snapshot_cycle()
+            if learning_result.get("status") != "not_due":
+                AUTO_LEARNING_LAST_RESULT = learning_result
             AUTO_SNAPSHOT_LAST_CYCLE_AT = int(time.time())
             AUTO_SNAPSHOT_LAST_ERROR = None
         except Exception as exc:

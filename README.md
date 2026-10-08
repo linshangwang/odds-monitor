@@ -5,11 +5,13 @@
 - [MODEL_RULES.md](MODEL_RULES.md)
 - [PROJECT_STATE.md](PROJECT_STATE.md)
 - [THE_ODDS_API.md](THE_ODDS_API.md)
+- [AUTO_LEARNING_TASK.md](AUTO_LEARNING_TASK.md)
+- [LEAGUE_DNA.md](LEAGUE_DNA.md)
 
 这是一个 Railway 可部署的 FastAPI 项目，用来测试：
 
 1. API-Football / API-SPORTS 的实时比赛、事件、技术统计接口
-2. TheStatsAPI 的通用 REST 接口代理测试
+2. 可选TheStatsAPI事件时间线增强适配器（未配置时不阻断主闭环）
 3. 后续可扩展 iSports 盘口接口、Sportradar Push/Webhook 接收口
 
 ## 本地运行
@@ -17,7 +19,7 @@
 ```bash
 pip install -r requirements.txt
 copy .env.example .env
-# 编辑 .env，填入 API_FOOTBALL_KEY / THESTATS_API_KEY
+# 编辑 .env，至少填入 API_FOOTBALL_KEY / THE_ODDS_API_KEY；THESTATS_API_KEY可留空
 uvicorn main:app --reload
 ```
 
@@ -37,7 +39,7 @@ uvicorn main:app --reload
 ```text
 API_FOOTBALL_KEY=你的 API-Football / API-SPORTS key
 API_FOOTBALL_BASE_URL=https://v3.football.api-sports.io
-THESTATS_API_KEY=你的 TheStatsAPI key
+THESTATS_API_KEY=可选；不用时留空
 THESTATS_BASE_URL=https://api.thestatsapi.com/api
 REQUEST_TIMEOUT=30
 ```
@@ -112,6 +114,69 @@ https://你的项目.up.railway.app/debug/last-push-statistics
 - v1.28 校准闭环通过 `/shadow/calibration/lock` 在赛前锁定 1X2 概率，通过 `/settle` 录入赛果，并由 `/report` 汇总 Brier Score、Log Loss、单位收益与 ROI；PASS 计入概率校准但不计入投注收益。
 - v1.29 的 `/shadow/operations/status` 汇总持久化完整性、自动采集线程、外部数据时效、逾期复核任务和校准样本门槛，并以 `healthy/degraded/blocked` 及 info/warning/critical 告警输出。
 - v1.30 冻结影子可用版契约。`/shadow/release-acceptance` 汇总发布检查、外部缺口和使用边界；当前只授权影子运行，任何正式建议仍必须通过单场 `decision_ready` 且达到校准样本门槛。
+- v1.88 增加顶级联赛自动学习治理接口：`/shadow/learning/freeze` 只接受明确核实的男子职业国内一级联赛并在开赛前生成不可覆写版本；`/settle` 必须绑定冻结ID；新理论只能登记为候选并使用独立已结算样本验证；即使全部门槛通过也只能生成等待用户确认的晋级候选，系统不存在自动写入Champion的路径。
+- v1.88 的 The Odds API 采集默认只请求本地尚未记录的节点；全节点已存在时零调用返回，已知 event id 的普通节点补采不重复扫描 Opening，`data_missing` 只有显式请求才重试。
+- v1.88 将自动学习发现范围与通用比赛范围彻底分离：`/shadow/learning/cycle-plan`只列出注册表确认的男子职业国内顶级联赛，生成未来24小时候选和过去36小时待复盘计划；所有学习接口在未配置`SHADOW_ACCESS_TOKEN`时均关闭。
+- v1.88 的学习结算要求结构化复盘场次选择、基本面、State Tree、盘口语言、市场表达和价格执行；必须明确声明未使用赛果倒推且未请求单场修改Champion。实现错误须引用既有规则并要求回归测试。
+- v1.89 增加幂等自动学习运行器`POST /shadow/learning/run`：默认dry-run，正式执行需要唯一run_id；自动生成计划内顶级联赛PIT赛前包、冻结原始决策并收集到期赛后事实，但没有自动理论注册或Champion写入路径。
+- v1.89 增加`GET /shadow/learning/review-queue`：单源赛果只能待核实，至少两个可定位且比分一致的独立来源才进入复盘就绪；事实与赛前冻结并列展示，Process分类仍必须基于过程审计而不是比分倒推。
+- v1.90 增加前向Shadow验证锁与派生Promotion证据：验证比赛必须在开赛前锁定Champion/Challenger/消融概率、入场价格和风险；赛后由系统计算Brier、CLV、消融、过程准确率和风险门槛。调用方提交自述的passed审计会被拒绝，所有门槛仍只生成待用户确认候选。
+- v1.91 将自动学习改为节点驱动版本链：T-24h至T-30m按时钟推进，Closing必须有真实合格快照；同节点仅在快照指纹或基本面复核证据变化时复算。后台5分钟快照线程只在存在节点更新或首次赛后事实待采时触发幂等学习周期；首次纳入上限与同场复算上限分离，Opening和错过节点均不得回填。
+- v1.92 按最新学习任务规则将自动学习固定为每天上海时间14:30运行：严格先处理过去36小时赛后事实和不可变复盘证据草稿，再发现未来24小时赛程；学习节点收缩为`Opening → T-12h → T-6h → T-1h`，取消每日比赛数及完整历史赔率样本数上限。该变更只作用于学习闭环，普通赛前八节点时间轴保持不变。双源赛果通过后系统只生成绑定冻结/事实哈希的人工复核草稿，不会用赛果自动判定过程、结算、登记理论或修改Champion。
+- v1.93 增加证据驱动自动复盘、多场重复信号提案与前向验证编排。`complete-review`不采信调用方Process分类：先从六项哈希绑定的过程审计派生正确/错误，再单独结算冻结选择的输赢；数据不足、事件污染、走盘和不支持的复杂盘口安全降为`DATA_INSUFFICIENT`。双源结果与事件核验同时检查证据链接和域名，来源改名不能伪造独立性。Selection Quality按真实比赛去重，默认至少5场不同比赛、同一失败维度3次且失败率25%才生成无模型影响的`RESEARCH_PROPOSAL`。提案不是理论；转为Hypothesis必须绑定最新提案哈希、全部支持样本和结构化验证范围。验证队列只接受登记后新增、未参与发现、尚未开赛的匹配比赛，同一比赛的多个版本不得重复充当验证样本。
+- v1.94 增加League DNA显式用户确认入口。完成全部Shadow门槛仍只形成99分激活候选；只有绑定最新`activation_hash`、确认人、可追溯凭据和精确确认语句的交互式请求才能写入100分`VERIFIED_ACTIVE`。定时任务和无人值守流程禁止调用该入口。
+- v1.95 将盘口语言正式接入决策终态：Home/Away/Over/Under分别输出`Capital Pressure Proxy`、盘口响应和`Accepted/Partial/Resistance/Rejected`，真实Money%/Bet%/成交额缺失时固定为`data_missing`。Expression Optimizer只在同一赛前剧本内寻找更低阻力表达；不能自动反向。Resistance无更优表达时输出`WAIT`，组合构建器只接纳`BET`腿；赛后不会把`WAIT/PASS`的监控表达伪装成已执行投注结算。
+- v1.96 增加独立`real_money_v1`输入契约。真实Money%/Bet%/成交额必须绑定同一比赛、受控来源注册表、可定位HTTP证据、已核实方法、赛前观测时间、具体盘口档位和闭合百分比；缺失、过期、跨比赛、未注册域名或自称A级的来源一律拒绝。合格资金证据标为A级并带不可变`evidence_hash`，只替代压力证据，不替代独立盘口响应；未配置来源注册表时继续安全使用Capital Pressure Proxy。
+- v1.97 增加不可变 Learning Card 与内部过程校准。每张卡绑定赛前冻结、赛后事实和复盘哈希；`PriorityQuality`来自场次选择审计，`SelectionQuality`来自表达与价格执行审计。最终比分不复制进卡片，缺失的赛前评级不补造，同场只以最新结算冻结版本参与校准；报告不自动调权、登记理论或修改Champion。
+- v1.98 将匿名消融升级为预登记模块级消融。Hypothesis必须先锁定结构化联赛/市场范围和`MSCB/STATE_TREE/IEH/TAC/TDD/LET/LPS/OCR`中的目标模块；每个前向样本必须在开赛前精确锁定全部模块的消融概率、计算时间和证据引用。系统逐模块派生Brier增益，并自动判定`support/counterexample`，调用方自报结论不生效。
+- v1.99 为自动学习赛前包增加可重放的独立概率契约。服务端只使用同一PIT积分榜中的主客场分项建立联赛基准及双方攻防率，经内置`fundamental_relative_strength_xg_v1`与`independent_poisson_v1`生成概率；完整输入、来源内容哈希、估计器哈希、模型哈希及重放哈希一并冻结。冻结前会在服务端重算，任何概率、输入、来源或哈希篡改均拒绝。未先保存为合规时间节点的即时赔率不得参与冻结决策；独立概率数据缺失时明确保留`PASS/data_missing`，不得从盘口或供应商预测反推。内部前向Shadow计算器也必须绑定该重放哈希，且其Champion概率必须与冻结基线完全一致，否则样本不能进入晋级证据。
+- v2.00 将前向Shadow评分绑定到赛前冻结的实际市场、选择与盘口档位，不再用1X2结果替代其他市场的验证目标。1X2按`home/draw/away`、BTTS按`yes/no`评分；AH、O/U及主客队总进球按`full_win/half_win/push/half_loss/full_loss`精确结算类别评分，四分之一盘保留半赢半输。内部运行器必须返回与冻结Poisson重放完全一致的Champion市场分布，Challenger与全部模块消融也必须使用同一结算空间。历史`legacy_1x2_brier`记录仅保留审计兼容，不能通过Promotion预登记门禁。
+- v2.01 补齐无人值守前向验证的内置Challenger运行器。每个Hypothesis必须预登记`poisson_log_rate_adjustment_v1`规格，将每个待验证模块映射为有界、赔率无关的主客队对数进球率增量；完整Challenger等于全部模块贡献之和，逐模块消融只移除该模块贡献。单模块绝对增量上限为0.25、组合上限为0.40，零贡献、模块集合不一致、规格哈希或运行器身份不一致均拒绝。每日周期可直接执行并锁定该Challenger，不再依赖测试注入或外部概率；仍不会自动改变Champion。
+- v2.02 打通无人值守赛后结果核验与安全归档。赛前冻结会把The Odds API的sport key、event id及主客队身份连同内容哈希固化；赛后只用该冻结身份调用官方`scores`端点，并与API-Football最终比分交叉核验。事件ID、球队、运动键、响应状态或比分任一不一致都不能形成第二来源。双源结果通过后，周期自动生成哈希绑定复盘并完成结果无关的证据审计；事件序列没有两个独立权威来源时固定归档为`DATA_INSUFFICIENT`，不会计算选择输赢、生成Learning Card、研究提案或Champion效果。
+- v2.03 接入TheStatsAPI作为第二独立事件权威。系统只能在开赛前通过UTC日期、主客队和开赛时间唯一匹配`match_id`并将身份哈希写入冻结；赛后再按该ID读取match detail与`/timeline`。最终比分须与API-Football一致，关键事件序列还必须在进球、红牌、点球、乌龙的类型、主客侧及分钟容差上逐项一致。两个事件来源都必须绑定同一`event_signature_hash`，缺哈希、错比赛、比分或事件不一致均保持单源/`DATA_INSUFFICIENT`。
+- v2.04 将TheStatsAPI赛前身份发现改为按UTC比赛日批量复用。一次完整分页结果在进程内短时缓存，同日多场及并发冻结共享同一份只读副本，避免逐场重复请求触发供应商分钟限速；失败、无效schema或不完整分页绝不缓存。缓存键绑定API域名、密钥指纹和UTC日期，默认TTL为600秒且最多保留16个比赛日键，不含真实密钥。
+- v2.05 加固每日14:30调度可靠性。14:30前严格不运行，之后由当日首个可用轮询补跑，不再因服务重启或轮询越过十分钟窗口而永久漏掉该日闭环；日期化run_id继续保证最多一次不可变写入，并记录计划时间与实际触发延迟。跨日不会伪造旧日期PIT运行。
+- v2.06 增加自动学习运行就绪契约，当时将API-Football、The Odds API、TheStatsAPI、安全令牌、持久化主存储与备份、自动工作线程、顶级联赛注册表和14:30调度逐项列为硬门禁；v2.17已将不再使用的TheStatsAPI改为可选事件增强源。普通手工Shadow可用不再被误解为无人值守闭环已运行；状态与发布报告只公开布尔检查和阻塞项，不泄露密钥。
+- v2.07 增加持久化每日执行健康审计。系统不再相信进程内“最后运行”状态，而是核对当日run id、固定执行顺序、开始时间和run hash；14:30后给予最多两轮询或600秒宽限，之后仍无有效记录即产生critical告警并撤销自动学习运行授权。服务重启后仍可从持久化账本证明当日是否真正执行。
+- v2.08 打通多场提案到前向验证的安全自动桥接，但禁止赛后临时编造理论。只有在全部发现样本之前就登记、且对联赛/市场/失败维度唯一匹配的不可变因果模板，才能自动实例化为`HYPOTHESIS_ONLY`；模板预先固定验证下限、消融模块和赔率无关Challenger。无模板、晚登记或多模板冲突均失败关闭，实例化后仍无Champion效力，只能使用登记后的新比赛进入Shadow验证。
+- v2.09 补齐前向验证的赛后自动结算与确认候选生成。系统从不可变Shadow锁、已核实Postmatch和赛前Closing共识快照派生Brier、CLV、模块消融、Process Accuracy与风险；Closing必须同市场、同选择、同档位且公司覆盖合格，缺失或跨档时失败关闭。九项门槛全部通过后只自动创建`AWAITING_EXPLICIT_USER_CONFIRMATION`，不会自动激活Champion。
+- v2.10 修正v2.09与四节点学习时间轴的冲突。自动学习的价格质量终点改为`T-1h`，只接受同市场、同选择、同档位且公司覆盖合格的T-1h共识价；价格和证据引用必须由服务端从持久化快照派生，调用方自报会被拒绝，Closing不能替代缺失的学习节点。普通赛前分析仍保留完整八节点及Closing。Promotion仍只生成等待用户明确确认的候选，绝不自动激活Champion。
+- v2.11 补齐自动赛后选择质量审核。比赛优先级只按冻结的A/B字母评级及决策合同判断，数字分数不擅自映射；价格执行只用服务端核验的同线T-1h证据，过程标签不读取赛果。State Tree等未决维度仍可让整体过程保持`DATA_INSUFFICIENT`，但不会再连带丢弃已独立核验的优先级和市场选择校准样本。
+- v2.12 将自动学习范围收紧为用户明确确认的“大型男子职业国内顶级联赛”白名单。注册表外赛事即使有官方一级联赛证明也不能自行进入学习池；它们只能通过`POST /shadow/market-language/freeze`和`POST /shadow/market-language/settle`进入独立观察/兑现存储，并固定声明对模型、Hypothesis、League DNA和Champion均无影响。
+- v2.13 补齐14:30治理周期与四节点分析之间的执行缺口。每日周期会把未来24小时合格比赛写入不可变`learning_admissions`，即使当时尚未到T-12h；5分钟工作线程只对这些已准入比赛推进`Opening/T-12h/T-6h/T-1h`版本，禁止重新发现或扩大范围。大型联赛注册表增加版本与内容哈希；注册表外赛前比赛自动路由到隔离的盘口语言观察存储。新增`/shadow/learning/registry`、`/shadow/learning/node-plan`、`/shadow/learning/node-run`和`/shadow/market-language/status`。
+- v2.14 将节点执行链加固为可恢复的生产契约。每个比赛/节点/证据组合生成稳定执行键，持久化`running/failed/completed`尝试账本；活跃租约阻止重复供应商调用，失败按有上限的指数退避重试，旧尝试按配置保留。`/shadow/learning/data-health`报告漏冻结、节点积压、过期赛后窗口、失败尝试、陈旧租约及隔离观察待兑现数量，并接入运维告警。14:30运行账本不再只检查`run_hash`存在，而是重新计算不可变内容哈希；被修改的记录直接判为无效。正式节点执行禁止调用方覆盖服务器时间。
+- v2.15 补齐非大型赛事“盘口语言观察→双源事实→待人工/代理复核兑现”闭环。14:30周期会在36小时窗口内为隔离观察自动采集赛果、事件和统计，写入独立`market_language_postmatch_facts`；双源一致后只进入`settlement_ready`，不会自动判断盘口语言正确、创建Learning Card或影响模型。兑现必须绑定最新事实哈希。新增`/shadow/market-language/collect-facts`及`/shadow/market-language/settlement-plan`。大型联赛超过36小时自动窗口后不再静默丢失，`/shadow/learning/postmatch-recovery`列出恢复项，`/shadow/learning/collect-facts`只补事实而禁止重建赛前分析。文件型事实库同时强制单worker运行，Procfile与Railway启动命令明确`--workers 1`，多写者配置会阻断无人值守授权。
+- v2.16 补齐单文件事实库的受保护人工恢复闭环。`GET /shadow/store-recovery-preview`只在主库不可读或缺失、且滚动备份可验证时生成绑定双方字节指纹的恢复令牌与精确确认短语；`POST /shadow/store-recover`重新核对同一状态后才原子恢复，损坏主文件保留为隔离副本，备份原件不改写，并把恢复审计写入新主库。后台任务永不调用恢复接口；主库损坏时运维状态仍可返回blocked与明确恢复提示，而不是因读取异常失去可观测性。主库、备份、检查和恢复路径同时统一采用有界gzip解压，并在原子写入前拒绝超过同一上限的事实库。
+- v2.17 按当前供应商策略把TheStatsAPI从无人值守启动硬门禁降为可选事件增强源。未配置时，API-Football与The Odds API仍可完成赛程、赛前冻结、赔率时间线和双源赛果归档；任何依赖红牌、点球、乌龙及进球顺序的过程复盘继续安全标记`DATA_INSUFFICIENT`，不得生成有效Learning Card、研究提案或Champion证据。若未来启用任一第二事件源，仍必须通过赛前身份冻结和一致`event_signature_hash`核验。
+
+真实资金包通过`/shadow/model/prematch-evaluate`或`/shadow/evaluate`请求体中的`real_money_data`提交。示例结构：
+
+```json
+{
+  "schema": "real_money_v1",
+  "fixture": "MATCH_ID",
+  "observed_at": 1791400000,
+  "source": {
+    "name": "Verified Exchange Feed",
+    "type": "betting_exchange",
+    "evidence_ref": "https://registered.example/market/MATCH_ID",
+    "authority_verified": true,
+    "methodology_verified": true,
+    "methodology": "Matched prematch stakes aggregated by selection before kickoff."
+  },
+  "markets": {
+    "asian_handicap": {
+      "line": -0.5,
+      "money_percent": {"home": 60, "away": 40},
+      "bet_percent": {"home": 55, "away": 45},
+      "turnover": 125000,
+      "currency": "USD"
+    }
+  }
+}
+```
+
+证据域名还必须预先存在于`REAL_MONEY_SOURCE_REGISTRY_JSON`；空注册表代表不信任任何真实资金输入。该配置只建立允许名单，不会自动获取或购买资金数据。
 - Opening 导入必须同时包含可解析的观测时间和非空公司盘口数组；缺一项即标记 `opening_source_unverified`，上游汇总值不能单独充当开盘证据。
 - 每个节点保存 1X2、亚洲让球、大小球，并在上游提供时保存 BTTS、主队进球数、客队进球数。
 - `primary` 字段继续保留以兼容旧调用方，但内容改为基于完整公司数组计算的 `consensus_main_line`，不再机械取第一家公司。
@@ -138,6 +203,8 @@ Edge、EV、脚本覆盖率、拥挤度和阵容可信度门槛，且不存在 D
 - `first_choice_high_consistency`：优先选择 Script Coverage 和基本面/盘口一致性最高的表达，允许赔率较低。
 - `second_choice_higher_return`：仍通过全部标准门槛，但在其他候选中优先更高 EV。
 - `high_variance_single`：Edge/EV 为正、覆盖率至少达到独立门槛，但未达到主推荐覆盖率，只能作为高博弈单关。
+
+单关候选还必须满足十进制赔率 `>= 1.75`（香港盘 `>= HK0.75`）。价格跌破门槛时返回 `WAIT`，不能为了凑出单关而切换到相反方向；更高赔率本身也不构成优先理由。
 
 高博弈候选不会为了填充结果而进入第一或第二首选；Crowding、Lineup Confidence、Death Path
 或关键字段出现硬性问题时，三层都清空并返回 `PASS`。
@@ -309,10 +376,14 @@ conservative、balanced、aggressive，复核原因必须是数组。异常输�
 而是清理临时文件并抛出统一的 `snapshot_store_write_failed`；只有原子替换完成才返回成功。
 读取端只在文件确实不存在时初始化空库；现有文件解压失败、JSON损坏或根结构不是对象时返回
 `snapshot_store_read_failed` 并停止后续写入，绝不把损坏文件当成空库覆盖。
-每次成功写入还会以相同编码原子更新 `.bak` 滚动备份。主文件损坏时不会自动恢复或覆盖，
-但可通过内部备份读取逻辑验证并用于人工恢复；备份不存在或损坏会返回独立错误。
+每次成功写入还会以相同编码原子更新 `.bak` 滚动备份。主文件损坏时绝不自动恢复或覆盖；
+受保护的`GET /shadow/store-recovery-preview`先生成绑定当前主文件和备份SHA-256的恢复令牌与精确确认短语，
+`POST /shadow/store-recover`只有在状态未变化且确认完全匹配时才原子恢复。损坏主文件会保留为带时间戳和指纹的隔离副本，
+备份原件保持不变，恢复审计写入新主库。备份不存在或损坏时恢复保持关闭。
 受令牌保护的 `GET /shadow/store-health` 可检查主文件与备份是否存在、可读、gzip状态、大小、
-版本、记录数量和SHA-256指纹。接口不返回比赛内容，也不会自动恢复或改写任何文件。
+版本、记录数量和SHA-256指纹。健康与预览接口不返回比赛内容，任何自动任务都没有恢复权限。
+主库、备份、健康检查和恢复候选统一使用`SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES`解压上限，默认512 MiB；
+超过上限的gzip或明文文件按损坏处理，新写入若超过同一上限也会在替换主库前失败，避免生成下次无法读取的事实库。
 为防止Railway卷无限增长，每场基本面版本和每个组合历史默认各保留最近100条，可分别通过
 `FUNDAMENTAL_VERSION_RETENTION`、`PORTFOLIO_RUN_RETENTION` 在10–1000范围调整。裁剪后版本号
 继续单调递增，不会重新从保留条数开始编号。
@@ -331,6 +402,9 @@ conservative、balanced、aggressive，复核原因必须是数组。异常输�
 ```text
 GET  /shadow/ai-packet?fixture=FIXTURE_ID
 POST /shadow/evaluate
+GET  /shadow/store-health
+GET  /shadow/store-recovery-preview
+POST /shadow/store-recover
 ```
 
 `/shadow/evaluate` 的 JSON 示例：
@@ -429,9 +503,86 @@ POST /shadow/model/fundamental-xg
 POST /shadow/model/prematch-evaluate
 POST /shadow/portfolio/evaluate
 GET  /shadow/imported-prematch/{MATCH_UUID}
+POST /shadow/learning/freeze
+GET  /shadow/learning/cycle-plan
+POST /shadow/learning/run
+GET  /shadow/learning/review-queue
+POST /shadow/learning/review-draft
+POST /shadow/learning/complete-review
+POST /shadow/learning/quality-cards/refresh
+GET  /shadow/learning/quality-calibration
+GET  /shadow/learning/research-proposals
+POST /shadow/learning/research-proposals/refresh
+GET  /shadow/learning/validation-queue
+POST /shadow/learning/settle
+POST /shadow/learning/hypotheses
+POST /shadow/learning/hypotheses/{HYPOTHESIS_ID}/shadow-lock
+POST /shadow/learning/hypotheses/{HYPOTHESIS_ID}/validation
+GET  /shadow/learning/hypotheses/{HYPOTHESIS_ID}/promotion-evidence
+POST /shadow/learning/hypotheses/{HYPOTHESIS_ID}/promotion-candidate
+POST /shadow/learning/league-dna
+POST /shadow/learning/league-dna/{TAG_ID}/activation-candidate
+POST /shadow/learning/league-dna/{TAG_ID}/confirm
+GET  /shadow/learning/league-dna/status
+GET  /shadow/learning/selection-quality
+GET  /shadow/learning/status
 ```
 
+模块级Shadow锁的核心字段示例：
+
+```json
+{
+  "freeze_id": "fixture:v2",
+  "champion_probabilities": {"home": 0.45, "draw": 0.25, "away": 0.30},
+  "challenger_probabilities": {"home": 0.30, "draw": 0.45, "away": 0.25},
+  "module_ablation_outputs": {
+    "MSCB": {
+      "probabilities": {"home": 0.33, "draw": 0.34, "away": 0.33},
+      "computed_at": 1791400000,
+      "output_reference": "model-run:mscb-ablation-001"
+    }
+  }
+}
+```
+
+锁定模块必须与Hypothesis预登记的`ablation_plan.required_modules`完全一致。`computed_at`必须位于赛前冻结之后、Shadow锁之前；验证结论由系统根据前向指标产生。
+
+Hypothesis还必须预登记可执行Challenger，例如：
+
+```json
+{
+  "challenger_spec": {
+    "schema_version": "poisson_log_rate_adjustment_v1",
+    "uses_market_odds": false,
+    "module_log_rate_deltas": {
+      "MSCB": {"home": 0.02, "away": -0.01}
+    }
+  }
+}
+```
+
+服务端会规范化并哈希该规格。正式前向锁只接受`builtin_preregistered_poisson_challenger`运行器；手工提交的概率仍可作为历史审计记录，但不具备Promotion资格。
+
 以上请求推荐通过 Header 携带令牌，不在 URL 中传递。
+
+自动周期默认只预览。正式执行示例：
+
+```json
+{
+  "apply": true,
+  "run_id": "daily-20261008-1430",
+  "auto_prepare_prematch": true,
+  "auto_collect_postmatch_facts": true,
+  "auto_build_postmatch_review_drafts": true,
+  "auto_refresh_quality_cards": true,
+  "auto_refresh_research_proposals": true,
+  "postmatch_fact_packets": {},
+  "review_completion_packets": [],
+  "settlement_packets": []
+}
+```
+
+`postmatch_fact_packets`用于补入第二个独立结果来源；两个来源必须分别带可定位`evidence_ref`且比分一致。事实核实后，运行器只生成绑定冻结与事实哈希的不可变复盘证据草稿；不会自动生成Process分类或结算。结构化复盘仍通过`settlement_packets`提交并接受反倒推门禁，而且必须携带复盘队列返回的最新已核实`fact_hash`。
 
 POST 请求可直接传一个数据包、数据包数组，或 `{ "packets": [...] }`。
 外部 UUID 与原有数字 fixture ID 分开使用；缺失节点保留为 `data_missing`，不会用当前盘口反推。

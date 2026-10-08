@@ -1,8 +1,11 @@
 import os
+import copy
 import gzip
 import tempfile
 import unittest
-from unittest.mock import patch
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from unittest.mock import Mock, patch
 
 import main
 
@@ -16,9 +19,11 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.old_store = main.SNAPSHOT_STORE_PATH
         self.tmp = tempfile.TemporaryDirectory()
         main.SNAPSHOT_STORE_PATH = os.path.join(self.tmp.name, "store.json")
+        main.THESTATS_FIXTURE_DAY_CACHE.clear()
 
     def tearDown(self):
         main.SNAPSHOT_STORE_PATH = self.old_store
+        main.THESTATS_FIXTURE_DAY_CACHE.clear()
         self.tmp.cleanup()
 
     def test_bounded_gzip_decompression_rejects_expansion_over_limit(self):
@@ -489,6 +494,30 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         finally:
             main.SHADOW_ACCESS_TOKEN = original
 
+    def test_learning_endpoints_fail_closed_without_configured_token(self):
+        with patch.object(main, "SHADOW_ACCESS_TOKEN", ""):
+            with self.assertRaises(main.HTTPException) as unavailable:
+                main.require_learning_token(None)
+        self.assertEqual(unavailable.exception.status_code, 503)
+        self.assertEqual(unavailable.exception.detail, "shadow_access_token_required_for_learning")
+        with patch.object(main, "SHADOW_ACCESS_TOKEN", "configured-token"):
+            with self.assertRaises(main.HTTPException) as rejected:
+                main.require_learning_token("wrong-token")
+            main.require_learning_token("configured-token")
+        self.assertEqual(rejected.exception.status_code, 401)
+
+    def test_paid_odds_endpoints_fail_closed_without_configured_token(self):
+        with patch.object(main, "SHADOW_ACCESS_TOKEN", ""):
+            with self.assertRaises(main.HTTPException) as unavailable:
+                main.require_paid_odds_token(None)
+        self.assertEqual(unavailable.exception.status_code, 503)
+        self.assertEqual(unavailable.exception.detail, "shadow_access_token_required_for_paid_odds")
+        with patch.object(main, "SHADOW_ACCESS_TOKEN", "configured-token"):
+            with self.assertRaises(main.HTTPException) as rejected:
+                main.require_paid_odds_token("wrong-token")
+            main.require_paid_odds_token("configured-token")
+        self.assertEqual(rejected.exception.status_code, 401)
+
     def test_all_shadow_endpoints_expose_header_authentication(self):
         schema = main.app.openapi()
         for path, operations in schema["paths"].items():
@@ -781,6 +810,255 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(gated["decision"], "home")
         self.assertTrue(gated["line_movement_audit"]["decision_eligible"])
 
+    def test_market_language_separates_pressure_proxy_from_line_response(self):
+        audit = {"decision_eligible": True}
+        base = {
+            "comparison_status": "compared",
+            "no_vig_probability_movements": {"1x2": {"status": "compared", "deltas": {"home": .04, "away": -.03}}},
+            "market_movements": {"asian_handicap": {"line": -.25}},
+        }
+        accepted = main.market_language_for_candidate({"market": "asian_handicap", "selection": "home"}, base, audit)
+        self.assertEqual(accepted["capital_pressure"]["label"], "Capital Pressure Proxy")
+        self.assertEqual(accepted["capital_pressure"]["evidence_grade"], "B")
+        self.assertFalse(accepted["capital_pressure"]["is_real_money"])
+        self.assertIsNone(accepted["capital_pressure"]["money_percent"])
+        self.assertEqual(accepted["line_response"]["response"], "upgrade")
+        self.assertEqual(accepted["market_acceptance"], "Accepted")
+        self.assertEqual(accepted["diagnostic"], "Accepted Repricing")
+
+        resistance = main.market_language_for_candidate(
+            {"market": "asian_handicap", "selection": "home"},
+            {**base, "market_movements": {"asian_handicap": {"line": 0.0}}}, audit,
+        )
+        self.assertEqual(resistance["line_response"]["response"], "static")
+        self.assertEqual(resistance["market_acceptance"], "Resistance")
+
+        rejected = main.market_language_for_candidate(
+            {"market": "asian_handicap", "selection": "home"},
+            {**base, "market_movements": {"asian_handicap": {"line": .25}}}, audit,
+        )
+        self.assertEqual(rejected["line_response"]["response"], "downgrade")
+        self.assertEqual(rejected["market_acceptance"], "Rejected")
+        self.assertEqual(rejected["diagnostic"], "Strong Resistance / Divergence")
+
+    def test_market_language_missing_timeline_never_invents_funds(self):
+        result = main.market_language_for_candidate(
+            {"market": "over_under", "selection": "over"},
+            {"comparison_status": "data_missing"}, {"decision_eligible": False},
+        )
+        self.assertEqual(result["capital_pressure"]["status"], "data_missing")
+        self.assertFalse(result["capital_pressure"]["is_real_money"])
+        self.assertEqual(result["market_acceptance"], "data_missing")
+
+    def test_real_money_schema_requires_bound_fresh_a_grade_evidence(self):
+        packet = {
+            "schema": "real_money_v1", "fixture": "fixture-1", "observed_at": 900,
+            "source": {
+                "name": "Verified Exchange Feed", "type": "betting_exchange",
+                "evidence_ref": "https://exchange.example/markets/fixture-1",
+                "authority_verified": True, "methodology_verified": True,
+                "methodology": "Matched exchange stakes aggregated by selection before kickoff.",
+            },
+            "markets": {
+                "asian_handicap": {
+                    "line": -.5, "money_percent": {"home": 70, "away": 30},
+                    "bet_percent": {"home": 60, "away": 40}, "turnover": 125000, "currency": "USD",
+                },
+                "over_under": {"line": 2.5, "money_percent": {"over": 65, "under": 35}},
+            },
+        }
+        registry = {"exchange.example": {"registry_id": "exchange-1", "allowed_types": ["betting_exchange"]}}
+        with patch.object(main, "REAL_MONEY_SOURCE_REGISTRY", registry):
+            audited = main.audit_real_money_data(packet, expected_fixture="fixture-1", data_cutoff_at=1000, kickoff_at=2000)
+        self.assertEqual(audited["status"], "available")
+        self.assertTrue(audited["decision_eligible"])
+        self.assertTrue(audited["is_real_money"])
+        self.assertEqual(audited["evidence_grade"], "A")
+        self.assertEqual(audited["source"]["authority_domain"], "exchange.example")
+        self.assertEqual(audited["markets"]["asian_handicap"]["direction"], "home")
+        self.assertEqual(audited["markets"]["asian_handicap"]["concentration_gap"], .4)
+        self.assertTrue(audited["evidence_hash"])
+
+    def test_real_money_schema_rejects_mismatch_stale_and_nonclosing_percentages(self):
+        packet = {
+            "schema": "real_money_v1", "fixture": "wrong-fixture", "observed_at": 1,
+            "source": {
+                "name": "Claimed Feed", "type": "verified_money_vendor",
+                "evidence_ref": "https://money.example/item/1",
+                "authority_verified": True, "methodology_verified": True,
+                "methodology": "Verified stake and ticket distribution captured before kickoff.",
+            },
+            "markets": {"over_under": {"line": 2.5, "money_percent": {"over": 75, "under": 15}}},
+        }
+        audited = main.audit_real_money_data(packet, expected_fixture="fixture-1", data_cutoff_at=30000, kickoff_at=40000)
+        self.assertEqual(audited["status"], "rejected")
+        self.assertFalse(audited["decision_eligible"])
+        self.assertFalse(audited["is_real_money"])
+        self.assertIsNone(audited["evidence_hash"])
+        self.assertIn("real_money_fixture_mismatch", audited["reasons"])
+        self.assertIn("real_money_observation_stale", audited["reasons"])
+        self.assertIn("over_under_money_percent_percentages_must_sum_to_100", audited["reasons"])
+
+    def test_unverified_or_unlocatable_money_source_never_becomes_a_grade(self):
+        packet = {
+            "schema": "real_money_v1", "fixture": "fixture-1", "observed_at": 900,
+            "source": {
+                "name": "Anonymous", "type": "social_media",
+                "evidence_ref": "rumor", "authority_verified": False,
+                "methodology_verified": False, "methodology": "unknown",
+            },
+            "markets": {"asian_handicap": {"line": -.5, "money_percent": {"home": 55, "away": 45}}},
+        }
+        audited = main.audit_real_money_data(packet, expected_fixture="fixture-1", data_cutoff_at=1000, kickoff_at=2000)
+        self.assertEqual(audited["status"], "rejected")
+        self.assertIn("real_money_source_type_not_a_grade", audited["reasons"])
+        self.assertIn("real_money_locatable_http_evidence_required", audited["reasons"])
+        self.assertIn("real_money_source_not_in_verified_registry", audited["reasons"])
+        self.assertIn("real_money_source_authority_verification_required", audited["reasons"])
+
+    def test_a_grade_real_money_is_distinct_from_proxy_and_does_not_replace_line_response(self):
+        packet = {
+            "schema": "real_money_v1", "fixture": "fixture-1", "observed_at": 900,
+            "source": {
+                "name": "Official Stakes", "type": "bookmaker_official",
+                "evidence_ref": "https://book.example/fixture-1/stakes",
+                "authority_verified": True, "methodology_verified": True,
+                "methodology": "Official prematch stake distribution across the quoted handicap line.",
+            },
+            "markets": {"asian_handicap": {"line": -.5, "money_percent": {"home": 70, "away": 30}, "bet_percent": {"home": 55, "away": 45}}},
+        }
+        registry = {"book.example": {"registry_id": "book-1", "allowed_types": ["bookmaker_official"]}}
+        with patch.object(main, "REAL_MONEY_SOURCE_REGISTRY", registry):
+            real = main.audit_real_money_data(packet, expected_fixture="fixture-1", data_cutoff_at=1000, kickoff_at=2000)
+        dynamics = {
+            "comparison_status": "compared",
+            "no_vig_probability_movements": {"1x2": {"status": "compared", "deltas": {"home": -.02, "away": .02}}},
+            "market_movements": {"asian_handicap": {"line": 0.0}},
+        }
+        language = main.market_language_for_candidate(
+            {"market": "asian_handicap", "selection": "home", "line": -.5},
+            dynamics, {"decision_eligible": True}, real,
+        )
+        self.assertEqual(language["capital_pressure"]["label"], "Real Funds")
+        self.assertEqual(language["capital_pressure"]["evidence_grade"], "A")
+        self.assertTrue(language["capital_pressure"]["is_real_money"])
+        self.assertEqual(language["capital_pressure"]["money_percent"]["home"], 70)
+        self.assertEqual(language["line_response"]["response"], "static")
+        self.assertEqual(language["market_acceptance"], "Resistance")
+        candidate = {
+            "market": "asian_handicap", "selection": "home", "line": -.5, "price": 1.91,
+            "model_probability": .57, "market_no_vig_probability": .52, "edge": .05, "ev": .089,
+            "script_coverage": .82, "market_coverage_eligible": True,
+            "consensus_source_eligible": True, "dispersion_eligible": True,
+        }
+        decision = {
+            "decision": "asian_handicap:home", "best_market": candidate, "candidates": [candidate],
+            "edge": .05, "ev": .089, "pass_reasons": [], "line_movement_audit": {"decision_eligible": True},
+            "recommendation_tiers": {"first_choice_high_consistency": candidate, "second_choice_higher_return": None, "high_variance_single": None},
+        }
+        optimized = main.apply_market_language_and_expression_optimizer(
+            decision, [{"stage": "T-1h", "snapshot_at": 1000, "market_dynamics": dynamics}], real,
+        )
+        self.assertFalse(optimized["market_language"]["capital_pressure_is_proxy_only"])
+        self.assertEqual(optimized["market_language"]["real_money_data"]["status"], "available")
+        self.assertEqual(optimized["market_language"]["real_money_data"]["evidence_hash"], real["evidence_hash"])
+
+    def test_expression_optimizer_switches_same_script_not_direction(self):
+        over = {
+            "market": "over_under", "selection": "over", "line": 2.5, "price": 1.9,
+            "model_probability": .57, "market_no_vig_probability": .52, "edge": .05, "ev": .083,
+            "script_coverage": .82, "market_coverage_eligible": True,
+            "consensus_source_eligible": True, "dispersion_eligible": True,
+        }
+        btts = {
+            "market": "btts", "selection": "yes", "line": None, "price": 1.85,
+            "model_probability": .58, "market_no_vig_probability": .53, "edge": .05, "ev": .073,
+            "script_coverage": .78, "market_coverage_eligible": True,
+            "consensus_source_eligible": True, "dispersion_eligible": True,
+        }
+        dynamics = {
+            "comparison_status": "compared",
+            "no_vig_probability_movements": {
+                "over_under": {"status": "compared", "deltas": {"over": .04, "under": -.04}},
+                "btts": {"status": "compared", "deltas": {"yes": .03, "no": -.03}},
+            },
+            "market_movements": {"over_under": {"line": 0.0}, "btts": {"yes": -.08, "no": .08}},
+        }
+        decision = {
+            "decision": "over_under:over", "best_market": over, "candidates": [over, btts],
+            "edge": over["edge"], "ev": over["ev"], "pass_reasons": [],
+            "line_movement_audit": {"decision_eligible": True},
+            "recommendation_tiers": {"first_choice_high_consistency": over, "second_choice_higher_return": btts, "high_variance_single": None},
+        }
+        history = [{"stage": "T-1h", "snapshot_at": 200, "market_dynamics": dynamics}]
+        optimized = main.apply_market_language_and_expression_optimizer(decision, history)
+        self.assertEqual(optimized["execution_action"], "BET")
+        self.assertEqual(optimized["best_market"]["market"], "btts")
+        self.assertEqual(optimized["best_market"]["selection"], "yes")
+        self.assertEqual(optimized["expression_optimizer"]["switch_type"], "cross_market_same_script")
+        self.assertFalse(optimized["expression_optimizer"]["automatic_direction_reversal"])
+        self.assertEqual(optimized["market_language"]["selected_acceptance"], "Partial")
+        self.assertEqual(set(optimized["market_language"]["axes"]), {"Home", "Away", "Over", "Under"})
+        self.assertEqual(optimized["market_language"]["real_money_data"]["status"], "data_missing")
+
+    def test_expression_optimizer_waits_when_pressure_meets_line_retreat(self):
+        home = {
+            "market": "asian_handicap", "selection": "home", "line": -.5, "price": 1.91,
+            "model_probability": .57, "market_no_vig_probability": .52, "edge": .05, "ev": .089,
+            "script_coverage": .82, "market_coverage_eligible": True,
+            "consensus_source_eligible": True, "dispersion_eligible": True,
+        }
+        dynamics = {
+            "comparison_status": "compared",
+            "no_vig_probability_movements": {"1x2": {"status": "compared", "deltas": {"home": .04, "draw": -.01, "away": -.03}}},
+            "market_movements": {"asian_handicap": {"line": .25}},
+        }
+        decision = {
+            "decision": "asian_handicap:home", "best_market": home, "candidates": [home],
+            "edge": home["edge"], "ev": home["ev"], "pass_reasons": [],
+            "line_movement_audit": {"decision_eligible": True},
+            "recommendation_tiers": {"first_choice_high_consistency": home, "second_choice_higher_return": None, "high_variance_single": None},
+        }
+        optimized = main.apply_market_language_and_expression_optimizer(decision, [{"stage": "T-1h", "snapshot_at": 200, "market_dynamics": dynamics}])
+        self.assertEqual(optimized["execution_action"], "WAIT")
+        self.assertEqual(optimized["market_language"]["selected_acceptance"], "Rejected")
+        self.assertEqual(optimized["market_language"]["selected_diagnostic"], "Strong Resistance / Divergence")
+        self.assertIsNone(optimized["recommendation_tiers"]["first_choice_high_consistency"])
+        self.assertEqual(optimized["best_market"]["selection"], "home")
+        self.assertFalse(optimized["expression_optimizer"]["automatic_direction_reversal"])
+
+    def test_portfolio_excludes_wait_expression_even_when_candidate_exists(self):
+        candidate = {
+            "market": "1x2", "selection": "home", "line": None, "price": 1.8,
+            "model_probability": .62, "market_no_vig_probability": .56,
+            "edge": .06, "ev": .116, "script_coverage": .8,
+        }
+        rows = []
+        for fixture, action in (("wait-leg", "WAIT"), ("bet-leg-1", "BET"), ("bet-leg-2", "BET")):
+            rows.append({
+                "fixture": fixture, "correlation_group": fixture,
+                "evaluation": {"decision_layer": {
+                    "execution_action": action, "lineup_confidence": .9, "crowding": .3,
+                    "line_movement": {"comparison_status": "compared"}, "death_path": [],
+                    "recommendation_tiers": {"first_choice_high_consistency": candidate},
+                }},
+            })
+        combination = main._combination_from_rows(rows, "first_choice_high_consistency", 3)
+        self.assertEqual(combination["decision"], "COMBINE")
+        self.assertEqual({leg["fixture"] for leg in combination["legs"]}, {"bet-leg-1", "bet-leg-2"})
+        excluded = {row["fixture"]: row for row in combination["selection_audit"]["excluded"]}
+        self.assertEqual(excluded["wait-leg"]["reason"], "execution_action_not_bet")
+
+    def test_wait_expression_is_not_retroactively_settled_as_a_bet(self):
+        freeze = {"decision": {
+            "decision": "asian_handicap:home", "execution_action": "WAIT",
+            "best_market": {"market": "asian_handicap", "selection": "home", "line": -.5, "price": 1.91},
+        }}
+        outcome = main._derive_frozen_selection_outcome(freeze, {"result": {"home_goals": 3, "away_goals": 0}})
+        self.assertEqual(outcome["status"], "not_executed")
+        self.assertIsNone(outcome["outcome"])
+        self.assertEqual(outcome["execution_action"], "WAIT")
+
     def test_line_movement_gate_rejects_duplicate_observation_times(self):
         history = [
             {"stage": "T-24h", "snapshot_at": 100, "import_status": "available", "market_snapshot": {"available": True}, "market_dynamics": {"comparison_status": "data_missing"}},
@@ -834,6 +1112,121 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(packet["market"]["total_asian_handicap_move"], 0.0)
         self.assertEqual(packet["decision_layer"]["decision"], "PASS")
         self.assertIn("line_movement_requires_two_real_comparable_stages", packet["decision_layer"]["pass_reasons"])
+
+    def standings_model_fixture(self, observed_at=900):
+        def row(team_id, home_played, home_for, home_against, away_played, away_for, away_against):
+            return {
+                "team": {"id": team_id, "name": f"Team {team_id}"},
+                "home": {"played": home_played, "goals": {"for": home_for, "against": home_against}},
+                "away": {"played": away_played, "goals": {"for": away_for, "against": away_against}},
+            }
+        response = {
+            "ok": True,
+            "data": {"response": [{"league": {"standings": [[
+                row(1, 10, 18, 8, 10, 11, 13),
+                row(2, 10, 14, 12, 10, 15, 14),
+                row(3, 10, 16, 10, 10, 9, 16),
+            ]]}}]},
+        }
+        return main.independent_model_inputs_from_standings(
+            response, 1, 2, observed_at=observed_at, lineup_confidence=.9,
+        )
+
+    def test_standings_probability_replay_is_odds_independent_and_recomputable(self):
+        bundle = self.standings_model_fixture()
+        self.assertEqual(bundle["status"], "ready")
+        self.assertFalse(bundle["uses_market_odds"])
+        self.assertAlmostEqual(bundle["inputs"]["home_attack_rate"], 1.8)
+        self.assertAlmostEqual(bundle["inputs"]["away_attack_rate"], 1.5)
+        replay = main.build_learning_probability_replay("1", bundle, generated_at=950)
+        self.assertEqual(replay["status"], "ready")
+        self.assertTrue(replay["decision_eligible"])
+        audit = main.audit_learning_probability_replay(replay, "1", 950, 2000)
+        self.assertEqual(audit["status"], "ready")
+        self.assertTrue(audit["decision_eligible"])
+
+        forged = copy.deepcopy(replay)
+        forged["model"]["probabilities"]["1x2"]["home"] += .01
+        rejected = main.audit_learning_probability_replay(forged, "1", 950, 2000)
+        self.assertEqual(rejected["status"], "invalid")
+        self.assertIn("probability_output_mismatch", rejected["issues"])
+        self.assertIn("replay_hash_mismatch", rejected["issues"])
+
+        contaminated = copy.deepcopy(replay)
+        contaminated["inputs"]["market_odds"] = {"home": 2.0}
+        contaminated["input_hash"] = main._content_hash(contaminated["inputs"])
+        contaminated["replay_hash"] = main._content_hash({key: value for key, value in contaminated.items() if key != "replay_hash"})
+        rejected = main.audit_learning_probability_replay(contaminated, "1", 950, 2000)
+        self.assertEqual(rejected["status"], "invalid")
+        self.assertTrue(any(issue.startswith("unexpected_model_input_fields") for issue in rejected["issues"]))
+        self.assertIn("market_derived_model_input_field_forbidden", rejected["issues"])
+
+    def test_market_forecast_projects_exact_quarter_line_settlement_space(self):
+        payload = self.learning_payload_with_probability_replay("forecast-projection", 900, 2000)
+        replay = payload["analysis"]["probability_replay"]
+        over = {"market": "over_under", "selection": "over", "line": 2.75}
+        forecast = main.market_forecast_from_probability_replay(replay, over)
+        self.assertEqual(forecast["categories"], list(main.LINE_SETTLEMENT_CATEGORIES))
+        self.assertAlmostEqual(sum(forecast["probabilities"].values()), 1.0, places=7)
+        self.assertEqual(main._learning_market_outcome_category(over, {"home_goals": 2, "away_goals": 1}), "half_win")
+        self.assertEqual(main._learning_market_outcome_category(
+            {"market": "over_under", "selection": "under", "line": 2.75},
+            {"home_goals": 2, "away_goals": 1},
+        ), "half_loss")
+        self.assertEqual(main._learning_market_outcome_category(
+            {"market": "asian_handicap", "selection": "home", "line": -.75},
+            {"home_goals": 2, "away_goals": 1},
+        ), "half_win")
+        self.assertEqual(main._learning_market_outcome_category(
+            {"market": "btts", "selection": "yes", "line": None},
+            {"home_goals": 2, "away_goals": 1},
+        ), "yes")
+        self.assertGreaterEqual(main._brier_market_forecast(forecast, over, {"home_goals": 2, "away_goals": 1}), 0.0)
+
+    def test_shadow_ai_packet_binds_probability_but_not_unpersisted_current_odds(self):
+        current_market = main.empty_market_snapshot()
+        current_market["available"] = True
+        current_market["consensus_main_line"]["1x2"] = {
+            "home": 2.0, "draw": 3.5, "away": 4.0,
+            "source": "complete_company_array", "bookmaker_count": 4,
+        }
+        data = {
+            "ok": True, "generated_at": 950,
+            "fixture": {"fixture_id": 1, "home": "H", "away": "A", "date": 2000},
+            "structured_inputs": {
+                "odds_market_snapshot": current_market,
+                "independent_model_inputs": self.standings_model_fixture(),
+                "lineups_available": True, "lineups_confirmed": True,
+            },
+            "coverage": {}, "data_quality": {}, "shadow_summary": {},
+        }
+        with patch.object(main, "collect_prematch_data", return_value=data), patch.object(main, "get_fixture_snapshots", return_value=[]), patch.object(main, "get_fundamental_versions", return_value=[]):
+            packet = main.build_shadow_ai_packet(1)
+        self.assertEqual(packet["probability_replay"]["status"], "ready")
+        self.assertEqual(packet["decision_layer"]["model_probability"], packet["probability_replay"]["model"]["probabilities"])
+        self.assertFalse(packet["decision_layer"]["market_evidence_binding"]["current_unpersisted_quote_used"])
+        self.assertEqual(packet["decision_layer"]["candidates"], [])
+        self.assertEqual(packet["decision_layer"]["decision"], "PASS")
+
+        candidate = {
+            "fixture_id": 1, "timestamp": 2000, "status": "NS",
+            "target_analysis_node": "T-12h", "scope": {"competition_id": 39},
+        }
+        frozen = main.build_learning_freeze_payload(candidate, packet, now_ts=950)
+        self.assertTrue(frozen["analysis"]["probability_replay_audit"]["decision_eligible"])
+        forged_action = copy.deepcopy(packet)
+        forged_action["decision_layer"].update({
+            "decision": "home", "execution_action": "BET",
+            "best_market": {"market": "1x2", "selection": "home"},
+        })
+        with self.assertRaises(main.HTTPException) as unbound_market:
+            main.build_learning_freeze_payload(candidate, forged_action, now_ts=950)
+        self.assertEqual(unbound_market.exception.detail, "actionable_decision_market_snapshot_not_hash_bound")
+        tampered = copy.deepcopy(packet)
+        tampered["probability_replay"]["inputs"]["home_attack_rate"] = 4.0
+        with self.assertRaises(main.HTTPException) as rejected:
+            main.build_learning_freeze_payload(candidate, tampered, now_ts=950)
+        self.assertEqual(rejected.exception.detail["error"], "learning_probability_replay_invalid")
 
     def test_decision_layer_calculates_no_vig_edge_ev(self):
         snapshot = main.empty_market_snapshot()
@@ -2254,6 +2647,11 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(blocked["status"], "blocked")
         self.assertIn("auto_snapshot_worker_not_running", [alert["code"] for alert in blocked["alerts"]])
 
+        with patch.object(main, "AUTO_SNAPSHOT_ENABLED", False), patch.object(main, "SNAPSHOT_STORE_WRITER_WORKERS", 2):
+            multiple_writers = main.operations_status_report(now_ts=4000)
+        self.assertEqual(multiple_writers["status"], "blocked")
+        self.assertIn("snapshot_store_single_writer_required", [alert["code"] for alert in multiple_writers["alerts"]])
+
         alive = unittest.mock.Mock()
         alive.is_alive.return_value = True
         with patch.object(main, "AUTO_SNAPSHOT_ENABLED", True), patch.object(main, "AUTO_SNAPSHOT_THREAD", alive), patch.object(main, "AUTO_SNAPSHOT_LAST_CYCLE_AT", 1000), patch.object(main, "AUTO_SNAPSHOT_LAST_ERROR", "TimeoutError"):
@@ -2261,6 +2659,13 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         codes = [alert["code"] for alert in stale["alerts"]]
         self.assertIn("auto_snapshot_cycle_stale", codes)
         self.assertIn("auto_snapshot_last_cycle_failed", codes)
+
+        after_daily_grace = int(datetime(2026, 10, 8, 6, 45, tzinfo=timezone.utc).timestamp())
+        with patch.object(main, "AUTO_SNAPSHOT_ENABLED", False):
+            missed = main.operations_status_report(now_ts=after_daily_grace)
+        self.assertEqual(missed["automatic_learning_schedule"]["status"], "overdue")
+        self.assertIn("auto_learning_daily_cycle_not_completed", [alert["code"] for alert in missed["alerts"]])
+        self.assertEqual(missed["status"], "blocked")
 
     def test_v130_release_acceptance_authorizes_shadow_not_real_money_use(self):
         operations = {
@@ -2279,10 +2684,12 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(release["version"], main.VERSION)
         self.assertEqual(release["status"], "shadow_usable")
         self.assertTrue(release["shadow_use_authorized"])
+        self.assertFalse(release["automatic_learning_runtime_authorized"])
         self.assertFalse(release["real_money_use_authorized"])
         self.assertFalse(release["controlled_decision_candidate"])
         self.assertIn("calibration_minimum_sample_not_reached", release["warnings"])
         self.assertIn("real_fixture_shadow_path_not_yet_validated", release["warnings"])
+        self.assertIn("automatic_learning_runtime_not_ready", release["warnings"])
         self.assertFalse(release["fixture_acceptance"]["shadow_path_validated"])
         self.assertTrue(release["usable_scope"]["system_usable"])
         self.assertEqual(release["usable_scope"]["operating_mode"], "manual_or_api_import_shadow")
@@ -2297,6 +2704,96 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(blocked["shadow_use_authorized"])
         self.assertIn("persistent_store_operational", blocked["blockers"])
         self.assertIn("protected_api_configured", blocked["blockers"])
+
+    def test_automatic_learning_runtime_readiness_requires_all_unattended_gates(self):
+        alive = Mock()
+        alive.is_alive.return_value = True
+        integrity = {"operational": True, "recovery_ready": True}
+        with patch.object(main, "API_FOOTBALL_KEY", "configured-api-football"), \
+             patch.object(main, "THE_ODDS_API_KEY", "configured-odds"), \
+             patch.object(main, "THESTATS_API_KEY", "configured-events"), \
+             patch.object(main, "SHADOW_ACCESS_TOKEN", "configured-shadow"), \
+             patch.object(main, "SNAPSHOT_STORE_PATH", "/data/shadow_snapshots.json"), \
+             patch.object(main, "AUTO_SNAPSHOT_ENABLED", True), \
+             patch.object(main, "AUTO_SNAPSHOT_THREAD", alive):
+            ready = main.automatic_learning_runtime_readiness(store_integrity=integrity)
+            with patch.object(main, "SNAPSHOT_STORE_WRITER_WORKERS", 2):
+                multiple_writers = main.automatic_learning_runtime_readiness(store_integrity=integrity)
+        self.assertTrue(ready["ready"])
+        self.assertEqual(ready["blockers"], [])
+        self.assertFalse(ready["secrets_exposed"])
+        self.assertFalse(multiple_writers["ready"])
+        self.assertIn("persistent_store_single_writer", multiple_writers["blockers"])
+
+        with patch.object(main, "API_FOOTBALL_KEY", "configured-api-football"), \
+             patch.object(main, "THE_ODDS_API_KEY", "configured-odds"), \
+             patch.object(main, "THESTATS_API_KEY", ""), \
+             patch.object(main, "SHADOW_ACCESS_TOKEN", "configured-shadow"), \
+             patch.object(main, "SNAPSHOT_STORE_PATH", "/data/shadow_snapshots.json"), \
+             patch.object(main, "AUTO_SNAPSHOT_ENABLED", True), \
+             patch.object(main, "AUTO_SNAPSHOT_THREAD", alive):
+            ready_without_optional_events = main.automatic_learning_runtime_readiness(store_integrity=integrity)
+        self.assertTrue(ready_without_optional_events["ready"])
+        self.assertEqual(ready_without_optional_events["blockers"], [])
+        self.assertFalse(ready_without_optional_events["checks"]["optional_event_enrichment_configured"])
+        self.assertFalse(ready_without_optional_events["provider_contract"]["event_dependent_learning_effect"])
+
+        with patch.object(main, "API_FOOTBALL_KEY", ""), \
+             patch.object(main, "THE_ODDS_API_KEY", ""), \
+             patch.object(main, "THESTATS_API_KEY", ""), \
+             patch.object(main, "SHADOW_ACCESS_TOKEN", ""), \
+             patch.object(main, "SNAPSHOT_STORE_PATH", "/tmp/shadow_snapshots.json"), \
+             patch.object(main, "AUTO_SNAPSHOT_ENABLED", False):
+            blocked = main.automatic_learning_runtime_readiness(
+                store_integrity={"operational": True, "recovery_ready": False}, worker_alive=False,
+            )
+        self.assertFalse(blocked["ready"])
+        self.assertIn("api_football_configured", blocked["blockers"])
+        self.assertIn("the_odds_api_configured", blocked["blockers"])
+        self.assertFalse(blocked["checks"]["optional_event_enrichment_configured"])
+        self.assertNotIn("optional_event_enrichment_configured", blocked["blockers"])
+        self.assertEqual(blocked["provider_contract"]["independent_event_timeline"], "optional_enrichment_only")
+        self.assertEqual(blocked["provider_contract"]["missing_secondary_event_policy"], "DATA_INSUFFICIENT")
+        self.assertIn("persistent_store_configured", blocked["blockers"])
+        self.assertIn("persistent_backup_ready", blocked["blockers"])
+        self.assertIn("auto_snapshot_worker_alive", blocked["blockers"])
+
+    def test_automatic_learning_schedule_health_uses_persisted_daily_run(self):
+        before_due = int(datetime(2026, 10, 8, 6, 29, tzinfo=timezone.utc).timestamp())
+        just_due = int(datetime(2026, 10, 8, 6, 35, tzinfo=timezone.utc).timestamp())
+        overdue = int(datetime(2026, 10, 8, 6, 45, tzinfo=timezone.utc).timestamp())
+        empty = {"learning_runs": {}}
+        self.assertEqual(main.automatic_learning_schedule_health(before_due, empty)["status"], "not_due")
+        self.assertEqual(main.automatic_learning_schedule_health(just_due, empty)["status"], "awaiting_worker_poll")
+        late = main.automatic_learning_schedule_health(overdue, empty)
+        self.assertEqual(late["status"], "overdue")
+        self.assertFalse(late["healthy"])
+
+        run_id = "daily-20261008-1430"
+        run_content = main.learning_run_hash_content({
+            "run_id": run_id, "started_at": just_due,
+            "execution_order": ["past_36h_postmatch", "future_24h_prematch"],
+            "automatic_champion_change": False,
+        })
+        run_record = {**run_content, "immutable": True, "run_hash": main._content_hash(run_content)}
+        completed_store = {"learning_runs": {run_id: run_record}}
+        completed = main.automatic_learning_schedule_health(overdue, completed_store)
+        self.assertEqual(completed["status"], "completed")
+        self.assertTrue(completed["healthy"])
+        self.assertEqual(completed["trigger_delay_seconds"], 5 * 60)
+        self.assertTrue(completed["persisted_evidence"])
+        self.assertTrue(completed["run_hash_valid"])
+
+        tampered_store = {"learning_runs": {run_id: {**run_record, "automatic_champion_change": True}}}
+        tampered = main.automatic_learning_schedule_health(overdue, tampered_store)
+        self.assertEqual(tampered["status"], "invalid_persisted_run")
+        self.assertFalse(tampered["run_hash_valid"])
+
+        invalid = {"learning_runs": {run_id: {"started_at": just_due}}}
+        self.assertEqual(
+            main.automatic_learning_schedule_health(overdue, invalid)["status"],
+            "invalid_persisted_run",
+        )
 
     def test_fixture_acceptance_requires_a_real_ready_fixture(self):
         reports = {
@@ -2581,6 +3078,26 @@ class ShadowV4UpgradeTests(unittest.TestCase):
                 main.write_snapshot_store({"version": main.VERSION, "fixtures": {}})
         self.assertEqual(str(raised.exception), "snapshot_store_write_failed")
 
+    def test_snapshot_store_rejects_gzip_expansion_over_runtime_limit(self):
+        oversized = main.gzip.compress(b'{"version":"x","fixtures":{},"padding":"' + b"x" * 200 + b'"}')
+        main.Path(main.SNAPSHOT_STORE_PATH).write_bytes(oversized)
+        with patch.object(main, "SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES", 64):
+            with self.assertRaises(main.SnapshotStoreReadError):
+                main.load_snapshot_store()
+            inspection = main.inspect_snapshot_store_file(main.Path(main.SNAPSHOT_STORE_PATH))
+        self.assertEqual(inspection["status"], "corrupt")
+        self.assertEqual(inspection["error"], "ValueError")
+
+    def test_snapshot_store_write_limit_preserves_existing_primary(self):
+        main.write_snapshot_store({"version": "baseline", "fixtures": {}})
+        primary_before = main.Path(main.SNAPSHOT_STORE_PATH).read_bytes()
+        backup_before = main.snapshot_backup_path().read_bytes()
+        with patch.object(main, "SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES", 64):
+            with self.assertRaises(main.SnapshotStoreWriteError):
+                main.write_snapshot_store({"version": "too-large", "fixtures": {}, "padding": "x" * 200})
+        self.assertEqual(main.Path(main.SNAPSHOT_STORE_PATH).read_bytes(), primary_before)
+        self.assertEqual(main.snapshot_backup_path().read_bytes(), backup_before)
+
     def test_corrupt_existing_snapshot_store_is_not_treated_as_empty(self):
         with open(main.SNAPSHOT_STORE_PATH, "wb") as handle:
             handle.write(b"not-json-and-not-gzip")
@@ -2636,6 +3153,91 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(integrity["operational"])
         self.assertEqual(integrity["primary"]["status"], "corrupt")
         self.assertTrue(integrity["recovery_ready"])
+        self.assertTrue(integrity["manual_recovery_required"])
+        self.assertFalse(integrity["automatic_restore"])
+
+    def test_snapshot_store_recovery_preview_is_read_only_and_state_bound(self):
+        main.write_snapshot_store({"version": "good", "fixtures": {"a": []}})
+        backup_before = main.snapshot_backup_path().read_bytes()
+        with open(main.SNAPSHOT_STORE_PATH, "wb") as handle:
+            handle.write(b"corrupt-primary")
+        corrupt_before = main.Path(main.SNAPSHOT_STORE_PATH).read_bytes()
+        preview = main.snapshot_store_recovery_preview()
+        self.assertTrue(preview["eligible"])
+        self.assertEqual(preview["reason"], "primary_unreadable_and_backup_verified")
+        self.assertTrue(preview["recovery_token"])
+        self.assertTrue(preview["required_confirmation"].startswith("RESTORE_SNAPSHOT_BACKUP:"))
+        self.assertEqual(main.Path(main.SNAPSHOT_STORE_PATH).read_bytes(), corrupt_before)
+        self.assertEqual(main.snapshot_backup_path().read_bytes(), backup_before)
+
+    def test_snapshot_store_recovery_refuses_healthy_primary_and_bad_confirmation(self):
+        main.write_snapshot_store({"version": "good", "fixtures": {}})
+        healthy = main.snapshot_store_recovery_preview()
+        self.assertFalse(healthy["eligible"])
+        with self.assertRaises(main.HTTPException) as not_eligible:
+            main.restore_snapshot_store_from_backup({"recovery_token": "x", "confirmation": "x"}, now_ts=100)
+        self.assertEqual(not_eligible.exception.detail, "snapshot_store_manual_recovery_not_eligible")
+
+        with open(main.SNAPSHOT_STORE_PATH, "wb") as handle:
+            handle.write(b"corrupt-primary")
+        preview = main.snapshot_store_recovery_preview()
+        with self.assertRaises(main.HTTPException) as bad_phrase:
+            main.restore_snapshot_store_from_backup({
+                "recovery_token": preview["recovery_token"], "confirmation": "wrong",
+            }, now_ts=101)
+        self.assertEqual(bad_phrase.exception.detail, "snapshot_recovery_confirmation_mismatch")
+
+    def test_snapshot_store_recovery_restores_backup_and_quarantines_corruption(self):
+        main.write_snapshot_store({"version": "good", "fixtures": {"a": [{"stage": "Opening"}]}})
+        backup_before = main.snapshot_backup_path().read_bytes()
+        backup_hash = main.hashlib.sha256(backup_before).hexdigest()
+        with open(main.SNAPSHOT_STORE_PATH, "wb") as handle:
+            handle.write(b"corrupt-primary")
+        preview = main.snapshot_store_recovery_preview()
+        result = main.restore_snapshot_store_from_backup({
+            "recovery_token": preview["recovery_token"],
+            "confirmation": preview["required_confirmation"],
+        }, now_ts=12345)
+        self.assertTrue(result["restored"])
+        self.assertFalse(result["automatic"])
+        self.assertTrue(result["displaced_primary_quarantined"])
+        self.assertTrue(result["backup_preserved"])
+        self.assertEqual(main.snapshot_backup_path().read_bytes(), backup_before)
+        self.assertEqual(result["recovered_from_backup_sha256"], backup_hash)
+        restored = main.load_snapshot_store()
+        self.assertEqual(set(restored["fixtures"]), {"a"})
+        self.assertEqual(restored["snapshot_store_recovery_audit"][-1]["recovered_at"], 12345)
+        self.assertFalse(restored["snapshot_store_recovery_audit"][-1]["automatic"])
+        quarantined = list(main.Path(main.SNAPSHOT_STORE_PATH).parent.glob("store.json.quarantine.12345.*"))
+        self.assertEqual(len(quarantined), 1)
+        self.assertEqual(quarantined[0].read_bytes(), b"corrupt-primary")
+        self.assertTrue(main.snapshot_store_integrity()["operational"])
+
+    def test_snapshot_store_recovery_rejects_stale_preview_after_backup_change(self):
+        main.write_snapshot_store({"version": "good", "fixtures": {}})
+        with open(main.SNAPSHOT_STORE_PATH, "wb") as handle:
+            handle.write(b"corrupt-primary")
+        preview = main.snapshot_store_recovery_preview()
+        main.snapshot_backup_path().write_bytes(b'{"version":"different","fixtures":{}}')
+        with self.assertRaises(main.HTTPException) as stale:
+            main.restore_snapshot_store_from_backup({
+                "recovery_token": preview["recovery_token"],
+                "confirmation": preview["required_confirmation"],
+            }, now_ts=200)
+        self.assertEqual(stale.exception.detail, "snapshot_recovery_preview_token_mismatch")
+        self.assertEqual(main.Path(main.SNAPSHOT_STORE_PATH).read_bytes(), b"corrupt-primary")
+
+    def test_operations_status_remains_observable_when_primary_store_is_corrupt(self):
+        main.write_snapshot_store({"version": "good", "fixtures": {}})
+        with open(main.SNAPSHOT_STORE_PATH, "wb") as handle:
+            handle.write(b"corrupt-primary")
+        status = main.operations_status_report(now_ts=300)
+        self.assertEqual(status["status"], "blocked")
+        codes = {row["code"] for row in status["alerts"]}
+        self.assertIn("snapshot_store_unavailable", codes)
+        self.assertIn("snapshot_store_manual_recovery_available", codes)
+        self.assertTrue(status["store"]["manual_recovery_available"])
+        self.assertEqual(status["automatic_learning_data_health"]["status"], "critical")
 
     def test_shadow_token_supports_header_and_bearer(self):
         self.assertEqual(main.resolve_shadow_token("query", None, "header"), "header")
@@ -3001,6 +3603,2750 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         packet["schema_version"] = "unknown"
         with self.assertRaises(main.HTTPException):
             main.import_prematch_packet(packet)
+
+    def odds_collection_payload(self, **overrides):
+        payload = {
+            "fixture": "odds-incremental-1", "sport_key": "soccer_finland_veikkausliiga",
+            "league": "Finland Veikkausliiga", "home_team": "IF Gnistan",
+            "away_team": "Inter Turku", "kickoff_utc": "2026-10-07T16:00:00Z",
+            "persist": False,
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_the_odds_api_incremental_collection_noops_when_nodes_exist(self):
+        store = {
+            "fixtures": {"odds-incremental-1": [{"stage": "Opening"}, {"stage": "T-24h"}]},
+            "external_prematch": {},
+        }
+        with patch.object(main, "THE_ODDS_API_KEY", "configured"), \
+                patch.object(main, "load_snapshot_store", return_value=store), \
+                patch.object(main, "collect_historical_timeline") as collector:
+            result = main.collect_the_odds_api_timeline(self.odds_collection_payload(requested_stages=["Opening", "T-24h"]))
+        self.assertTrue(result["incremental_noop"])
+        self.assertEqual(result["request_count"], 0)
+        collector.assert_not_called()
+
+    def test_the_odds_api_incremental_collection_passes_only_missing_nodes_and_known_event(self):
+        store = {
+            "fixtures": {"odds-incremental-1": [{"stage": "Opening"}]},
+            "external_prematch": {
+                "odds-incremental-1": {"provider_fixture_ids": {"the_odds_api": "known-event-1"}}
+            },
+        }
+        provider_result = {
+            "ok": True, "request_count": 1, "packet": {"timeline": []},
+            "requested_stages": ["T-6h"], "request_audit": [],
+        }
+        with patch.object(main, "THE_ODDS_API_KEY", "configured"), \
+                patch.object(main, "load_snapshot_store", return_value=store), \
+                patch.object(main, "collect_historical_timeline", return_value=provider_result) as collector:
+            result = main.collect_the_odds_api_timeline(self.odds_collection_payload(requested_stages=["Opening", "T-6h"]))
+        self.assertEqual(result["stages_to_fetch"], ["T-6h"])
+        self.assertEqual(result["skipped_existing_stages"], ["Opening"])
+        self.assertEqual(collector.call_args.kwargs["requested_stages"], ["T-6h"])
+        self.assertEqual(collector.call_args.kwargs["known_event_id"], "known-event-1")
+
+    def test_the_odds_api_incremental_collection_requires_explicit_retry_for_recorded_missing_node(self):
+        store = {
+            "fixtures": {"odds-incremental-1": [{"stage": "T-3h", "import_status": "data_missing"}]},
+            "external_prematch": {},
+        }
+        with patch.object(main, "THE_ODDS_API_KEY", "configured"), \
+                patch.object(main, "load_snapshot_store", return_value=store), \
+                patch.object(main, "collect_historical_timeline") as collector:
+            no_retry = main.collect_the_odds_api_timeline(self.odds_collection_payload(requested_stages=["T-3h"]))
+        self.assertTrue(no_retry["incremental_noop"])
+        collector.assert_not_called()
+
+        provider_result = {"ok": True, "request_count": 2, "packet": {"timeline": []}, "request_audit": []}
+        with patch.object(main, "THE_ODDS_API_KEY", "configured"), \
+                patch.object(main, "load_snapshot_store", return_value=store), \
+                patch.object(main, "collect_historical_timeline", return_value=provider_result) as collector:
+            retry = main.collect_the_odds_api_timeline(self.odds_collection_payload(requested_stages=["T-3h"], retry_data_missing=True))
+        self.assertEqual(retry["stages_to_fetch"], ["T-3h"])
+        collector.assert_called_once()
+
+    def learning_payload(self, fixture="learn-1", captured_at=900, kickoff_at=1000, analysis=None):
+        return {
+            "fixture": fixture,
+            "captured_at": captured_at,
+            "data_cutoff_at": captured_at,
+            "kickoff_at": kickoff_at,
+            "scope": {
+                "competition_id": 39, "competition_name": "England Premier League", "country": "England",
+                "competition_type": "domestic_league",
+                "tier": 1, "gender": "men", "professional": True,
+                "team_level": "first_team", "season": "2026", "phase": "regular_season",
+            },
+            "versions": {"rules": "2026-10-08", "model": "champion-test", "league_dna": "data_missing"},
+            "analysis": analysis or {"fundamental_chain": {"status": "complete"}},
+            "decision": {"decision": "PASS", "match_rating": "B"},
+            "source_refs": ["source:test"],
+        }
+
+    def learning_payload_with_probability_replay(self, fixture, captured_at, kickoff_at):
+        source_hash = main._content_hash({"fixture": fixture, "observed_at": captured_at, "source": "test-standings"})
+        inputs = {
+            "league_home_rate": 1.5, "league_away_rate": 1.2,
+            "home_attack_rate": 1.7, "home_defense_rate": 1.0,
+            "away_attack_rate": 1.3, "away_defense_rate": 1.4,
+            "home_sample_size": 10, "away_sample_size": 10, "league_sample_size": 100,
+            "metric_type": "goals", "home_adjustment": 1.0, "away_adjustment": 1.0,
+            "lineup_confidence": .9,
+            "provenance": {
+                "source": "test_standings_venue_split", "uses_market_odds": False,
+                "observed_at": captured_at, "source_content_hash": source_hash,
+            },
+        }
+        replay = main.build_learning_probability_replay(
+            fixture,
+            {"status": "ready", "inputs": inputs, "source_content_hash": source_hash},
+            generated_at=captured_at,
+        )
+        payload = self.learning_payload(
+            fixture, captured_at, kickoff_at,
+            analysis={"fundamental_chain": {"status": "complete"}, "probability_replay": replay},
+        )
+        payload["decision"].update({
+            "model_probability": replay["model"]["probabilities"],
+            "probability_replay_hash": replay["replay_hash"],
+            "selected_expression": {"market": "1x2", "selection": "draw", "line": None, "price": 3.0},
+        })
+        return payload
+
+    def settle_learning_fixture(self, fixture, captured_at, kickoff_at):
+        frozen = main.freeze_learning_sample(self.learning_payload(fixture, captured_at, kickoff_at), now_ts=captured_at)
+        facts = self.collect_verified_learning_facts(frozen, 1, 1, kickoff_at + 7200)
+        settled = main.settle_learning_sample(
+            frozen["freeze_id"], {"status": "FT", "home_goals": 1, "away_goals": 1},
+            "PROCESS_CORRECT_RESULT_LOSS", {"status": "clean", "red_cards": 0}, kickoff_at + 7200,
+            self.learning_postmatch_review(), facts["fact_hash"],
+        )
+        return frozen, settled
+
+    def learning_ablation_plan(self, modules=("MSCB",)):
+        return {
+            "primary_module": modules[0],
+            "required_modules": list(modules),
+            "module_interventions": {
+                module: {
+                    "intervention": main.LEARNING_ABLATION_INTERVENTIONS[module],
+                    "minimum_brier_gain": 0.0,
+                }
+                for module in modules
+            },
+            "minimum_challenger_brier_gain_over_champion": 0.0,
+        }
+
+    def learning_challenger_spec(self, modules=("MSCB",)):
+        return {
+            "schema_version": "poisson_log_rate_adjustment_v1",
+            "uses_market_odds": False,
+            "module_log_rate_deltas": {
+                module: {"home": 0.02 + index * 0.005, "away": -0.01 - index * 0.005}
+                for index, module in enumerate(modules)
+            },
+        }
+
+    def learning_validation_plan(self, minimum_samples=2, modules=("MSCB",), markets=("1x2",)):
+        return {
+            "minimum_samples": minimum_samples,
+            "structured_scope": {"competition_ids": [39], "markets": list(markets)},
+            "ablation_plan": self.learning_ablation_plan(modules),
+            "challenger_spec": self.learning_challenger_spec(modules),
+        }
+
+    def save_learning_t1h_reference(self, fixture, kickoff_at, expression_source, price):
+        expression = expression_source.get("selected_expression") if isinstance(expression_source.get("selected_expression"), dict) else expression_source
+        market = expression["market"]
+        selection = expression["selection"]
+        market_snapshot = main.empty_market_snapshot()
+        market_snapshot["available"] = True
+        reference = {
+            "source": "complete_company_array",
+            "bookmaker_count": max(5, main.MIN_CONSENSUS_BOOKMAKERS),
+            selection: price,
+        }
+        if expression.get("line") is not None:
+            reference["line"] = expression["line"]
+        market_snapshot["consensus_main_line"][market] = reference
+        store = main.load_snapshot_store()
+        store.setdefault("fixtures", {}).setdefault(str(fixture), []).append({
+            "stage": "T-1h", "snapshot_at": max(1, int(kickoff_at) - 3600),
+            "market_snapshot": market_snapshot,
+            "stage_timing_audit": {"status": "valid"},
+            "sequence_timing_audit": {"status": "valid"},
+        })
+        main.write_snapshot_store(store)
+
+    def module_ablation_outputs(self, computed_at, modules=("MSCB",), probabilities=None):
+        probabilities = probabilities or {"home": 0.33, "draw": 0.34, "away": 0.33}
+        return {
+            module: {
+                "probabilities": probabilities,
+                "output_reference": f"test:ablation:{module}:{computed_at}",
+                "computed_at": computed_at,
+            }
+            for module in modules
+        }
+
+    def learning_shadow_runner(self, champion=None, challenger=None, ablation=None, market="1x2"):
+        challenger = challenger or {"home": 0.30, "draw": 0.45, "away": 0.25}
+        ablation = ablation or {"home": 0.33, "draw": 0.34, "away": 0.33}
+
+        def runner(request):
+            champion_output = champion or request["frozen_champion_probabilities"]
+            frozen_expression = request["frozen_selected_expression"]
+            frozen_forecast = request["frozen_champion_forecast"]
+            generated_at = int(request["freeze"]["captured_at"]) + 5
+            modules = request["hypothesis"]["ablation_plan"]["required_modules"]
+            content = {
+                "schema": "learning_shadow_model_run_v1",
+                "runner_id": "builtin_preregistered_poisson_challenger", "runner_version": "1",
+                "challenger_spec_hash": request["hypothesis"]["challenger_spec"]["spec_hash"],
+                "generated_at": generated_at, "input_hash": request["input_hash"],
+                "freeze_hash": request["freeze"]["content_hash"],
+                "hypothesis_hash": request["hypothesis"]["hypothesis_hash"],
+                "champion_probabilities": champion_output,
+                "challenger_probabilities": challenger,
+                "champion_forecast": frozen_forecast,
+                "challenger_forecast": frozen_forecast,
+                "module_ablations": {
+                    module: {"probabilities": ablation, "forecast": frozen_forecast}
+                    for module in modules
+                },
+                "selected_expression": {
+                    "market": frozen_expression["market"], "selection": frozen_expression["selection"],
+                    "line": frozen_expression.get("line"),
+                    "entry_decimal_price": frozen_expression.get("price") or (3.0 if frozen_expression["market"] == "1x2" else 1.91),
+                    "entry_price_evidence_ref": f"test:internal-runner:{frozen_expression['market']}",
+                },
+                "risk": {"champion_tail_risk": 0.10, "challenger_tail_risk": 0.10},
+            }
+            return {**content, "run_hash": main._content_hash(content)}
+
+        return runner
+
+    def settle_hypothesis_validation_fixture(self, hypothesis_id, fixture, captured_at, kickoff_at, modules=("MSCB",)):
+        frozen = main.freeze_learning_sample(self.learning_payload_with_probability_replay(fixture, captured_at, kickoff_at), now_ts=captured_at)
+        shadow_lock = main.generate_internal_shadow_lock(
+            hypothesis_id, frozen["freeze_id"], model_runner=self.learning_shadow_runner(), now_ts=captured_at + 10,
+        )
+        self.save_learning_t1h_reference(fixture, kickoff_at, shadow_lock, 2.8)
+        facts = self.collect_verified_learning_facts(frozen, 1, 1, kickoff_at + 7200)
+        main.settle_learning_sample(
+            frozen["freeze_id"], {"status": "FT", "home_goals": 1, "away_goals": 1},
+            "PROCESS_CORRECT_RESULT_LOSS", {"status": "clean"}, kickoff_at + 7200,
+            self.learning_postmatch_review(), facts["fact_hash"],
+        )
+        evidence = main.record_hypothesis_validation(hypothesis_id, {
+            "freeze_id": frozen["freeze_id"], "outcome": "support",
+            "evidence_summary": f"Independent locked validation for {fixture}",
+            "pit_audit": {"status": "passed"}, "event_pollution_audit": {"status": "passed"},
+            "shadow_lock_hash": shadow_lock["lock_hash"],
+        })
+        return frozen, evidence
+
+    def learning_postmatch_review(self, **disposition_overrides):
+        disposition = {
+            "result_backfit_used": False, "champion_change_requested": False,
+            "new_theory_status": "none", "existing_rule_implementation_gap": False,
+        }
+        disposition.update(disposition_overrides)
+        return {
+            "match_selection_quality": {"status": "inconclusive"},
+            "fundamental_chain_audit": {"status": "passed"},
+            "state_tree_coverage": {"status": "inconclusive"},
+            "market_language_audit": {"status": "passed"},
+            "expression_audit": {"status": "inconclusive"},
+            "price_execution_audit": {"status": "inconclusive"},
+            "process_reasoning": "Review compares the frozen prematch process with verified events, independent of the final score.",
+            "review_mode": "manual",
+            "outcome_not_used_for_process_grade": True,
+            "learning_disposition": disposition,
+        }
+
+    def test_learning_freeze_requires_verified_top_flight_scope_and_prematch_time(self):
+        payload = self.learning_payload()
+        payload["scope"]["tier"] = 2
+        with self.assertRaises(main.HTTPException) as wrong_tier:
+            main.freeze_learning_sample(payload, now_ts=900)
+        self.assertEqual(wrong_tier.exception.status_code, 422)
+        self.assertIn("tier_one_required", wrong_tier.exception.detail["reasons"])
+
+        late = self.learning_payload(captured_at=1000, kickoff_at=1000)
+        with self.assertRaises(main.HTTPException) as after_kickoff:
+            main.freeze_learning_sample(late, now_ts=1000)
+        self.assertEqual(after_kickoff.exception.status_code, 409)
+
+    def test_learning_scope_requires_explicit_major_league_registry_membership(self):
+        unverified = self.learning_payload()["scope"]
+        unverified["competition_id"] = 999999
+        unverified["competition_name"] = "Unregistered Premier"
+        audit = main.audit_learning_scope(unverified)
+        self.assertFalse(audit["eligible"])
+        self.assertIn("competition_not_in_major_learning_registry", audit["reasons"])
+        self.assertEqual(audit["learning_eligibility"], "MODEL_LEARNING_EXCLUDED")
+        self.assertEqual(audit["allowed_modes"], ["MARKET_LANGUAGE_ONLY", "SETTLEMENT_ONLY"])
+
+        unverified["verification_status"] = "verified"
+        unverified["verification_refs"] = [{"source": "league_organizer", "url": "https://example.test/competition"}]
+        evidenced = main.audit_learning_scope(unverified)
+        self.assertFalse(evidenced["eligible"])
+        self.assertIn("competition_not_in_major_learning_registry", evidenced["reasons"])
+        self.assertEqual(evidenced["normalized"]["verification_method"], "not_in_major_learning_registry")
+
+        finland = self.learning_payload()["scope"]
+        finland.update({"competition_id": 244, "competition_name": "Finland Veikkausliiga", "country": "Finland"})
+        finland_audit = main.audit_learning_scope(finland)
+        self.assertFalse(finland_audit["eligible"])
+        self.assertEqual(finland_audit["allowed_modes"], ["MARKET_LANGUAGE_ONLY", "SETTLEMENT_ONLY"])
+
+        mismatch = self.learning_payload()["scope"]
+        mismatch["competition_name"] = "UEFA Champions League"
+        registry_audit = main.audit_learning_scope(mismatch)
+        self.assertFalse(registry_audit["eligible"])
+        self.assertIn("competition_name_registry_mismatch", registry_audit["reasons"])
+
+        manifest = main.learning_major_league_registry_manifest()
+        self.assertEqual(manifest["version"], main.LEARNING_MAJOR_LEAGUES_VERSION)
+        self.assertEqual(manifest["league_count"], len(main.LEARNING_MAJOR_LEAGUES))
+        self.assertEqual(len(manifest["registry_hash"]), 64)
+        self.assertTrue(manifest["requires_explicit_user_confirmation_for_changes"])
+        self.assertEqual(audit["normalized"]["major_league_registry_hash"], manifest["registry_hash"])
+
+    def learning_fixture_row(self, fixture_id, league_id, kickoff_at, status="NS"):
+        return {
+            "fixture": {"id": fixture_id, "timestamp": kickoff_at, "date": main.datetime.fromtimestamp(kickoff_at, tz=main.timezone.utc).isoformat(), "status": {"short": status}},
+            "league": {"id": league_id, "name": "League", "country": "Country", "season": 2026, "round": "Regular Season - 1"},
+            "teams": {"home": {"id": fixture_id * 10, "name": "Home"}, "away": {"id": fixture_id * 10 + 1, "name": "Away"}},
+            "goals": {"home": None, "away": None},
+        }
+
+    def test_learning_discovery_excludes_continental_live_and_outside_horizon(self):
+        now_ts = 100000
+        rows = [
+            self.learning_fixture_row(1, 39, now_ts + 3600),
+            self.learning_fixture_row(2, 2, now_ts + 3600),
+            self.learning_fixture_row(3, 39, now_ts + 3600, status="1H"),
+            self.learning_fixture_row(4, 39, now_ts + 25 * 3600),
+        ]
+        discovery = main.discover_learning_fixtures(now_ts=now_ts, fixture_rows=rows)
+        self.assertEqual(discovery["candidate_count"], 1)
+        self.assertEqual(discovery["candidates"][0]["fixture_id"], 1)
+        self.assertTrue(discovery["candidates"][0]["learning_scope_verified"])
+        self.assertEqual(discovery["candidates"][0]["scope"]["competition_type"], "domestic_league")
+        self.assertEqual(discovery["excluded_counts"]["competition_not_in_major_learning_registry"], 1)
+        self.assertEqual(discovery["excluded_counts"]["fixture_not_not_started"], 1)
+        self.assertEqual(discovery["excluded_counts"]["outside_learning_discovery_horizon"], 1)
+
+    def test_learning_discovery_excludes_non_major_top_flight_for_market_language_only(self):
+        now_ts = 100000
+        rows = [self.learning_fixture_row(2441, 244, now_ts + 3600)]
+        discovery = main.discover_learning_fixtures(now_ts=now_ts, fixture_rows=rows)
+        self.assertEqual(discovery["candidate_count"], 0)
+        self.assertEqual(discovery["excluded_count"], 1)
+        excluded = discovery["excluded_sample"][0]
+        self.assertEqual(excluded["learning_eligibility"], "MODEL_LEARNING_EXCLUDED")
+        self.assertEqual(excluded["allowed_modes"], ["MARKET_LANGUAGE_ONLY", "SETTLEMENT_ONLY"])
+        self.assertEqual(discovery["observation_candidate_count"], 1)
+        observation = discovery["observation_candidates"][0]
+        self.assertEqual(observation["fixture_id"], 2441)
+        self.assertEqual(observation["routing_reason"], "competition_not_in_major_learning_registry")
+
+    def test_non_major_observation_is_separate_from_learning_and_settles_without_model_effect(self):
+        paths = {route.path for route in main.app.routes}
+        self.assertIn("/shadow/market-language/freeze", paths)
+        self.assertIn("/shadow/market-language/settle", paths)
+        payload = self.learning_payload("finland-observe", captured_at=900, kickoff_at=1000)
+        payload["scope"].update({
+            "competition_id": 244, "competition_name": "Finland Veikkausliiga", "country": "Finland",
+        })
+        frozen = main.freeze_market_language_observation(payload, now_ts=900)
+        self.assertEqual(frozen["observation_id"], "market:finland-observe:v1")
+        self.assertEqual(frozen["learning_eligibility"], "MODEL_LEARNING_EXCLUDED")
+        self.assertFalse(frozen["model_learning_effect"])
+        store = main.load_snapshot_store()
+        self.assertNotIn("learning_frozen", store)
+        self.assertIn("finland-observe", store["market_language_frozen"])
+
+        settled = main.settle_market_language_observation(frozen["observation_id"], {
+            "result": {"status": "FT", "home_goals": 1, "away_goals": 2},
+            "verification_refs": [
+                {"source": "official_league", "id": "result-1"},
+                {"source": "independent_stats", "url": "https://example.test/result-1"},
+            ],
+            "market_read_evaluation": "PARTIAL",
+            "settlement": {"payout_outcome": "LOSS", "unit_return": -1.0},
+            "event_audit": {"status": "clean"},
+            "settled_at": 1100,
+        }, now_ts=1100)
+        self.assertEqual(settled["action"], "settled")
+        self.assertFalse(settled["hypothesis_effect"])
+        self.assertFalse(settled["league_dna_effect"])
+        final_store = main.load_snapshot_store()
+        self.assertNotIn("learning_postmatch", final_store)
+        self.assertIn(frozen["observation_id"], final_store["market_language_settlements"])
+
+    def test_major_league_cannot_use_market_language_only_freeze(self):
+        with self.assertRaises(main.HTTPException) as blocked:
+            main.freeze_market_language_observation(self.learning_payload(), now_ts=900)
+        self.assertEqual(blocked.exception.status_code, 409)
+        self.assertEqual(blocked.exception.detail, "major_league_sample_requires_learning_pipeline")
+
+    def test_market_language_settlement_rejects_two_labels_from_same_authority(self):
+        payload = self.learning_payload("cup-observe", captured_at=900, kickoff_at=1000)
+        payload["scope"].update({"competition_id": 2, "competition_name": "Continental Cup", "competition_type": "continental_cup"})
+        frozen = main.freeze_market_language_observation(payload, now_ts=900)
+        with self.assertRaises(main.HTTPException) as blocked:
+            main.settle_market_language_observation(frozen["observation_id"], {
+                "result": {"status": "FT", "home_goals": 1, "away_goals": 0},
+                "verification_refs": [
+                    {"source": "label_a", "url": "https://same.test/a"},
+                    {"source": "label_b", "url": "https://same.test/b"},
+                ],
+                "market_read_evaluation": "CONFIRMED",
+                "settlement": {"payout_outcome": "WIN"},
+                "settled_at": 1100,
+            }, now_ts=1100)
+        self.assertEqual(blocked.exception.status_code, 409)
+        self.assertEqual(blocked.exception.detail, "two_independent_result_sources_required")
+
+    def test_market_language_status_separates_prematch_due_and_settled(self):
+        future = self.learning_payload("observe-future", captured_at=900, kickoff_at=20000)
+        future["scope"].update({"competition_id": 244, "competition_name": "Finland Veikkausliiga", "country": "Finland"})
+        main.freeze_market_language_observation(future, now_ts=900)
+        due = self.learning_payload("observe-due", captured_at=900, kickoff_at=1000)
+        due["scope"].update({"competition_id": 244, "competition_name": "Finland Veikkausliiga", "country": "Finland"})
+        main.freeze_market_language_observation(due, now_ts=900)
+        report = main.market_language_observation_status_report(now_ts=8300)
+        self.assertEqual(report["fixture_count"], 2)
+        self.assertEqual(report["state_counts"]["prematch_frozen"], 1)
+        self.assertEqual(report["state_counts"]["fact_collection_due"], 1)
+        self.assertFalse(report["model_learning_effect"])
+        self.assertEqual(report["fact_collection_due"][0]["fixture"], "observe-due")
+
+    def test_market_language_facts_are_isolated_and_settlement_binds_latest_fact_hash(self):
+        payload = self.learning_payload("observe-facts", captured_at=900, kickoff_at=1000)
+        payload["scope"].update({"competition_id": 244, "competition_name": "Finland Veikkausliiga", "country": "Finland"})
+        frozen = main.freeze_market_language_observation(payload, now_ts=900)
+        facts = main.collect_market_language_postmatch_facts(
+            frozen["observation_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(
+                sources=("api_football", "the_odds_api"), home_goals=2, away_goals=1,
+            ),
+        )
+        self.assertEqual(facts["verification"]["status"], "verified")
+        self.assertTrue(facts["verification"]["settlement_eligible"])
+        store = main.load_snapshot_store()
+        self.assertIn(frozen["observation_id"], store["market_language_postmatch_facts"])
+        self.assertNotIn("learning_postmatch_facts", store)
+
+        settlement_payload = {
+            "fact_hash": "wrong",
+            "result": {"status": "FT", "home_goals": 2, "away_goals": 1},
+            "market_read_evaluation": "INCONCLUSIVE",
+            "settlement": {"payout_outcome": "PASS"},
+            "settled_at": 9001,
+        }
+        with self.assertRaises(main.HTTPException) as wrong_hash:
+            main.settle_market_language_observation(frozen["observation_id"], settlement_payload, now_ts=9001)
+        self.assertEqual(wrong_hash.exception.detail, "latest_market_language_fact_hash_required")
+
+        settlement_payload["fact_hash"] = facts["fact_hash"]
+        settled = main.settle_market_language_observation(
+            frozen["observation_id"], settlement_payload, now_ts=9001,
+        )
+        self.assertEqual(settled["fact_hash"], facts["fact_hash"])
+        self.assertFalse(settled["model_learning_effect"])
+        status = main.market_language_observation_status_report(now_ts=9002)
+        self.assertEqual(status["state_counts"]["settled"], 1)
+
+    def test_daily_cycle_collects_observation_facts_without_grading_market_read(self):
+        payload = self.learning_payload("observe-auto-facts", captured_at=900, kickoff_at=1000)
+        payload["scope"].update({"competition_id": 244, "competition_name": "Finland Veikkausliiga", "country": "Finland"})
+        frozen = main.freeze_market_language_observation(payload, now_ts=900)
+        result = main.run_learning_cycle(
+            {"apply": True, "run_id": "observation-fact-cycle"},
+            now_ts=9000, fixture_rows=[],
+            market_language_fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(
+                sources=("api_football", "the_odds_api"), home_goals=1, away_goals=1,
+            ),
+        )
+        self.assertEqual(result["market_language_postmatch_fact_collected_count"], 1)
+        fact_result = result["market_language_postmatch_fact_results"][0]
+        self.assertEqual(fact_result["action"], "facts_collected")
+        self.assertTrue(fact_result["verification"]["settlement_eligible"])
+        store = main.load_snapshot_store()
+        facts = store["market_language_postmatch_facts"][frozen["observation_id"]][-1]
+        self.assertIsNone(facts["market_read_evaluation"])
+        self.assertFalse(facts["model_learning_effect"])
+        self.assertNotIn("learning_postmatch_facts", store)
+        self.assertNotIn("learning_postmatch", store)
+
+    def test_learning_discovery_accepts_canonical_fixture_summaries_from_snapshot_worker(self):
+        now_ts = 100000
+        raw = self.learning_fixture_row(6, 39, now_ts + 3600)
+        summary = main.fixture_summary(raw)
+        discovery = main.discover_learning_fixtures(now_ts=now_ts, fixture_rows=[summary])
+        self.assertEqual(discovery["candidate_count"], 1)
+        self.assertEqual(discovery["candidates"][0]["fixture_id"], 6)
+        self.assertEqual(discovery["candidates"][0]["scope"]["tier"], 1)
+
+    def test_learning_cycle_plan_prioritizes_latest_unsettled_freeze_without_mutating(self):
+        main.freeze_learning_sample(self.learning_payload("due", captured_at=900, kickoff_at=1000), now_ts=900)
+        main.freeze_learning_sample(self.learning_payload("due", captured_at=950, kickoff_at=1000, analysis={"node": "T-30m"}), now_ts=950)
+        rows = [self.learning_fixture_row(5, 39, 11800 + 3600)]
+        before = main.load_snapshot_store()
+        plan = main.learning_cycle_plan(now_ts=11800, fixture_rows=rows)
+        after = main.load_snapshot_store()
+        self.assertEqual(plan["settlement_due_count"], 1)
+        self.assertEqual(plan["settlement_due"][0]["freeze_id"], "due:v2")
+        self.assertIsNone(plan["remaining_freeze_capacity"])
+        self.assertIsNone(plan["match_limit"])
+        self.assertIsNone(plan["full_historical_odds_sample_limit"])
+        self.assertEqual(plan["learning_prematch_stages"], ["Opening", "T-12h", "T-6h", "T-1h"])
+        self.assertEqual(plan["reanalysis_today_count"], 1)
+        self.assertEqual(plan["discovery"]["candidate_count"], 1)
+        self.assertEqual(before, after)
+        self.assertFalse(plan["automatic_champion_promotion"])
+
+    def test_learning_freeze_is_immutable_and_changed_updates_create_new_version(self):
+        payload = self.learning_payload()
+        first = main.freeze_learning_sample(payload, now_ts=900)
+        self.assertEqual(first["freeze_id"], "learn-1:v1")
+        self.assertTrue(first["immutable"])
+        duplicate = main.freeze_learning_sample(payload, now_ts=900)
+        self.assertEqual(duplicate["action"], "unchanged")
+
+        updated = self.learning_payload(captured_at=950, analysis={"fundamental_chain": {"status": "complete"}, "new_stage": "T-1h"})
+        second = main.freeze_learning_sample(updated, now_ts=950)
+        self.assertEqual(second["freeze_id"], "learn-1:v2")
+        rows = main.load_snapshot_store()["learning_frozen"]["learn-1"]
+        self.assertEqual(len(rows), 2)
+        self.assertNotEqual(rows[0]["content_hash"], rows[1]["content_hash"])
+
+        stale_update = self.learning_payload(captured_at=925, analysis={"changed": True})
+        with self.assertRaises(main.HTTPException) as non_monotonic:
+            main.freeze_learning_sample(stale_update, now_ts=925)
+        self.assertEqual(non_monotonic.exception.status_code, 409)
+
+    def test_learning_postmatch_requires_and_immutably_binds_frozen_version(self):
+        with self.assertRaises(main.HTTPException) as missing:
+            main.settle_learning_sample("missing:v1", {"status": "FT", "home_goals": 0, "away_goals": 0}, "PROCESS_CORRECT_RESULT_WIN", settled_at=2000)
+        self.assertEqual(missing.exception.status_code, 404)
+
+        frozen, settled = self.settle_learning_fixture("settled-1", 900, 1000)
+        self.assertEqual(settled["freeze_hash"], frozen["content_hash"])
+        self.assertFalse(settled["champion_effect"])
+        unchanged = main.settle_learning_sample(
+            frozen["freeze_id"], {"status": "FT", "home_goals": 1, "away_goals": 1},
+            "PROCESS_CORRECT_RESULT_LOSS", {"status": "clean", "red_cards": 0}, 8200,
+            self.learning_postmatch_review(), settled["fact_hash"],
+        )
+        self.assertEqual(unchanged["action"], "unchanged")
+        with self.assertRaises(main.HTTPException) as changed:
+            main.settle_learning_sample(frozen["freeze_id"], {"status": "FT", "home_goals": 2, "away_goals": 1}, "PROCESS_ERROR_RESULT_WIN", settled_at=8300, review=self.learning_postmatch_review(), fact_hash=settled["fact_hash"])
+        self.assertEqual(changed.exception.status_code, 409)
+
+    def test_learning_postmatch_review_rejects_backfit_and_single_match_champion_change(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("review-gate", 900, 1000), now_ts=900)
+        with self.assertRaises(main.HTTPException) as missing:
+            main.settle_learning_sample(
+                frozen["freeze_id"], {"status": "FT", "home_goals": 1, "away_goals": 0},
+                "PROCESS_CORRECT_RESULT_WIN", settled_at=8200,
+            )
+        self.assertEqual(missing.exception.status_code, 422)
+        self.assertIn("result_backfit_must_be_explicitly_false", missing.exception.detail["reasons"])
+
+        forbidden = self.learning_postmatch_review(result_backfit_used=True, champion_change_requested=True, new_theory_status="LEAGUE_TAG_CANDIDATE")
+        with self.assertRaises(main.HTTPException) as rejected:
+            main.settle_learning_sample(
+                frozen["freeze_id"], {"status": "FT", "home_goals": 1, "away_goals": 0},
+                "PROCESS_CORRECT_RESULT_WIN", settled_at=8200, review=forbidden,
+            )
+        self.assertIn("result_backfit_must_be_explicitly_false", rejected.exception.detail["reasons"])
+        self.assertIn("single_match_champion_change_forbidden", rejected.exception.detail["reasons"])
+
+    def test_learning_implementation_gap_requires_rule_reference_and_regression_test(self):
+        invalid = self.learning_postmatch_review(existing_rule_implementation_gap=True)
+        audit = main.audit_learning_postmatch_review(invalid)
+        self.assertFalse(audit["eligible"])
+        self.assertIn("implementation_gap_requires_existing_rule_reference", audit["reasons"])
+        self.assertIn("implementation_gap_requires_regression_test", audit["reasons"])
+        valid = self.learning_postmatch_review(
+            existing_rule_implementation_gap=True, existing_rule_ref="MODEL_RULES.md#market-resistance",
+            regression_test_required=True,
+        )
+        self.assertTrue(main.audit_learning_postmatch_review(valid)["eligible"])
+
+    def test_single_match_hypothesis_cannot_promote_and_discovery_sample_cannot_validate(self):
+        discovery, _ = self.settle_learning_fixture("discovery", 900, 1000)
+        with patch.object(main.time, "time", return_value=8300):
+            hypothesis = main.register_learning_hypothesis({
+                "hypothesis_id": "hyp-one", "type": "HYPOTHESIS_ONLY", "title": "Candidate only",
+                "definition": "A candidate relationship", "applicable_scope": "men tier-one leagues",
+                "expected_direction": "positive", "failure_conditions": "effect disappears",
+                "falsification_criteria": "independent counterexample", "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": self.learning_validation_plan(minimum_samples=30),
+            })
+        self.assertFalse(hypothesis["champion_effect"])
+        with self.assertRaises(main.HTTPException) as reuse:
+            main.record_hypothesis_validation("hyp-one", {"freeze_id": discovery["freeze_id"], "outcome": "support", "evidence_summary": "same sample"})
+        self.assertEqual(reuse.exception.status_code, 409)
+        with self.assertRaises(main.HTTPException) as premature:
+            main.create_promotion_candidate("hyp-one", {})
+        self.assertEqual(premature.exception.status_code, 409)
+        self.assertIn("independent_support_sample_minimum_not_reached", premature.exception.detail["blockers"])
+        fake_gates = {gate: {"status": "passed", "evidence_refs": ["caller:self-attestation"]} for gate in main.LEARNING_PROMOTION_REQUIRED_GATES}
+        with self.assertRaises(main.HTTPException) as forged:
+            main.create_promotion_candidate("hyp-one", fake_gates)
+        self.assertEqual(forged.exception.status_code, 400)
+        self.assertEqual(forged.exception.detail, "caller_supplied_promotion_gate_audit_forbidden")
+
+    def test_validated_hypothesis_only_creates_candidate_waiting_for_user(self):
+        discovery, _ = self.settle_learning_fixture("discovery-ready", 900, 1000)
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "hyp-ready", "type": "LEAGUE_TAG_CANDIDATE", "title": "League candidate",
+                "definition": "A registered league prior", "applicable_scope": "one league-season-phase",
+                "expected_direction": "positive", "failure_conditions": "unstable out of sample",
+                "falsification_criteria": "any unresolved counterexample", "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": self.learning_validation_plan(),
+            })
+        for index in range(2):
+            self.settle_hypothesis_validation_fixture("hyp-ready", f"validation-{index}", 8400 + index, 9000 + index)
+        with patch.object(main, "LEARNING_MIN_VALIDATION_SAMPLES", 2):
+            evidence_report = main.promotion_evidence_report("hyp-ready")
+            refreshed = main.refresh_learning_promotion_candidates(now_ts=10000)
+        self.assertEqual(refreshed["candidate_created_count"], 1)
+        candidate = main.load_snapshot_store()["learning_promotions"]["hyp-ready"]
+        self.assertTrue(evidence_report["promotion_ready"])
+        self.assertTrue(all(row["status"] == "passed" for row in evidence_report["gates"].values()))
+        self.assertFalse(evidence_report["caller_supplied_gate_status_used"])
+        self.assertFalse(evidence_report["result_outcome_used_as_optimization_target"])
+        self.assertEqual(candidate["promotion_evidence_report_hash"], evidence_report["report_hash"])
+        self.assertEqual(candidate["status"], "AWAITING_EXPLICIT_USER_CONFIRMATION")
+        self.assertFalse(candidate["champion_effect"])
+        self.assertFalse(candidate["automatic_promotion"])
+        status = main.learning_status_report()
+        self.assertEqual(status["promotion_candidate_count"], 1)
+        self.assertFalse(status["automatic_champion_promotion"])
+
+    def test_forward_validation_evidence_is_automatically_derived_from_t1h_snapshot(self):
+        discovery, _ = self.settle_learning_fixture("auto-evidence-discovery", 900, 1000)
+        main.register_learning_hypothesis({
+            "hypothesis_id": "auto-evidence-hyp", "type": "HYPOTHESIS_ONLY",
+            "title": "Automatic evidence hypothesis",
+            "definition": "Score only immutable forward locks against verified facts and T-1h evidence.",
+            "applicable_scope": "England Premier League 1x2",
+            "expected_direction": "lower forward Brier",
+            "failure_conditions": "no gain or missing evidence",
+            "falsification_criteria": "any unresolved counterexample",
+            "discovery_freeze_ids": [discovery["freeze_id"]],
+            "validation_plan": self.learning_validation_plan(),
+        }, now_ts=8300)
+        frozen = main.freeze_learning_sample(
+            self.learning_payload_with_probability_replay("auto-evidence-validation", 8400, 9000), now_ts=8400,
+        )
+        main.generate_internal_shadow_lock(
+            "auto-evidence-hyp", frozen["freeze_id"],
+            model_runner=self.learning_shadow_runner(), now_ts=8410,
+        )
+        facts = self.collect_verified_learning_facts(frozen, 1, 1, 16200)
+        main.settle_learning_sample(
+            frozen["freeze_id"], {"status": "FT", "home_goals": 1, "away_goals": 1},
+            "PROCESS_CORRECT_RESULT_LOSS", {"status": "clean"}, 16200,
+            self.learning_postmatch_review(), facts["fact_hash"],
+        )
+        without_t1h = main.refresh_learning_forward_validation_evidence(now_ts=16200)
+        self.assertEqual(without_t1h["recorded_count"], 0)
+        self.assertEqual(without_t1h["results"][0]["reason"], "verified_learning_t1h_snapshot_required")
+        store = main.load_snapshot_store()
+        market = main.empty_market_snapshot()
+        market["available"] = True
+        market["consensus_main_line"]["1x2"] = {
+            "source": "complete_company_array", "bookmaker_count": max(5, main.MIN_CONSENSUS_BOOKMAKERS),
+            "home": 2.5, "draw": 2.8, "away": 3.1,
+        }
+        store.setdefault("fixtures", {})["auto-evidence-validation"] = [{
+            "stage": "Closing", "snapshot_at": 8940, "market_snapshot": market,
+            "stage_timing_audit": {"status": "valid"}, "sequence_timing_audit": {"status": "valid"},
+        }]
+        main.write_snapshot_store(store)
+
+        closing_cannot_substitute = main.refresh_learning_forward_validation_evidence(now_ts=16200)
+        self.assertEqual(closing_cannot_substitute["recorded_count"], 0)
+        self.assertEqual(closing_cannot_substitute["results"][0]["reason"], "verified_learning_t1h_snapshot_required")
+        store = main.load_snapshot_store()
+        store["fixtures"]["auto-evidence-validation"].append({
+            "stage": "T-1h", "snapshot_at": 5400, "market_snapshot": market,
+            "stage_timing_audit": {"status": "valid"}, "sequence_timing_audit": {"status": "valid"},
+        })
+        main.write_snapshot_store(store)
+
+        refreshed = main.refresh_learning_forward_validation_evidence(now_ts=16201)
+        self.assertEqual(refreshed["recorded_count"], 1)
+        evidence = main.load_snapshot_store()["learning_hypotheses"]["auto-evidence-hyp"]["validation_evidence"][0]
+        self.assertEqual(evidence["freeze_id"], frozen["freeze_id"])
+        self.assertEqual(evidence["price_reference"]["stage"], "T-1h")
+        self.assertTrue(evidence["price_reference"]["evidence_ref"].startswith("snapshot:"))
+        self.assertIn("t1h_price_probability_delta", evidence["derived_metrics"])
+        self.assertFalse(evidence["outcome_derivation"]["caller_supplied_outcome_used"])
+        self.assertFalse(evidence["derived_metrics"]["result_outcome_used_as_rule_label"])
+        self.assertEqual(main.refresh_learning_forward_validation_evidence(now_ts=16202)["recorded_count"], 0)
+        self.assertNotIn("learning_promotions", main.load_snapshot_store())
+
+    def test_shadow_validation_requires_forward_locked_sample_and_is_immutable(self):
+        discovery, _ = self.settle_learning_fixture("shadow-discovery", 900, 1000)
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "shadow-lock-hyp", "type": "HYPOTHESIS_ONLY", "title": "Locked challenger",
+                "definition": "Forward locked challenger output", "applicable_scope": "men top flights",
+                "expected_direction": "lower brier", "failure_conditions": "no OOS improvement",
+                "falsification_criteria": "challenger underperforms", "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": self.learning_validation_plan(),
+            })
+        frozen = main.freeze_learning_sample(self.learning_payload("shadow-validation", 8400, 9000), now_ts=8400)
+        lock_payload = {
+            "freeze_id": frozen["freeze_id"],
+            "champion_probabilities": {"home": 0.45, "draw": 0.25, "away": 0.30},
+            "challenger_probabilities": {"home": 0.30, "draw": 0.45, "away": 0.25},
+            "module_ablation_outputs": self.module_ablation_outputs(8405),
+            "selected_expression": {"market": "1x2", "selection": "draw", "entry_decimal_price": 3.0, "entry_price_evidence_ref": "test:entry:shadow-validation"},
+            "risk": {"champion_tail_risk": 0.10, "challenger_tail_risk": 0.10},
+        }
+        with self.assertRaises(main.HTTPException) as late:
+            main.lock_hypothesis_shadow_prediction("shadow-lock-hyp", lock_payload, now_ts=9000)
+        self.assertEqual(late.exception.detail, "shadow_prediction_must_be_locked_before_kickoff")
+        locked = main.lock_hypothesis_shadow_prediction("shadow-lock-hyp", lock_payload, now_ts=8410)
+        changed = {**lock_payload, "challenger_probabilities": {"home": 0.20, "draw": 0.55, "away": 0.25}}
+        with self.assertRaises(main.HTTPException) as overwrite:
+            main.lock_hypothesis_shadow_prediction("shadow-lock-hyp", changed, now_ts=8420)
+        self.assertEqual(overwrite.exception.detail, "shadow_prediction_already_locked")
+        self.assertTrue(locked["immutable"])
+        self.assertFalse(locked["champion_effect"])
+
+    def test_validation_evidence_cannot_be_added_without_pre_kickoff_lock(self):
+        discovery, _ = self.settle_learning_fixture("no-lock-discovery", 900, 1000)
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "no-lock-hyp", "type": "HYPOTHESIS_ONLY", "title": "No lock rejection",
+                "definition": "Must lock before validation", "applicable_scope": "men top flights",
+                "expected_direction": "positive", "failure_conditions": "not locked",
+                "falsification_criteria": "missing lock", "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": self.learning_validation_plan(),
+            })
+        frozen, _ = self.settle_learning_fixture("no-lock-validation", 8400, 9000)
+        with self.assertRaises(main.HTTPException) as rejected:
+            main.record_hypothesis_validation("no-lock-hyp", {
+                "freeze_id": frozen["freeze_id"], "outcome": "support", "evidence_summary": "Retrospective claim",
+            })
+        self.assertEqual(rejected.exception.detail, "pre_kickoff_shadow_lock_required")
+
+    def test_hypothesis_requires_exact_preregistered_module_ablation_plan(self):
+        discovery, _ = self.settle_learning_fixture("ablation-plan-discovery", 900, 1000)
+        base = {
+            "hypothesis_id": "ablation-plan-hyp", "type": "HYPOTHESIS_ONLY",
+            "title": "Module ablation required", "definition": "Test one isolated module change.",
+            "applicable_scope": "men top flights", "expected_direction": "lower forward Brier",
+            "failure_conditions": "no isolated gain", "falsification_criteria": "module removal does not degrade output",
+            "discovery_freeze_ids": [discovery["freeze_id"]],
+        }
+        with self.assertRaises(main.HTTPException) as missing:
+            main.register_learning_hypothesis({
+                **base,
+                "validation_plan": {
+                    "minimum_samples": 2,
+                    "structured_scope": {"competition_ids": [39], "markets": ["1x2"]},
+                },
+            })
+        self.assertEqual(missing.exception.detail, "ablation_plan_required_modules_required")
+
+        invalid_plan = self.learning_ablation_plan()
+        invalid_plan["required_modules"] = ["UNKNOWN"]
+        invalid_plan["primary_module"] = "UNKNOWN"
+        with self.assertRaises(main.HTTPException) as unsupported:
+            main.register_learning_hypothesis({
+                **base,
+                "validation_plan": {
+                    "minimum_samples": 2,
+                    "structured_scope": {"competition_ids": [39], "markets": ["1x2"]},
+                    "ablation_plan": invalid_plan,
+                },
+            })
+        self.assertEqual(unsupported.exception.detail["error"], "unsupported_ablation_module")
+
+        with self.assertRaises(main.HTTPException) as missing_challenger:
+            main.register_learning_hypothesis({
+                **base,
+                "validation_plan": {
+                    "minimum_samples": 2,
+                    "structured_scope": {"competition_ids": [39], "markets": ["1x2"]},
+                    "ablation_plan": self.learning_ablation_plan(),
+                },
+            })
+        self.assertEqual(missing_challenger.exception.detail, "executable_challenger_spec_required")
+
+        invalid_challenger = self.learning_validation_plan()
+        invalid_challenger["challenger_spec"]["module_log_rate_deltas"]["MSCB"] = {"home": 0.26, "away": 0.0}
+        with self.assertRaises(main.HTTPException) as unbounded_challenger:
+            main.register_learning_hypothesis({**base, "validation_plan": invalid_challenger})
+        self.assertEqual(unbounded_challenger.exception.detail["error"], "challenger_module_log_rate_delta_out_of_range")
+
+        zero_challenger = self.learning_validation_plan()
+        zero_challenger["challenger_spec"]["module_log_rate_deltas"]["MSCB"] = {"home": 0.0, "away": 0.0}
+        with self.assertRaises(main.HTTPException) as zero_intervention:
+            main.register_learning_hypothesis({**base, "validation_plan": zero_challenger})
+        self.assertEqual(zero_intervention.exception.detail["error"], "challenger_module_intervention_cannot_be_zero")
+
+        invalid_scope = self.learning_validation_plan()
+        invalid_scope["structured_scope"]["markets"] = ["invented_market"]
+        with self.assertRaises(main.HTTPException) as unsupported_market:
+            main.register_learning_hypothesis({**base, "validation_plan": invalid_scope})
+        self.assertEqual(unsupported_market.exception.detail["error"], "unsupported_structured_scope_market")
+
+    def test_shadow_lock_requires_exact_modules_and_pit_ablation_timestamp(self):
+        discovery, _ = self.settle_learning_fixture("exact-ablation-discovery", 900, 1000)
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "exact-ablation-hyp", "type": "HYPOTHESIS_ONLY",
+                "title": "Exact module lock", "definition": "Lock MSCB and State Tree removals.",
+                "applicable_scope": "men top flights", "expected_direction": "lower forward Brier",
+                "failure_conditions": "either module has no gain", "falsification_criteria": "any module counterexample",
+                "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": self.learning_validation_plan(modules=("MSCB", "STATE_TREE")),
+            })
+        frozen = main.freeze_learning_sample(self.learning_payload("exact-ablation-validation", 8400, 9000), now_ts=8400)
+        base_lock = {
+            "freeze_id": frozen["freeze_id"],
+            "champion_probabilities": {"home": 0.45, "draw": 0.25, "away": 0.30},
+            "challenger_probabilities": {"home": 0.30, "draw": 0.45, "away": 0.25},
+            "selected_expression": {"market": "1x2", "selection": "draw", "entry_decimal_price": 3.0, "entry_price_evidence_ref": "test:entry:exact"},
+            "risk": {"champion_tail_risk": 0.10, "challenger_tail_risk": 0.10},
+        }
+        with self.assertRaises(main.HTTPException) as wrong_market:
+            main.lock_hypothesis_shadow_prediction("exact-ablation-hyp", {
+                **base_lock,
+                "selected_expression": {
+                    **base_lock["selected_expression"], "market": "over_under",
+                },
+                "module_ablation_outputs": self.module_ablation_outputs(8405, modules=("MSCB", "STATE_TREE")),
+            }, now_ts=8410)
+        self.assertEqual(wrong_market.exception.detail, "validation_market_outside_preregistered_scope")
+
+        with self.assertRaises(main.HTTPException) as partial:
+            main.lock_hypothesis_shadow_prediction("exact-ablation-hyp", {
+                **base_lock, "module_ablation_outputs": self.module_ablation_outputs(8405),
+            }, now_ts=8410)
+        self.assertEqual(partial.exception.detail["error"], "exact_preregistered_module_ablation_outputs_required")
+
+        with self.assertRaises(main.HTTPException) as post_lock_time:
+            main.lock_hypothesis_shadow_prediction("exact-ablation-hyp", {
+                **base_lock,
+                "module_ablation_outputs": self.module_ablation_outputs(8420, modules=("MSCB", "STATE_TREE")),
+            }, now_ts=8410)
+        self.assertEqual(post_lock_time.exception.detail["error"], "module_ablation_computed_at_must_be_pit")
+
+        locked = main.lock_hypothesis_shadow_prediction("exact-ablation-hyp", {
+            **base_lock,
+            "module_ablation_outputs": self.module_ablation_outputs(8405, modules=("MSCB", "STATE_TREE")),
+        }, now_ts=8410)
+        self.assertEqual(set(locked["module_ablations"]), {"MSCB", "STATE_TREE"})
+        self.assertTrue(all(row["freeze_hash"] == frozen["content_hash"] for row in locked["module_ablations"].values()))
+
+    def test_validation_outcome_is_metric_derived_and_caller_support_is_ignored(self):
+        discovery, _ = self.settle_learning_fixture("derived-outcome-discovery", 900, 1000)
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "derived-outcome-hyp", "type": "HYPOTHESIS_ONLY",
+                "title": "Derived validation outcome", "definition": "Caller cannot self-attest support.",
+                "applicable_scope": "men top flights", "expected_direction": "lower forward Brier",
+                "failure_conditions": "challenger is worse", "falsification_criteria": "negative locked metric gain",
+                "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": self.learning_validation_plan(),
+            })
+        frozen = main.freeze_learning_sample(self.learning_payload("derived-outcome-validation", 8400, 9000), now_ts=8400)
+        lock = main.lock_hypothesis_shadow_prediction("derived-outcome-hyp", {
+            "freeze_id": frozen["freeze_id"],
+            "champion_probabilities": {"home": 0.25, "draw": 0.50, "away": 0.25},
+            "challenger_probabilities": {"home": 0.45, "draw": 0.10, "away": 0.45},
+            "module_ablation_outputs": self.module_ablation_outputs(8405),
+            "selected_expression": {"market": "1x2", "selection": "draw", "entry_decimal_price": 3.0, "entry_price_evidence_ref": "test:entry:derived"},
+            "risk": {"champion_tail_risk": 0.10, "challenger_tail_risk": 0.10},
+        }, now_ts=8410)
+        facts = self.collect_verified_learning_facts(frozen, 1, 1, 16200)
+        main.settle_learning_sample(
+            frozen["freeze_id"], {"status": "FT", "home_goals": 1, "away_goals": 1},
+            "PROCESS_CORRECT_RESULT_LOSS", {"status": "clean"}, 16200,
+            self.learning_postmatch_review(), facts["fact_hash"],
+        )
+        self.save_learning_t1h_reference("derived-outcome-validation", 9000, lock, 2.8)
+        with self.assertRaises(main.HTTPException) as caller_price:
+            main.record_hypothesis_validation("derived-outcome-hyp", {
+                "freeze_id": frozen["freeze_id"], "evidence_summary": "Caller supplied price must be rejected.",
+                "shadow_lock_hash": lock["lock_hash"], "price_reference_stage": "T-1h",
+                "reference_decimal_price": 2.8, "price_reference_evidence_ref": "test:forged:t1h",
+            })
+        self.assertEqual(caller_price.exception.detail, "caller_supplied_price_reference_forbidden")
+        evidence = main.record_hypothesis_validation("derived-outcome-hyp", {
+            "freeze_id": frozen["freeze_id"], "outcome": "support",
+            "evidence_summary": "Caller attempts to claim support despite worse locked metrics.",
+            "shadow_lock_hash": lock["lock_hash"],
+        })
+        self.assertEqual(evidence["outcome"], "counterexample")
+        self.assertEqual(evidence["outcome_derivation"]["caller_supplied_outcome"], "support")
+        self.assertFalse(evidence["outcome_derivation"]["caller_supplied_outcome_used"])
+        report = main.promotion_evidence_report("derived-outcome-hyp")
+        self.assertEqual(report["support_count"], 0)
+        self.assertEqual(report["counterexample_count"], 1)
+        self.assertFalse(report["caller_supplied_validation_outcome_used"])
+
+    def test_multimodule_ablation_gate_reports_each_preregistered_module(self):
+        discovery, _ = self.settle_learning_fixture("multimodule-discovery", 900, 1000)
+        modules = ("MSCB", "STATE_TREE")
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "multimodule-hyp", "type": "HYPOTHESIS_ONLY",
+                "title": "Two-module ablation", "definition": "Validate two isolated module contributions.",
+                "applicable_scope": "men top flights", "expected_direction": "positive isolated gains",
+                "failure_conditions": "either module fails", "falsification_criteria": "any forward module counterexample",
+                "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": self.learning_validation_plan(modules=modules),
+            })
+        for index in range(2):
+            self.settle_hypothesis_validation_fixture(
+                "multimodule-hyp", f"multimodule-validation-{index}", 8400 + index, 9000 + index, modules=modules,
+            )
+        with patch.object(main, "LEARNING_MIN_VALIDATION_SAMPLES", 2):
+            report = main.promotion_evidence_report("multimodule-hyp")
+        gate = report["gates"]["ablation"]
+        self.assertEqual(gate["status"], "passed")
+        self.assertEqual(set(gate["required_modules"]), set(modules))
+        self.assertEqual(set(gate["module_metrics"]), set(modules))
+        self.assertTrue(all(row["sample_count"] == 2 for row in gate["module_metrics"].values()))
+
+    def test_internal_shadow_runner_hash_and_identity_are_fail_closed(self):
+        discovery, _ = self.settle_learning_fixture("runner-hash-discovery", 900, 1000)
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "runner-hash-hyp", "type": "HYPOTHESIS_ONLY",
+                "title": "Runner hash", "definition": "Only verified internal model runs may lock.",
+                "applicable_scope": "men top flights", "expected_direction": "lower forward Brier",
+                "failure_conditions": "runner identity fails", "falsification_criteria": "invalid run hash",
+                "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": self.learning_validation_plan(),
+            })
+        no_replay_payload = self.learning_payload("runner-no-replay", 8350, 9000)
+        no_replay_payload["decision"] = {
+            "decision": "BET", "selected_expression": {"market": "1x2", "selection": "draw", "price": 3.0},
+        }
+        no_replay = main.freeze_learning_sample(no_replay_payload, now_ts=8350)
+        should_not_run = Mock(side_effect=AssertionError("runner must not receive an unauditable freeze"))
+        with self.assertRaises(main.HTTPException) as missing_replay:
+            main.generate_internal_shadow_lock(
+                "runner-hash-hyp", no_replay["freeze_id"], model_runner=should_not_run, now_ts=8360,
+            )
+        self.assertEqual(missing_replay.exception.detail["error"], "forward_shadow_requires_replayable_pit_probability_inputs")
+        should_not_run.assert_not_called()
+
+        payload = self.learning_payload_with_probability_replay("runner-hash-validation", 8400, 9000)
+        payload["decision"] = {
+            "decision": "BET", "selected_expression": {"market": "1x2", "selection": "draw", "price": 3.0},
+        }
+        frozen = main.freeze_learning_sample(payload, now_ts=8400)
+
+        valid_runner = self.learning_shadow_runner()
+        def tampered_runner(request):
+            result = valid_runner(request)
+            return {**result, "run_hash": "0" * 64}
+
+        with self.assertRaises(main.HTTPException) as tampered:
+            main.generate_internal_shadow_lock(
+                "runner-hash-hyp", frozen["freeze_id"], model_runner=tampered_runner, now_ts=8410,
+            )
+        self.assertEqual(tampered.exception.detail, "internal_shadow_model_run_hash_mismatch")
+        self.assertNotIn(frozen["freeze_id"], main.load_snapshot_store().get("learning_shadow_locks", {}).get("runner-hash-hyp", {}))
+
+        with self.assertRaises(main.HTTPException) as champion_mismatch:
+            main.generate_internal_shadow_lock(
+                "runner-hash-hyp", frozen["freeze_id"],
+                model_runner=self.learning_shadow_runner(champion={"home": .45, "draw": .25, "away": .30}),
+                now_ts=8410,
+            )
+        self.assertEqual(champion_mismatch.exception.detail, "internal_shadow_champion_must_match_frozen_probability_replay")
+
+    def test_learning_cycle_automatically_locks_forward_sample_with_internal_runner(self):
+        discovery, _ = self.settle_learning_fixture("cycle-runner-discovery", 900, 1000)
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "cycle-runner-hyp", "type": "HYPOTHESIS_ONLY",
+                "title": "Automatic runner", "definition": "Cycle invokes the trusted PIT runner.",
+                "applicable_scope": "men top flights", "expected_direction": "lower forward Brier",
+                "failure_conditions": "no runnable calculator", "falsification_criteria": "invalid forward output",
+                "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": self.learning_validation_plan(),
+            })
+        payload = self.learning_payload_with_probability_replay("cycle-runner-validation", 8400, 10000)
+        payload["decision"] = {
+            "decision": "BET", "selected_expression": {"market": "1x2", "selection": "draw", "price": 3.0},
+        }
+        frozen = main.freeze_learning_sample(payload, now_ts=8400)
+        result = main.run_learning_cycle(
+            {"apply": True, "run_id": "internal-runner-cycle", "auto_prepare_prematch": False},
+            now_ts=8500, fixture_rows=[], shadow_model_runner=self.learning_shadow_runner(),
+        )
+        self.assertEqual(result["shadow_lock_created_count"], 1)
+        self.assertEqual(result["shadow_lock_results"][0]["action"], "locked")
+        self.assertEqual(result["forward_validation_queue"]["queue_count"], 0)
+        lock = main.load_snapshot_store()["learning_shadow_locks"]["cycle-runner-hyp"][frozen["freeze_id"]]
+        self.assertEqual(lock["calculator_provenance"]["origin"], "internal_shadow_runner")
+        self.assertTrue(lock["calculator_provenance"]["promotion_eligible"])
+
+    def test_forward_shadow_scores_the_frozen_over_under_market_not_1x2(self):
+        discovery, _ = self.settle_learning_fixture("ou-runner-discovery", 900, 1000)
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "ou-runner-hyp", "type": "HYPOTHESIS_ONLY",
+                "title": "O/U market forecast", "definition": "Validate the frozen total expression directly.",
+                "applicable_scope": "men top flights", "expected_direction": "lower market Brier",
+                "failure_conditions": "no O/U calibration gain", "falsification_criteria": "forward O/U counterexample",
+                "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": self.learning_validation_plan(markets=("over_under",)),
+            })
+        payload = self.learning_payload_with_probability_replay("ou-runner-validation", 8400, 10000)
+        payload["decision"].update({
+            "decision": "BET",
+            "selected_expression": {"market": "over_under", "selection": "over", "line": 2.75, "price": 1.91},
+        })
+        frozen = main.freeze_learning_sample(payload, now_ts=8400)
+        lock = main.generate_internal_shadow_lock(
+            "ou-runner-hyp", frozen["freeze_id"], model_runner=self.learning_shadow_runner(), now_ts=8410,
+        )
+        self.assertEqual(lock["scoring_contract"], "learning_market_forecast_v1")
+        self.assertEqual(lock["champion_forecast"]["market"], "over_under")
+        self.assertEqual(lock["champion_forecast"]["line"], 2.75)
+        facts = self.collect_verified_learning_facts(frozen, 2, 1, 17200)
+        main.settle_learning_sample(
+            frozen["freeze_id"], {"status": "FT", "home_goals": 2, "away_goals": 1},
+            "PROCESS_CORRECT_RESULT_WIN", {"status": "clean"}, 17200,
+            self.learning_postmatch_review(), facts["fact_hash"],
+        )
+        self.save_learning_t1h_reference("ou-runner-validation", 10000, lock, 1.85)
+        evidence = main.record_hypothesis_validation("ou-runner-hyp", {
+            "freeze_id": frozen["freeze_id"], "outcome": "support",
+            "evidence_summary": "The frozen O/U 2.75 expression is scored in its own settlement space.",
+            "shadow_lock_hash": lock["lock_hash"],
+        })
+        metrics = evidence["derived_metrics"]
+        self.assertEqual(metrics["forecast_market"], "over_under")
+        self.assertEqual(metrics["realized_forecast_category"], "half_win")
+        self.assertIsNone(metrics["champion_brier_1x2"])
+        self.assertIsNotNone(metrics["champion_brier"])
+
+    def test_daily_cycle_uses_builtin_preregistered_challenger_without_injection(self):
+        discovery, _ = self.settle_learning_fixture("builtin-runner-discovery", 900, 1000)
+        with patch.object(main.time, "time", return_value=8300):
+            hypothesis = main.register_learning_hypothesis({
+                "hypothesis_id": "builtin-runner-hyp", "type": "HYPOTHESIS_ONLY",
+                "title": "Built-in executable challenger",
+                "definition": "Apply only the preregistered bounded log-rate intervention.",
+                "applicable_scope": "men top flights", "expected_direction": "lower forward market Brier",
+                "failure_conditions": "no forward gain", "falsification_criteria": "any unresolved counterexample",
+                "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": self.learning_validation_plan(),
+            })
+        payload = self.learning_payload_with_probability_replay("builtin-runner-validation", 8400, 10000)
+        frozen = main.freeze_learning_sample(payload, now_ts=8400)
+        result = main.run_learning_cycle(
+            {"apply": True, "run_id": "builtin-runner-cycle", "auto_prepare_prematch": False},
+            now_ts=8500, fixture_rows=[],
+        )
+        self.assertEqual(result["shadow_lock_created_count"], 1)
+        lock = main.load_snapshot_store()["learning_shadow_locks"]["builtin-runner-hyp"][frozen["freeze_id"]]
+        self.assertEqual(lock["calculator_provenance"]["runner_id"], "builtin_preregistered_poisson_challenger")
+        self.assertEqual(lock["challenger_spec_hash"], hypothesis["pre_registered_validation_plan"]["challenger_spec"]["spec_hash"])
+        self.assertNotEqual(lock["challenger_probabilities"], lock["champion_probabilities"])
+        self.assertEqual(lock["module_ablations"]["MSCB"]["probabilities"], lock["champion_probabilities"])
+        self.assertEqual(lock["scoring_contract"], "learning_market_forecast_v1")
+
+    def test_learning_cycle_reports_runner_blocker_without_accepting_external_outputs(self):
+        discovery, _ = self.settle_learning_fixture("cycle-no-runner-discovery", 900, 1000)
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "cycle-no-runner-hyp", "type": "HYPOTHESIS_ONLY",
+                "title": "Missing runner", "definition": "Missing calculator remains blocked.",
+                "applicable_scope": "men top flights", "expected_direction": "lower forward Brier",
+                "failure_conditions": "calculator unavailable", "falsification_criteria": "no internal run",
+                "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": self.learning_validation_plan(),
+            })
+        payload = self.learning_payload("cycle-no-runner-validation", 8400, 10000)
+        payload["decision"] = {
+            "decision": "BET", "selected_expression": {"market": "1x2", "selection": "draw", "price": 3.0},
+        }
+        frozen = main.freeze_learning_sample(payload, now_ts=8400)
+        with patch.object(main, "LEARNING_SHADOW_MODEL_RUNNER", None):
+            result = main.run_learning_cycle(
+                {"apply": True, "run_id": "missing-runner-cycle", "auto_prepare_prematch": False},
+                now_ts=8500, fixture_rows=[],
+            )
+        self.assertEqual(result["shadow_lock_created_count"], 0)
+        self.assertEqual(result["shadow_lock_results"][0]["action"], "blocked")
+        self.assertEqual(result["shadow_lock_results"][0]["reason"], "internal_shadow_model_runner_not_configured")
+        self.assertNotIn(frozen["freeze_id"], main.load_snapshot_store().get("learning_shadow_locks", {}).get("cycle-no-runner-hyp", {}))
+
+    def register_league_dna_fixture(self, hypothesis_id="league-dna-hyp", tag_id="eng-goal-environment"):
+        discovery, _ = self.settle_learning_fixture(f"{tag_id}-discovery", 900, 1000)
+        with patch.object(main.time, "time", return_value=8300):
+            main.register_learning_hypothesis({
+                "hypothesis_id": hypothesis_id, "type": "LEAGUE_TAG_CANDIDATE",
+                "title": "League goal environment candidate",
+                "definition": "A preregistered league-level goal environment offset",
+                "applicable_scope": "England Premier League 2026 regular season",
+                "expected_direction": "positive", "failure_conditions": "effect decays out of sample",
+                "falsification_criteria": "unresolved independent counterexample",
+                "discovery_freeze_ids": [discovery["freeze_id"]],
+                "validation_plan": self.learning_validation_plan(),
+            })
+        candidate = main.register_league_dna_candidate({
+            "tag_id": tag_id, "hypothesis_id": hypothesis_id,
+            "scope": self.learning_payload()["scope"],
+            "category": "goal_environment", "market": "over_under",
+            "label": "Goal environment above global comparable baseline",
+            "magnitude_score": 1.25,
+            "metric_definition": "PIT opening total distribution and event-level goal environment",
+            "baseline_definition": "Comparable professional domestic tier-one leagues",
+            "expected_model_effect": "Bounded prior offset before team residuals",
+            "anti_double_counting_rule": "Team inputs must use residuals relative to this league prior",
+            "sample_window": {
+                "training_start": "2024-01-01", "training_end": "2025-12-31",
+                "validation_start": "2026-01-01", "validation_end": "2026-12-31",
+                "minimum_independent_samples": 30,
+            },
+        })
+        return discovery, candidate
+
+    def test_league_dna_candidate_is_stored_but_never_enters_prematch_prior(self):
+        _, candidate = self.register_league_dna_fixture()
+        self.assertEqual(candidate["status"], "LEAGUE_TAG_CANDIDATE")
+        self.assertEqual(candidate["evidence_confidence"], 0)
+        self.assertFalse(candidate["champion_effect"])
+        view = main.league_dna_model_view(self.learning_payload()["scope"])
+        self.assertEqual(view["status"], "candidate_only")
+        self.assertEqual(view["active_tag_count"], 0)
+        self.assertFalse(view["champion_effect"])
+
+        payload = self.learning_payload("dna-freeze", 1200, 1300)
+        payload["versions"]["league_dna"] = "fabricated-active-version"
+        with self.assertRaises(main.HTTPException) as rejected:
+            main.freeze_learning_sample(payload, now_ts=1200)
+        self.assertEqual(rejected.exception.status_code, 409)
+        self.assertEqual(rejected.exception.detail, "unverified_league_dna_cannot_enter_prematch_freeze")
+
+        payload["versions"]["league_dna"] = "candidate_only"
+        frozen = main.freeze_learning_sample(payload, now_ts=1200)
+        self.assertEqual(frozen["versions"]["league_dna"], "candidate_only")
+        self.assertFalse(frozen["league_dna_audit"]["champion_effect"])
+
+    def test_league_dna_activation_candidate_still_waits_for_user_confirmation(self):
+        _, candidate = self.register_league_dna_fixture("dna-ready-hyp", "dna-ready-tag")
+        with self.assertRaises(main.HTTPException) as premature:
+            main.create_league_dna_activation_candidate(candidate["tag_id"])
+        self.assertEqual(premature.exception.status_code, 409)
+
+        for index in range(2):
+            self.settle_hypothesis_validation_fixture("dna-ready-hyp", f"dna-validation-{index}", 8400 + index, 9000 + index)
+        with patch.object(main, "LEARNING_MIN_VALIDATION_SAMPLES", 2):
+            main.create_promotion_candidate("dna-ready-hyp", None)
+            activation = main.create_league_dna_activation_candidate("dna-ready-tag")
+        self.assertEqual(activation["status"], "AWAITING_EXPLICIT_USER_CONFIRMATION")
+        self.assertEqual(activation["evidence_confidence"], 99)
+        self.assertFalse(activation["champion_effect"])
+        self.assertFalse(activation["automatic_activation"])
+        report = main.league_dna_status_report(39)
+        self.assertEqual(report["activation_candidate_count"], 1)
+        self.assertEqual(report["verified_active_count"], 0)
+        self.assertFalse(report["automatic_activation"])
+        self.assertEqual(main.league_dna_model_view(self.learning_payload()["scope"])["status"], "candidate_only")
+
+    def test_league_dna_activation_requires_hash_bound_explicit_user_confirmation(self):
+        _, candidate = self.register_league_dna_fixture("dna-confirm-hyp", "dna-confirm-tag")
+        for index in range(2):
+            self.settle_hypothesis_validation_fixture("dna-confirm-hyp", f"dna-confirm-validation-{index}", 8500 + index, 9100 + index)
+        with patch.object(main, "LEARNING_MIN_VALIDATION_SAMPLES", 2):
+            main.create_promotion_candidate("dna-confirm-hyp", None)
+            activation = main.create_league_dna_activation_candidate(candidate["tag_id"])
+
+        base = {
+            "confirmed": True,
+            "activation_hash": activation["activation_hash"],
+            "confirmed_by": "project-owner",
+            "confirmation_reference": "thread:test-turn-1",
+            "confirmation_statement": f"CONFIRM LEAGUE_DNA {candidate['tag_id']} {activation['activation_hash']}",
+        }
+        with self.assertRaises(main.HTTPException) as missing_true:
+            main.confirm_league_dna_activation(candidate["tag_id"], {**base, "confirmed": False}, now_ts=9200)
+        self.assertEqual(missing_true.exception.detail, "explicit_confirmation_true_required")
+
+        wrong_hash = "0" * 64
+        with self.assertRaises(main.HTTPException) as stale_hash:
+            main.confirm_league_dna_activation(candidate["tag_id"], {
+                **base,
+                "activation_hash": wrong_hash,
+                "confirmation_statement": f"CONFIRM LEAGUE_DNA {candidate['tag_id']} {wrong_hash}",
+            }, now_ts=9200)
+        self.assertEqual(stale_hash.exception.detail, "latest_activation_candidate_hash_required")
+
+        with self.assertRaises(main.HTTPException) as wrong_statement:
+            main.confirm_league_dna_activation(candidate["tag_id"], {**base, "confirmation_statement": "yes"}, now_ts=9200)
+        self.assertEqual(wrong_statement.exception.status_code, 422)
+
+        active = main.confirm_league_dna_activation(candidate["tag_id"], base, now_ts=9200)
+        self.assertEqual(active["status"], "VERIFIED_ACTIVE")
+        self.assertEqual(active["evidence_confidence"], 100)
+        self.assertTrue(active["champion_effect"])
+        self.assertFalse(active["automatic_activation"])
+        self.assertTrue(active["immutable"])
+
+        repeated = main.confirm_league_dna_activation(candidate["tag_id"], base, now_ts=9300)
+        self.assertEqual(repeated["action"], "unchanged")
+        self.assertEqual(repeated["active_hash"], active["active_hash"])
+        with self.assertRaises(main.HTTPException) as overwrite:
+            main.confirm_league_dna_activation(candidate["tag_id"], {**base, "confirmation_reference": "thread:different-turn"}, now_ts=9400)
+        self.assertEqual(overwrite.exception.detail, "league_dna_tag_already_active")
+
+        view = main.league_dna_model_view(self.learning_payload()["scope"])
+        self.assertEqual(view["status"], "VERIFIED_ACTIVE")
+        self.assertEqual(view["active_tag_count"], 1)
+        self.assertTrue(view["champion_effect"])
+        report = main.league_dna_status_report(39)
+        self.assertEqual(report["verified_active_count"], 1)
+
+    def learning_prematch_packet(self, fixture_id, generated_at):
+        return {
+            "ok": True, "version": main.VERSION, "generated_at": generated_at,
+            "source": "test_pit_packet", "fixture": {"fixture_id": fixture_id},
+            "data_quality": {"status": "partial"}, "coverage": {"status": "partial"},
+            "pure_fundamental_script": {
+                "status": "partial",
+                "chain": {"game_state_elasticity": {"status": "data_missing"}},
+            },
+            "market": {"timeline": [], "latest_dynamics": {"status": "data_missing"}},
+            "analysis_rules": {"prematch_only": True},
+            "decision_layer": {"decision": "PASS", "pass_reasons": ["fundamental_chain_insufficient"]},
+        }
+
+    def test_learning_cycle_dry_run_previews_freeze_without_mutation(self):
+        now_ts = 100000
+        fixture_row = self.learning_fixture_row(71, 39, now_ts + 3600)
+        preview = main.run_learning_cycle({
+            "apply": False,
+            "prematch_packets": {"71": self.learning_prematch_packet(71, now_ts)},
+        }, now_ts=now_ts, fixture_rows=[fixture_row])
+        self.assertEqual(preview["action"], "previewed")
+        self.assertEqual(preview["freeze_results"][0]["action"], "would_freeze")
+        self.assertFalse(preview["automatic_hypothesis_registration"])
+        self.assertFalse(preview["automatic_champion_change"])
+        self.assertFalse(os.path.exists(main.SNAPSHOT_STORE_PATH))
+
+    def test_learning_cycle_apply_auto_prepares_and_is_run_idempotent(self):
+        now_ts = 100000
+        fixture_row = self.learning_fixture_row(72, 39, now_ts + 3600)
+        builder_calls = []
+
+        def builder(fixture_id):
+            builder_calls.append(fixture_id)
+            return self.learning_prematch_packet(fixture_id, now_ts)
+
+        payload = {"apply": True, "run_id": "cycle-20261008-a", "auto_prepare_prematch": True}
+        first = main.run_learning_cycle(payload, now_ts=now_ts, fixture_rows=[fixture_row], prematch_packet_builder=builder)
+        self.assertEqual(first["frozen_count"], 1)
+        self.assertEqual(first["probability_replay_ready_count"], 0)
+        self.assertEqual(first["probability_replay_missing_count"], 1)
+        self.assertEqual(first["freeze_results"][0]["decision"], "PASS")
+        self.assertEqual(first["freeze_results"][0]["probability_replay_status"], "data_missing")
+        self.assertEqual(builder_calls, [72])
+        store = main.load_snapshot_store()
+        self.assertIn("72", store["learning_frozen"])
+        self.assertIn("cycle-20261008-a", store["learning_runs"])
+        persisted_run = store["learning_runs"]["cycle-20261008-a"]
+        self.assertTrue(persisted_run["immutable"])
+        self.assertEqual(persisted_run["run_hash"], main._content_hash(main.learning_run_hash_content(persisted_run)))
+        self.assertNotIn("learning_hypotheses", store)
+        self.assertNotIn("league_dna_active", store)
+
+        second = main.run_learning_cycle(payload, now_ts=now_ts, fixture_rows=[fixture_row], prematch_packet_builder=builder)
+        self.assertEqual(second["action"], "unchanged")
+        self.assertEqual(builder_calls, [72])
+        self.assertEqual(len(main.load_snapshot_store()["learning_frozen"]["72"]), 1)
+
+        tampered_store = main.load_snapshot_store()
+        tampered_store["learning_runs"]["cycle-20261008-a"]["automatic_champion_change"] = True
+        main.write_snapshot_store(tampered_store)
+        with self.assertRaises(main.HTTPException) as invalid_run:
+            main.run_learning_cycle(payload, now_ts=now_ts, fixture_rows=[fixture_row], prematch_packet_builder=builder)
+        self.assertEqual(invalid_run.exception.status_code, 409)
+        self.assertEqual(invalid_run.exception.detail, "learning_run_integrity_invalid")
+
+    def test_learning_cycle_creates_one_version_per_due_clock_node(self):
+        kickoff_at = 200000
+        t12_now = kickoff_at - 10 * 3600
+        t6_now = kickoff_at - 5 * 3600
+        fixture_row = self.learning_fixture_row(720, 39, kickoff_at)
+        builder_times = []
+
+        def builder(fixture_id):
+            generated_at = builder_times[-1]
+            return self.learning_prematch_packet(fixture_id, generated_at)
+
+        builder_times.append(t12_now)
+        first = main.run_learning_cycle(
+            {"apply": True, "run_id": "node-t12"}, now_ts=t12_now,
+            fixture_rows=[fixture_row], prematch_packet_builder=builder,
+        )
+        self.assertEqual(first["frozen_count"], 1)
+        self.assertEqual(first["freeze_results"][0]["analysis_node"], "T-12h")
+
+        builder_times.append(t6_now)
+        second = main.run_learning_cycle(
+            {"apply": True, "run_id": "node-t6"}, now_ts=t6_now,
+            fixture_rows=[fixture_row], prematch_packet_builder=builder,
+        )
+        self.assertEqual(second["frozen_count"], 1)
+        self.assertEqual(second["freeze_results"][0]["analysis_node"], "T-6h")
+        self.assertEqual(second["freeze_results"][0]["reason"], "analysis_node_advanced")
+
+        calls_before = len(builder_times)
+        same_node = main.run_learning_cycle(
+            {"apply": True, "run_id": "node-t6-repeat"}, now_ts=t6_now + 60,
+            fixture_rows=[fixture_row],
+            prematch_packet_builder=Mock(side_effect=AssertionError("same node must not rebuild")),
+        )
+        self.assertEqual(same_node["frozen_count"], 0)
+        self.assertEqual(same_node["freeze_results"][0]["reason"], "no_new_node_or_material_evidence")
+        self.assertEqual(len(main.load_snapshot_store()["learning_frozen"]["720"]), 2)
+        self.assertEqual(len(builder_times), calls_before)
+
+    def test_learning_cycle_reanalyzes_same_node_only_for_new_snapshot_evidence(self):
+        kickoff_at = 300000
+        now_ts = kickoff_at - 10 * 3600
+        fixture_row = self.learning_fixture_row(721, 39, kickoff_at)
+        first = main.run_learning_cycle(
+            {"apply": True, "run_id": "same-node-initial"}, now_ts=now_ts,
+            fixture_rows=[fixture_row],
+            prematch_packet_builder=lambda fixture_id: self.learning_prematch_packet(fixture_id, now_ts),
+        )
+        self.assertEqual(first["freeze_results"][0]["analysis_node"], "T-12h")
+
+        snapshot_at = now_ts + 60
+        market = main.empty_market_snapshot()
+        market["available"] = True
+        market["primary"] = {"1x2": {"home": 2.0, "draw": 3.4, "away": 4.0}}
+        store = main.load_snapshot_store()
+        store.setdefault("fixtures", {})["721"] = [{
+            "fixture": 721, "stage": "T-12h", "snapshot_at": snapshot_at,
+            "import_status": "available", "market_snapshot": market,
+            "market_dynamics": {"comparison_status": "data_missing"},
+            "stage_timing_audit": main.audit_stage_timing("T-12h", snapshot_at, kickoff_at),
+            "sequence_timing_audit": {"status": "valid"},
+        }]
+        main.write_snapshot_store(store)
+        marker = main._learning_snapshot_marker(main.load_snapshot_store(), "721", snapshot_at)
+
+        packet = self.learning_prematch_packet(721, snapshot_at)
+        packet["market"]["timeline"] = [{
+            "stage": "T-12h", "status": "available", "snapshot_at": snapshot_at,
+            "source_content_hash": marker["evidence_hash"],
+        }]
+        second = main.run_learning_cycle(
+            {"apply": True, "run_id": "same-node-new-evidence", "prematch_packets": {"721": packet}},
+            now_ts=snapshot_at, fixture_rows=[fixture_row],
+        )
+        self.assertEqual(second["frozen_count"], 1)
+        self.assertEqual(second["freeze_results"][0]["reason"], "new_snapshot_evidence_at_current_node")
+        self.assertEqual(second["freeze_results"][0]["analysis_node"], "T-12h")
+
+        repeat = main.learning_cycle_plan(now_ts=snapshot_at + 60, fixture_rows=[fixture_row])
+        candidate = repeat["discovery"]["candidates"][0]
+        self.assertFalse(candidate["analysis_due"])
+        self.assertEqual(candidate["analysis_due_reason"], "no_new_node_or_material_evidence")
+
+    def test_learning_plan_ignores_non_learning_closing_snapshot(self):
+        kickoff_at = 400000
+        now_ts = kickoff_at - 5 * 60
+        fixture_row = self.learning_fixture_row(722, 39, kickoff_at)
+        without_closing = main.learning_cycle_plan(now_ts=now_ts, fixture_rows=[fixture_row])
+        self.assertEqual(without_closing["discovery"]["candidates"][0]["target_analysis_node"], "T-1h")
+
+        market = main.empty_market_snapshot()
+        market["available"] = True
+        store = main.load_snapshot_store()
+        store.setdefault("fixtures", {})["722"] = [{
+            "fixture": 722, "stage": "Closing", "snapshot_at": now_ts,
+            "import_status": "available", "market_snapshot": market,
+            "stage_timing_audit": main.audit_stage_timing("Closing", now_ts, kickoff_at),
+            "sequence_timing_audit": {"status": "valid"},
+        }]
+        main.write_snapshot_store(store)
+        with_closing = main.learning_cycle_plan(now_ts=now_ts, fixture_rows=[fixture_row])
+        self.assertEqual(with_closing["discovery"]["candidates"][0]["target_analysis_node"], "T-1h")
+
+    def test_learning_freeze_payload_reaudits_caller_supplied_stage_time(self):
+        generated_at = 500000
+        kickoff_at = generated_at + 20 * 3600
+        candidate = main.discover_learning_fixtures(
+            now_ts=generated_at,
+            fixture_rows=[self.learning_fixture_row(723, 39, kickoff_at)],
+        )["candidates"][0]
+        candidate["target_analysis_node"] = "Opening"
+        packet = self.learning_prematch_packet(723, generated_at)
+        packet["market"]["timeline"] = [{
+            "stage": "Closing", "status": "available", "snapshot_at": generated_at,
+            "source_content_hash": "caller-forged-future-closing",
+        }]
+        with self.assertRaises(main.HTTPException) as rejected:
+            main.build_learning_freeze_payload(candidate, packet, now_ts=generated_at)
+        self.assertEqual(rejected.exception.status_code, 409)
+        self.assertEqual(rejected.exception.detail, "verified_opening_snapshot_required_for_learning_node")
+
+    def test_auto_learning_cycle_runs_once_after_daily_1430_due_time(self):
+        before_due = datetime(2026, 10, 8, 6, 29, tzinfo=timezone.utc)
+        due = datetime(2026, 10, 8, 6, 30, tzinfo=timezone.utc)
+        cycle_result = {
+            "frozen_count": 0, "settled_count": 0, "rejected_count": 0,
+            "review_draft_count": 0,
+            "execution_order": ["past_36h_postmatch", "future_24h_prematch"],
+            "postmatch_fact_results": [{"action": "facts_collected"}],
+            "postmatch_review_draft_results": [],
+        }
+        with patch.object(main, "run_learning_cycle", return_value=cycle_result) as runner:
+            idle = main.auto_learning_daily_cycle(before_due, [])
+            result = main.auto_learning_daily_cycle(due, [])
+        self.assertEqual(idle["status"], "not_due")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["run_id"], "daily-20261008-1430")
+        self.assertEqual(result["trigger_delay_seconds"], 0)
+        self.assertEqual(result["execution_order"], ["past_36h_postmatch", "future_24h_prematch"])
+        self.assertEqual(result["postmatch_fact_results"][0]["action"], "facts_collected")
+        self.assertFalse(result["automatic_hypothesis_registration"])
+        self.assertFalse(result["automatic_champion_change"])
+        runner.assert_called_once()
+
+    def test_auto_learning_cycle_catches_up_after_original_ten_minute_window(self):
+        late = datetime(2026, 10, 8, 11, 45, tzinfo=timezone.utc)
+        cycle_result = {
+            "frozen_count": 0, "settled_count": 0, "rejected_count": 0,
+            "review_draft_count": 0,
+            "execution_order": ["past_36h_postmatch", "future_24h_prematch"],
+        }
+        with patch.object(main, "run_learning_cycle", return_value=cycle_result) as runner:
+            result = main.auto_learning_daily_cycle(late, [])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["run_id"], "daily-20261008-1430")
+        self.assertEqual(result["scheduled_at"], int(datetime(2026, 10, 8, 6, 30, tzinfo=timezone.utc).timestamp()))
+        self.assertEqual(result["trigger_delay_seconds"], 5 * 3600 + 15 * 60)
+        runner.assert_called_once()
+
+    def test_snapshot_worker_enters_daily_learning_before_future_fixture_collection(self):
+        due = datetime(2026, 10, 8, 6, 30, tzinfo=timezone.utc)
+        calls = []
+
+        def daily(now, fixture_rows=None):
+            calls.append("learning")
+            self.assertIsNone(fixture_rows)
+            return {"status": "completed", "execution_order": ["past_36h_postmatch", "future_24h_prematch"]}
+
+        def targets(date_str, timezone_name):
+            calls.append("raw_snapshot_fixture_discovery")
+            return {"fixtures": []}
+
+        def node_executor(now_ts=None, apply_changes=True):
+            calls.append("learning_node_executor")
+            return {"advanced_count": 0, "discovery_performed": False}
+
+        with patch.object(main, "auto_learning_daily_cycle", side_effect=daily), \
+             patch.object(main, "target_fixtures_for_date", side_effect=targets), \
+             patch.object(main, "run_learning_node_executor", side_effect=node_executor):
+            result = main.auto_snapshot_cycle(due)
+        self.assertEqual(calls[0], "learning")
+        self.assertEqual(calls[-1], "learning_node_executor")
+        self.assertEqual(result["execution_order"], ["past_36h_postmatch", "future_24h_prematch"])
+        self.assertFalse(result["node_execution"]["discovery_performed"])
+
+    def test_learning_cycle_routes_non_major_packets_to_isolated_observation_store(self):
+        now_ts = 100000
+        rows = [
+            self.learning_fixture_row(73, 39, now_ts + 3600),
+            self.learning_fixture_row(74, 2, now_ts + 3600),
+            self.learning_fixture_row(75, 39, now_ts + 3600, status="1H"),
+        ]
+        built = []
+
+        def builder(fixture_id):
+            built.append(fixture_id)
+            return self.learning_prematch_packet(fixture_id, now_ts)
+
+        result = main.run_learning_cycle(
+            {"apply": True, "run_id": "cycle-scope-gate", "auto_prepare_prematch": True},
+            now_ts=now_ts, fixture_rows=rows, prematch_packet_builder=builder,
+        )
+        self.assertEqual(result["frozen_count"], 1)
+        self.assertEqual(result["market_language_observation_frozen_count"], 1)
+        self.assertEqual(built, [73, 74])
+        store = main.load_snapshot_store()
+        self.assertEqual(set(store["learning_frozen"]), {"73"})
+        self.assertEqual(set(store["market_language_frozen"]), {"74"})
+        self.assertNotIn("74", store["learning_frozen"])
+
+    def test_node_executor_advances_only_previously_admitted_fixture(self):
+        kickoff_at = 200000
+        t12_now = kickoff_at - 10 * 3600
+        t6_now = kickoff_at - 5 * 3600
+        fixture_row = self.learning_fixture_row(760, 39, kickoff_at)
+        first = main.run_learning_cycle(
+            {"apply": True, "run_id": "admit-for-node-executor"},
+            now_ts=t12_now, fixture_rows=[fixture_row],
+            prematch_packet_builder=lambda fixture_id: self.learning_prematch_packet(fixture_id, t12_now),
+        )
+        self.assertEqual(first["freeze_results"][0]["analysis_node"], "T-12h")
+
+        plan = main.learning_node_execution_plan(now_ts=t6_now)
+        self.assertEqual(plan["due_count"], 1)
+        self.assertEqual(plan["due"][0]["fixture_id"], "760")
+        self.assertFalse(plan["discovery_performed"])
+        result = main.run_learning_node_executor(
+            now_ts=t6_now,
+            prematch_packet_builder=lambda fixture_id: self.learning_prematch_packet(fixture_id, t6_now),
+        )
+        self.assertEqual(result["advanced_count"], 1)
+        self.assertEqual(result["results"][0]["analysis_node"], "T-6h")
+        self.assertFalse(result["discovery_performed"])
+        self.assertFalse(result["postmatch_learning_performed"])
+        self.assertEqual(len(main.load_snapshot_store()["learning_frozen"]["760"]), 2)
+
+        repeat = main.run_learning_node_executor(
+            now_ts=t6_now + 60,
+            prematch_packet_builder=Mock(side_effect=AssertionError("same node must not rebuild")),
+        )
+        self.assertEqual(repeat["advanced_count"], 0)
+        self.assertEqual(repeat["plan"]["due_count"], 0)
+
+    def test_daily_governance_admits_before_first_node_then_executor_freezes_at_t12(self):
+        kickoff_at = 300000
+        governance_now = kickoff_at - 20 * 3600
+        t12_now = kickoff_at - 10 * 3600
+        fixture_row = self.learning_fixture_row(761, 39, kickoff_at)
+
+        daily = main.run_learning_cycle(
+            {"apply": True, "run_id": "admit-before-first-node"},
+            now_ts=governance_now,
+            fixture_rows=[fixture_row],
+            prematch_packet_builder=Mock(side_effect=AssertionError("no analysis node is due yet")),
+        )
+        self.assertEqual(daily["admitted_count"], 1)
+        self.assertEqual(daily["frozen_count"], 0)
+        self.assertEqual(daily["freeze_results"][0]["reason"], "analysis_clock_node_not_due")
+        store = main.load_snapshot_store()
+        self.assertIn("761", store["learning_admissions"])
+        self.assertNotIn("761", store.get("learning_frozen") or {})
+
+        plan = main.learning_node_execution_plan(now_ts=t12_now)
+        self.assertEqual(plan["due_count"], 1)
+        self.assertEqual(plan["due"][0]["fixture_id"], "761")
+        self.assertEqual(plan["due"][0]["target_analysis_node"], "T-12h")
+        advanced = main.run_learning_node_executor(
+            now_ts=t12_now,
+            prematch_packet_builder=lambda fixture_id: self.learning_prematch_packet(fixture_id, t12_now),
+        )
+        self.assertEqual(advanced["advanced_count"], 1)
+        self.assertEqual(advanced["results"][0]["analysis_node"], "T-12h")
+        self.assertEqual(len(main.load_snapshot_store()["learning_frozen"]["761"]), 1)
+        status = main.learning_status_report(now_ts=t12_now)
+        self.assertEqual(status["admitted_fixture_count"], 1)
+        self.assertEqual(status["major_league_registry"]["version"], main.LEARNING_MAJOR_LEAGUES_VERSION)
+        self.assertFalse(status["node_executor"]["scope_expansion_allowed"])
+
+    def test_node_executor_persists_failure_backoff_then_recovers(self):
+        kickoff_at = 400000
+        governance_now = kickoff_at - 20 * 3600
+        node_now = kickoff_at - 10 * 3600
+        fixture_row = self.learning_fixture_row(762, 39, kickoff_at)
+        main.run_learning_cycle(
+            {"apply": True, "run_id": "admit-for-retry"},
+            now_ts=governance_now, fixture_rows=[fixture_row],
+            prematch_packet_builder=Mock(side_effect=AssertionError("node not due")),
+        )
+
+        failed = main.run_learning_node_executor(
+            now_ts=node_now,
+            prematch_packet_builder=Mock(side_effect=TimeoutError("provider unavailable")),
+        )
+        self.assertEqual(failed["rejected_count"], 1)
+        execution_key = failed["results"][0]["execution_key"]
+        attempt = main.load_snapshot_store()["learning_node_attempts"][execution_key]
+        self.assertEqual(attempt["status"], "failed")
+        self.assertEqual(attempt["attempt_count"], 1)
+        self.assertGreater(attempt["retry_after_at"], node_now)
+
+        blocked_builder = Mock(side_effect=AssertionError("backoff must prevent provider call"))
+        blocked = main.run_learning_node_executor(
+            now_ts=node_now + 60, prematch_packet_builder=blocked_builder,
+        )
+        self.assertEqual(blocked["plan"]["due_count"], 0)
+        self.assertIn("node_retry_backoff_active", [row["reason"] for row in blocked["plan"]["skipped"]])
+        blocked_builder.assert_not_called()
+
+        retry_at = int(attempt["retry_after_at"])
+        recovered = main.run_learning_node_executor(
+            now_ts=retry_at,
+            prematch_packet_builder=lambda fixture_id: self.learning_prematch_packet(fixture_id, retry_at),
+        )
+        self.assertEqual(recovered["advanced_count"], 1)
+        final_attempt = main.load_snapshot_store()["learning_node_attempts"][execution_key]
+        self.assertEqual(final_attempt["status"], "completed")
+        self.assertEqual(final_attempt["attempt_count"], 2)
+        self.assertTrue(final_attempt["freeze_id"])
+
+    def test_node_executor_active_lease_prevents_duplicate_provider_call(self):
+        kickoff_at = 500000
+        governance_now = kickoff_at - 20 * 3600
+        node_now = kickoff_at - 10 * 3600
+        fixture_row = self.learning_fixture_row(763, 39, kickoff_at)
+        main.run_learning_cycle(
+            {"apply": True, "run_id": "admit-for-lease"},
+            now_ts=governance_now, fixture_rows=[fixture_row],
+            prematch_packet_builder=Mock(side_effect=AssertionError("node not due")),
+        )
+        plan = main.learning_node_execution_plan(now_ts=node_now)
+        claimed = main.claim_learning_node_execution(plan["due"][0], now_ts=node_now)
+        self.assertTrue(claimed["claimed"])
+
+        builder = Mock(side_effect=AssertionError("leased job must not call provider"))
+        blocked = main.run_learning_node_executor(now_ts=node_now + 1, prematch_packet_builder=builder)
+        self.assertEqual(blocked["plan"]["due_count"], 0)
+        self.assertIn("node_execution_lease_active", [row["reason"] for row in blocked["plan"]["skipped"]])
+        builder.assert_not_called()
+
+    def test_learning_data_health_flags_admission_that_expired_without_freeze(self):
+        now_ts = 600000
+        fixture_row = self.learning_fixture_row(764, 39, now_ts + 100)
+        candidate = main.discover_learning_fixtures(now_ts=now_ts, fixture_rows=[fixture_row])["candidates"][0]
+        main.admit_learning_candidate(candidate, now_ts=now_ts)
+
+        health = main.automatic_learning_data_health(now_ts=now_ts + 200)
+        self.assertEqual(health["status"], "critical")
+        self.assertEqual(health["expired_unfrozen_count"], 1)
+        self.assertEqual(health["state_counts"]["expired_without_freeze"], 1)
+        with patch.object(main, "AUTO_SNAPSHOT_ENABLED", False):
+            operations = main.operations_status_report(now_ts=now_ts + 200)
+        self.assertIn("learning_admission_expired_without_freeze", [row["code"] for row in operations["alerts"]])
+        self.assertEqual(operations["status"], "blocked")
+
+    def test_postmatch_recovery_queue_keeps_expired_automatic_window_recoverable(self):
+        frozen = main.freeze_learning_sample(
+            self.learning_payload("recovery-fixture", captured_at=900, kickoff_at=1000), now_ts=900,
+        )
+        recovery_now = 1000 + (main.LEARNING_POSTMATCH_LOOKBACK_HOURS + 1) * 3600
+        queue = main.learning_postmatch_recovery_queue(now_ts=recovery_now)
+        self.assertEqual(queue["manual_recovery_required_count"], 1)
+        self.assertEqual(queue["items"][0]["freeze_id"], frozen["freeze_id"])
+        self.assertFalse(queue["items"][0]["prematch_rebuild_allowed"])
+        with patch.object(main, "AUTO_SNAPSHOT_ENABLED", False):
+            operations = main.operations_status_report(now_ts=recovery_now)
+        self.assertIn("learning_postmatch_manual_recovery_required", [row["code"] for row in operations["alerts"]])
+
+        facts = main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=recovery_now,
+            fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(
+                sources=("api_football", "the_odds_api"), home_goals=2, away_goals=0,
+            ),
+        )
+        self.assertTrue(facts["verification"]["settlement_eligible"])
+        recovered_queue = main.learning_postmatch_recovery_queue(now_ts=recovery_now + 1)
+        self.assertEqual(recovered_queue["manual_recovery_required_count"], 0)
+        self.assertEqual(recovered_queue["verified_facts_awaiting_review_count"], 1)
+
+    def test_learning_cycle_settles_only_due_freeze_using_explicit_process_review(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("cycle-due", 900, 1000), now_ts=900)
+        facts = self.collect_verified_learning_facts(frozen, 2, 0, 9000)
+        settlement = {
+            "freeze_id": frozen["freeze_id"],
+            "fact_hash": facts["fact_hash"],
+            "result": {"status": "FT", "home_goals": 2, "away_goals": 0},
+            "process_classification": "PROCESS_ERROR_RESULT_WIN",
+            "event_audit": {"status": "clean", "source_count": 2},
+            "settled_at": 9000,
+            "review": self.learning_postmatch_review(),
+        }
+        result = main.run_learning_cycle({
+            "apply": True, "run_id": "cycle-settle-due", "auto_prepare_prematch": False,
+            "settlement_packets": [settlement],
+        }, now_ts=9000, fixture_rows=[])
+        self.assertEqual(result["settled_count"], 1)
+        saved = main.load_snapshot_store()["learning_postmatch"][frozen["freeze_id"]]
+        self.assertEqual(saved["process_classification"], "PROCESS_ERROR_RESULT_WIN")
+        self.assertFalse(saved["review"]["learning_disposition"]["result_backfit_used"])
+        self.assertNotIn("learning_hypotheses", main.load_snapshot_store())
+        self.assertFalse(result["automatic_champion_change"])
+
+    def learning_postmatch_facts(self, sources=("api_football",), home_goals=2, away_goals=1):
+        return {
+            "ok": True,
+            "result": {"status": "FT", "home_goals": home_goals, "away_goals": away_goals},
+            "events": [{"elapsed": 10, "type": "Goal", "detail": "Normal Goal"}],
+            "statistics": [{"team": "Home", "statistics": {"Total Shots": 12}}],
+            "source_audit": [
+                {"source": source, "component": "result", "ok": True, "evidence_ref": f"test:{source}:fixture",
+                 "home_goals": home_goals, "away_goals": away_goals}
+                for source in sources
+            ],
+        }
+
+    def collect_verified_learning_facts(self, frozen, home_goals, away_goals, collected_at=9000):
+        return main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=collected_at,
+            fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(
+                ("api_football", "official_league"), home_goals, away_goals,
+            ),
+        )
+
+    def test_learning_cycle_collects_single_source_facts_but_never_classifies_or_settles(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("801", 900, 1000), now_ts=900)
+        calls = []
+
+        def fetcher(fixture_id):
+            calls.append(fixture_id)
+            return self.learning_postmatch_facts()
+
+        result = main.run_learning_cycle({
+            "apply": True, "run_id": "cycle-facts-only", "auto_prepare_prematch": False,
+            "auto_collect_postmatch_facts": True,
+        }, now_ts=9000, fixture_rows=[], postmatch_fact_fetcher=fetcher)
+        self.assertEqual(calls, ["801"])
+        self.assertEqual(result["postmatch_fact_results"][0]["action"], "facts_collected")
+        self.assertFalse(result["postmatch_fact_results"][0]["verification"]["settlement_eligible"])
+        store = main.load_snapshot_store()
+        facts = store["learning_postmatch_facts"][frozen["freeze_id"]][0]
+        self.assertEqual(facts["verification"]["status"], "single_source_pending")
+        self.assertIsNone(facts["process_classification"])
+        self.assertFalse(facts["result_backfit_used"])
+        self.assertNotIn(frozen["freeze_id"], store.get("learning_postmatch", {}))
+        self.assertNotIn("learning_hypotheses", store)
+
+    def test_two_source_fact_packet_becomes_review_eligible_but_does_not_auto_settle(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("802", 900, 1000), now_ts=900)
+        facts = main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(("api_football", "official_league")),
+        )
+        self.assertTrue(facts["verification"]["settlement_eligible"])
+        self.assertEqual(facts["verification"]["independent_source_count"], 2)
+        self.assertIsNone(facts["process_classification"])
+        self.assertNotIn(frozen["freeze_id"], main.load_snapshot_store().get("learning_postmatch", {}))
+
+    def test_learning_cycle_reuses_fact_queue_without_repeating_provider_calls(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("803", 900, 1000), now_ts=900)
+        main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(),
+        )
+        fetcher = Mock(side_effect=AssertionError("provider must not be called twice"))
+        result = main.run_learning_cycle({
+            "apply": True, "run_id": "cycle-facts-reuse", "auto_prepare_prematch": False,
+        }, now_ts=9100, fixture_rows=[], postmatch_fact_fetcher=fetcher)
+        self.assertEqual(result["postmatch_fact_results"][0]["action"], "awaiting_independent_verification")
+        fetcher.assert_not_called()
+
+    def test_learning_cycle_can_version_fact_queue_with_supplied_second_source(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("804", 900, 1000), now_ts=900)
+        main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(),
+        )
+        supplied = self.learning_postmatch_facts(("api_football", "official_league"))
+        result = main.run_learning_cycle({
+            "apply": True, "run_id": "cycle-facts-verified", "auto_prepare_prematch": False,
+            "postmatch_fact_packets": {frozen["freeze_id"]: supplied},
+        }, now_ts=9100, fixture_rows=[])
+        verification = result["postmatch_fact_results"][0]["verification"]
+        self.assertTrue(verification["settlement_eligible"])
+        rows = main.load_snapshot_store()["learning_postmatch_facts"][frozen["freeze_id"]]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[-1]["verification"]["independent_source_count"], 2)
+        postmatch = main.load_snapshot_store()["learning_postmatch"][frozen["freeze_id"]]
+        self.assertEqual(postmatch["process_classification"], "DATA_INSUFFICIENT")
+        self.assertEqual(postmatch["review"]["review_mode"], "automatic_evidence_review")
+        self.assertFalse(postmatch["event_audit"]["automatic_review_derivation"]["result_backfit_used"])
+        self.assertEqual(
+            postmatch["event_audit"]["automatic_review_derivation"]["selection_outcome_audit"]["status"],
+            "not_used",
+        )
+
+    def test_learning_freeze_binds_the_odds_api_identity_before_kickoff(self):
+        now_ts, kickoff_at = 100000, 100000 + 3600
+        candidate = main.discover_learning_fixtures(
+            now_ts=now_ts, fixture_rows=[self.learning_fixture_row(8041, 39, kickoff_at)],
+        )["candidates"][0]
+        packet = self.learning_prematch_packet(8041, now_ts)
+        identity = {
+            "source": "the_odds_api", "sport_key": "soccer_epl",
+            "event_id": "0123456789abcdef0123456789abcdef",
+            "home_team": "Home", "away_team": "Away",
+        }
+        packet["provider_identity"] = {**identity, "source_hash": main._content_hash(identity)}
+        freeze_payload = main.build_learning_freeze_payload(candidate, packet, now_ts=now_ts)
+        frozen_identity = next(row for row in freeze_payload["source_refs"] if isinstance(row, dict) and row.get("source") == "the_odds_api")
+        self.assertEqual(frozen_identity["event_id"], identity["event_id"])
+        self.assertEqual(frozen_identity["identity_bound_at"], now_ts)
+        self.assertEqual(frozen_identity["identity_source_hash"], main._content_hash(identity))
+
+    def test_the_odds_api_score_corroboration_requires_exact_frozen_event_and_teams(self):
+        identity = {
+            "source": "the_odds_api", "sport_key": "soccer_epl",
+            "event_id": "0123456789abcdef0123456789abcdef",
+            "home_team": "Home United", "away_team": "Away City",
+        }
+        payload = self.learning_payload("8042", 900, 1000)
+        payload["source_refs"] = [{
+            **identity, "identity_bound_at": 900,
+            "identity_source_hash": main._content_hash(identity),
+        }]
+        frozen = main.freeze_learning_sample(payload, now_ts=900)
+        response = {
+            "ok": True, "status_code": 200,
+            "data": [{
+                "id": identity["event_id"], "sport_key": identity["sport_key"], "completed": True,
+                "home_team": "Home United", "away_team": "Away City",
+                "scores": [{"name": "Home United", "score": "2"}, {"name": "Away City", "score": "1"}],
+            }],
+        }
+        with patch.object(main, "call_the_odds_api", return_value=response) as scores:
+            evidence = main._the_odds_api_frozen_result_evidence(frozen)
+        self.assertTrue(evidence["ok"])
+        self.assertEqual((evidence["home_goals"], evidence["away_goals"]), (2, 1))
+        self.assertEqual(scores.call_args.args[0], "/sports/soccer_epl/scores")
+        self.assertEqual(scores.call_args.args[1]["eventIds"], identity["event_id"])
+
+        mismatched = copy.deepcopy(response)
+        mismatched["data"][0]["home_team"] = "Different Team"
+        with patch.object(main, "call_the_odds_api", return_value=mismatched):
+            rejected = main._the_odds_api_frozen_result_evidence(frozen)
+        self.assertFalse(rejected["ok"])
+        self.assertEqual(rejected["error"], "the_odds_api_bound_event_team_mismatch")
+
+        failed_response = copy.deepcopy(response)
+        failed_response["ok"] = False
+        with patch.object(main, "call_the_odds_api", return_value=failed_response):
+            rejected = main._the_odds_api_frozen_result_evidence(frozen)
+        self.assertFalse(rejected["ok"])
+        self.assertEqual(rejected["error"], "the_odds_api_score_request_failed")
+
+    def test_the_odds_api_mismatched_score_never_verifies_postmatch_result(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("8043", 900, 1000), now_ts=900)
+        packet = self.learning_postmatch_facts(home_goals=2, away_goals=1)
+        packet["source_audit"] = [
+            {"source": "api_football", "component": "result", "ok": True, "evidence_ref": "https://api-football.example/8043", "home_goals": 2, "away_goals": 1},
+            {"source": "the_odds_api", "component": "result", "ok": True, "evidence_ref": "https://api.the-odds-api.com/8043", "home_goals": 1, "away_goals": 2},
+        ]
+        facts = main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000, fact_fetcher=lambda _: packet,
+        )
+        self.assertEqual(facts["verification"]["status"], "single_source_pending")
+        self.assertFalse(facts["verification"]["settlement_eligible"])
+        self.assertEqual(facts["verification"]["independent_source_count"], 1)
+
+    def test_thestats_identity_is_uniquely_bound_before_kickoff(self):
+        kickoff_at, observed_at = 200000, 190000
+        fixture = {"home": "Home United", "away": "Away City", "timestamp": kickoff_at}
+        row = {
+            "id": "mt_8045", "utc_date": datetime.fromtimestamp(kickoff_at, tz=timezone.utc).isoformat(),
+            "status": "scheduled",
+            "home_team": {"name": "Home United"}, "away_team": {"name": "Away City"},
+        }
+        response = {"ok": True, "status_code": 200, "data": {"data": [row], "meta": {"total_pages": 1}}}
+        with patch.object(main, "THESTATS_API_KEY", "configured"), patch.object(main, "call_thestats", return_value=response) as fetch:
+            identity = main._resolve_thestats_prematch_identity(fixture, observed_at)
+        self.assertTrue(identity["ok"])
+        self.assertEqual(identity["match_id"], "mt_8045")
+        self.assertEqual(identity["source_hash"], main._content_hash({
+            "source": "thestats", "match_id": "mt_8045", "kickoff_at": kickoff_at,
+            "home_team": "Home United", "away_team": "Away City",
+        }))
+        self.assertEqual(fetch.call_args.args[0], "/football/matches")
+
+        packet = self.learning_prematch_packet(8045, observed_at)
+        packet["provider_identities"] = [{key: value for key, value in identity.items() if key != "ok"}]
+        candidate = main.discover_learning_fixtures(
+            now_ts=observed_at, fixture_rows=[self.learning_fixture_row(8045, 39, kickoff_at)],
+        )["candidates"][0]
+        freeze_payload = main.build_learning_freeze_payload(candidate, packet, now_ts=observed_at)
+        frozen_identity = next(row for row in freeze_payload["source_refs"] if row.get("source") == "thestats")
+        self.assertEqual(frozen_identity["match_id"], "mt_8045")
+        self.assertEqual(frozen_identity["identity_bound_at"], observed_at)
+
+    def test_thestats_match_day_lookup_is_shared_across_concurrent_fixture_binding(self):
+        kickoff_at, observed_at = 300000, 290000
+        kickoff_iso = datetime.fromtimestamp(kickoff_at, tz=timezone.utc).isoformat()
+        response = {
+            "ok": True, "status_code": 200,
+            "data": {"data": [
+                {"id": "mt_a", "utc_date": kickoff_iso, "status": "scheduled", "home_team": {"name": "Home A"}, "away_team": {"name": "Away A"}},
+                {"id": "mt_b", "utc_date": kickoff_iso, "status": "scheduled", "home_team": {"name": "Home B"}, "away_team": {"name": "Away B"}},
+            ], "meta": {"total_pages": 1}},
+        }
+        fixtures = [
+            {"home": "Home A", "away": "Away A", "timestamp": kickoff_at},
+            {"home": "Home B", "away": "Away B", "timestamp": kickoff_at},
+        ]
+        with patch.object(main, "THESTATS_API_KEY", "configured-cache"), patch.object(main, "call_thestats", return_value=response) as fetch:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                identities = list(pool.map(lambda fixture: main._resolve_thestats_prematch_identity(fixture, observed_at), fixtures))
+        self.assertEqual({row["match_id"] for row in identities}, {"mt_a", "mt_b"})
+        self.assertEqual(sum(bool(row["lookup_cache_hit"]) for row in identities), 1)
+        fetch.assert_called_once()
+
+    def test_thestats_match_day_failure_is_not_cached(self):
+        kickoff_at, observed_at = 400000, 390000
+        fixture = {"home": "Home", "away": "Away", "timestamp": kickoff_at}
+        failed = {"ok": False, "status_code": 429, "error": "rate_limited"}
+        with patch.object(main, "THESTATS_API_KEY", "configured-failure"), patch.object(main, "call_thestats", return_value=failed) as fetch:
+            first = main._resolve_thestats_prematch_identity(fixture, observed_at)
+            second = main._resolve_thestats_prematch_identity(fixture, observed_at)
+        self.assertFalse(first["ok"])
+        self.assertFalse(second["ok"])
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(main.THESTATS_FIXTURE_DAY_CACHE, {})
+
+    def test_thestats_postmatch_requires_exact_result_and_matching_material_events(self):
+        kickoff_at = 1000
+        identity = {
+            "source": "thestats", "match_id": "mt_8046", "kickoff_at": kickoff_at,
+            "home_team": "Home United", "away_team": "Away City",
+        }
+        payload = self.learning_payload("8046", 900, kickoff_at)
+        payload["source_refs"] = [{
+            **identity, "identity_bound_at": 900,
+            "identity_source_hash": main._content_hash(identity),
+        }]
+        frozen = main.freeze_learning_sample(payload, now_ts=900)
+        api_events = [
+            {"elapsed": 12, "type": "Goal", "detail": "Normal Goal", "team": "Home United"},
+            {"elapsed": 40, "type": "Goal", "detail": "Normal Goal", "team": "Away City"},
+        ]
+        detail = {
+            "ok": True, "status_code": 200,
+            "data": {"data": {
+                "id": "mt_8046", "utc_date": datetime.fromtimestamp(kickoff_at, tz=timezone.utc).isoformat(),
+                "status": "finished", "home_team": {"name": "Home United"},
+                "away_team": {"name": "Away City"}, "score": {"home": 1, "away": 1},
+            }},
+        }
+        timeline = {
+            "ok": True, "status_code": 200,
+            "data": {"data": {"events": [
+                {"minute": 12, "type": "goal", "detail": "normal", "team": {"name": "Home United"}},
+                {"minute": 41, "type": "goal", "detail": "normal", "team": {"name": "Away City"}},
+            ]}},
+        }
+        with patch.object(main, "call_thestats", side_effect=[detail, timeline]):
+            evidence = main._thestats_frozen_postmatch_evidence(
+                frozen, api_events, {"home_goals": 1, "away_goals": 1},
+            )
+        self.assertTrue(evidence["ok"])
+        self.assertTrue(evidence["result_audit"]["ok"])
+        self.assertTrue(evidence["event_audit"]["ok"])
+        self.assertEqual(
+            evidence["event_audit"]["event_signature_hash"],
+            main._content_hash(main._material_event_signature(api_events, "Home United", "Away City")),
+        )
+
+        bad_timeline = copy.deepcopy(timeline)
+        bad_timeline["data"]["data"]["events"][1]["minute"] = 70
+        with patch.object(main, "call_thestats", side_effect=[detail, bad_timeline]):
+            rejected_events = main._thestats_frozen_postmatch_evidence(
+                frozen, api_events, {"home_goals": 1, "away_goals": 1},
+            )
+        self.assertTrue(rejected_events["result_audit"]["ok"])
+        self.assertFalse(rejected_events["event_audit"]["ok"])
+        self.assertIsNone(rejected_events["event_audit"]["event_signature_hash"])
+
+    def test_automatic_review_does_not_equate_verified_events_with_state_tree_correctness(self):
+        payload = self.learning_payload("8044", 900, 1000)
+        payload["analysis"]["state_tree"] = {"states": {"FGH": {"prediction": "home_first_goal"}}}
+        payload["decision"] = {
+            "decision": "BET", "execution_action": "BET", "match_rating": "B", "market_rating": "B",
+            "model_probability": 0.56, "market_no_vig_probability": 0.51,
+            "edge": 0.05, "ev": 0.0696, "script_coverage": 0.70,
+            "crowding": 0.50, "line_movement": "stable", "lineup_confidence": 0.80,
+            "death_path": [], "pass_reasons": [],
+            "best_market": {
+                "market": "over_under", "selection": "under", "line": 2.75, "price": 1.91,
+                "model_probability": 0.56, "market_no_vig_probability": 0.51,
+                "edge": 0.05, "ev": 0.0696, "script_coverage": 0.70,
+            },
+            "selected_expression": {"market": "over_under", "selection": "under", "line": 2.75, "price": 1.91},
+        }
+        frozen = main.freeze_learning_sample(payload, now_ts=900)
+        self.save_learning_t1h_reference(
+            "8044", 1000, frozen["decision"]["selected_expression"], 1.80,
+        )
+        main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda _: self.verified_event_fact_packet(1, 0),
+        )
+        main.build_learning_postmatch_review_draft(frozen["freeze_id"], now_ts=9001)
+        completed = main.complete_automatic_learning_postmatch_review(frozen["freeze_id"], now_ts=9002)
+        self.assertEqual(completed["process_classification"], "DATA_INSUFFICIENT")
+        self.assertEqual(completed["review"]["match_selection_quality"]["status"], "passed")
+        self.assertEqual(completed["review"]["match_selection_quality"]["required_minimum_rating"], "B")
+        self.assertFalse(completed["review"]["match_selection_quality"]["rating_derived_from_result"])
+        self.assertEqual(completed["review"]["price_execution_audit"]["status"], "passed")
+        self.assertEqual(completed["review"]["price_execution_audit"]["reference_stage"], "T-1h")
+        self.assertFalse(completed["review"]["price_execution_audit"]["caller_supplied_price_reference_used"])
+        self.assertEqual(completed["review"]["state_tree_coverage"]["status"], "inconclusive")
+        self.assertEqual(
+            completed["event_audit"]["automatic_review_derivation"]["selection_outcome_audit"]["status"],
+            "not_used",
+        )
+        refreshed = main.refresh_learning_quality_cards(now_ts=9003)
+        self.assertEqual(refreshed["created_count"], 1)
+        card = main.load_snapshot_store()["learning_quality_cards"][frozen["freeze_id"]]
+        self.assertFalse(card["sample_eligibility"]["eligible"])
+        self.assertTrue(card["sample_eligibility"]["priority_calibration_eligible"])
+        self.assertTrue(card["sample_eligibility"]["selection_calibration_eligible"])
+        calibration = main.learning_quality_calibration_report(minimum_samples=2)
+        self.assertEqual(calibration["calibration_group_count"], 2)
+        self.assertTrue(all(row["eligible_sample_count"] == 1 for row in calibration["groups"]))
+
+    def test_automatic_match_threshold_uses_only_explicit_letter_grades(self):
+        self.assertTrue(main._learning_match_rating_at_least_b("A-"))
+        self.assertTrue(main._learning_match_rating_at_least_b("B+"))
+        self.assertFalse(main._learning_match_rating_at_least_b("C"))
+        self.assertIsNone(main._learning_match_rating_at_least_b(7.5))
+        self.assertIsNone(main._learning_match_rating_at_least_b("7.5/10"))
+
+    def test_fact_verification_counts_only_matching_result_evidence(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("805", 900, 1000), now_ts=900)
+        supplied = self.learning_postmatch_facts(("api_football", "official_league"))
+        supplied["source_audit"][1]["away_goals"] = 0
+        facts = main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000, fact_fetcher=lambda fixture_id: supplied,
+        )
+        self.assertEqual(facts["verification"]["independent_source_count"], 1)
+        self.assertFalse(facts["verification"]["settlement_eligible"])
+
+    def test_fact_verification_rejects_duplicate_refs_and_same_domain_aliases(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("805-alias", 900, 1000), now_ts=900)
+        supplied = self.learning_postmatch_facts(("source_a", "source_b"))
+        supplied["source_audit"][0]["evidence_ref"] = "https://scores.example.test/match/805"
+        supplied["source_audit"][1]["evidence_ref"] = "https://scores.example.test/match/805?mirror=1"
+        facts = main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000, fact_fetcher=lambda fixture_id: supplied,
+        )
+        self.assertEqual(facts["verification"]["independent_source_count"], 1)
+        self.assertEqual(facts["verification"]["verified_source_authorities"], ["scores.example.test"])
+        self.assertFalse(facts["verification"]["settlement_eligible"])
+
+        frozen_duplicate = main.freeze_learning_sample(self.learning_payload("805-duplicate", 901, 1001), now_ts=901)
+        duplicate = self.learning_postmatch_facts(("source_a", "source_b"))
+        duplicate["source_audit"][0]["evidence_ref"] = "opaque:same-result-record"
+        duplicate["source_audit"][1]["evidence_ref"] = "opaque:same-result-record"
+        duplicate_facts = main.collect_learning_postmatch_facts(
+            frozen_duplicate["freeze_id"], now_ts=9000, fact_fetcher=lambda fixture_id: duplicate,
+        )
+        self.assertEqual(duplicate_facts["verification"]["unique_evidence_ref_count"], 1)
+        self.assertEqual(duplicate_facts["verification"]["independent_source_count"], 1)
+        self.assertFalse(duplicate_facts["verification"]["settlement_eligible"])
+
+    def test_review_queue_prioritizes_verified_facts_and_preserves_frozen_context(self):
+        waiting = main.freeze_learning_sample(self.learning_payload("806", 900, 1000), now_ts=900)
+        ready = main.freeze_learning_sample(self.learning_payload("807", 901, 1001), now_ts=901)
+        main.collect_learning_postmatch_facts(
+            waiting["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(),
+        )
+        main.collect_learning_postmatch_facts(
+            ready["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(("api_football", "official_league")),
+        )
+        queue = main.learning_review_queue()
+        self.assertEqual(queue["queue_count"], 2)
+        self.assertEqual(queue["review_ready_count"], 1)
+        self.assertEqual(queue["items"][0]["freeze_id"], ready["freeze_id"])
+        self.assertTrue(queue["items"][0]["review_ready"])
+        self.assertEqual(queue["items"][0]["freeze_hash"], ready["content_hash"])
+        self.assertEqual(queue["items"][0]["frozen_decision"]["decision"], "PASS")
+        self.assertFalse(queue["automatic_process_classification"])
+        self.assertFalse(queue["result_backfit_allowed"])
+        self.assertFalse(queue["automatic_champion_change"])
+
+    def test_postmatch_review_draft_is_immutable_and_never_grades_process_from_result(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("draft-1", 900, 1000), now_ts=900)
+        facts = self.collect_verified_learning_facts(frozen, 4, 0, 9000)
+        first = main.build_learning_postmatch_review_draft(frozen["freeze_id"], now_ts=9001)
+        second = main.build_learning_postmatch_review_draft(frozen["freeze_id"], now_ts=9002)
+
+        self.assertEqual(first["action"], "drafted")
+        self.assertEqual(second["action"], "unchanged")
+        self.assertEqual(first["freeze_hash"], frozen["content_hash"])
+        self.assertEqual(first["fact_hash"], facts["fact_hash"])
+        self.assertEqual(first["suggested_process_classification"], "DATA_INSUFFICIENT")
+        self.assertTrue(first["manual_review_required"])
+        self.assertFalse(first["automatic_settlement_eligible"])
+        self.assertFalse(first["result_outcome_used_to_grade_process"])
+        self.assertFalse(first["automatic_hypothesis_registration"])
+        self.assertFalse(first["automatic_champion_change"])
+        store = main.load_snapshot_store()
+        self.assertNotIn(frozen["freeze_id"], store.get("learning_postmatch", {}))
+        self.assertNotIn("learning_hypotheses", store)
+
+    def test_postmatch_review_draft_requires_two_source_result_verification(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("draft-single", 900, 1000), now_ts=900)
+        main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(),
+        )
+        with self.assertRaises(main.HTTPException) as rejected:
+            main.build_learning_postmatch_review_draft(frozen["freeze_id"], now_ts=9001)
+        self.assertEqual(rejected.exception.status_code, 409)
+        self.assertEqual(rejected.exception.detail, "independent_result_verification_required_for_review_draft")
+
+    def test_postmatch_review_draft_flags_event_pollution_without_auto_classification(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("draft-red", 900, 1000), now_ts=900)
+        packet = self.learning_postmatch_facts(("api_football", "official_league"), 2, 1)
+        packet["events"].append({"elapsed": 55, "type": "Card", "detail": "Red Card", "team": "Away"})
+        event_hash = main._content_hash(main._material_event_signature(packet["events"]))
+        packet["source_audit"].extend([
+            {"source": "api_football", "component": "events", "ok": True, "evidence_ref": "test:api:events", "event_signature_hash": event_hash},
+            {"source": "official_league", "component": "events", "ok": True, "evidence_ref": "test:official:events", "event_signature_hash": event_hash},
+        ])
+        main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000, fact_fetcher=lambda fixture_id: packet,
+        )
+        draft = main.build_learning_postmatch_review_draft(frozen["freeze_id"], now_ts=9001)
+        self.assertEqual(draft["event_evidence"]["pollution_status"], "requires_human_review")
+        self.assertEqual(draft["event_evidence"]["pollution_flags"], ["red_card"])
+        self.assertEqual(draft["suggested_process_classification"], "DATA_INSUFFICIENT")
+        self.assertTrue(draft["manual_review_required"])
+
+    def test_event_verification_rejects_same_domain_aliases(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("draft-event-alias", 900, 1000), now_ts=900)
+        packet = self.learning_postmatch_facts(("api_football", "official_league"), 2, 1)
+        event_hash = main._content_hash(main._material_event_signature(packet["events"]))
+        packet["source_audit"].extend([
+            {"source": "event_feed_a", "component": "events", "ok": True, "evidence_ref": "https://events.example.test/match/1", "event_signature_hash": event_hash},
+            {"source": "event_feed_b", "component": "events", "ok": True, "evidence_ref": "https://events.example.test/match/1/timeline", "event_signature_hash": event_hash},
+        ])
+        main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000, fact_fetcher=lambda fixture_id: packet,
+        )
+        draft = main.build_learning_postmatch_review_draft(frozen["freeze_id"], now_ts=9001)
+        self.assertEqual(draft["event_evidence"]["event_source_count"], 1)
+        self.assertEqual(draft["event_evidence"]["event_verification"], "single_source")
+        self.assertEqual(draft["event_evidence"]["event_source_authorities"], ["events.example.test"])
+
+    def test_event_verification_requires_both_sources_to_bind_same_sequence_hash(self):
+        facts = self.learning_postmatch_facts(("api_football", "official_league"), 1, 0)
+        event_hash = main._content_hash(main._material_event_signature(facts["events"]))
+        facts["source_audit"].extend([
+            {"source": "api_football", "component": "events", "ok": True, "evidence_ref": "https://api.example.test/events/1", "event_signature_hash": event_hash},
+            {"source": "official_league", "component": "events", "ok": True, "evidence_ref": "https://league.example.test/events/1", "event_signature_hash": "mismatched"},
+        ])
+        evidence = main._postmatch_event_evidence(facts)
+        self.assertEqual(evidence["event_source_count"], 1)
+        self.assertEqual(evidence["event_verification"], "single_source")
+
+    def verified_event_fact_packet(self, home_goals=3, away_goals=2):
+        packet = self.learning_postmatch_facts(("api_football", "official_league"), home_goals, away_goals)
+        packet["events"] = [
+            {"elapsed": 12, "type": "Goal", "detail": "Normal Goal", "team": "Home"},
+            {"elapsed": 40, "type": "Goal", "detail": "Normal Goal", "team": "Away"},
+        ]
+        event_hash = main._content_hash(main._material_event_signature(packet["events"]))
+        packet["source_audit"].extend([
+            {"source": "api_football", "component": "events", "ok": True, "evidence_ref": "test:api:events", "event_signature_hash": event_hash},
+            {"source": "official_league", "component": "events", "ok": True, "evidence_ref": "test:official:events", "event_signature_hash": event_hash},
+        ])
+        return packet
+
+    def automatic_evidence_review(self, frozen, facts, expression_status="passed"):
+        freeze_ref = f"freeze:{frozen['content_hash']}"
+        fact_ref = f"fact:{facts['fact_hash']}"
+        review = self.learning_postmatch_review()
+        statuses = {
+            "match_selection_quality": "passed",
+            "fundamental_chain_audit": "passed",
+            "state_tree_coverage": "passed",
+            "market_language_audit": "passed",
+            "expression_audit": expression_status,
+            "price_execution_audit": "passed",
+        }
+        for section, status in statuses.items():
+            review[section] = {
+                "status": status,
+                "reason": f"Hash-bound evidence supports the {section} process assessment.",
+                "evidence_refs": [fact_ref if section == "state_tree_coverage" else freeze_ref],
+            }
+        review["review_mode"] = "scheduled_agent"
+        review["outcome_not_used_for_process_grade"] = True
+        review["process_reasoning"] = "The process grade is derived from frozen inputs and hash-bound event evidence before the separately calculated selection outcome."
+        return review
+
+    def test_evidence_review_derives_process_before_selection_outcome_and_ignores_caller_class(self):
+        payload = self.learning_payload("auto-review-error", 900, 1000)
+        payload["decision"] = {
+            "decision": "BET", "match_rating": "B",
+            "selected_expression": {"market": "over_under", "selection": "under", "line": 2.75, "price": 1.91},
+        }
+        frozen = main.freeze_learning_sample(payload, now_ts=900)
+        facts = main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.verified_event_fact_packet(3, 2),
+        )
+        draft = main.build_learning_postmatch_review_draft(frozen["freeze_id"], now_ts=9001)
+        completed = main.complete_learning_postmatch_review({
+            "freeze_id": frozen["freeze_id"], "draft_hash": draft["draft_hash"],
+            "process_classification": "PROCESS_CORRECT_RESULT_WIN",
+            "review": self.automatic_evidence_review(frozen, facts, expression_status="failed"),
+            "event_audit": {"status": "clean", "evidence_refs": [f"fact:{facts['fact_hash']}"]},
+            "settled_at": 9002,
+        }, now_ts=9002)
+        self.assertEqual(completed["process_classification"], "PROCESS_ERROR_RESULT_LOSS")
+        derivation = completed["event_audit"]["automatic_review_derivation"]
+        self.assertEqual(derivation["process_grade"], "error")
+        self.assertTrue(derivation["process_grade_derived_before_outcome"])
+        self.assertEqual(derivation["selection_outcome_audit"]["outcome"], "loss")
+        self.assertFalse(derivation["caller_supplied_process_classification_used"])
+        self.assertFalse(derivation["result_backfit_used"])
+
+    def test_evidence_review_can_mark_process_correct_despite_selection_loss(self):
+        payload = self.learning_payload("auto-review-correct-loss", 900, 1000)
+        payload["decision"] = {
+            "decision": "BET", "match_rating": "B",
+            "selected_expression": {"market": "over_under", "selection": "under", "line": 2.75, "price": 1.91},
+        }
+        frozen = main.freeze_learning_sample(payload, now_ts=900)
+        facts = main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.verified_event_fact_packet(3, 2),
+        )
+        draft = main.build_learning_postmatch_review_draft(frozen["freeze_id"], now_ts=9001)
+        completed = main.complete_learning_postmatch_review({
+            "freeze_id": frozen["freeze_id"], "draft_hash": draft["draft_hash"],
+            "review": self.automatic_evidence_review(frozen, facts, expression_status="passed"),
+            "event_audit": {"status": "clean", "evidence_refs": [f"draft:{draft['draft_hash']}"]},
+        }, now_ts=9002)
+        self.assertEqual(completed["process_classification"], "PROCESS_CORRECT_RESULT_LOSS")
+
+    def test_automatic_evidence_review_rejects_unbound_section_assertions(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("auto-review-unbound", 900, 1000), now_ts=900)
+        facts = main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.verified_event_fact_packet(1, 1),
+        )
+        draft = main.build_learning_postmatch_review_draft(frozen["freeze_id"], now_ts=9001)
+        review = self.automatic_evidence_review(frozen, facts)
+        review["market_language_audit"]["evidence_refs"] = ["unbound:claim"]
+        with self.assertRaises(main.HTTPException) as rejected:
+            main.complete_learning_postmatch_review({
+                "freeze_id": frozen["freeze_id"], "draft_hash": draft["draft_hash"],
+                "review": review,
+                "event_audit": {"status": "clean", "evidence_refs": [f"fact:{facts['fact_hash']}"]},
+            }, now_ts=9002)
+        self.assertEqual(rejected.exception.status_code, 422)
+        self.assertIn("market_language_audit_hash_bound_evidence_required", rejected.exception.detail["reasons"])
+
+    def test_learning_cycle_can_complete_hash_bound_evidence_review(self):
+        payload = self.learning_payload("cycle-auto-review", 900, 1000)
+        payload["decision"] = {
+            "decision": "BET", "match_rating": "B",
+            "selected_expression": {"market": "over_under", "selection": "under", "line": 2.75, "price": 1.91},
+        }
+        frozen = main.freeze_learning_sample(payload, now_ts=900)
+        facts = main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.verified_event_fact_packet(3, 2),
+        )
+        draft = main.build_learning_postmatch_review_draft(frozen["freeze_id"], now_ts=9001)
+        result = main.run_learning_cycle({
+            "apply": True, "run_id": "cycle-complete-review",
+            "auto_collect_postmatch_facts": False,
+            "review_completion_packets": [{
+                "freeze_id": frozen["freeze_id"], "draft_hash": draft["draft_hash"],
+                "review": self.automatic_evidence_review(frozen, facts),
+                "event_audit": {"status": "clean", "evidence_refs": [f"fact:{facts['fact_hash']}"]},
+            }],
+        }, now_ts=9002, fixture_rows=[])
+        self.assertEqual(result["settled_count"], 1)
+        self.assertEqual(result["review_completion_results"][0]["action"], "settled")
+        self.assertEqual(result["review_completion_results"][0]["process_classification"], "PROCESS_CORRECT_RESULT_LOSS")
+        self.assertFalse(result["review_completion_results"][0]["caller_supplied_process_classification_used"])
+
+    def test_learning_cycle_finishes_postmatch_evidence_before_future_prematch(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("order-past", 900, 1000), now_ts=900)
+        future = self.learning_fixture_row(809, 39, 10000)
+        calls = []
+
+        def fetcher(fixture_id):
+            calls.append("postmatch")
+            return self.learning_postmatch_facts(("api_football", "official_league"))
+
+        def builder(fixture_id):
+            calls.append("prematch")
+            return self.learning_prematch_packet(fixture_id, 9000)
+
+        result = main.run_learning_cycle(
+            {"apply": True, "run_id": "ordered-cycle"}, now_ts=9000,
+            fixture_rows=[future], prematch_packet_builder=builder,
+            postmatch_fact_fetcher=fetcher,
+        )
+        self.assertEqual(calls, ["postmatch", "prematch"])
+        self.assertEqual(result["execution_order"], ["past_36h_postmatch", "future_24h_prematch"])
+        self.assertEqual(result["postmatch_review_draft_results"][0]["action"], "drafted")
+        self.assertEqual(result["review_draft_count"], 1)
+        self.assertEqual(result["frozen_count"], 1)
+        postmatch = main.load_snapshot_store()["learning_postmatch"][frozen["freeze_id"]]
+        self.assertEqual(postmatch["process_classification"], "DATA_INSUFFICIENT")
+        self.assertEqual(postmatch["review"]["review_mode"], "automatic_evidence_review")
+
+    def test_learning_plan_has_no_daily_match_or_historical_sample_limit(self):
+        now_ts = 100000
+        fixtures = [self.learning_fixture_row(900 + index, 39, now_ts + 3600) for index in range(12)]
+        plan = main.learning_cycle_plan(now_ts=now_ts, fixture_rows=fixtures)
+        self.assertEqual(plan["discovery"]["candidate_count"], 12)
+        self.assertIsNone(plan["match_limit"])
+        self.assertIsNone(plan["daily_freeze_cap"])
+        self.assertIsNone(plan["full_historical_odds_sample_limit"])
+        self.assertIsNone(plan["remaining_freeze_capacity"])
+
+    def test_settlement_cannot_bypass_latest_verified_fact_packet(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("808", 900, 1000), now_ts=900)
+        result = {"status": "FT", "home_goals": 2, "away_goals": 1}
+        with self.assertRaises(main.HTTPException) as no_facts:
+            main.settle_learning_sample(
+                frozen["freeze_id"], result, "PROCESS_CORRECT_RESULT_WIN",
+                {"status": "clean"}, 9000, self.learning_postmatch_review(), "missing-hash",
+            )
+        self.assertEqual(no_facts.exception.detail, "verified_postmatch_fact_packet_required")
+
+        single = main.collect_learning_postmatch_facts(
+            frozen["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda fixture_id: self.learning_postmatch_facts(),
+        )
+        with self.assertRaises(main.HTTPException) as one_source:
+            main.settle_learning_sample(
+                frozen["freeze_id"], result, "PROCESS_CORRECT_RESULT_WIN",
+                {"status": "clean"}, 9000, self.learning_postmatch_review(), single["fact_hash"],
+            )
+        self.assertEqual(one_source.exception.detail, "independent_result_verification_required")
+
+        verified = self.collect_verified_learning_facts(frozen, 2, 1, 9001)
+        with self.assertRaises(main.HTTPException) as stale_hash:
+            main.settle_learning_sample(
+                frozen["freeze_id"], result, "PROCESS_CORRECT_RESULT_WIN",
+                {"status": "clean"}, 9001, self.learning_postmatch_review(), single["fact_hash"],
+            )
+        self.assertEqual(stale_hash.exception.detail, "latest_verified_fact_hash_required")
+        with self.assertRaises(main.HTTPException) as wrong_result:
+            main.settle_learning_sample(
+                frozen["freeze_id"], {"status": "FT", "home_goals": 3, "away_goals": 1},
+                "PROCESS_CORRECT_RESULT_WIN", {"status": "clean"}, 9001,
+                self.learning_postmatch_review(), verified["fact_hash"],
+            )
+        self.assertEqual(wrong_result.exception.detail, "submitted_result_does_not_match_verified_facts")
+
+    def test_learning_cycle_rejects_apply_without_safe_run_id(self):
+        with self.assertRaises(main.HTTPException) as missing:
+            main.run_learning_cycle({"apply": True}, now_ts=100000, fixture_rows=[])
+        self.assertEqual(missing.exception.status_code, 400)
+        with self.assertRaises(main.HTTPException):
+            main.run_learning_cycle({"apply": True, "run_id": "unsafe/id"}, now_ts=100000, fixture_rows=[])
+
+    def settle_selection_quality_sample(self, fixture, process_class, expression_status="passed", market_rating=None, match_status="passed"):
+        payload = self.learning_payload(fixture, 900, 1000)
+        payload["decision"] = {
+            "decision": "BET", "match_rating": "B",
+            "selected_expression": {"market": "over_under", "selection": "under", "line": 2.75, "price": 1.91},
+        }
+        if market_rating is not None:
+            payload["decision"]["market_rating"] = market_rating
+        frozen = main.freeze_learning_sample(payload, now_ts=900)
+        facts = self.collect_verified_learning_facts(frozen, 3, 2, 8200)
+        review = self.learning_postmatch_review()
+        review["match_selection_quality"] = {"status": match_status}
+        review["expression_audit"] = {"status": expression_status}
+        review["price_execution_audit"] = {"status": "passed"}
+        return main.settle_learning_sample(
+            frozen["freeze_id"], {"status": "FT", "home_goals": 3, "away_goals": 2},
+            process_class, {"status": "clean"}, 8200, review, facts["fact_hash"],
+        )
+
+    def test_selection_quality_cards_use_process_not_result_and_never_auto_optimize(self):
+        self.settle_selection_quality_sample("quality-correct", "PROCESS_CORRECT_RESULT_LOSS", expression_status="failed")
+        self.settle_selection_quality_sample("quality-error", "PROCESS_ERROR_RESULT_WIN", expression_status="passed")
+        self.settle_selection_quality_sample("quality-event", "EVENT_CONTAMINATED", expression_status="failed")
+        report = main.learning_selection_quality_report(minimum_samples=2)
+        self.assertEqual(report["card_count"], 1)
+        card = report["cards"][0]
+        self.assertEqual(card["eligible_sample_count"], 2)
+        self.assertEqual(card["process_correct_count"], 1)
+        self.assertEqual(card["process_error_count"], 1)
+        self.assertEqual(card["rates"]["process_accuracy"], 0.5)
+        self.assertEqual(card["rates"]["expression_failure_rate"], 0.5)
+        self.assertTrue(card["sample_ready"])
+        self.assertEqual(card["research_signal"], "HYPOTHESIS_ONLY_REVIEW_ALLOWED")
+        self.assertFalse(card["result_outcome_used_for_optimization"])
+        self.assertFalse(card["automatic_weight_change"])
+        self.assertFalse(card["champion_effect"])
+        self.assertEqual(report["excluded_counts"]["event_contaminated"], 1)
+        self.assertFalse(report["automatic_hypothesis_registration"])
+        self.assertFalse(report["automatic_champion_change"])
+
+    def test_selection_quality_counts_latest_version_per_fixture_only(self):
+        self.settle_selection_quality_sample("quality-versioned", "PROCESS_CORRECT_RESULT_LOSS", expression_status="failed")
+        payload = self.learning_payload(
+            "quality-versioned", 950, 1000,
+            analysis={"fundamental_chain": {"status": "complete"}, "revision": 2},
+        )
+        payload["decision"] = {
+            "decision": "BET", "match_rating": "B",
+            "selected_expression": {"market": "over_under", "selection": "under", "line": 2.75, "price": 1.91},
+        }
+        latest = main.freeze_learning_sample(payload, now_ts=950)
+        facts = self.collect_verified_learning_facts(latest, 3, 2, 8201)
+        review = self.learning_postmatch_review()
+        review["match_selection_quality"] = {"status": "passed"}
+        review["expression_audit"] = {"status": "failed"}
+        review["price_execution_audit"] = {"status": "passed"}
+        main.settle_learning_sample(
+            latest["freeze_id"], {"status": "FT", "home_goals": 3, "away_goals": 2},
+            "PROCESS_CORRECT_RESULT_WIN", {"status": "clean"}, 8201, review, facts["fact_hash"],
+        )
+
+        report = main.learning_selection_quality_report(minimum_samples=2)
+        self.assertEqual(report["cards"][0]["eligible_sample_count"], 1)
+        self.assertEqual(report["cards"][0]["fixture_ids"], ["quality-versioned"])
+        self.assertEqual(report["excluded_counts"]["superseded_freeze_version"], 1)
+
+    def test_learning_quality_cards_are_hash_bound_immutable_and_result_independent(self):
+        self.settle_selection_quality_sample(
+            "card-result-win", "PROCESS_CORRECT_RESULT_WIN", expression_status="failed", market_rating="B+",
+        )
+        self.settle_selection_quality_sample(
+            "card-result-loss", "PROCESS_CORRECT_RESULT_LOSS", expression_status="failed", market_rating="B+",
+        )
+        first = main.refresh_learning_quality_cards(now_ts=9000)
+        second = main.refresh_learning_quality_cards(now_ts=9001)
+        self.assertEqual(first["created_count"], 2)
+        self.assertEqual(second["created_count"], 0)
+        cards = main.load_snapshot_store()["learning_quality_cards"]
+        win_card = cards["card-result-win:v1"]
+        loss_card = cards["card-result-loss:v1"]
+        self.assertEqual(win_card["priority_quality"]["label"], loss_card["priority_quality"]["label"])
+        self.assertEqual(win_card["selection_quality"]["label"], loss_card["selection_quality"]["label"])
+        self.assertEqual(win_card["selection_quality"]["label"], "failed")
+        self.assertNotEqual(win_card["outcome_context"]["process_classification"], loss_card["outcome_context"]["process_classification"])
+        self.assertFalse(win_card["outcome_context"]["final_score_copied_into_card"])
+        self.assertEqual(win_card["freeze_hash"], main._learning_freeze_by_id(main.load_snapshot_store(), "card-result-win:v1")["content_hash"])
+        self.assertFalse(first["result_outcome_used_for_labels"])
+        self.assertFalse(first["automatic_champion_change"])
+
+    def test_quality_calibration_uses_explicit_ratings_and_process_labels_only(self):
+        self.settle_selection_quality_sample(
+            "calibration-pass", "PROCESS_CORRECT_RESULT_LOSS", market_rating="A", match_status="passed",
+        )
+        self.settle_selection_quality_sample(
+            "calibration-fail", "PROCESS_ERROR_RESULT_WIN", market_rating="A", match_status="failed",
+        )
+        self.settle_selection_quality_sample(
+            "calibration-no-market-rating", "PROCESS_CORRECT_RESULT_WIN", match_status="passed",
+        )
+        main.refresh_learning_quality_cards(now_ts=9000)
+        report = main.learning_quality_calibration_report(minimum_samples=2)
+        priority = next(row for row in report["groups"] if row["dimension"] == "priority_quality")
+        selection = next(row for row in report["groups"] if row["dimension"] == "selection_quality")
+        self.assertEqual(priority["eligible_sample_count"], 3)
+        self.assertEqual(priority["observed_process_pass_rate"], 0.666667)
+        self.assertEqual(selection["eligible_sample_count"], 2)
+        self.assertEqual(selection["observed_process_pass_rate"], 1.0)
+        self.assertTrue(selection["sample_ready"])
+        self.assertEqual(report["excluded_counts"]["selection_rating_missing"], 1)
+        self.assertFalse(report["result_outcome_used_for_calibration"])
+        self.assertFalse(report["automatic_weight_change"])
+
+    def test_quality_calibration_counts_only_latest_freeze_version(self):
+        self.settle_selection_quality_sample(
+            "quality-card-versioned", "PROCESS_CORRECT_RESULT_LOSS", market_rating="B",
+        )
+        payload = self.learning_payload(
+            "quality-card-versioned", 950, 1000,
+            analysis={"fundamental_chain": {"status": "complete"}, "revision": 2},
+        )
+        payload["decision"] = {
+            "decision": "BET", "match_rating": "B", "market_rating": "B",
+            "selected_expression": {"market": "over_under", "selection": "under", "line": 2.75, "price": 1.91},
+        }
+        latest = main.freeze_learning_sample(payload, now_ts=950)
+        facts = self.collect_verified_learning_facts(latest, 3, 2, 8201)
+        review = self.learning_postmatch_review()
+        review["match_selection_quality"] = {"status": "failed"}
+        review["expression_audit"] = {"status": "failed"}
+        review["price_execution_audit"] = {"status": "passed"}
+        main.settle_learning_sample(
+            latest["freeze_id"], {"status": "FT", "home_goals": 3, "away_goals": 2},
+            "PROCESS_ERROR_RESULT_WIN", {"status": "clean"}, 8201, review, facts["fact_hash"],
+        )
+        main.refresh_learning_quality_cards(now_ts=9000)
+        report = main.learning_quality_calibration_report(minimum_samples=2)
+        self.assertEqual(report["stored_card_count"], 2)
+        self.assertEqual(report["latest_fixture_card_count"], 1)
+        self.assertEqual(report["excluded_counts"]["superseded_freeze_version"], 1)
+        self.assertTrue(all(row["eligible_sample_count"] == 1 for row in report["groups"]))
+
+    def test_quality_card_without_outcome_independence_attestation_is_audit_only(self):
+        payload = self.learning_payload("quality-unattested", 900, 1000)
+        payload["decision"] = {
+            "decision": "BET", "match_rating": "A", "market_rating": "A",
+            "selected_expression": {"market": "over_under", "selection": "under", "line": 2.75, "price": 1.91},
+        }
+        frozen = main.freeze_learning_sample(payload, now_ts=900)
+        facts = self.collect_verified_learning_facts(frozen, 3, 2, 8200)
+        review = self.learning_postmatch_review()
+        review.pop("outcome_not_used_for_process_grade")
+        review["match_selection_quality"] = {"status": "passed"}
+        review["expression_audit"] = {"status": "passed"}
+        review["price_execution_audit"] = {"status": "passed"}
+        main.settle_learning_sample(
+            frozen["freeze_id"], {"status": "FT", "home_goals": 3, "away_goals": 2},
+            "PROCESS_CORRECT_RESULT_WIN", {"status": "clean"}, 8200, review, facts["fact_hash"],
+        )
+        main.refresh_learning_quality_cards(now_ts=9000)
+        card = main.load_snapshot_store()["learning_quality_cards"][frozen["freeze_id"]]
+        self.assertFalse(card["sample_eligibility"]["eligible"])
+        self.assertEqual(card["sample_eligibility"]["reason"], "outcome_independence_attestation_missing")
+        report = main.learning_quality_calibration_report(minimum_samples=2)
+        self.assertEqual(report["calibration_group_count"], 0)
+        self.assertEqual(report["excluded_counts"]["sample_ineligible"], 1)
+
+    def test_single_match_failure_cannot_create_research_proposal(self):
+        self.settle_selection_quality_sample("proposal-single", "PROCESS_CORRECT_RESULT_WIN", expression_status="failed")
+        derived = main.learning_research_proposal_candidates(minimum_matches=3)
+        self.assertEqual(derived["candidate_count"], 0)
+        self.assertFalse(derived["automatic_hypothesis_registration"])
+        self.assertNotIn("learning_research_proposals", main.load_snapshot_store())
+        self.assertNotIn("learning_hypotheses", main.load_snapshot_store())
+
+    def test_repeated_multi_match_failure_creates_immutable_proposal_only(self):
+        for index in range(3):
+            self.settle_selection_quality_sample(
+                f"proposal-repeat-{index}", "PROCESS_CORRECT_RESULT_LOSS", expression_status="failed",
+            )
+        derived = main.learning_research_proposal_candidates(minimum_matches=3)
+        self.assertEqual(derived["candidate_count"], 1)
+        candidate = derived["candidates"][0]
+        self.assertEqual(candidate["signal_dimension"], "expression")
+        self.assertEqual(candidate["evidence"]["eligible_distinct_match_count"], 3)
+        self.assertEqual(candidate["evidence"]["failure_count"], 3)
+        self.assertFalse(candidate["evidence"]["result_outcome_used"])
+        self.assertEqual(candidate["causal_claim_status"], "not_formulated")
+        self.assertFalse(candidate["automatic_hypothesis_registration"])
+        self.assertFalse(candidate["automatic_model_effect"])
+        self.assertFalse(candidate["champion_effect"])
+
+        first = main.refresh_learning_research_proposals(now_ts=9000, minimum_matches=3)
+        second = main.refresh_learning_research_proposals(now_ts=9001, minimum_matches=3)
+        self.assertEqual(first["new_proposal_version_count"], 1)
+        self.assertEqual(first["results"][0]["action"], "proposed")
+        self.assertEqual(second["new_proposal_version_count"], 0)
+        self.assertEqual(second["results"][0]["action"], "unchanged")
+        self.assertEqual(main.learning_research_proposal_report()["proposal_count"], 1)
+        store = main.load_snapshot_store()
+        self.assertNotIn("learning_hypotheses", store)
+        self.assertNotIn("learning_promotions", store)
+
+    def test_learning_cycle_refreshes_repeated_signal_before_future_discovery(self):
+        template = main.register_learning_hypothesis_template({
+            "template_id": "expression-template", "type": "HYPOTHESIS_ONLY",
+            "title": "Preregistered expression challenger",
+            "definition": "Test a fixed odds-independent MSCB intervention after repeated expression audit failures.",
+            "applicable_scope": "England Premier League over_under",
+            "expected_direction": "lower out-of-sample Brier without worse tail risk",
+            "failure_conditions": "no forward gain or any unresolved counterexample",
+            "falsification_criteria": "challenger fails any derived promotion gate",
+            "signal_dimensions": ["expression"],
+            "validation_plan": self.learning_validation_plan(
+                minimum_samples=main.LEARNING_MIN_VALIDATION_SAMPLES, markets=("over_under",),
+            ),
+        }, now_ts=100)
+        self.assertFalse(template["champion_effect"])
+        for index in range(3):
+            self.settle_selection_quality_sample(
+                f"cycle-proposal-{index}", "PROCESS_CORRECT_RESULT_WIN", expression_status="failed",
+            )
+        with patch.object(main, "LEARNING_RESEARCH_PROPOSAL_MIN_MATCHES", 3):
+            result = main.run_learning_cycle(
+                {"apply": True, "run_id": "proposal-cycle"}, now_ts=9000, fixture_rows=[],
+            )
+        self.assertEqual(result["execution_order"], ["past_36h_postmatch", "future_24h_prematch"])
+        self.assertEqual(result["research_proposal_version_count"], 1)
+        self.assertEqual(result["research_proposal_results"][0]["action"], "proposed")
+        self.assertTrue(result["automatic_hypothesis_registration"])
+        self.assertEqual(result["hypothesis_registered_count"], 1)
+        hypothesis = next(iter(main.load_snapshot_store()["learning_hypotheses"].values()))
+        self.assertEqual(hypothesis["registration_provenance"]["template_id"], "expression-template")
+        self.assertTrue(hypothesis["registration_provenance"]["all_supporting_samples_postdate_template"])
+        self.assertFalse(hypothesis["registration_provenance"]["result_outcome_used"])
+        self.assertFalse(hypothesis["champion_effect"])
+        self.assertNotIn("learning_promotions", main.load_snapshot_store())
+
+    def test_late_or_ambiguous_hypothesis_template_cannot_auto_register(self):
+        proposal = self.create_expression_research_proposal()
+        base = {
+            "type": "HYPOTHESIS_ONLY",
+            "title": "Late expression challenger",
+            "definition": "A fixed intervention that was not preregistered before discovery evidence.",
+            "applicable_scope": "England Premier League over_under",
+            "expected_direction": "lower out-of-sample Brier",
+            "failure_conditions": "no forward gain",
+            "falsification_criteria": "any unresolved counterexample",
+            "signal_dimensions": ["expression"],
+            "validation_plan": self.learning_validation_plan(
+                minimum_samples=main.LEARNING_MIN_VALIDATION_SAMPLES, markets=("over_under",),
+            ),
+        }
+        late_template = main.register_learning_hypothesis_template({**base, "template_id": "late-template"}, now_ts=8300)
+        with self.assertRaises(main.HTTPException) as spoofed:
+            main.register_learning_hypothesis({
+                **base, "hypothesis_id": "spoofed-auto-hypothesis",
+                "discovery_freeze_ids": proposal["evidence"]["supporting_freeze_ids"],
+                "source_proposal_id": proposal["proposal_id"],
+                "source_proposal_hash": proposal["proposal_hash"],
+                "registration_provenance": {
+                    "mode": "automatic_from_preregistered_template",
+                    "template_id": "late-template", "template_hash": late_template["template_hash"],
+                    "proposal_id": proposal["proposal_id"], "proposal_hash": proposal["proposal_hash"],
+                },
+            }, now_ts=8400)
+        self.assertEqual(spoofed.exception.detail, "hypothesis_template_must_predate_all_discovery_samples")
+        blocked = main.instantiate_preregistered_learning_hypotheses(now_ts=8400)
+        self.assertEqual(blocked["registered_count"], 0)
+        self.assertEqual(blocked["results"][0]["reason"], "no_preregistered_template")
+        self.assertNotIn("learning_hypotheses", main.load_snapshot_store())
+
+        store = main.load_snapshot_store()
+        store["learning_hypothesis_templates"] = {}
+        main.write_snapshot_store(store)
+        main.register_learning_hypothesis_template({**base, "template_id": "early-a"}, now_ts=100)
+        main.register_learning_hypothesis_template({**base, "template_id": "early-b", "title": "Second early template"}, now_ts=101)
+        ambiguous = main.instantiate_preregistered_learning_hypotheses(now_ts=8400)
+        self.assertEqual(ambiguous["registered_count"], 0)
+        self.assertEqual(ambiguous["results"][0]["reason"], "ambiguous_preregistered_templates")
+        self.assertNotIn("learning_hypotheses", main.load_snapshot_store())
+
+    def create_expression_research_proposal(self):
+        for index in range(3):
+            self.settle_selection_quality_sample(
+                f"proposal-source-{index}", "PROCESS_CORRECT_RESULT_LOSS", expression_status="failed",
+            )
+        refreshed = main.refresh_learning_research_proposals(now_ts=8400, minimum_matches=3)
+        return refreshed["results"][0]
+
+    def test_proposal_sourced_hypothesis_binds_latest_hash_and_all_discovery_samples(self):
+        proposal = self.create_expression_research_proposal()
+        base = {
+            "hypothesis_id": "proposal-hyp", "type": "HYPOTHESIS_ONLY",
+            "title": "Expression failure challenger",
+            "definition": "A preregistered challenger will test a lower-condition expression gate.",
+            "applicable_scope": "England Premier League over_under",
+            "expected_direction": "lower expression audit failure without worse tail risk",
+            "failure_conditions": "no out-of-sample process gain or worse tail risk",
+            "falsification_criteria": "any unresolved counterexample or failed promotion gate",
+            "discovery_freeze_ids": proposal["evidence"]["supporting_freeze_ids"],
+            "source_proposal_id": proposal["proposal_id"],
+            "source_proposal_hash": proposal["proposal_hash"],
+            "validation_plan": {
+                "minimum_samples": main.LEARNING_MIN_VALIDATION_SAMPLES,
+                "structured_scope": {"competition_ids": [39], "markets": ["over_under"]},
+                "ablation_plan": self.learning_ablation_plan(),
+                "challenger_spec": self.learning_challenger_spec(),
+            },
+        }
+        stale = {**base, "source_proposal_hash": "stale"}
+        with self.assertRaises(main.HTTPException) as stale_rejected:
+            main.register_learning_hypothesis(stale)
+        self.assertEqual(stale_rejected.exception.detail, "latest_source_research_proposal_hash_required")
+
+        partial = {**base, "discovery_freeze_ids": base["discovery_freeze_ids"][:-1]}
+        with self.assertRaises(main.HTTPException) as partial_rejected:
+            main.register_learning_hypothesis(partial)
+        self.assertEqual(partial_rejected.exception.detail, "hypothesis_must_bind_all_and_only_supporting_proposal_samples")
+
+        with patch.object(main.time, "time", return_value=8500):
+            hypothesis = main.register_learning_hypothesis(base)
+        self.assertEqual(hypothesis["source_research_proposal"]["proposal_id"], proposal["proposal_id"])
+        self.assertEqual(hypothesis["source_research_proposal"]["proposal_hash"], proposal["proposal_hash"])
+        self.assertFalse(hypothesis["champion_effect"])
+
+    def test_forward_validation_queue_requires_new_distinct_matching_frozen_match(self):
+        proposal = self.create_expression_research_proposal()
+        with patch.object(main.time, "time", return_value=8500):
+            main.register_learning_hypothesis({
+                "hypothesis_id": "forward-hyp", "type": "HYPOTHESIS_ONLY",
+                "title": "Forward expression challenger",
+                "definition": "Test a preregistered lower-condition expression gate.",
+                "applicable_scope": "England Premier League over_under",
+                "expected_direction": "lower expression failures",
+                "failure_conditions": "no independent gain",
+                "falsification_criteria": "challenger fails any derived gate",
+                "discovery_freeze_ids": proposal["evidence"]["supporting_freeze_ids"],
+                "source_proposal_id": proposal["proposal_id"],
+                "source_proposal_hash": proposal["proposal_hash"],
+                "validation_plan": {
+                    "minimum_samples": main.LEARNING_MIN_VALIDATION_SAMPLES,
+                    "structured_scope": {"competition_ids": [39], "markets": ["over_under"]},
+                    "ablation_plan": self.learning_ablation_plan(),
+                    "challenger_spec": self.learning_challenger_spec(),
+                },
+            })
+
+        future_payload = self.learning_payload("forward-fixture", 8600, 10000)
+        future_payload["decision"] = {
+            "decision": "BET", "match_rating": "B",
+            "selected_expression": {"market": "over_under", "selection": "under", "line": 2.75, "price": 1.91},
+        }
+        frozen = main.freeze_learning_sample(future_payload, now_ts=8600)
+        queue = main.learning_forward_validation_queue(now_ts=8700)
+        self.assertEqual(queue["queue_count"], 1)
+        self.assertEqual(queue["items"][0]["freeze_id"], frozen["freeze_id"])
+        self.assertTrue(queue["items"][0]["automatic_shadow_lock"])
+
+        lock_payload = {
+            "freeze_id": frozen["freeze_id"],
+            "champion_probabilities": {"home": 0.45, "draw": 0.25, "away": 0.30},
+            "challenger_probabilities": {"home": 0.30, "draw": 0.45, "away": 0.25},
+            "module_ablation_outputs": self.module_ablation_outputs(8650),
+            "selected_expression": {"market": "over_under", "selection": "under", "entry_decimal_price": 1.91, "entry_price_evidence_ref": "test:entry:forward"},
+            "risk": {"champion_tail_risk": 0.10, "challenger_tail_risk": 0.10},
+        }
+        main.lock_hypothesis_shadow_prediction("forward-hyp", lock_payload, now_ts=8700)
+        self.assertEqual(main.learning_forward_validation_queue(now_ts=8750)["queue_count"], 0)
+
+        later_payload = self.learning_payload(
+            "forward-fixture", 8800, 10000,
+            analysis={"fundamental_chain": {"status": "complete"}, "revision": 2},
+        )
+        later_payload["decision"] = future_payload["decision"]
+        later = main.freeze_learning_sample(later_payload, now_ts=8800)
+        with self.assertRaises(main.HTTPException) as duplicate_fixture:
+            main.lock_hypothesis_shadow_prediction(
+                "forward-hyp", {
+                    **lock_payload, "freeze_id": later["freeze_id"],
+                    "module_ablation_outputs": self.module_ablation_outputs(8805),
+                }, now_ts=8810,
+            )
+        self.assertEqual(duplicate_fixture.exception.detail, "validation_fixture_already_locked_for_hypothesis")
 
 
 if __name__ == "__main__":
