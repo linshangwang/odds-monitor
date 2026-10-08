@@ -3619,6 +3619,29 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "challenger_spec": self.learning_challenger_spec(modules),
         }
 
+    def save_learning_t1h_reference(self, fixture, kickoff_at, shadow_lock, price):
+        expression = shadow_lock["selected_expression"]
+        market = expression["market"]
+        selection = expression["selection"]
+        market_snapshot = main.empty_market_snapshot()
+        market_snapshot["available"] = True
+        reference = {
+            "source": "complete_company_array",
+            "bookmaker_count": max(5, main.MIN_CONSENSUS_BOOKMAKERS),
+            selection: price,
+        }
+        if expression.get("line") is not None:
+            reference["line"] = expression["line"]
+        market_snapshot["consensus_main_line"][market] = reference
+        store = main.load_snapshot_store()
+        store.setdefault("fixtures", {}).setdefault(str(fixture), []).append({
+            "stage": "T-1h", "snapshot_at": int(kickoff_at) - 3600,
+            "market_snapshot": market_snapshot,
+            "stage_timing_audit": {"status": "valid"},
+            "sequence_timing_audit": {"status": "valid"},
+        })
+        main.write_snapshot_store(store)
+
     def module_ablation_outputs(self, computed_at, modules=("MSCB",), probabilities=None):
         probabilities = probabilities or {"home": 0.33, "draw": 0.34, "away": 0.33}
         return {
@@ -3672,6 +3695,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         shadow_lock = main.generate_internal_shadow_lock(
             hypothesis_id, frozen["freeze_id"], model_runner=self.learning_shadow_runner(), now_ts=captured_at + 10,
         )
+        self.save_learning_t1h_reference(fixture, kickoff_at, shadow_lock, 2.8)
         facts = self.collect_verified_learning_facts(frozen, 1, 1, kickoff_at + 7200)
         main.settle_learning_sample(
             frozen["freeze_id"], {"status": "FT", "home_goals": 1, "away_goals": 1},
@@ -3682,8 +3706,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "freeze_id": frozen["freeze_id"], "outcome": "support",
             "evidence_summary": f"Independent locked validation for {fixture}",
             "pit_audit": {"status": "passed"}, "event_pollution_audit": {"status": "passed"},
-            "shadow_lock_hash": shadow_lock["lock_hash"], "closing_decimal_price": 2.8,
-            "closing_price_evidence_ref": f"test:closing:{fixture}",
+            "shadow_lock_hash": shadow_lock["lock_hash"],
         })
         return frozen, evidence
 
@@ -3913,12 +3936,12 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(status["promotion_candidate_count"], 1)
         self.assertFalse(status["automatic_champion_promotion"])
 
-    def test_forward_validation_evidence_is_automatically_derived_from_closing_snapshot(self):
+    def test_forward_validation_evidence_is_automatically_derived_from_t1h_snapshot(self):
         discovery, _ = self.settle_learning_fixture("auto-evidence-discovery", 900, 1000)
         main.register_learning_hypothesis({
             "hypothesis_id": "auto-evidence-hyp", "type": "HYPOTHESIS_ONLY",
             "title": "Automatic evidence hypothesis",
-            "definition": "Score only immutable forward locks against verified facts and Closing evidence.",
+            "definition": "Score only immutable forward locks against verified facts and T-1h evidence.",
             "applicable_scope": "England Premier League 1x2",
             "expected_direction": "lower forward Brier",
             "failure_conditions": "no gain or missing evidence",
@@ -3939,9 +3962,9 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "PROCESS_CORRECT_RESULT_LOSS", {"status": "clean"}, 16200,
             self.learning_postmatch_review(), facts["fact_hash"],
         )
-        without_closing = main.refresh_learning_forward_validation_evidence(now_ts=16200)
-        self.assertEqual(without_closing["recorded_count"], 0)
-        self.assertEqual(without_closing["results"][0]["reason"], "verified_prematch_closing_snapshot_required")
+        without_t1h = main.refresh_learning_forward_validation_evidence(now_ts=16200)
+        self.assertEqual(without_t1h["recorded_count"], 0)
+        self.assertEqual(without_t1h["results"][0]["reason"], "verified_learning_t1h_snapshot_required")
         store = main.load_snapshot_store()
         market = main.empty_market_snapshot()
         market["available"] = True
@@ -3955,11 +3978,23 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         }]
         main.write_snapshot_store(store)
 
+        closing_cannot_substitute = main.refresh_learning_forward_validation_evidence(now_ts=16200)
+        self.assertEqual(closing_cannot_substitute["recorded_count"], 0)
+        self.assertEqual(closing_cannot_substitute["results"][0]["reason"], "verified_learning_t1h_snapshot_required")
+        store = main.load_snapshot_store()
+        store["fixtures"]["auto-evidence-validation"].append({
+            "stage": "T-1h", "snapshot_at": 5400, "market_snapshot": market,
+            "stage_timing_audit": {"status": "valid"}, "sequence_timing_audit": {"status": "valid"},
+        })
+        main.write_snapshot_store(store)
+
         refreshed = main.refresh_learning_forward_validation_evidence(now_ts=16201)
         self.assertEqual(refreshed["recorded_count"], 1)
         evidence = main.load_snapshot_store()["learning_hypotheses"]["auto-evidence-hyp"]["validation_evidence"][0]
         self.assertEqual(evidence["freeze_id"], frozen["freeze_id"])
-        self.assertTrue(evidence["closing_price_evidence_ref"].startswith("snapshot:"))
+        self.assertEqual(evidence["price_reference"]["stage"], "T-1h")
+        self.assertTrue(evidence["price_reference"]["evidence_ref"].startswith("snapshot:"))
+        self.assertIn("t1h_price_probability_delta", evidence["derived_metrics"])
         self.assertFalse(evidence["outcome_derivation"]["caller_supplied_outcome_used"])
         self.assertFalse(evidence["derived_metrics"]["result_outcome_used_as_rule_label"])
         self.assertEqual(main.refresh_learning_forward_validation_evidence(now_ts=16202)["recorded_count"], 0)
@@ -4009,7 +4044,6 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         with self.assertRaises(main.HTTPException) as rejected:
             main.record_hypothesis_validation("no-lock-hyp", {
                 "freeze_id": frozen["freeze_id"], "outcome": "support", "evidence_summary": "Retrospective claim",
-                "closing_decimal_price": 2.8, "closing_price_evidence_ref": "test:closing",
             })
         self.assertEqual(rejected.exception.detail, "pre_kickoff_shadow_lock_required")
 
@@ -4150,11 +4184,18 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "PROCESS_CORRECT_RESULT_LOSS", {"status": "clean"}, 16200,
             self.learning_postmatch_review(), facts["fact_hash"],
         )
+        self.save_learning_t1h_reference("derived-outcome-validation", 9000, lock, 2.8)
+        with self.assertRaises(main.HTTPException) as caller_price:
+            main.record_hypothesis_validation("derived-outcome-hyp", {
+                "freeze_id": frozen["freeze_id"], "evidence_summary": "Caller supplied price must be rejected.",
+                "shadow_lock_hash": lock["lock_hash"], "price_reference_stage": "T-1h",
+                "reference_decimal_price": 2.8, "price_reference_evidence_ref": "test:forged:t1h",
+            })
+        self.assertEqual(caller_price.exception.detail, "caller_supplied_price_reference_forbidden")
         evidence = main.record_hypothesis_validation("derived-outcome-hyp", {
             "freeze_id": frozen["freeze_id"], "outcome": "support",
             "evidence_summary": "Caller attempts to claim support despite worse locked metrics.",
-            "shadow_lock_hash": lock["lock_hash"], "closing_decimal_price": 2.8,
-            "closing_price_evidence_ref": "test:closing:derived",
+            "shadow_lock_hash": lock["lock_hash"],
         })
         self.assertEqual(evidence["outcome"], "counterexample")
         self.assertEqual(evidence["outcome_derivation"]["caller_supplied_outcome"], "support")
@@ -4294,11 +4335,11 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "PROCESS_CORRECT_RESULT_WIN", {"status": "clean"}, 17200,
             self.learning_postmatch_review(), facts["fact_hash"],
         )
+        self.save_learning_t1h_reference("ou-runner-validation", 10000, lock, 1.85)
         evidence = main.record_hypothesis_validation("ou-runner-hyp", {
             "freeze_id": frozen["freeze_id"], "outcome": "support",
             "evidence_summary": "The frozen O/U 2.75 expression is scored in its own settlement space.",
-            "shadow_lock_hash": lock["lock_hash"], "closing_decimal_price": 1.85,
-            "closing_price_evidence_ref": "test:closing:ou-runner",
+            "shadow_lock_hash": lock["lock_hash"],
         })
         metrics = evidence["derived_metrics"]
         self.assertEqual(metrics["forecast_market"], "over_under")

@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.09.0"
+VERSION = "2.10.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -198,7 +198,7 @@ LEARNING_TOP_FLIGHT_LEAGUES: Dict[int, Dict[str, str]] = {
 }
 LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
 LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
-LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.09").strip() or "MODEL_RULES.md@2026-10-08-v2.09"
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.10").strip() or "MODEL_RULES.md@2026-10-08-v2.10"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -8560,24 +8560,25 @@ def generate_internal_shadow_lock(
     )
 
 
-def _learning_closing_price_evidence(
+def _learning_terminal_price_evidence(
     freeze: Dict[str, Any], shadow_lock: Dict[str, Any], store: Dict[str, Any],
 ) -> Dict[str, Any]:
+    """Return the exact-line T-1h consensus used by the four-node learning task."""
     fixture = str(freeze.get("fixture") or "")
     kickoff_at = int(freeze.get("kickoff_at") or 0)
     rows = [
         row for row in ((store.get("fixtures") or {}).get(fixture) or [])
-        if isinstance(row, dict) and row.get("stage") == "Closing"
+        if isinstance(row, dict) and row.get("stage") == "T-1h"
         and 0 < int(row.get("snapshot_at") or 0) < kickoff_at
         and get_nested(row, ["stage_timing_audit", "status"]) != "invalid"
         and get_nested(row, ["sequence_timing_audit", "status"]) != "invalid"
     ]
-    closing = max(rows, key=lambda row: int(row.get("snapshot_at") or 0), default=None)
-    if not closing:
-        return {"ok": False, "reason": "verified_prematch_closing_snapshot_required"}
-    market_snapshot = closing.get("market_snapshot") if isinstance(closing.get("market_snapshot"), dict) else {}
+    terminal = max(rows, key=lambda row: int(row.get("snapshot_at") or 0), default=None)
+    if not terminal:
+        return {"ok": False, "reason": "verified_learning_t1h_snapshot_required"}
+    market_snapshot = terminal.get("market_snapshot") if isinstance(terminal.get("market_snapshot"), dict) else {}
     if market_snapshot.get("available") is not True:
-        return {"ok": False, "reason": "closing_market_snapshot_unavailable"}
+        return {"ok": False, "reason": "learning_t1h_market_snapshot_unavailable"}
     expression = shadow_lock.get("selected_expression") if isinstance(shadow_lock.get("selected_expression"), dict) else {}
     market = str(expression.get("market") or "").strip()
     selection = str(expression.get("selection") or "").strip().casefold()
@@ -8591,22 +8592,22 @@ def _learning_closing_price_evidence(
     selection = selection_aliases.get(selection, selection)
     main_line = get_nested(market_snapshot, ["consensus_main_line", market], {}) or get_nested(market_snapshot, ["primary", market], {}) or {}
     if market in {"asian_handicap", "over_under", "home_team_total", "away_team_total"}:
-        closing_line = as_float(main_line.get("line"))
-        if line is None or closing_line is None or abs(line - closing_line) > 1e-9:
-            return {"ok": False, "reason": "closing_consensus_same_line_required", "market": market, "entry_line": line, "closing_line": closing_line}
+        reference_line = as_float(main_line.get("line"))
+        if line is None or reference_line is None or abs(line - reference_line) > 1e-9:
+            return {"ok": False, "reason": "learning_t1h_consensus_same_line_required", "market": market, "entry_line": line, "reference_line": reference_line}
     price = as_float(main_line.get(selection))
     bookmaker_count = int(as_float(main_line.get("bookmaker_count")) or 0)
     if price is None or not 1.01 <= price <= 1000 or bookmaker_count < MIN_CONSENSUS_BOOKMAKERS:
-        return {"ok": False, "reason": "closing_consensus_price_or_coverage_missing", "market": market, "selection": selection}
+        return {"ok": False, "reason": "learning_t1h_consensus_price_or_coverage_missing", "market": market, "selection": selection}
     evidence_hash = _content_hash({
-        "fixture": fixture, "stage": "Closing", "snapshot_at": closing.get("snapshot_at"),
+        "fixture": fixture, "stage": "T-1h", "snapshot_at": terminal.get("snapshot_at"),
         "market": market, "selection": selection, "line": line,
         "price": price, "bookmaker_count": bookmaker_count, "market_snapshot": market_snapshot,
     })
     return {
-        "ok": True, "closing_decimal_price": price,
-        "closing_price_evidence_ref": f"snapshot:{evidence_hash}:Closing:{market}:{selection}",
-        "snapshot_at": closing.get("snapshot_at"), "evidence_hash": evidence_hash,
+        "ok": True, "reference_stage": "T-1h", "reference_decimal_price": price,
+        "price_reference_evidence_ref": f"snapshot:{evidence_hash}:T-1h:{market}:{selection}",
+        "snapshot_at": terminal.get("snapshot_at"), "evidence_hash": evidence_hash,
     }
 
 
@@ -8633,12 +8634,18 @@ def record_hypothesis_validation(hypothesis_id: Any, payload: Dict[str, Any], no
             raise HTTPException(status_code=409, detail="pre_kickoff_shadow_lock_required")
         if str(payload.get("shadow_lock_hash") or "").strip() != str(shadow_lock.get("lock_hash") or ""):
             raise HTTPException(status_code=409, detail="matching_shadow_lock_hash_required")
-        closing_decimal_price = as_float(payload.get("closing_decimal_price"))
-        if closing_decimal_price is None or not 1.01 <= closing_decimal_price <= 1000:
-            raise HTTPException(status_code=422, detail="valid_closing_decimal_price_required")
-        closing_price_evidence_ref = str(payload.get("closing_price_evidence_ref") or "").strip()
-        if not closing_price_evidence_ref:
-            raise HTTPException(status_code=422, detail="closing_price_evidence_ref_required")
+        caller_price_fields = {
+            "price_reference_stage", "reference_decimal_price", "price_reference_evidence_ref",
+            "closing_decimal_price", "closing_price_evidence_ref",
+        }
+        if any(key in payload for key in caller_price_fields):
+            raise HTTPException(status_code=400, detail="caller_supplied_price_reference_forbidden")
+        reference = _learning_terminal_price_evidence(freeze, shadow_lock, store)
+        if reference.get("ok") is not True:
+            raise HTTPException(status_code=409, detail=reference.get("reason"))
+        reference_stage = str(reference.get("reference_stage") or "")
+        reference_decimal_price = float(reference["reference_decimal_price"])
+        price_reference_evidence_ref = str(reference.get("price_reference_evidence_ref") or "")
         postmatch = store["learning_postmatch"][freeze_id]
         final_result = postmatch.get("result") if isinstance(postmatch.get("result"), dict) else {}
         locked_expression = shadow_lock.get("selected_expression") if isinstance(shadow_lock.get("selected_expression"), dict) else {}
@@ -8664,7 +8671,7 @@ def record_hypothesis_validation(hypothesis_id: Any, payload: Dict[str, Any], no
             module: round(value - challenger_brier, 8) for module, value in module_briers.items()
         }
         entry_decimal_price = float(get_nested(shadow_lock, ["selected_expression", "entry_decimal_price"]))
-        clv_probability_delta = round(1.0 / closing_decimal_price - 1.0 / entry_decimal_price, 8)
+        t1h_price_probability_delta = round(1.0 / reference_decimal_price - 1.0 / entry_decimal_price, 8)
         risk_delta = round(float(get_nested(shadow_lock, ["risk", "challenger_tail_risk"])) - float(get_nested(shadow_lock, ["risk", "champion_tail_risk"])), 8)
         champion_brier_gain = round(champion_brier - challenger_brier, 8)
         minimum_champion_gain = float(ablation_plan.get("minimum_challenger_brier_gain_over_champion") or 0.0)
@@ -8715,7 +8722,11 @@ def record_hypothesis_validation(hypothesis_id: Any, payload: Dict[str, Any], no
                 "caller_status_used": False,
             },
             "shadow_lock_hash": shadow_lock.get("lock_hash"),
-            "closing_price_evidence_ref": closing_price_evidence_ref,
+            "price_reference": {
+                "stage": reference_stage,
+                "decimal_price": reference_decimal_price,
+                "evidence_ref": price_reference_evidence_ref,
+            },
             "derived_metrics": {
                 "scoring_contract": shadow_lock.get("scoring_contract"),
                 "forecast_market": locked_expression.get("market"),
@@ -8730,7 +8741,7 @@ def record_hypothesis_validation(hypothesis_id: Any, payload: Dict[str, Any], no
                 "module_ablation_brier": module_briers,
                 "module_ablation_brier_1x2": module_briers if locked_expression.get("market") == "1x2" else None,
                 "module_ablation_brier_gain": module_brier_gains,
-                "clv_probability_delta": clv_probability_delta,
+                "t1h_price_probability_delta": t1h_price_probability_delta,
                 "champion_tail_risk": get_nested(shadow_lock, ["risk", "champion_tail_risk"]),
                 "challenger_tail_risk": get_nested(shadow_lock, ["risk", "challenger_tail_risk"]),
                 "tail_risk_delta": risk_delta,
@@ -8755,7 +8766,7 @@ def record_hypothesis_validation(hypothesis_id: Any, payload: Dict[str, Any], no
 
 
 def refresh_learning_forward_validation_evidence(now_ts: Optional[int] = None, apply_changes: bool = True) -> Dict[str, Any]:
-    """Settle locked forward samples from verified postmatch and exact-line Closing evidence."""
+    """Settle locked forward samples from verified postmatch and exact-line T-1h evidence."""
     now_ts = int(now_ts or time.time())
     store = load_snapshot_store()
     results = []
@@ -8773,23 +8784,21 @@ def refresh_learning_forward_validation_evidence(now_ts: Optional[int] = None, a
             if not isinstance(postmatch, dict) or not isinstance(freeze, dict):
                 results.append({"hypothesis_id": hypothesis_id, "freeze_id": freeze_id, "action": "blocked", "reason": "independent_settled_frozen_sample_required"})
                 continue
-            closing = _learning_closing_price_evidence(freeze, shadow_lock, store)
-            if closing.get("ok") is not True:
+            reference = _learning_terminal_price_evidence(freeze, shadow_lock, store)
+            if reference.get("ok") is not True:
                 results.append({
                     "hypothesis_id": hypothesis_id, "freeze_id": freeze_id,
-                    "action": "blocked", "reason": closing.get("reason"),
+                    "action": "blocked", "reason": reference.get("reason"),
                 })
                 continue
             if not apply_changes:
-                results.append({"hypothesis_id": hypothesis_id, "freeze_id": freeze_id, "action": "would_record", "closing_evidence_hash": closing.get("evidence_hash")})
+                results.append({"hypothesis_id": hypothesis_id, "freeze_id": freeze_id, "action": "would_record", "price_reference_evidence_hash": reference.get("evidence_hash")})
                 continue
             try:
                 evidence = record_hypothesis_validation(hypothesis_id, {
                     "freeze_id": freeze_id,
-                    "evidence_summary": "Automatically derived from the immutable Shadow lock, verified postmatch record and exact-line Closing snapshot.",
+                    "evidence_summary": "Automatically derived from the immutable Shadow lock, verified postmatch record and exact-line T-1h learning snapshot.",
                     "shadow_lock_hash": shadow_lock.get("lock_hash"),
-                    "closing_decimal_price": closing.get("closing_decimal_price"),
-                    "closing_price_evidence_ref": closing.get("closing_price_evidence_ref"),
                 }, now_ts=now_ts)
                 results.append({
                     "hypothesis_id": hypothesis_id, "freeze_id": freeze_id,
@@ -8866,14 +8875,14 @@ def promotion_evidence_report(hypothesis_id: Any, store_override: Optional[Dict[
             "mean_challenger_gain_over_ablation": round(sum(gain_values) / len(gain_values), 8) if complete else None,
             "minimum_required_gain": as_float(get_nested(ablation_plan, ["module_interventions", module, "minimum_brier_gain"])),
         }
-    mean_clv = mean("clv_probability_delta")
+    mean_t1h_price_delta = mean("t1h_price_probability_delta")
     mean_risk_delta = mean("tail_risk_delta")
     process_eligible = [get_nested(row, ["derived_metrics", "process_classification"]) for row in evidence]
     process_accuracy = round(sum(str(value).startswith("PROCESS_CORRECT_") for value in process_eligible) / len(process_eligible), 8) if process_eligible else None
     max_brier = as_float(plan.get("maximum_challenger_brier"))
     max_brier = 0.34 if max_brier is None else max_brier
-    min_clv = as_float(plan.get("minimum_mean_clv"))
-    min_clv = 0.0 if min_clv is None else min_clv
+    min_t1h_price_delta = as_float(plan.get("minimum_mean_t1h_price_probability_delta"))
+    min_t1h_price_delta = 0.0 if min_t1h_price_delta is None else min_t1h_price_delta
     min_process_accuracy = as_float(plan.get("minimum_process_accuracy"))
     min_process_accuracy = 0.6 if min_process_accuracy is None else min_process_accuracy
     max_risk_increase = as_float(plan.get("maximum_mean_tail_risk_increase"))
@@ -8904,7 +8913,13 @@ def promotion_evidence_report(hypothesis_id: Any, store_override: Optional[Dict[
             module_metrics=module_ablation_metrics,
         ),
         "calibration": gate("passed" if enough and challenger_brier is not None and champion_brier is not None and challenger_brier <= champion_brier and challenger_brier <= max_brier else ("failed" if enough else "missing"), all_hashes, champion_brier=champion_brier, challenger_brier=challenger_brier, maximum_challenger_brier=max_brier),
-        "clv_or_price_quality": gate("passed" if enough and mean_clv is not None and mean_clv >= min_clv else ("failed" if enough else "missing"), all_hashes, mean_clv=mean_clv, minimum_mean_clv=min_clv),
+        "clv_or_price_quality": gate(
+            "passed" if enough and mean_t1h_price_delta is not None and mean_t1h_price_delta >= min_t1h_price_delta else ("failed" if enough else "missing"),
+            all_hashes,
+            reference_stage="T-1h",
+            mean_t1h_price_probability_delta=mean_t1h_price_delta,
+            minimum_mean_t1h_price_probability_delta=min_t1h_price_delta,
+        ),
         "process_accuracy": gate("passed" if enough and process_accuracy is not None and process_accuracy >= min_process_accuracy else ("failed" if enough else "missing"), all_hashes, process_accuracy=process_accuracy, minimum_process_accuracy=min_process_accuracy),
         "risk_review": gate("passed" if enough and mean_risk_delta is not None and mean_risk_delta <= max_risk_increase else ("failed" if enough else "missing"), all_hashes, mean_tail_risk_delta=mean_risk_delta, maximum_mean_tail_risk_increase=max_risk_increase),
     }

@@ -157,9 +157,9 @@ TheStatsAPI赛前比赛列表按UTC比赛日批量抓取并在同一运行进程
 
 自动任务可以持续收集独立多场样本并运行Shadow、样本外验证和消融测试，但只有全部门槛100%完成、没有未解决反例时，才能生成`PROMOTION_CANDIDATE`。
 
-每个验证样本必须先通过`/shadow/learning/hypotheses/{id}/shadow-lock`在开赛前锁定Champion概率、Challenger概率、选择表达、入场价格、两者尾部风险，以及预登记全部模块的消融输出。模块消融范围限定为`MSCB`、`STATE_TREE`、`IEH`、`TAC`、`TDD`、`LET`、`LPS`、`OCR`；每项必须绑定固定干预、冻结哈希、计算时间和证据定位，模块缺失、多余或开赛后计算均拒绝。冻结样本不得早于假设登记，发现样本不得充当验证样本，比赛和市场必须落在预登记结构化范围内。赛后验证必须绑定该`lock_hash`和Closing价格证据。系统从不可变冻结、结算与Shadow锁自动计算冻结市场的类别Brier、CLV概率差、逐模块消融增益、Process Accuracy及尾部风险差，并按预登记阈值派生`support/counterexample`；调用方自报的验证结论、PIT状态或事件污染状态均不采信。类别空间必须与冻结表达完全一致：1X2为`home/draw/away`，BTTS为`yes/no`，AH/O-U/球队总进球为`full_win/half_win/push/half_loss/full_loss`；禁止用1X2替代其他市场评分。
+每个验证样本必须先通过`/shadow/learning/hypotheses/{id}/shadow-lock`在开赛前锁定Champion概率、Challenger概率、选择表达、入场价格、两者尾部风险，以及预登记全部模块的消融输出。模块消融范围限定为`MSCB`、`STATE_TREE`、`IEH`、`TAC`、`TDD`、`LET`、`LPS`、`OCR`；每项必须绑定固定干预、冻结哈希、计算时间和证据定位，模块缺失、多余或开赛后计算均拒绝。冻结样本不得早于假设登记，发现样本不得充当验证样本，比赛和市场必须落在预登记结构化范围内。赛后验证必须绑定该`lock_hash`和自动学习四节点终点`T-1h`价格证据。系统从不可变冻结、结算与Shadow锁自动计算冻结市场的类别Brier、T-1h价格概率差、逐模块消融增益、Process Accuracy及尾部风险差，并按预登记阈值派生`support/counterexample`；调用方自报的验证结论、PIT状态或事件污染状态均不采信。类别空间必须与冻结表达完全一致：1X2为`home/draw/away`，BTTS为`yes/no`，AH/O-U/球队总进球为`full_win/half_win/push/half_loss/full_loss`；禁止用1X2替代其他市场评分。
 
-每日周期会自动结算已经锁定且赛后核实完成的前向样本。Closing证据必须来自开赛前保存的`Closing`快照，使用完整公司数组形成的共识价，并与Shadow锁保持同一市场、同一选择和同一盘口档位；缺快照、覆盖不足或盘口跨档时固定blocked，不使用当前赔率或其他档位替代。九项Promotion门槛全部由账本达到passed后，周期可以自动创建`AWAITING_EXPLICIT_USER_CONFIRMATION`，但该动作只生成候选包，`champion_effect=false`且不能替代用户确认。
+每日周期会自动结算已经锁定且赛后核实完成的前向样本。价格质量证据必须由服务端从开赛前保存的`T-1h`快照自行派生，使用完整公司数组形成的共识价，并与Shadow锁保持同一市场、同一选择和同一盘口档位；调用方提交价格或证据引用会被拒绝。缺快照、覆盖不足或盘口跨档时固定blocked，不使用Closing、当前赔率或其他档位替代。普通赛前分析的八节点及Closing规则保持不变。九项Promotion门槛全部由账本达到passed后，周期可以自动创建`AWAITING_EXPLICIT_USER_CONFIRMATION`，但该动作只生成候选包，`champion_effect=false`且不能替代用户确认。
 
 前向队列由内置`builtin_preregistered_poisson_challenger@1`自动执行。Hypothesis登记时必须提供`poisson_log_rate_adjustment_v1`：为每个预登记模块声明有界、赔率无关的主客队对数进球率贡献；运行器在冻结Poisson基线上生成全量Challenger，并逐项移除模块形成消融输出。规格缺失、零贡献、越界、身份或哈希不一致时必须fail-closed，禁止临场或赛后临时选择参数。
 
@@ -170,7 +170,7 @@ TheStatsAPI赛前比赛列表按UTC比赛日批量抓取并在同一运行进程
 - 理论定义及适用范围。
 - 发现样本与独立验证样本分离证明。
 - 全部支持与反例。
-- 消融、Calibration、CLV、Process Accuracy和风险影响。
+- 消融、Calibration、T-1h价格质量、Process Accuracy和风险影响。
 - 建议权重、保护上限和回退条件。
 
 只有用户对该具体晋级包明确确认后，才允许版本化进入Champion。
