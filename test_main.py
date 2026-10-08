@@ -825,6 +825,11 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(accepted["line_response"]["response"], "upgrade")
         self.assertEqual(accepted["market_acceptance"], "Accepted")
         self.assertEqual(accepted["diagnostic"], "Accepted Repricing")
+        attribution = accepted["repricing_attribution"]
+        self.assertEqual(attribution["status"], "market_move_cause_unverified")
+        self.assertEqual(attribution["pressure_evidence_type"], "capital_pressure_proxy")
+        self.assertFalse(attribution["market_response_is_cause_evidence"])
+        self.assertFalse(attribution["source_attribution_verified"])
 
         resistance = main.market_language_for_candidate(
             {"market": "asian_handicap", "selection": "home"},
@@ -945,6 +950,9 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(language["capital_pressure"]["money_percent"]["home"], 70)
         self.assertEqual(language["line_response"]["response"], "static")
         self.assertEqual(language["market_acceptance"], "Resistance")
+        self.assertTrue(language["repricing_attribution"]["verified_real_money_pressure_present"])
+        self.assertFalse(language["repricing_attribution"]["real_money_pressure_proves_repricing_cause"])
+        self.assertEqual(language["repricing_attribution"]["status"], "market_move_cause_unverified")
         candidate = {
             "market": "asian_handicap", "selection": "home", "line": -.5, "price": 1.91,
             "model_probability": .57, "market_no_vig_probability": .52, "edge": .05, "ev": .089,
@@ -962,6 +970,47 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(optimized["market_language"]["capital_pressure_is_proxy_only"])
         self.assertEqual(optimized["market_language"]["real_money_data"]["status"], "available")
         self.assertEqual(optimized["market_language"]["real_money_data"]["evidence_hash"], real["evidence_hash"])
+        self.assertTrue(optimized["market_language"]["selected_repricing_attribution"]["verified_real_money_pressure_present"])
+
+    def test_repricing_attribution_requires_verified_fundamental_change_and_market_trigger(self):
+        pressure = {
+            "status": "proxy_available", "is_real_money": False,
+            "real_money_evidence_hash": None,
+        }
+        confirmed = main.build_repricing_attribution({
+            "comparison_status": "compared",
+            "revalidation_trigger": {"triggered": True},
+            "classification_audit": {
+                "classification": "Fundamental Confirmed",
+                "matched_classifications": ["Fundamental Confirmed", "Cross-Market Divergence"],
+            },
+        }, pressure, "Accepted Repricing")
+        self.assertEqual(confirmed["status"], "fundamental_repricing_confirmed")
+        self.assertTrue(confirmed["source_attribution_verified"])
+        self.assertFalse(confirmed["market_response_is_cause_evidence"])
+
+        no_trigger = main.build_repricing_attribution({
+            "comparison_status": "compared",
+            "revalidation_trigger": {"triggered": False},
+            "classification_audit": {
+                "classification": "Fundamental Confirmed",
+                "matched_classifications": ["Fundamental Confirmed"],
+            },
+        }, pressure, "Accepted Repricing")
+        self.assertEqual(no_trigger["status"], "verified_fundamental_change_without_market_trigger")
+        self.assertFalse(no_trigger["source_attribution_verified"])
+
+    def test_repricing_attribution_keeps_unconfirmed_information_unverified(self):
+        attribution = main.build_repricing_attribution({
+            "comparison_status": "compared",
+            "revalidation_trigger": {"triggered": True},
+            "classification_audit": {
+                "classification": "Likely Information-Driven",
+                "matched_classifications": ["Likely Information-Driven"],
+            },
+        }, {"status": "proxy_available", "is_real_money": False}, "Accepted Repricing")
+        self.assertEqual(attribution["status"], "likely_information_driven_unconfirmed")
+        self.assertFalse(attribution["source_attribution_verified"])
 
     def test_expression_optimizer_switches_same_script_not_direction(self):
         over = {

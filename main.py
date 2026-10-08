@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.19.2"
+VERSION = "2.19.3"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -2172,11 +2172,114 @@ def _pressure_strength(value: Optional[float]) -> str:
     return "neutral"
 
 
+def build_repricing_attribution(
+    dynamics: Dict[str, Any],
+    capital_pressure: Optional[Dict[str, Any]] = None,
+    market_response_diagnostic: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Separate observed market response from evidence about why repricing occurred."""
+    classification_audit = dynamics.get("classification_audit") if isinstance(dynamics.get("classification_audit"), dict) else {}
+    fallback_classification = "Market-Only Move" if dynamics.get("comparison_status") == "compared" else "data_missing"
+    classification = str(classification_audit.get("classification") or dynamics.get("classification") or fallback_classification)
+    matched = classification_audit.get("matched_classifications") if isinstance(classification_audit.get("matched_classifications"), list) else []
+    if classification not in {"", "data_missing", "None"} and classification not in matched:
+        matched = [classification, *matched]
+    matched = list(dict.fromkeys(str(value) for value in matched if value))
+    trigger_verified = get_nested(dynamics, ["revalidation_trigger", "triggered"]) is True
+    fundamental_change_verified = "Fundamental Confirmed" in matched
+    likely_information = "Likely Information-Driven" in matched
+    pressure = capital_pressure if isinstance(capital_pressure, dict) else {}
+    real_money_present = pressure.get("is_real_money") is True and bool(pressure.get("real_money_evidence_hash"))
+
+    if fundamental_change_verified and trigger_verified:
+        status = "fundamental_repricing_confirmed"
+        basis = "verified_substantive_fundamental_change_after_market_revalidation_trigger"
+        source_attribution_verified = True
+    elif fundamental_change_verified:
+        status = "verified_fundamental_change_without_market_trigger"
+        basis = "fundamental_change_is_verified_but_market_repricing_causation_is_not_established"
+        source_attribution_verified = False
+    elif likely_information:
+        status = "likely_information_driven_unconfirmed"
+        basis = "bounded_information_evidence_exists_but_the_underlying_fact_is_unconfirmed"
+        source_attribution_verified = False
+    elif classification == "data_missing" or dynamics.get("comparison_status") != "compared":
+        status = "data_missing"
+        basis = "comparable_market_timeline_or_classification_unavailable"
+        source_attribution_verified = False
+    else:
+        status = "market_move_cause_unverified"
+        basis = "market_path_observed_without_verified_fundamental_cause"
+        source_attribution_verified = False
+
+    return {
+        "schema": "repricing_attribution_v1",
+        "status": status,
+        "market_move_classification": classification,
+        "matched_classifications": matched,
+        "market_response_diagnostic": market_response_diagnostic,
+        "market_response_is_cause_evidence": False,
+        "source_attribution_verified": source_attribution_verified,
+        "verified_fundamental_change_present": fundamental_change_verified,
+        "market_revalidation_triggered": trigger_verified,
+        "verified_real_money_pressure_present": real_money_present,
+        "real_money_pressure_proves_repricing_cause": False,
+        "pressure_evidence_type": "real_money_a_grade" if real_money_present else ("capital_pressure_proxy" if pressure.get("status") == "proxy_available" else "data_missing"),
+        "basis": basis,
+        "policy": "market acceptance, money pressure, and repricing cause are separate claims; Accepted Repricing never proves a cause by itself",
+    }
+
+
+def attach_repricing_attribution(decision: Dict[str, Any], classification_audit: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    dynamics = decision.get("line_movement") if isinstance(decision.get("line_movement"), dict) else {}
+    if isinstance(classification_audit, dict):
+        dynamics = dict(dynamics)
+        dynamics["classification"] = classification_audit.get("classification") or dynamics.get("classification")
+        dynamics["classification_audit"] = classification_audit
+        decision["line_movement"] = dynamics
+    fallback_classification = "Market-Only Move" if dynamics.get("comparison_status") == "compared" else "data_missing"
+    effective_audit = dynamics.get("classification_audit") if isinstance(dynamics.get("classification_audit"), dict) else {
+        "classification": dynamics.get("classification") or fallback_classification,
+        "matched_classifications": [dynamics.get("classification") or fallback_classification],
+        "basis": "no_verified_fundamental_change" if fallback_classification == "Market-Only Move" else "comparable_market_timeline_unavailable",
+        "inferred_without_evidence": False,
+    }
+    decision["market_move_classification"] = effective_audit.get("classification") or "data_missing"
+    decision["market_move_classification_audit"] = effective_audit
+
+    for candidate in decision.get("candidates") or []:
+        language = candidate.get("market_language") if isinstance(candidate.get("market_language"), dict) else None
+        if language is not None:
+            language["repricing_attribution"] = build_repricing_attribution(
+                dynamics, language.get("capital_pressure"), language.get("diagnostic")
+            )
+    market_language = decision.get("market_language") if isinstance(decision.get("market_language"), dict) else None
+    if market_language is not None:
+        for language in (market_language.get("axes") or {}).values():
+            if isinstance(language, dict):
+                language["repricing_attribution"] = build_repricing_attribution(
+                    dynamics, language.get("capital_pressure"), language.get("diagnostic")
+                )
+        selected_raw = decision.get("best_market") if isinstance(decision.get("best_market"), dict) else None
+        selected = next((
+            row for row in (decision.get("candidates") or [])
+            if isinstance(row, dict) and selected_raw
+            and (row.get("market"), row.get("selection"), row.get("line"))
+            == (selected_raw.get("market"), selected_raw.get("selection"), selected_raw.get("line"))
+        ), selected_raw)
+        selected_language = selected.get("market_language") if isinstance((selected or {}).get("market_language"), dict) else None
+        market_language["selected_repricing_attribution"] = (
+            selected_language.get("repricing_attribution") if selected_language else None
+        )
+        market_language["repricing_policy"] = "acceptance describes market response; attribution requires separate fundamental or information evidence"
+    return decision
+
+
 def market_language_for_candidate(candidate: Dict[str, Any], dynamics: Dict[str, Any], timeline_audit: Dict[str, Any], real_money_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     axis = _market_axis_for_candidate(candidate)
     if not timeline_audit.get("decision_eligible") or dynamics.get("comparison_status") != "compared":
         real_pressure, real_basis, real_market = _candidate_real_money_signal(candidate, real_money_data or {})
-        return {
+        result = {
             "axis": axis,
             "capital_pressure": {
                 "status": "real_money_available" if real_pressure is not None else "data_missing",
@@ -2195,6 +2298,8 @@ def market_language_for_candidate(candidate: Dict[str, Any], dynamics: Dict[str,
             "market_acceptance": "data_missing", "diagnostic": "insufficient_comparable_timeline",
             "expression_risk": "unknown",
         }
+        result["repricing_attribution"] = build_repricing_attribution(dynamics, result["capital_pressure"], result["diagnostic"])
+        return result
     real_pressure, real_basis, real_market = _candidate_real_money_signal(candidate, real_money_data or {})
     if real_pressure is not None:
         pressure, basis, pressure_is_real = real_pressure, real_basis, True
@@ -2228,7 +2333,7 @@ def market_language_for_candidate(candidate: Dict[str, Any], dynamics: Dict[str,
     elif axis == "BTTS No": opposite = "BTTS Yes"
     elif axis.endswith(" Over"): opposite = axis[:-5] + " Under"
     elif axis.endswith(" Under"): opposite = axis[:-6] + " Over"
-    return {
+    result = {
         "axis": axis,
         "capital_pressure": {
             "status": "real_money_available" if pressure is not None and pressure_is_real else ("proxy_available" if pressure is not None else "data_missing"),
@@ -2248,6 +2353,8 @@ def market_language_for_candidate(candidate: Dict[str, Any], dynamics: Dict[str,
         "diagnostic": diagnostic,
         "expression_risk": risk,
     }
+    result["repricing_attribution"] = build_repricing_attribution(dynamics, result["capital_pressure"], result["diagnostic"])
+    return result
 
 
 def _expression_family(candidate: Dict[str, Any]) -> str:
@@ -2308,7 +2415,7 @@ def apply_market_language_and_expression_optimizer(decision: Dict[str, Any], his
             "axes": axis_language, "real_money_data": normalized_real_money, "capital_pressure_is_proxy_only": not real_money_used,
         }
         decision["expression_optimizer"] = {"action": "PASS", "original_expression": original, "selected_expression": None, "switch_type": None, "reason": "mandatory_gate_failed_or_no_eligible_expression", "automatic_direction_reversal": False}
-        return decision
+        return attach_repricing_attribution(decision)
     original_language = original["market_language"]
     acceptance_rank = {"Accepted": 4, "Partial": 3, "data_missing": 2, "Resistance": 1, "Rejected": 0}
     original_acceptance = original_language.get("market_acceptance", "data_missing")
@@ -2358,7 +2465,7 @@ def apply_market_language_and_expression_optimizer(decision: Dict[str, Any], his
         "reason": reason, "automatic_direction_reversal": False,
         "wait_conditions": ["structural_line_accepts_pressure", "lower_resistance_same_script_expression_appears", "new_verified_fundamental_evidence"] if action == "WAIT" else [],
     }
-    return decision
+    return attach_repricing_attribution(decision)
 
 
 def apply_line_movement_gate(decision: Dict[str, Any], history: List[Dict[str, Any]], real_money_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -4473,6 +4580,7 @@ def build_decision_summary(decision: Dict[str, Any], chain_audit: Dict[str, Any]
         "fundamental_chain_status": chain_audit.get("status"),
         "market_move_classification": decision.get("market_move_classification"),
         "market_acceptance": get_nested(decision, ["market_language", "selected_acceptance"]),
+        "repricing_attribution": get_nested(decision, ["market_language", "selected_repricing_attribution"]),
         "pass_reasons": decision.get("pass_reasons") or [],
         "explanation": "No bet: one or more mandatory gates failed." if passed else ("Wait: model direction is retained but the market has not accepted this expression." if execution_action == "WAIT" else "Selection passed model, price, script, market-language and risk gates."),
     }
@@ -4510,6 +4618,28 @@ def audit_decision_output(decision: Dict[str, Any]) -> Dict[str, Any]:
             consistency_issues.append("real_money_axis_requires_audited_evidence_hash")
         if get_nested(decision, ["expression_optimizer", "automatic_direction_reversal"]) is not False:
             consistency_issues.append("expression_optimizer_must_forbid_automatic_direction_reversal")
+        attribution_rows = [
+            get_nested(row, ["market_language", "repricing_attribution"])
+            for row in (decision.get("candidates") or []) if isinstance(row, dict)
+        ] + [
+            get_nested(axes or {}, [axis, "repricing_attribution"])
+            for axis in ("Home", "Away", "Over", "Under")
+        ]
+        if any(not isinstance(row, dict) or row.get("schema") != "repricing_attribution_v1" for row in attribution_rows):
+            consistency_issues.append("terminal_market_language_requires_repricing_attribution_v1")
+        for attribution in [row for row in attribution_rows if isinstance(row, dict)]:
+            if attribution.get("market_response_is_cause_evidence") is not False:
+                consistency_issues.append("market_response_must_not_be_treated_as_cause_evidence")
+            if attribution.get("real_money_pressure_proves_repricing_cause") is not False:
+                consistency_issues.append("real_money_pressure_must_not_claim_repricing_causation")
+            if attribution.get("source_attribution_verified") is True and not (
+                attribution.get("status") == "fundamental_repricing_confirmed"
+                and attribution.get("verified_fundamental_change_present") is True
+                and attribution.get("market_revalidation_triggered") is True
+            ):
+                consistency_issues.append("repricing_source_verification_requires_fundamental_change_and_market_trigger")
+        if execution_action in ("BET", "WAIT") and not isinstance(get_nested(decision, ["market_language", "selected_repricing_attribution"]), dict):
+            consistency_issues.append("selected_expression_requires_repricing_attribution")
         optimizer_action = get_nested(decision, ["expression_optimizer", "action"])
         if optimizer_action != execution_action:
             consistency_issues.append("expression_optimizer_action_mismatch")
@@ -4628,13 +4758,16 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
         market_data_eligible=bool(latest) and freshness.get("decision_eligible") is True,
     )
     decision["model_market_divergence"] = model_market_divergence
-    decision["market_move_classification"] = "Model-Market Divergence" if model_market_divergence["triggered"] else get_nested(decision, ["line_movement", "classification"])
+    versions = get_fundamental_versions(fixture)
+    previous = versions[-1] if versions else None
+    move_classification = classify_market_move_details(
+        decision.get("line_movement") or {}, previous, script, model_market_divergence["triggered"]
+    )
+    decision = attach_repricing_attribution(decision, move_classification)
     output_audit = audit_decision_output(decision)
     if not output_audit["decision_eligible"]:
         force_pass_decision(decision, "final_output_contract_incomplete")
     decision["output_contract_audit"] = output_audit
-    versions = get_fundamental_versions(fixture)
-    previous = versions[-1] if versions else None
     previous_probability = get_nested(previous or {}, ["script", "model", "probabilities", "1x2"])
     current_probability = get_nested(model, ["probabilities", "1x2"])
     probability_change = {
