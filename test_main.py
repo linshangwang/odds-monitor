@@ -3619,8 +3619,8 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "challenger_spec": self.learning_challenger_spec(modules),
         }
 
-    def save_learning_t1h_reference(self, fixture, kickoff_at, shadow_lock, price):
-        expression = shadow_lock["selected_expression"]
+    def save_learning_t1h_reference(self, fixture, kickoff_at, expression_source, price):
+        expression = expression_source.get("selected_expression") if isinstance(expression_source.get("selected_expression"), dict) else expression_source
         market = expression["market"]
         selection = expression["selection"]
         market_snapshot = main.empty_market_snapshot()
@@ -3635,7 +3635,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         market_snapshot["consensus_main_line"][market] = reference
         store = main.load_snapshot_store()
         store.setdefault("fixtures", {}).setdefault(str(fixture), []).append({
-            "stage": "T-1h", "snapshot_at": int(kickoff_at) - 3600,
+            "stage": "T-1h", "snapshot_at": max(1, int(kickoff_at) - 3600),
             "market_snapshot": market_snapshot,
             "stage_timing_audit": {"status": "valid"},
             "sequence_timing_audit": {"status": "valid"},
@@ -5088,7 +5088,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         payload = self.learning_payload("8044", 900, 1000)
         payload["analysis"]["state_tree"] = {"states": {"FGH": {"prediction": "home_first_goal"}}}
         payload["decision"] = {
-            "decision": "BET", "execution_action": "BET", "match_rating": "B",
+            "decision": "BET", "execution_action": "BET", "match_rating": "B", "market_rating": "B",
             "model_probability": 0.56, "market_no_vig_probability": 0.51,
             "edge": 0.05, "ev": 0.0696, "script_coverage": 0.70,
             "crowding": 0.50, "line_movement": "stable", "lineup_confidence": 0.80,
@@ -5101,6 +5101,9 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "selected_expression": {"market": "over_under", "selection": "under", "line": 2.75, "price": 1.91},
         }
         frozen = main.freeze_learning_sample(payload, now_ts=900)
+        self.save_learning_t1h_reference(
+            "8044", 1000, frozen["decision"]["selected_expression"], 1.80,
+        )
         main.collect_learning_postmatch_facts(
             frozen["freeze_id"], now_ts=9000,
             fact_fetcher=lambda _: self.verified_event_fact_packet(1, 0),
@@ -5108,12 +5111,33 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         main.build_learning_postmatch_review_draft(frozen["freeze_id"], now_ts=9001)
         completed = main.complete_automatic_learning_postmatch_review(frozen["freeze_id"], now_ts=9002)
         self.assertEqual(completed["process_classification"], "DATA_INSUFFICIENT")
-        self.assertEqual(completed["review"]["match_selection_quality"]["status"], "inconclusive")
+        self.assertEqual(completed["review"]["match_selection_quality"]["status"], "passed")
+        self.assertEqual(completed["review"]["match_selection_quality"]["required_minimum_rating"], "B")
+        self.assertFalse(completed["review"]["match_selection_quality"]["rating_derived_from_result"])
+        self.assertEqual(completed["review"]["price_execution_audit"]["status"], "passed")
+        self.assertEqual(completed["review"]["price_execution_audit"]["reference_stage"], "T-1h")
+        self.assertFalse(completed["review"]["price_execution_audit"]["caller_supplied_price_reference_used"])
         self.assertEqual(completed["review"]["state_tree_coverage"]["status"], "inconclusive")
         self.assertEqual(
             completed["event_audit"]["automatic_review_derivation"]["selection_outcome_audit"]["status"],
             "not_used",
         )
+        refreshed = main.refresh_learning_quality_cards(now_ts=9003)
+        self.assertEqual(refreshed["created_count"], 1)
+        card = main.load_snapshot_store()["learning_quality_cards"][frozen["freeze_id"]]
+        self.assertFalse(card["sample_eligibility"]["eligible"])
+        self.assertTrue(card["sample_eligibility"]["priority_calibration_eligible"])
+        self.assertTrue(card["sample_eligibility"]["selection_calibration_eligible"])
+        calibration = main.learning_quality_calibration_report(minimum_samples=2)
+        self.assertEqual(calibration["calibration_group_count"], 2)
+        self.assertTrue(all(row["eligible_sample_count"] == 1 for row in calibration["groups"]))
+
+    def test_automatic_match_threshold_uses_only_explicit_letter_grades(self):
+        self.assertTrue(main._learning_match_rating_at_least_b("A-"))
+        self.assertTrue(main._learning_match_rating_at_least_b("B+"))
+        self.assertFalse(main._learning_match_rating_at_least_b("C"))
+        self.assertIsNone(main._learning_match_rating_at_least_b(7.5))
+        self.assertIsNone(main._learning_match_rating_at_least_b("7.5/10"))
 
     def test_fact_verification_counts_only_matching_result_evidence(self):
         frozen = main.freeze_learning_sample(self.learning_payload("805", 900, 1000), now_ts=900)

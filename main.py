@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.10.0"
+VERSION = "2.11.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -198,7 +198,7 @@ LEARNING_TOP_FLIGHT_LEAGUES: Dict[int, Dict[str, str]] = {
 }
 LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
 LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
-LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.10").strip() or "MODEL_RULES.md@2026-10-08-v2.10"
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-08-v2.11").strip() or "MODEL_RULES.md@2026-10-08-v2.11"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -6467,7 +6467,7 @@ def build_learning_postmatch_review_draft(freeze_id: Any, now_ts: Optional[int] 
         expression_status, expression_reason = "data_missing", "frozen_expression_contract_is_not_complete_enough_for_automatic_audit"
     entry_price = as_float(selected_expression.get("price"))
     price_status = "inconclusive" if entry_price is not None else "data_missing"
-    price_reason = "entry_price_present_but_verified_closing_price_is_not_in_postmatch_facts" if entry_price is not None else "entry_or_closing_price_evidence_missing"
+    price_reason = "entry_price_present_pending_server_verified_t1h_reference" if entry_price is not None else "entry_or_t1h_price_evidence_missing"
     match_rating = decision.get("match_rating")
     match_status = "inconclusive" if match_rating is not None else "data_missing"
     match_reason = "frozen_match_rating_present_but_selection_quality_requires_cross_match_comparison" if match_rating is not None else "frozen_match_rating_missing"
@@ -6712,6 +6712,21 @@ def complete_learning_postmatch_review(payload: Dict[str, Any], now_ts: Optional
     )
 
 
+def _learning_match_rating_at_least_b(value: Any) -> Optional[bool]:
+    """Grade only an explicitly frozen rating; never infer one from the result."""
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return None
+    normalized = str(value).strip().upper().replace("级", "")
+    if not normalized:
+        return None
+    grade = normalized[0]
+    if grade not in {"A", "B", "C", "D", "E", "F"}:
+        return None
+    return grade in {"A", "B"}
+
+
 def complete_automatic_learning_postmatch_review(freeze_id: Any, now_ts: Optional[int] = None) -> Dict[str, Any]:
     """Complete a deterministic evidence-contract review without using the realised score to grade process."""
     freeze_id = str(freeze_id or "").strip()
@@ -6736,12 +6751,20 @@ def complete_automatic_learning_postmatch_review(freeze_id: Any, now_ts: Optiona
     frozen_decision = freeze.get("decision") if isinstance(freeze.get("decision"), dict) else {}
     decision_contract = audit_decision_output(frozen_decision)
     is_pass = str(frozen_decision.get("decision") or "").upper() == "PASS"
+    frozen_match_rating = _learning_frozen_rating(frozen_decision, "match_rating")
+    rating_at_least_b = _learning_match_rating_at_least_b(frozen_match_rating)
     if is_pass and bool(frozen_decision.get("pass_reasons")):
         match_status = "passed"
         match_reason = "The frozen safe PASS has explicit reasons and is auditable without consulting the final score."
+    elif decision_contract.get("decision_eligible") is True and rating_at_least_b is True:
+        match_status = "passed"
+        match_reason = "The actionable decision satisfied the frozen contract and the preregistered B-or-better match threshold."
+    elif decision_contract.get("decision_eligible") is True and rating_at_least_b is False:
+        match_status = "failed"
+        match_reason = "The actionable decision was taken below the preregistered B match threshold."
     elif decision_contract.get("decision_eligible") is True:
-        match_status = "inconclusive"
-        match_reason = "The actionable decision contract is complete, but contract completeness alone cannot prove match-selection quality."
+        match_status = "data_missing"
+        match_reason = "The actionable decision has no parseable frozen match rating."
     else:
         match_status = "failed"
         match_reason = "The frozen actionable decision did not satisfy the prematch decision contract."
@@ -6754,11 +6777,50 @@ def complete_automatic_learning_postmatch_review(freeze_id: Any, now_ts: Optiona
         state_status, state_reason = "inconclusive", "Frozen state predictions and independently verified events are present, but no deterministic state-path comparison proves coverage automatically."
     else:
         state_status, state_reason = "data_missing", "Frozen state predictions exist but the event sequence lacks independent verification."
+    frozen_expression = _learning_selected_expression(frozen_decision)
+    entry_price = as_float(frozen_expression.get("price"))
+    if is_pass:
+        price_status = "not_applicable"
+        price_reason = "The frozen decision was PASS, so no price execution was attempted."
+        price_evidence_refs = []
+        price_details = {"entry_price": entry_price, "reference_stage": "T-1h"}
+    elif entry_price is None:
+        price_status = "failed"
+        price_reason = "The actionable frozen expression omitted its entry price."
+        price_evidence_refs = [freeze_ref]
+        price_details = {"entry_price": None, "reference_stage": "T-1h"}
+    else:
+        price_reference = _learning_t1h_price_evidence_for_expression(freeze, frozen_expression, store)
+        if price_reference.get("ok") is not True:
+            price_status = "data_missing"
+            price_reason = str(price_reference.get("reason") or "verified_learning_t1h_snapshot_required")
+            price_evidence_refs = [freeze_ref]
+            price_details = {"entry_price": entry_price, "reference_stage": "T-1h"}
+        else:
+            reference_price = float(price_reference["reference_decimal_price"])
+            price_probability_delta = round(1.0 / reference_price - 1.0 / entry_price, 8)
+            price_status = "passed" if price_probability_delta >= 0.0 else "failed"
+            price_reason = (
+                "The frozen entry held or improved versus the exact-line T-1h consensus."
+                if price_status == "passed"
+                else "The frozen entry deteriorated versus the exact-line T-1h consensus."
+            )
+            price_evidence_refs = [freeze_ref, str(price_reference["price_reference_evidence_ref"])]
+            price_details = {
+                "entry_price": entry_price, "reference_stage": "T-1h",
+                "reference_price": reference_price,
+                "t1h_price_probability_delta": price_probability_delta,
+                "reference_snapshot_at": price_reference.get("snapshot_at"),
+                "caller_supplied_price_reference_used": False,
+            }
     review = copy.deepcopy(draft.get("review") if isinstance(draft.get("review"), dict) else {})
     section_overrides = {
         "match_selection_quality": {
             "status": match_status,
             "reason": match_reason,
+            "frozen_match_rating": frozen_match_rating,
+            "required_minimum_rating": "B",
+            "rating_derived_from_result": False,
             "evidence_refs": [freeze_ref] if match_status in {"passed", "failed"} else [],
         },
         "state_tree_coverage": {
@@ -6766,9 +6828,10 @@ def complete_automatic_learning_postmatch_review(freeze_id: Any, now_ts: Optiona
             "evidence_refs": [freeze_ref, fact_ref] if state_status in {"passed", "failed"} else [],
         },
         "price_execution_audit": {
-            "status": "not_applicable",
-            "reason": "Verified closing-price evidence is not part of the result fact packet and is not inferred.",
-            "evidence_refs": [],
+            "status": price_status,
+            "reason": price_reason,
+            **price_details,
+            "evidence_refs": price_evidence_refs,
         },
     }
     for section in LEARNING_REVIEW_SECTIONS:
@@ -8560,10 +8623,10 @@ def generate_internal_shadow_lock(
     )
 
 
-def _learning_terminal_price_evidence(
-    freeze: Dict[str, Any], shadow_lock: Dict[str, Any], store: Dict[str, Any],
+def _learning_t1h_price_evidence_for_expression(
+    freeze: Dict[str, Any], expression: Dict[str, Any], store: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Return the exact-line T-1h consensus used by the four-node learning task."""
+    """Return the exact-line T-1h consensus for one frozen market expression."""
     fixture = str(freeze.get("fixture") or "")
     kickoff_at = int(freeze.get("kickoff_at") or 0)
     rows = [
@@ -8579,7 +8642,7 @@ def _learning_terminal_price_evidence(
     market_snapshot = terminal.get("market_snapshot") if isinstance(terminal.get("market_snapshot"), dict) else {}
     if market_snapshot.get("available") is not True:
         return {"ok": False, "reason": "learning_t1h_market_snapshot_unavailable"}
-    expression = shadow_lock.get("selected_expression") if isinstance(shadow_lock.get("selected_expression"), dict) else {}
+    expression = expression if isinstance(expression, dict) else {}
     market = str(expression.get("market") or "").strip()
     selection = str(expression.get("selection") or "").strip().casefold()
     line = as_float(expression.get("line"))
@@ -8609,6 +8672,14 @@ def _learning_terminal_price_evidence(
         "price_reference_evidence_ref": f"snapshot:{evidence_hash}:T-1h:{market}:{selection}",
         "snapshot_at": terminal.get("snapshot_at"), "evidence_hash": evidence_hash,
     }
+
+
+def _learning_terminal_price_evidence(
+    freeze: Dict[str, Any], shadow_lock: Dict[str, Any], store: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return the exact-line T-1h consensus used by forward Shadow validation."""
+    expression = shadow_lock.get("selected_expression") if isinstance(shadow_lock.get("selected_expression"), dict) else {}
+    return _learning_t1h_price_evidence_for_expression(freeze, expression, store)
 
 
 def record_hypothesis_validation(hypothesis_id: Any, payload: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
@@ -9391,10 +9462,13 @@ def _learning_quality_card_candidate(freeze: Dict[str, Any], postmatch: Dict[str
     process_class = str(postmatch.get("process_classification") or "DATA_INSUFFICIENT")
     outcome_independence_attested = review.get("outcome_not_used_for_process_grade") is True
     result_backfit_rejected = get_nested(review, ["learning_disposition", "result_backfit_used"]) is False
-    sample_eligible = (
-        process_class not in {"EVENT_CONTAMINATED", "DATA_INSUFFICIENT"}
+    section_evidence_eligible = (
+        process_class != "EVENT_CONTAMINATED"
         and outcome_independence_attested and result_backfit_rejected
     )
+    sample_eligible = section_evidence_eligible and process_class != "DATA_INSUFFICIENT"
+    priority_eligible = section_evidence_eligible and priority_quality["calibration_eligible"]
+    selection_eligible = section_evidence_eligible and selection_quality["calibration_eligible"]
     match_rating = _learning_frozen_rating(decision, "match_rating")
     market_rating = _learning_frozen_rating(decision, "market_rating")
     immutable = {
@@ -9421,8 +9495,12 @@ def _learning_quality_card_candidate(freeze: Dict[str, Any], postmatch: Dict[str
         "diagnostics": {section: get_nested(review, [section, "status"]) for section in LEARNING_REVIEW_SECTIONS},
         "sample_eligibility": {
             "eligible": sample_eligible,
+            "priority_calibration_eligible": priority_eligible,
+            "selection_calibration_eligible": selection_eligible,
+            "section_evidence_isolated": True,
             "reason": (
                 "verified_outcome_independent_process_review" if sample_eligible else
+                "independent_sections_only; overall_process_data_insufficient" if process_class == "DATA_INSUFFICIENT" and section_evidence_eligible else
                 process_class.lower() if process_class in {"EVENT_CONTAMINATED", "DATA_INSUFFICIENT"} else
                 "outcome_independence_attestation_missing"
             ),
@@ -9514,19 +9592,26 @@ def learning_quality_calibration_report(minimum_samples: Optional[int] = None) -
     groups: Dict[Tuple[str, Any, str], Dict[str, Any]] = {}
     excluded = {
         "superseded_freeze_version": superseded, "sample_ineligible": 0,
+        "priority_sample_ineligible": 0, "selection_sample_ineligible": 0,
         "priority_rating_missing": 0, "priority_label_ungraded": 0,
         "selection_rating_missing": 0, "selection_label_ungraded": 0,
     }
     for card in latest_by_fixture.values():
-        if get_nested(card, ["sample_eligibility", "eligible"]) is not True:
-            excluded["sample_ineligible"] += 1
-            continue
+        any_dimension_eligible = False
         competition_id = get_nested(card, ["scope", "competition_id"])
         competition_name = get_nested(card, ["scope", "competition_name"])
         for dimension, rating_field, prefix in (
             ("priority_quality", "match_rating", "priority"),
             ("selection_quality", "market_rating", "selection"),
         ):
+            eligibility_key = f"{prefix}_calibration_eligible"
+            dimension_eligible = get_nested(card, ["sample_eligibility", eligibility_key])
+            if dimension_eligible is None:
+                dimension_eligible = get_nested(card, ["sample_eligibility", "eligible"])
+            if dimension_eligible is not True:
+                excluded[f"{prefix}_sample_ineligible"] += 1
+                continue
+            any_dimension_eligible = True
             rating = get_nested(card, ["frozen_decision", rating_field])
             bucket = _learning_rating_bucket(rating)
             label = get_nested(card, [dimension, "label"])
@@ -9548,6 +9633,8 @@ def learning_quality_calibration_report(minimum_samples: Optional[int] = None) -
             group["card_ids"].append(card.get("card_id"))
             group["freeze_ids"].append(card.get("freeze_id"))
             group["fixture_ids"].append(card.get("fixture"))
+        if not any_dimension_eligible:
+            excluded["sample_ineligible"] += 1
     calibration_groups = []
     for group in groups.values():
         count = group["eligible_sample_count"]
