@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.18.1"
+VERSION = "2.19.0"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -207,6 +207,25 @@ LEARNING_MAJOR_LEAGUES: Dict[int, Dict[str, str]] = {
     144: {"name": "Belgium Pro League", "country": "Belgium"},
     203: {"name": "Turkey Super Lig", "country": "Turkey"},
     253: {"name": "USA Major League Soccer", "country": "USA"},
+}
+# Explicit cross-provider registry for odds-only fixture discovery. The
+# registry is deliberately coupled to the user-approved major-league pool:
+# unmapped or newly added competitions cannot enter the watchlist silently.
+THE_ODDS_API_MAJOR_LEAGUE_SPORT_KEYS: Dict[int, str] = {
+    39: "soccer_epl",
+    61: "soccer_france_ligue_one",
+    71: "soccer_brazil_campeonato",
+    78: "soccer_germany_bundesliga",
+    88: "soccer_netherlands_eredivisie",
+    94: "soccer_portugal_primeira_liga",
+    103: "soccer_norway_eliteserien",
+    113: "soccer_sweden_allsvenskan",
+    128: "soccer_argentina_primera_division",
+    135: "soccer_italy_serie_a",
+    140: "soccer_spain_la_liga",
+    144: "soccer_belgium_first_div",
+    203: "soccer_turkey_super_league",
+    253: "soccer_usa_mls",
 }
 # Backward-compatible alias. New code and external contracts should use the
 # major-league name because domestic tier one alone is not sufficient.
@@ -12745,6 +12764,120 @@ def completed_auto_snapshot_stages(history: List[Dict[str, Any]]) -> set:
     }
 
 
+def discover_the_odds_api_watchlist(
+    now: Optional[datetime] = None,
+    store_override: Optional[Dict[str, Any]] = None,
+    api_caller: Optional[Any] = None,
+    persist: bool = True,
+) -> Dict[str, Any]:
+    """Discover the next 24h major-league events without admitting model samples.
+
+    Discovery is idempotent per Shanghai calendar day after 14:30. It stores
+    provider identity only; it neither creates a fundamental packet nor a
+    betting direction, and it does not spend historical-odds requests.
+    """
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    now_ts = int(now.timestamp())
+    local_now = now.astimezone(ZoneInfo("Asia/Shanghai"))
+    scheduled = local_now.replace(hour=14, minute=30, second=0, microsecond=0)
+    run_id = f"odds-watchlist-{local_now.date().strftime('%Y%m%d')}-1430"
+    if local_now < scheduled:
+        return {"status": "not_due", "run_id": run_id, "at": now_ts, "discovered_count": 0}
+    if not THE_ODDS_API_KEY:
+        return {"status": "skipped", "reason": "the_odds_api_not_configured", "run_id": run_id, "at": now_ts, "discovered_count": 0}
+
+    store = store_override if isinstance(store_override, dict) else load_snapshot_store()
+    prior = (store.get("the_odds_api_discovery_runs") or {}).get(run_id)
+    if isinstance(prior, dict):
+        return {
+            "status": "already_completed", "run_id": run_id, "at": now_ts,
+            "discovered_count": int(prior.get("discovered_count") or 0),
+            "request_count": int(prior.get("request_count") or 0),
+        }
+
+    caller = api_caller or call_the_odds_api
+    horizon_end = now + timedelta(hours=LEARNING_DISCOVERY_HORIZON_HOURS)
+    params = {
+        "dateFormat": "iso",
+        "commenceTimeFrom": now.isoformat().replace("+00:00", "Z"),
+        "commenceTimeTo": horizon_end.isoformat().replace("+00:00", "Z"),
+    }
+    watchlist = store.setdefault("the_odds_api_watchlist", {})
+    request_audit: List[Dict[str, Any]] = []
+    discovered_ids = []
+    rejected_count = 0
+    for league_id, sport_key in THE_ODDS_API_MAJOR_LEAGUE_SPORT_KEYS.items():
+        league = LEARNING_MAJOR_LEAGUES.get(league_id)
+        if not league:
+            rejected_count += 1
+            continue
+        response = caller(f"/sports/{sport_key}/events", params)
+        rows = response.get("data") if isinstance(response, dict) and isinstance(response.get("data"), list) else []
+        request_audit.append({
+            "league_id": league_id, "sport_key": sport_key,
+            "ok": bool(response.get("ok")) if isinstance(response, dict) else False,
+            "status_code": response.get("status_code") if isinstance(response, dict) else None,
+            "returned_count": len(rows),
+        })
+        if not isinstance(response, dict) or not response.get("ok"):
+            continue
+        for event in rows:
+            if not isinstance(event, dict):
+                rejected_count += 1
+                continue
+            event_id = str(event.get("id") or "").strip()
+            kickoff_ts = _parse_timestamp(event.get("commence_time"))
+            home_team = str(event.get("home_team") or "").strip()
+            away_team = str(event.get("away_team") or "").strip()
+            if (
+                not event_id or len(event_id) > 200 or any(ord(char) < 32 for char in event_id)
+                or not kickoff_ts or not (now_ts < kickoff_ts <= int(horizon_end.timestamp()))
+                or not home_team or not away_team
+            ):
+                rejected_count += 1
+                continue
+            fixture = f"odds-watch-{event_id}"
+            watchlist[fixture] = {
+                "schema": "the_odds_api_watchlist_v1",
+                "fixture": fixture,
+                "source": "the_odds_api",
+                "discovered_at": now_ts,
+                "expires_at": kickoff_ts + 3 * 3600,
+                "league_id": league_id,
+                "league": league["name"],
+                "country": league["country"],
+                "provider_fixture_ids": {"the_odds_api": event_id},
+                "match": {
+                    "kickoff_utc": datetime.fromtimestamp(kickoff_ts, tz=timezone.utc).isoformat(),
+                    "home_team_name": home_team, "away_team_name": away_team,
+                    "the_odds_api_sport_key": sport_key,
+                },
+                "tracking_mode": "fixed_node_market_only",
+                "learning_eligibility": "MODEL_LEARNING_EXCLUDED",
+                "model_learning_effect": False,
+                "direction_generation_allowed": False,
+                "fundamentals_status": "data_missing",
+                "admission_blockers": ["verified_fundamental_chain_missing", "provider_identity_not_reconciled"],
+            }
+            discovered_ids.append(fixture)
+
+    failed_count = sum(not row["ok"] for row in request_audit)
+    audit = {
+        "schema": "the_odds_api_discovery_run_v1", "run_id": run_id,
+        "status": "completed" if failed_count == 0 else "degraded",
+        "at": now_ts, "horizon_end": int(horizon_end.timestamp()),
+        "request_count": len(request_audit), "failed_request_count": failed_count,
+        "discovered_count": len(set(discovered_ids)), "rejected_count": rejected_count,
+        "discovered_fixtures": sorted(set(discovered_ids)), "request_audit": request_audit,
+        "historical_odds_requested": False, "model_learning_effect": False,
+    }
+    store.setdefault("the_odds_api_discovery_runs", {})[run_id] = audit
+    if persist and store_override is None:
+        store["version"] = VERSION
+        write_snapshot_store(store)
+    return audit
+
+
 def auto_collect_the_odds_api_due_stages(
     now: Optional[datetime] = None,
     store_override: Optional[Dict[str, Any]] = None,
@@ -12762,7 +12895,9 @@ def auto_collect_the_odds_api_due_stages(
     collect = collector or collect_the_odds_api_timeline
     results: List[Dict[str, Any]] = []
     due_count = 0
-    for fixture, metadata in (store.get("external_prematch") or {}).items():
+    tracked = dict(store.get("the_odds_api_watchlist") or {})
+    tracked.update(store.get("external_prematch") or {})
+    for fixture, metadata in tracked.items():
         if not isinstance(metadata, dict) or metadata.get("source") != "the_odds_api":
             continue
         match = metadata.get("match") if isinstance(metadata.get("match"), dict) else {}
@@ -12920,6 +13055,7 @@ def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[st
 def auto_snapshot_cycle(now: Optional[datetime] = None) -> Dict[str, Any]:
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     learning_result = auto_learning_daily_cycle(now)
+    the_odds_api_discovery = discover_the_odds_api_watchlist(now)
     the_odds_api_due_collection = auto_collect_the_odds_api_due_stages(now)
     api_football_authenticated = API_FOOTBALL_STARTUP_PROBE.get("authenticated") is True
     dates = sorted({(now + timedelta(days=i)).astimezone(ZoneInfo(AUTO_FETCH_TIMEZONE)).date().isoformat() for i in range(AUTO_SNAPSHOT_DAYS_AHEAD + 1)}) if api_football_authenticated else []
@@ -12984,6 +13120,7 @@ def auto_snapshot_cycle(now: Optional[datetime] = None) -> Dict[str, Any]:
     }
     combined = {
         **learning_result, "node_execution": node_result,
+        "the_odds_api_discovery": the_odds_api_discovery,
         "the_odds_api_due_collection": the_odds_api_due_collection,
         "api_football_due_collection": api_football_due_collection,
     }
