@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.19.0"
+VERSION = "2.19.1"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -162,6 +162,8 @@ THE_ODDS_API_MAX_HISTORY_REQUESTS = max(16, min(int(os.getenv("THE_ODDS_API_MAX_
 THE_ODDS_API_MIN_1X2_BOOKMAKERS = max(1, int(os.getenv("THE_ODDS_API_MIN_1X2_BOOKMAKERS", "5")))
 THE_ODDS_API_MIN_AH_BOOKMAKERS = max(1, int(os.getenv("THE_ODDS_API_MIN_AH_BOOKMAKERS", "3")))
 THE_ODDS_API_MIN_OU_BOOKMAKERS = max(1, int(os.getenv("THE_ODDS_API_MIN_OU_BOOKMAKERS", "3")))
+THE_ODDS_API_DISCOVERY_MAX_ATTEMPTS = max(1, min(int(os.getenv("THE_ODDS_API_DISCOVERY_MAX_ATTEMPTS", "3")), 5))
+THE_ODDS_API_DISCOVERY_RETRY_SECONDS = max(300, min(int(os.getenv("THE_ODDS_API_DISCOVERY_RETRY_SECONDS", "900")), 3600))
 NAMI_API_USER = os.getenv("NAMI_API_USER", "")
 NAMI_API_SECRET = os.getenv("NAMI_API_SECRET", "")
 NAMI_API_BASE_URL = os.getenv("NAMI_API_BASE_URL", "https://open.sportnanoapi.com").rstrip("/")
@@ -4994,7 +4996,7 @@ def health():
         "fresh_fixture_count": get_nested(route, ["pang", "fresh_fixture_count"], 0),
         "missing_action": route.get("missing_action"),
     }
-    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "the_odds_api_base_url": THE_ODDS_API_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "api_football_startup_probe": API_FOOTBALL_STARTUP_PROBE, "has_thestats_key": bool(THESTATS_API_KEY), "thestats_fixture_day_cache_ttl_seconds": THESTATS_FIXTURE_DAY_CACHE_TTL_SECONDS, "thestats_fixture_day_cache_entries": len(THESTATS_FIXTURE_DAY_CACHE), "has_the_odds_api_key": bool(THE_ODDS_API_KEY), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "nami_odds_startup_probe": NAMI_ODDS_STARTUP_PROBE, "nami_odds_probe_ttl_seconds": NAMI_ODDS_PROBE_TTL_SECONDS, "market_data_route": route_summary, "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "snapshot_store_writer_workers": SNAPSHOT_STORE_WRITER_WORKERS, "snapshot_store_single_writer_required": True, "snapshot_store_warn_bytes": SNAPSHOT_STORE_WARN_BYTES, "snapshot_store_max_decompressed_bytes": SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES, "fundamental_version_retention": FUNDAMENTAL_VERSION_RETENTION, "portfolio_run_retention": PORTFOLIO_RUN_RETENTION, "external_data_stale_seconds": EXTERNAL_DATA_STALE_SECONDS, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}, "auto_provider_reconciliation": AUTO_RECONCILIATION_LAST_RESULT}
+    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "the_odds_api_base_url": THE_ODDS_API_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "api_football_startup_probe": API_FOOTBALL_STARTUP_PROBE, "has_thestats_key": bool(THESTATS_API_KEY), "thestats_fixture_day_cache_ttl_seconds": THESTATS_FIXTURE_DAY_CACHE_TTL_SECONDS, "thestats_fixture_day_cache_entries": len(THESTATS_FIXTURE_DAY_CACHE), "has_the_odds_api_key": bool(THE_ODDS_API_KEY), "the_odds_api_watchlist": the_odds_api_watchlist_health(), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "nami_odds_startup_probe": NAMI_ODDS_STARTUP_PROBE, "nami_odds_probe_ttl_seconds": NAMI_ODDS_PROBE_TTL_SECONDS, "market_data_route": route_summary, "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "snapshot_store_writer_workers": SNAPSHOT_STORE_WRITER_WORKERS, "snapshot_store_single_writer_required": True, "snapshot_store_warn_bytes": SNAPSHOT_STORE_WARN_BYTES, "snapshot_store_max_decompressed_bytes": SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES, "fundamental_version_retention": FUNDAMENTAL_VERSION_RETENTION, "portfolio_run_retention": PORTFOLIO_RUN_RETENTION, "external_data_stale_seconds": EXTERNAL_DATA_STALE_SECONDS, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}, "auto_provider_reconciliation": AUTO_RECONCILIATION_LAST_RESULT}
 
 
 @app.get("/shadow/nami-capabilities")
@@ -12764,6 +12766,36 @@ def completed_auto_snapshot_stages(history: List[Dict[str, Any]]) -> set:
     }
 
 
+def the_odds_api_watchlist_health(
+    now_ts: Optional[int] = None,
+    store_override: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return a compact, public-safe view of discovery and watchlist state."""
+    now_ts = int(time.time()) if now_ts is None else int(now_ts)
+    try:
+        store = store_override if isinstance(store_override, dict) else load_snapshot_store()
+    except SnapshotStoreReadError:
+        return {"status": "store_unavailable", "active_count": 0, "expired_count": 0, "latest_run": None}
+    rows = [row for row in (store.get("the_odds_api_watchlist") or {}).values() if isinstance(row, dict)]
+    active_count = sum((_parse_timestamp(row.get("expires_at")) or 0) >= now_ts for row in rows)
+    expired_count = len(rows) - active_count
+    runs = [row for row in (store.get("the_odds_api_discovery_runs") or {}).values() if isinstance(row, dict)]
+    latest = max(runs, key=lambda row: int(row.get("at") or 0), default=None)
+    latest_summary = None if latest is None else {
+        "run_id": latest.get("run_id"), "status": latest.get("status"),
+        "at": latest.get("at"), "attempt_count": latest.get("attempt_count", 1),
+        "discovered_count": latest.get("discovered_count", 0),
+        "failed_request_count": latest.get("failed_request_count", 0),
+        "next_retry_at": latest.get("next_retry_at"),
+    }
+    return {
+        "status": "ready" if latest_summary else "awaiting_first_run",
+        "active_count": active_count, "expired_count": expired_count,
+        "latest_run": latest_summary,
+        "learning_eligibility": "MODEL_LEARNING_EXCLUDED",
+    }
+
+
 def discover_the_odds_api_watchlist(
     now: Optional[datetime] = None,
     store_override: Optional[Dict[str, Any]] = None,
@@ -12787,13 +12819,47 @@ def discover_the_odds_api_watchlist(
         return {"status": "skipped", "reason": "the_odds_api_not_configured", "run_id": run_id, "at": now_ts, "discovered_count": 0}
 
     store = store_override if isinstance(store_override, dict) else load_snapshot_store()
+    watchlist = store.setdefault("the_odds_api_watchlist", {})
+    expired_fixtures = [
+        fixture for fixture, row in watchlist.items()
+        if not isinstance(row, dict) or (_parse_timestamp(row.get("expires_at")) or 0) < now_ts
+    ]
+    for fixture in expired_fixtures:
+        watchlist.pop(fixture, None)
+
+    def persist_pruning_if_needed() -> None:
+        if expired_fixtures and persist and store_override is None:
+            store["version"] = VERSION
+            write_snapshot_store(store)
+
     prior = (store.get("the_odds_api_discovery_runs") or {}).get(run_id)
-    if isinstance(prior, dict):
+    prior_status = str((prior or {}).get("status") or "completed") if isinstance(prior, dict) else None
+    if isinstance(prior, dict) and prior_status == "completed":
+        persist_pruning_if_needed()
         return {
             "status": "already_completed", "run_id": run_id, "at": now_ts,
             "discovered_count": int(prior.get("discovered_count") or 0),
             "request_count": int(prior.get("request_count") or 0),
+            "pruned_count": len(expired_fixtures),
         }
+    prior_attempt_count = int((prior or {}).get("attempt_count") or 0) if isinstance(prior, dict) else 0
+    if isinstance(prior, dict) and prior_status == "degraded":
+        next_retry_at = int(prior.get("next_retry_at") or 0)
+        if prior_attempt_count >= THE_ODDS_API_DISCOVERY_MAX_ATTEMPTS:
+            persist_pruning_if_needed()
+            return {
+                "status": "retry_exhausted", "run_id": run_id, "at": now_ts,
+                "attempt_count": prior_attempt_count, "failed_request_count": prior.get("failed_request_count", 0),
+                "pruned_count": len(expired_fixtures),
+            }
+        if now_ts < next_retry_at:
+            persist_pruning_if_needed()
+            return {
+                "status": "retry_scheduled", "run_id": run_id, "at": now_ts,
+                "attempt_count": prior_attempt_count, "next_retry_at": next_retry_at,
+                "failed_request_count": prior.get("failed_request_count", 0),
+                "pruned_count": len(expired_fixtures),
+            }
 
     caller = api_caller or call_the_odds_api
     horizon_end = now + timedelta(hours=LEARNING_DISCOVERY_HORIZON_HOURS)
@@ -12802,11 +12868,15 @@ def discover_the_odds_api_watchlist(
         "commenceTimeFrom": now.isoformat().replace("+00:00", "Z"),
         "commenceTimeTo": horizon_end.isoformat().replace("+00:00", "Z"),
     }
-    watchlist = store.setdefault("the_odds_api_watchlist", {})
     request_audit: List[Dict[str, Any]] = []
     discovered_ids = []
     rejected_count = 0
-    for league_id, sport_key in THE_ODDS_API_MAJOR_LEAGUE_SPORT_KEYS.items():
+    failed_sport_keys = set((prior or {}).get("failed_sport_keys") or []) if isinstance(prior, dict) else set()
+    league_items = [
+        (league_id, sport_key) for league_id, sport_key in THE_ODDS_API_MAJOR_LEAGUE_SPORT_KEYS.items()
+        if not failed_sport_keys or sport_key in failed_sport_keys
+    ]
+    for league_id, sport_key in league_items:
         league = LEARNING_MAJOR_LEAGUES.get(league_id)
         if not league:
             rejected_count += 1
@@ -12861,14 +12931,23 @@ def discover_the_odds_api_watchlist(
             }
             discovered_ids.append(fixture)
 
-    failed_count = sum(not row["ok"] for row in request_audit)
+    current_failed_sport_keys = sorted(row["sport_key"] for row in request_audit if not row["ok"])
+    failed_count = len(current_failed_sport_keys)
+    attempt_count = prior_attempt_count + 1
+    prior_fixtures = set((prior or {}).get("discovered_fixtures") or []) if isinstance(prior, dict) else set()
+    all_discovered = sorted(prior_fixtures | set(discovered_ids))
+    retry_seconds = THE_ODDS_API_DISCOVERY_RETRY_SECONDS * (2 ** max(0, attempt_count - 1))
     audit = {
         "schema": "the_odds_api_discovery_run_v1", "run_id": run_id,
         "status": "completed" if failed_count == 0 else "degraded",
         "at": now_ts, "horizon_end": int(horizon_end.timestamp()),
-        "request_count": len(request_audit), "failed_request_count": failed_count,
-        "discovered_count": len(set(discovered_ids)), "rejected_count": rejected_count,
-        "discovered_fixtures": sorted(set(discovered_ids)), "request_audit": request_audit,
+        "attempt_count": attempt_count,
+        "request_count": int((prior or {}).get("request_count") or 0) + len(request_audit),
+        "failed_request_count": failed_count, "failed_sport_keys": current_failed_sport_keys,
+        "next_retry_at": now_ts + retry_seconds if failed_count and attempt_count < THE_ODDS_API_DISCOVERY_MAX_ATTEMPTS else None,
+        "discovered_count": len(all_discovered), "rejected_count": int((prior or {}).get("rejected_count") or 0) + rejected_count,
+        "discovered_fixtures": all_discovered, "request_audit": request_audit,
+        "pruned_count": len(expired_fixtures),
         "historical_odds_requested": False, "model_learning_effect": False,
     }
     store.setdefault("the_odds_api_discovery_runs", {})[run_id] = audit

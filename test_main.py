@@ -3758,6 +3758,59 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["discovered_count"], 3)
         caller.assert_not_called()
 
+    def test_the_odds_api_watchlist_retries_only_failed_league_after_backoff(self):
+        now = datetime(2026, 10, 9, 7, 0, tzinfo=timezone.utc)
+        calls = []
+
+        def first_caller(path, params):
+            calls.append(path)
+            if "soccer_norway_eliteserien" in path:
+                return {"ok": False, "status_code": 503, "data": {}}
+            return {"ok": True, "status_code": 200, "data": []}
+
+        store = {"fixtures": {}}
+        with patch.object(main, "THE_ODDS_API_KEY", "configured"), \
+             patch.object(main, "THE_ODDS_API_DISCOVERY_RETRY_SECONDS", 900):
+            first = main.discover_the_odds_api_watchlist(now, store_override=store, api_caller=first_caller, persist=False)
+            waiting = main.discover_the_odds_api_watchlist(now + timedelta(minutes=10), store_override=store, api_caller=Mock(), persist=False)
+            retry_caller = Mock(return_value={"ok": True, "status_code": 200, "data": []})
+            recovered = main.discover_the_odds_api_watchlist(now + timedelta(minutes=15), store_override=store, api_caller=retry_caller, persist=False)
+        self.assertEqual(first["status"], "degraded")
+        self.assertEqual(first["attempt_count"], 1)
+        self.assertEqual(first["failed_sport_keys"], ["soccer_norway_eliteserien"])
+        self.assertEqual(waiting["status"], "retry_scheduled")
+        self.assertEqual(recovered["status"], "completed")
+        self.assertEqual(recovered["attempt_count"], 2)
+        retry_caller.assert_called_once()
+        self.assertIn("soccer_norway_eliteserien", retry_caller.call_args.args[0])
+
+    def test_the_odds_api_watchlist_prunes_expired_rows_and_exposes_compact_health(self):
+        now_ts = int(datetime(2026, 10, 9, 7, 0, tzinfo=timezone.utc).timestamp())
+        run_id = "odds-watchlist-20261009-1430"
+        store = {
+            "the_odds_api_watchlist": {
+                "expired": {"expires_at": now_ts - 1},
+                "active": {"expires_at": now_ts + 100},
+            },
+            "the_odds_api_discovery_runs": {run_id: {
+                "run_id": run_id, "status": "completed", "at": now_ts,
+                "attempt_count": 1, "discovered_count": 2, "failed_request_count": 0,
+            }},
+        }
+        with patch.object(main, "THE_ODDS_API_KEY", "configured"):
+            result = main.discover_the_odds_api_watchlist(
+                datetime.fromtimestamp(now_ts, tz=timezone.utc), store_override=store, api_caller=Mock(), persist=False,
+            )
+        self.assertEqual(result["status"], "already_completed")
+        self.assertEqual(result["pruned_count"], 1)
+        self.assertEqual(set(store["the_odds_api_watchlist"]), {"active"})
+        health = main.the_odds_api_watchlist_health(now_ts=now_ts, store_override=store)
+        self.assertEqual(health["status"], "ready")
+        self.assertEqual(health["active_count"], 1)
+        self.assertEqual(health["expired_count"], 0)
+        self.assertEqual(health["latest_run"]["status"], "completed")
+        self.assertEqual(health["learning_eligibility"], "MODEL_LEARNING_EXCLUDED")
+
     def test_the_odds_api_watchlist_fixture_reaches_due_collector_without_learning_admission(self):
         kickoff = datetime(2026, 10, 10, 3, 0, tzinfo=timezone.utc)
         fixture = "odds-watch-event-3"
