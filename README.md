@@ -39,10 +39,20 @@ uvicorn main:app --reload
 ```text
 API_FOOTBALL_KEY=你的 API-Football / API-SPORTS key
 API_FOOTBALL_BASE_URL=https://v3.football.api-sports.io
+THE_ODDS_API_KEY=你的 The Odds API key
+THE_ODDS_API_BASE_URL=https://api.the-odds-api.com/v4
+SHADOW_ACCESS_TOKEN=单独生成的长随机访问令牌
+SNAPSHOT_STORE_PATH=/data/shadow_snapshots.json
+SNAPSHOT_STORE_GZIP=true
+AUTO_SNAPSHOT_ENABLED=true
+UVICORN_WORKERS=1
+RELEASE_COMMIT_SHA=部署目标的真实Git提交号
 THESTATS_API_KEY=可选；不用时留空
 THESTATS_BASE_URL=https://api.thestatsapi.com/api
 REQUEST_TIMEOUT=30
 ```
+
+其中`/data`必须已挂载持久化Volume。`RELEASE_COMMIT_SHA`必须由部署流程绑定目标提交，不能填写示例值；所有真实密钥只进入Railway Variables或被`.gitignore`排除的本地`.env`。仓库中的`.env.example`固定使用`AUTO_SNAPSHOT_ENABLED=false`和本地临时路径，复制后默认只能运行手工/API导入Shadow，不会意外启动无人值守学习。
 
 如果以后补 iSports，再加：
 
@@ -768,3 +778,35 @@ V2.19 增加 The Odds API 每日自动选场层。北京时间 14:30 后每天�
 V2.19.1 为每日选场增加有界失败恢复和运维可见性。单个联赛目录失败时按15分钟起始的指数退避最多尝试3次，后续只重试失败联赛，不重复请求已经成功的目录；过期观察项自动清理。公开健康接口只返回观察名单数量和最新运行的脱敏摘要，不公开球队明细、供应商响应或密钥。
 
 V2.19.2 严格隔离两套赔率时间轴：每日自动选场产生的学习观察项只推进 Opening、T-12h、T-6h、T-1h，其中 Opening 仍必须来自真实开盘证据且不会自动回填；T-24h、T-3h、T-30m、Closing 只保留给普通赛前分析或已经转入正式外部赛前包的比赛。观察项过期后转入有界审计归档，保存可用、`data_missing`和未观测节点，不再直接删除历史证据。
+
+V2.19.3 新增`repricing_attribution_v1`：市场接受度、A级真实资金压力和盘口变化成因分别输出。`Accepted Repricing`只代表市场响应；A级Money%/Bet%只证明资金压力存在；只有通过审计的实质基本面版本变化与对应市场复核触发器同时存在，才确认`fundamental_repricing_confirmed`。该版本不改变模型概率、门槛、方向或Expression Optimizer排序。
+
+V2.19.4 将“基本面先行”落实为代码执行门禁。完整赛前评估先生成赔率无关估计、模型概率、Pure Fundamental Script和基本面链审计，再冻结`fundamental_first_freeze_v1`，之后才允许读取盘口和运行Expression Optimizer。`fundamental_first_pipeline_audit_v1`校验市场处理前后脚本哈希不变；基本面不足或污染时，盘口输出只能用于`diagnostic_only`并强制PASS。
+
+V2.19.5 扩展`/shadow/release-acceptance`为三层发布前门禁。`release_preflight_v1`分别输出代码候选就绪、Shadow运行环境就绪和无人值守学习激活就绪；外部凭据或运行环境缺口不再被误判为代码回归，代码自检通过也不能绕过持久化、访问令牌、运维健康和自动学习门禁。内置自检覆盖基本面冻结哈希、防篡改以及`Accepted Repricing`非因果语言。
+
+V2.19.6 新增确定性的`release_artifact_manifest_v1`，将服务版本、`LEARNING_RULES_VERSION`、`RELEASE_COMMIT_SHA`、必需契约、必需端点和自检哈希绑定为可重算的发布工件哈希。提交号缺失、版本或规则不一致、契约/端点变化以及清单篡改都会阻止部署工件就绪；代码测试通过但提交号未绑定时明确输出`code_ready_artifact_unbound`。
+
+V2.19.7 新增`prematch_priority_vector_v1`。跨场排序由赛前基本面准入与完整度先行，随后比较阵容可信度、剧本覆盖、盘口接受度、Edge和EV；不读取比分、结算、命中率或收益。输出保存每场排序依据与赛果隔离声明，赛后只能审计冻结排序，不能重排历史名单。
+
+V2.19.8 将排序从运行时输出升级为不可变证据。普通组合评估保存带哈希及证据绑定的`prematch_priority_board_v1`；14:30自动学习周期和固定节点执行器均保存`learning_prematch_priority_board_v1`，每日榜单同时纳入run hash。榜单拆分为比赛参与排名和盘口表达排名，每场绑定赛前`freeze_id/freeze_hash`。自动复盘的PriorityQuality优先审计冻结核心前三与B级门槛，高波动单关同样执行基本面先行；发布自检会验证两类榜单的防篡改门禁，缺失或赛后重排不能形成有效学习标签。
+
+V2.19.8 的学习数据健康同时审计榜单完整性：哈希失效为critical，仍在赛前的已准入最新冻结没有任何有效榜单引用时为warning；对应运维告警为`learning_priority_board_integrity_invalid`与`learning_freeze_missing_priority_board`。
+
+V2.19.8 新增受学习令牌保护的只读接口`GET /shadow/learning/priority-boards`。传`board_id`返回指定不可变榜及重算审计，不传时按`created_at`倒序返回，`limit`范围1–50；接口只读本地事实库，不调用外部供应商，也不接收或暴露赛果字段。
+
+V2.19.8 的排名参与门禁限定为`execution_action=BET`且候选表达完整。WAIT、PASS和缺失表达仍随同一哈希冻结到`non_participating_records`，但不占用核心前三；高波动单关同样不能绕过该执行门禁。
+
+V2.19.8 支持榜单已写入、每日run账本尚未写入时的崩溃重放。相同run id重试会先重算审计并复用原榜；榜单事实进入run hash，但`frozen/unchanged`动作只作运行结果元数据，不影响不可变哈希。
+
+V2.19.8 的榜单审计同时执行语义重放，除SHA-256外还验证连续名次、唯一成员、比赛榜/表达榜一致性、核心角色、BET参与资格、冻结ID与哈希、赛前时间以及由冻结优先级字段重算出的顺序。篡改者即使重新生成内容哈希，也不能让错误排名通过持久化、健康或发布门禁。
+
+V2.19.8 对自动赛后证据复盘实行榜单完整性全局失败关闭。只要事实库中存在一张无效学习榜单，自动复盘即返回`409 learning_priority_board_integrity_invalid`，不会把损坏榜单当成缺失证据并退回旧字母评级路径。
+
+V2.19.8 的普通组合运行在落库前也必须通过榜单完整审计；失败返回`422 portfolio_priority_board_invalid`且不写入版本。组合历史接口每次读取都会重新计算审计，不信任存储中旧的审计结论。
+
+V2.19.8及以后生成的可执行学习冻结必须绑定有效优先级榜；缺失时场次选择质量保持`data_missing/ungraded`，不能仅凭B级评级通过。旧版本历史记录保留兼容读取。Learning Card同步保存榜单ID、哈希、冻结名次、角色和核心名次数。
+
+V2.19.9 新增确定性的`automatic_learning_activation_plan_v1`及受保护只读接口`GET /shadow/learning/activation-plan`。运行门禁被转换为固定顺序的无密钥激活计划，逐项公开责任方、依赖、外部变更需求、下一动作和验证方法；计划本身不能执行任何配置或外部调用。语义审计会在哈希之外复核完整门禁集合及动作定义，发布自检和工件清单同时绑定该合同。
+
+V2.19.10 将就绪门禁从可观测状态升级为执行门禁。未通过`automatic_learning_activation_plan_v1`时，14:30周期返回`automatic_learning_execution_gate_v1/blocked`且不写日运行账本，固定节点执行器同样不产生学习变更。The Odds API观察名单与独立赔率节点采集仍可运行，但保持模型学习隔离。两个自动学习写入边界各自在变更前重新读取实时门禁，不复用早先的ready状态；发布自检验证ready路径可放行、任一门禁失败则停止自动写入。
