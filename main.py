@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.19.4"
+VERSION = "2.19.5"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -12086,18 +12086,95 @@ def release_candidate_self_test() -> Dict[str, Any]:
         crowding=.30, lineup_confidence=.90, death_path=[],
     )
     actionable_audit = audit_decision_output(actionable)
+    estimator = {
+        "uses_market_odds": False, "method": "release_self_test", "inputs": {},
+        "expected_goals": {"home": 1.4, "away": 1.0}, "confidence": .8,
+    }
+    model = {
+        "method": "independent_poisson", "model_hash": "release-self-test-model",
+        "probabilities": {"1x2": {"home": .48, "draw": .28, "away": .24}},
+    }
+    fundamental_script = _fundamental_evaluation_script({"fixture": "release-self-test"}, estimator, model)
+    fundamental_audit = audit_fundamental_chain(fundamental_script)
+    fundamental_freeze = freeze_fundamental_stage(
+        "release-self-test", fundamental_script, fundamental_audit, estimator, model, int(time.time())
+    )
+    fundamental_pipeline = audit_fundamental_first_pipeline(fundamental_freeze, fundamental_script)
+    tampered_freeze = {**fundamental_freeze, "frozen_at": int(fundamental_freeze["frozen_at"]) + 1}
+    tampered_pipeline = audit_fundamental_first_pipeline(tampered_freeze, fundamental_script)
+    repricing = build_repricing_attribution(
+        {"comparison_status": "compared", "classification": "Market-Only Move", "revalidation_trigger": {"triggered": True}},
+        {"status": "proxy_available", "is_real_money": False},
+        "Accepted Repricing",
+    )
     checks = {
         "missing_data_returns_pass": safe_pass.get("decision") == "PASS",
         "pass_output_contract_complete": safe_pass_audit.get("decision_eligible") is True,
         "eligible_data_returns_actionable": actionable.get("decision") != "PASS",
         "actionable_output_contract_complete": actionable_audit.get("decision_eligible") is True,
+        "fundamental_first_freeze_hash_valid": fundamental_freeze.get("script_hash_valid") is True,
+        "fundamental_first_pipeline_passes": fundamental_pipeline.get("status") == "passed",
+        "fundamental_freeze_tamper_rejected": tampered_pipeline.get("status") == "failed",
+        "accepted_repricing_does_not_claim_causation": (
+            repricing.get("status") == "market_move_cause_unverified"
+            and repricing.get("market_response_is_cause_evidence") is False
+            and repricing.get("source_attribution_verified") is False
+        ),
     }
     return {
-        "status": "passed" if all(checks.values()) else "failed",
+        "version": VERSION, "status": "passed" if all(checks.values()) else "failed",
         "passed": all(checks.values()), "checks": checks,
         "pass_reasons": safe_pass.get("pass_reasons"),
         "actionable_selection": actionable.get("decision"),
-        "policy": "release requires both safe PASS and complete actionable decision paths",
+        "fundamental_first_pipeline": fundamental_pipeline,
+        "repricing_attribution": repricing,
+        "policy": "release requires safe PASS, complete actionable output, immutable fundamental-first execution, and non-causal market-response language",
+    }
+
+
+def build_release_preflight(
+    checks: Dict[str, Any],
+    self_test: Dict[str, Any],
+    automatic_learning_authorized: bool,
+) -> Dict[str, Any]:
+    code_checks = {
+        "release_version_bound_to_self_test": self_test.get("version") == VERSION,
+        "required_release_endpoints_present": checks.get("required_release_endpoints_present") is True,
+        "internal_decision_contract_self_test": checks.get("internal_decision_contract_self_test") is True,
+        "fundamental_first_contract": get_nested(self_test, ["checks", "fundamental_first_pipeline_passes"]) is True,
+        "fundamental_freeze_tamper_rejected": get_nested(self_test, ["checks", "fundamental_freeze_tamper_rejected"]) is True,
+        "repricing_causation_contract": get_nested(self_test, ["checks", "accepted_repricing_does_not_claim_causation"]) is True,
+        "opening_requires_verified_source": checks.get("opening_requires_verified_source") is True,
+        "missing_history_never_backfilled": checks.get("missing_history_never_backfilled") is True,
+        "pang_access_is_read_only": checks.get("pang_access_is_read_only") is True,
+    }
+    shadow_runtime_checks = {
+        "persistent_store_operational": checks.get("persistent_store_operational") is True,
+        "protected_api_configured": checks.get("protected_api_configured") is True,
+        "operations_not_blocked": checks.get("operations_not_blocked") is True,
+    }
+    code_blockers = [name for name, passed in code_checks.items() if not passed]
+    shadow_runtime_blockers = [name for name, passed in shadow_runtime_checks.items() if not passed]
+    code_ready = not code_blockers
+    shadow_runtime_ready = code_ready and not shadow_runtime_blockers
+    production_activation_ready = shadow_runtime_ready and automatic_learning_authorized
+    status = (
+        "production_activation_ready" if production_activation_ready else
+        "shadow_runtime_ready_learning_blocked" if shadow_runtime_ready else
+        "code_ready_runtime_blocked" if code_ready else
+        "code_not_ready"
+    )
+    return {
+        "schema": "release_preflight_v1", "version": VERSION, "status": status,
+        "code_release_ready": code_ready,
+        "shadow_runtime_ready": shadow_runtime_ready,
+        "automatic_learning_runtime_ready": bool(automatic_learning_authorized),
+        "production_activation_ready": production_activation_ready,
+        "code_checks": code_checks, "code_blockers": code_blockers,
+        "shadow_runtime_checks": shadow_runtime_checks,
+        "shadow_runtime_blockers": shadow_runtime_blockers,
+        "external_runtime_gaps_do_not_fail_code_release": True,
+        "policy": "artifact readiness, shadow runtime readiness, and unattended learning activation are independent gates; no lower gate overrides a higher one",
     }
 
 
@@ -12127,6 +12204,7 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         "/shadow/learning/data-health", "/shadow/market-language/status",
         "/shadow/learning/postmatch-recovery", "/shadow/learning/collect-facts",
         "/shadow/market-language/collect-facts", "/shadow/market-language/settlement-plan",
+        "/shadow/model/prematch-evaluate", "/shadow/release-acceptance",
     }
     checks = {
         "persistent_store_operational": operations["store"].get("operational") is True,
@@ -12155,6 +12233,7 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
     shadow_usable = not blockers
     controlled_decision_candidate = shadow_usable and operations["calibration"].get("sample_ready") is True
     operating_mode = "live_feed_shadow" if fixture_acceptance["shadow_path_validated"] else "manual_or_api_import_shadow"
+    release_preflight = build_release_preflight(checks, self_test, automatic_learning_authorized)
     return {
         "version": VERSION, "release_channel": RELEASE_CHANNEL,
         "status": "shadow_usable" if shadow_usable else "not_ready",
@@ -12172,6 +12251,7 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
             "not_authorized": ["real_money_betting", "automatic_recommendations_without_fresh_verified_data"],
         },
         "checks": checks, "blockers": blockers, "warnings": warnings,
+        "release_preflight": release_preflight,
         "operations_status": operations.get("status"),
         "calibration_sample": operations.get("calibration"),
         "fixture_acceptance": fixture_acceptance,

@@ -772,3 +772,5 @@ V2.19.2 严格隔离两套赔率时间轴：每日自动选场产生的学习观
 V2.19.3 新增`repricing_attribution_v1`：市场接受度、A级真实资金压力和盘口变化成因分别输出。`Accepted Repricing`只代表市场响应；A级Money%/Bet%只证明资金压力存在；只有通过审计的实质基本面版本变化与对应市场复核触发器同时存在，才确认`fundamental_repricing_confirmed`。该版本不改变模型概率、门槛、方向或Expression Optimizer排序。
 
 V2.19.4 将“基本面先行”落实为代码执行门禁。完整赛前评估先生成赔率无关估计、模型概率、Pure Fundamental Script和基本面链审计，再冻结`fundamental_first_freeze_v1`，之后才允许读取盘口和运行Expression Optimizer。`fundamental_first_pipeline_audit_v1`校验市场处理前后脚本哈希不变；基本面不足或污染时，盘口输出只能用于`diagnostic_only`并强制PASS。
+
+V2.19.5 扩展`/shadow/release-acceptance`为三层发布前门禁。`release_preflight_v1`分别输出代码候选就绪、Shadow运行环境就绪和无人值守学习激活就绪；外部凭据或运行环境缺口不再被误判为代码回归，代码自检通过也不能绕过持久化、访问令牌、运维健康和自动学习门禁。内置自检覆盖基本面冻结哈希、防篡改以及`Accepted Repricing`非因果语言。

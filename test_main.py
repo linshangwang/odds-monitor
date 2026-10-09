@@ -2836,6 +2836,11 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertTrue(release["usable_scope"]["safe_pass_without_fresh_data"])
         self.assertIn("real_money_betting", release["usable_scope"]["not_authorized"])
         self.assertEqual(release["blockers"], [])
+        self.assertEqual(release["release_preflight"]["schema"], "release_preflight_v1")
+        self.assertTrue(release["release_preflight"]["code_release_ready"])
+        self.assertTrue(release["release_preflight"]["shadow_runtime_ready"])
+        self.assertFalse(release["release_preflight"]["automatic_learning_runtime_ready"])
+        self.assertEqual(release["release_preflight"]["status"], "shadow_runtime_ready_learning_blocked")
 
         blocked_operations = {**operations, "status": "blocked", "store": {"operational": False, "recovery_ready": False}}
         with patch.object(main, "operations_status_report", return_value=blocked_operations), patch.object(main, "fixture_acceptance_summary", return_value=fixture_acceptance), patch.object(main, "SHADOW_ACCESS_TOKEN", ""):
@@ -2844,6 +2849,9 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(blocked["shadow_use_authorized"])
         self.assertIn("persistent_store_operational", blocked["blockers"])
         self.assertIn("protected_api_configured", blocked["blockers"])
+        self.assertTrue(blocked["release_preflight"]["code_release_ready"])
+        self.assertFalse(blocked["release_preflight"]["shadow_runtime_ready"])
+        self.assertEqual(blocked["release_preflight"]["status"], "code_ready_runtime_blocked")
 
     def test_automatic_learning_runtime_readiness_requires_all_unattended_gates(self):
         alive = Mock()
@@ -2983,6 +2991,42 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertTrue(all(result["checks"].values()))
         self.assertNotEqual(result["actionable_selection"], "PASS")
+        self.assertEqual(result["version"], main.VERSION)
+        self.assertEqual(result["fundamental_first_pipeline"]["status"], "passed")
+        self.assertEqual(result["repricing_attribution"]["status"], "market_move_cause_unverified")
+
+    def test_release_preflight_fails_code_gate_when_new_contract_regresses(self):
+        checks = {
+            "required_release_endpoints_present": True,
+            "internal_decision_contract_self_test": True,
+            "opening_requires_verified_source": True,
+            "missing_history_never_backfilled": True,
+            "pang_access_is_read_only": True,
+            "persistent_store_operational": True,
+            "protected_api_configured": True,
+            "operations_not_blocked": True,
+        }
+        self_test = {
+            "version": main.VERSION, "checks": {
+                "fundamental_first_pipeline_passes": True,
+                "fundamental_freeze_tamper_rejected": True,
+                "accepted_repricing_does_not_claim_causation": True,
+            },
+        }
+        ready = main.build_release_preflight(checks, self_test, automatic_learning_authorized=True)
+        self.assertTrue(ready["code_release_ready"])
+        self.assertTrue(ready["production_activation_ready"])
+        self.assertEqual(ready["status"], "production_activation_ready")
+
+        checks["internal_decision_contract_self_test"] = False
+        self_test["checks"]["accepted_repricing_does_not_claim_causation"] = False
+        preflight = main.build_release_preflight(checks, self_test, automatic_learning_authorized=True)
+        self.assertFalse(preflight["code_release_ready"])
+        self.assertFalse(preflight["shadow_runtime_ready"])
+        self.assertFalse(preflight["production_activation_ready"])
+        self.assertEqual(preflight["status"], "code_not_ready")
+        self.assertIn("internal_decision_contract_self_test", preflight["code_blockers"])
+        self.assertIn("repricing_causation_contract", preflight["code_blockers"])
 
     def test_imported_ai_packet_excludes_invalid_latest_node(self):
         packet = self.prematch_packet()
