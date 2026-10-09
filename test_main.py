@@ -2819,7 +2819,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "shadow_path_validated": False, "decision_path_validated": False,
             "fixtures": [], "fixtures_truncated": False,
         }
-        with patch.object(main, "operations_status_report", return_value=operations), patch.object(main, "fixture_acceptance_summary", return_value=fixture_acceptance), patch.object(main, "SHADOW_ACCESS_TOKEN", "configured"):
+        with patch.object(main, "operations_status_report", return_value=operations), patch.object(main, "fixture_acceptance_summary", return_value=fixture_acceptance), patch.object(main, "SHADOW_ACCESS_TOKEN", "configured"), patch.object(main, "RELEASE_SOURCE_REVISION", "a" * 40):
             release = main.release_acceptance_report(now_ts=1000)
         self.assertEqual(release["version"], main.VERSION)
         self.assertEqual(release["status"], "shadow_usable")
@@ -2838,12 +2838,13 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(release["blockers"], [])
         self.assertEqual(release["release_preflight"]["schema"], "release_preflight_v1")
         self.assertTrue(release["release_preflight"]["code_release_ready"])
+        self.assertTrue(release["release_preflight"]["deployment_artifact_ready"])
         self.assertTrue(release["release_preflight"]["shadow_runtime_ready"])
         self.assertFalse(release["release_preflight"]["automatic_learning_runtime_ready"])
         self.assertEqual(release["release_preflight"]["status"], "shadow_runtime_ready_learning_blocked")
 
         blocked_operations = {**operations, "status": "blocked", "store": {"operational": False, "recovery_ready": False}}
-        with patch.object(main, "operations_status_report", return_value=blocked_operations), patch.object(main, "fixture_acceptance_summary", return_value=fixture_acceptance), patch.object(main, "SHADOW_ACCESS_TOKEN", ""):
+        with patch.object(main, "operations_status_report", return_value=blocked_operations), patch.object(main, "fixture_acceptance_summary", return_value=fixture_acceptance), patch.object(main, "SHADOW_ACCESS_TOKEN", ""), patch.object(main, "RELEASE_SOURCE_REVISION", "a" * 40):
             blocked = main.release_acceptance_report(now_ts=1000)
         self.assertEqual(blocked["status"], "not_ready")
         self.assertFalse(blocked["shadow_use_authorized"])
@@ -3013,20 +3014,48 @@ class ShadowV4UpgradeTests(unittest.TestCase):
                 "accepted_repricing_does_not_claim_causation": True,
             },
         }
-        ready = main.build_release_preflight(checks, self_test, automatic_learning_authorized=True)
+        manifest = main.build_release_artifact_manifest(self_test, ["/shadow/release-acceptance"], source_revision="b" * 40)
+        ready = main.build_release_preflight(checks, self_test, automatic_learning_authorized=True, artifact_manifest=manifest)
         self.assertTrue(ready["code_release_ready"])
         self.assertTrue(ready["production_activation_ready"])
         self.assertEqual(ready["status"], "production_activation_ready")
 
         checks["internal_decision_contract_self_test"] = False
         self_test["checks"]["accepted_repricing_does_not_claim_causation"] = False
-        preflight = main.build_release_preflight(checks, self_test, automatic_learning_authorized=True)
+        preflight = main.build_release_preflight(checks, self_test, automatic_learning_authorized=True, artifact_manifest=manifest)
         self.assertFalse(preflight["code_release_ready"])
         self.assertFalse(preflight["shadow_runtime_ready"])
         self.assertFalse(preflight["production_activation_ready"])
         self.assertEqual(preflight["status"], "code_not_ready")
         self.assertIn("internal_decision_contract_self_test", preflight["code_blockers"])
         self.assertIn("repricing_causation_contract", preflight["code_blockers"])
+
+    def test_release_artifact_manifest_is_deterministic_revision_bound_and_tamper_evident(self):
+        self_test = main.release_candidate_self_test()
+        paths = ["/shadow/release-acceptance", "/shadow/model/prematch-evaluate"]
+        first = main.build_release_artifact_manifest(self_test, paths, source_revision="c" * 40)
+        second = main.build_release_artifact_manifest(self_test, reversed(paths), source_revision="c" * 40)
+        self.assertEqual(first["artifact_hash"], second["artifact_hash"])
+        self.assertTrue(first["deployment_artifact_ready"])
+        self.assertEqual(first["audit"]["status"], "ready")
+        self.assertFalse(first["audit"]["secrets_included"])
+        self.assertEqual(first["rules_version"], main.LEARNING_RULES_VERSION)
+
+        tampered = {**first, "version": "9.9.9"}
+        tampered_audit = main.audit_release_artifact_manifest(tampered, expected_revision="c" * 40)
+        self.assertFalse(tampered_audit["deployment_artifact_ready"])
+        self.assertIn("version_matches_runtime", tampered_audit["blockers"])
+        self.assertIn("artifact_hash_valid", tampered_audit["blockers"])
+
+        unbound = main.build_release_artifact_manifest(self_test, paths, source_revision="")
+        self.assertFalse(unbound["deployment_artifact_ready"])
+        self.assertIn("source_revision_bound", unbound["blockers"])
+
+        secret_injected = {**first, "api_key": "must-never-appear"}
+        secret_audit = main.audit_release_artifact_manifest(secret_injected, expected_revision="c" * 40)
+        self.assertFalse(secret_audit["deployment_artifact_ready"])
+        self.assertTrue(secret_audit["secrets_included"])
+        self.assertIn("contains_no_sensitive_fields", secret_audit["blockers"])
 
     def test_imported_ai_packet_excludes_invalid_latest_node(self):
         packet = self.prematch_packet()

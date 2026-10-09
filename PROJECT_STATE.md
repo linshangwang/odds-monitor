@@ -13,8 +13,8 @@
 - 仓库：`linshangwang/odds-monitor`
 - 分支：`codex/auto-learning-v1.89`（草稿发布候选；生产仍跟踪`main`）
 - 接管基线提交：`b7feddc`
-- 本地候选版本：`2.19.5`（线上为 `2.19.1`，本版本尚未部署）
-- 测试基线：422 项通过
+- 本地候选版本：`2.19.6`（线上为 `2.19.1`，本版本尚未部署）
+- 测试基线：423 项通过
 - GitHub发布候选：草稿PR `#1`，分支`codex/auto-learning-v1.89`；Railway仍只跟踪`main`，因此草稿PR不会触发生产部署。分支名称保留历史版本标识，PR内容将以当前`2.17.0`为准。
 - 正式赛前时间轴：Opening、T-24h、T-12h、T-6h、T-3h、T-1h、T-30m、Closing
 - 自动学习时间轴：Opening、T-12h、T-6h、T-1h。该精简只适用于学习任务，不改写普通赛前分析时间轴。
@@ -85,6 +85,7 @@
 - 盘口响应与重定价成因已形成独立`repricing_attribution_v1`契约：`Accepted Repricing`只表示结构盘口接受压力，不再暗示真实资金或基本面成因；A级资金只确认压力存在，只有实质基本面版本变化与市场复核触发器同时成立才确认`fundamental_repricing_confirmed`。该层只增强解释与审计，不修改模型概率、评分、方向或Expression Optimizer排序。
 - 完整赛前评估已把“基本面先行”落实为实际执行顺序：赔率无关估计、模型概率、Pure Fundamental Script和基本面链审计先冻结为`fundamental_first_freeze_v1`，之后才读取盘口并生成候选；`fundamental_first_pipeline_audit_v1`复核市场处理没有改写脚本。基本面不合格时盘口层只能运行`diagnostic_only`并保持PASS。
 - 发布验收新增`release_preflight_v1`，独立报告代码候选、Shadow运行环境和无人值守学习激活三层状态。外部凭据或运行环境缺口不会伪装成代码回归，但代码就绪也不能绕过持久化、令牌、运维健康、数据源与自动学习门禁。发布自检已覆盖基本面冻结哈希、防篡改和重定价非因果语言。
+- 发布候选新增确定性的`release_artifact_manifest_v1`：绑定服务版本、规则版本、Git提交号、必需契约、必需端点和自检哈希，并生成可重算的工件哈希。未注入`RELEASE_COMMIT_SHA`或清单被篡改时只能保持`code_ready_artifact_unbound`，不得进入部署激活。
 
 ## 当前真实阻塞
 
@@ -101,7 +102,7 @@
 3. 如需恢复事件路径学习，接入一个经授权的第二事件源并用真实顶级联赛样本验收赛前身份、赛后比赛详情及timeline schema；通过前保持事件维度`DATA_INSUFFICIENT`。
 4. 数据源恢复后先进行 Shadow 验收；满足新鲜度、完整公司数组、基本面链和阵容置信门槛后，才允许生成非 PASS 建议。
 5. 为MLS、巴西甲、阿根廷甲和挪威顶级联赛积累合格冻结发现样本后，按新League DNA存储登记候选并启动独立验证；在此之前不影响任何正式分析。
-6. 部署并验收本地`2.19.5`，确认每日选场审计、按失败联赛重试、四节点学习时间轴、观察名单归档、固定节点续采、`repricing_attribution_v1`、基本面先行流水线和`release_preflight_v1`均正常，同时API-Football鉴权失败不会阻断Odds目录发现与节点采集。
+6. 为目标提交注入`RELEASE_COMMIT_SHA`后部署并验收本地`2.19.6`，确认每日选场审计、按失败联赛重试、四节点学习时间轴、观察名单归档、固定节点续采、`repricing_attribution_v1`、基本面先行流水线、`release_preflight_v1`和发布工件哈希均正常，同时API-Football鉴权失败不会阻断Odds目录发现与节点采集。
 
 ## 接管原则
 

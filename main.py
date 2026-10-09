@@ -25,8 +25,9 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.19.5"
+VERSION = "2.19.6"
 RELEASE_CHANNEL = "shadow-usable"
+RELEASE_SOURCE_REVISION = os.getenv("RELEASE_COMMIT_SHA", "").strip().lower()
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 AUTO_FETCH_DATE = os.getenv("AUTO_FETCH_DATE", "2026-09-28")
@@ -242,7 +243,7 @@ LEARNING_NODE_RETRY_MAX_SECONDS = max(
     min(int(os.getenv("LEARNING_NODE_RETRY_MAX_SECONDS", "3600")), 12 * 3600),
 )
 LEARNING_NODE_ATTEMPT_RETENTION = max(100, min(int(os.getenv("LEARNING_NODE_ATTEMPT_RETENTION", "5000")), 50000))
-LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-09-v2.17").strip() or "MODEL_RULES.md@2026-10-09-v2.17"
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-09-v2.19.6").strip() or "MODEL_RULES.md@2026-10-09-v2.19.6"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -12132,10 +12133,110 @@ def release_candidate_self_test() -> Dict[str, Any]:
     }
 
 
+def _release_revision_valid(value: Any) -> bool:
+    revision = str(value or "").strip().lower()
+    return 7 <= len(revision) <= 64 and all(character in "0123456789abcdef" for character in revision)
+
+
+def _release_artifact_hash_content(manifest: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: manifest.get(key) for key in (
+            "schema", "version", "release_channel", "source_revision",
+            "rules_version", "required_contract_schemas", "required_release_endpoints", "self_test_hash",
+        )
+    }
+
+
+def audit_release_artifact_manifest(manifest: Any, expected_revision: Optional[str] = None) -> Dict[str, Any]:
+    row = manifest if isinstance(manifest, dict) else {}
+    content = _release_artifact_hash_content(row)
+    revision = str(row.get("source_revision") or "").strip().lower()
+    revision_valid = _release_revision_valid(revision)
+    expected = str(expected_revision or "").strip().lower() or None
+    sensitive_names = {"api_key", "secret", "token", "password", "credential", "authorization", "cookie"}
+
+    def sensitive_paths(value: Any, path: str = "") -> List[str]:
+        found = []
+        if isinstance(value, dict):
+            for key, child in value.items():
+                key_text = str(key).lower()
+                child_path = f"{path}.{key}" if path else str(key)
+                if key_text in sensitive_names or any(key_text.endswith(f"_{name}") for name in sensitive_names):
+                    found.append(child_path)
+                found.extend(sensitive_paths(child, child_path))
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                found.extend(sensitive_paths(child, f"{path}[{index}]"))
+        return found
+
+    secret_paths = sensitive_paths(row)
+    checks = {
+        "schema_valid": row.get("schema") == "release_artifact_manifest_v1",
+        "version_matches_runtime": row.get("version") == VERSION,
+        "release_channel_matches_runtime": row.get("release_channel") == RELEASE_CHANNEL,
+        "rules_version_matches_runtime": row.get("rules_version") == LEARNING_RULES_VERSION,
+        "source_revision_bound": revision_valid,
+        "source_revision_matches_expected": expected is None or revision == expected,
+        "required_contracts_complete": set(row.get("required_contract_schemas") or []) == {
+            "repricing_attribution_v1", "fundamental_first_freeze_v1",
+            "fundamental_first_pipeline_audit_v1", "release_preflight_v1",
+            "release_artifact_manifest_v1",
+        },
+        "required_endpoints_bound": isinstance(row.get("required_release_endpoints"), list) and bool(row.get("required_release_endpoints")),
+        "self_test_hash_bound": bool(row.get("self_test_hash")),
+        "artifact_hash_valid": bool(row.get("artifact_hash")) and _content_hash(content) == row.get("artifact_hash"),
+        "contains_no_sensitive_fields": not secret_paths,
+    }
+    blockers = [name for name, passed in checks.items() if not passed]
+    return {
+        "schema": "release_artifact_manifest_audit_v1",
+        "status": "ready" if not blockers else "blocked",
+        "deployment_artifact_ready": not blockers,
+        "checks": checks, "blockers": blockers,
+        "expected_artifact_hash": _content_hash(content),
+        "observed_artifact_hash": row.get("artifact_hash"),
+        "secrets_included": bool(secret_paths),
+        "sensitive_field_paths": secret_paths,
+        "policy": "deployment must use the exact version, source revision, endpoint set, contract set, and self-test result bound by the artifact hash",
+    }
+
+
+def build_release_artifact_manifest(
+    self_test: Dict[str, Any],
+    required_paths: Any,
+    source_revision: Optional[str] = None,
+) -> Dict[str, Any]:
+    revision = str(source_revision if source_revision is not None else RELEASE_SOURCE_REVISION).strip().lower() or None
+    manifest = {
+        "schema": "release_artifact_manifest_v1",
+        "version": VERSION,
+        "release_channel": RELEASE_CHANNEL,
+        "source_revision": revision,
+        "rules_version": LEARNING_RULES_VERSION,
+        "required_contract_schemas": sorted([
+            "repricing_attribution_v1", "fundamental_first_freeze_v1",
+            "fundamental_first_pipeline_audit_v1", "release_preflight_v1",
+            "release_artifact_manifest_v1",
+        ]),
+        "required_release_endpoints": sorted(str(path) for path in (required_paths or [])),
+        "self_test_hash": _content_hash({"version": self_test.get("version"), "checks": self_test.get("checks")}),
+    }
+    manifest["artifact_hash"] = _content_hash(_release_artifact_hash_content(manifest))
+    audit = audit_release_artifact_manifest(manifest, expected_revision=revision if revision else None)
+    return {
+        **manifest,
+        "status": audit["status"],
+        "deployment_artifact_ready": audit["deployment_artifact_ready"],
+        "blockers": audit["blockers"],
+        "audit": audit,
+    }
+
+
 def build_release_preflight(
     checks: Dict[str, Any],
     self_test: Dict[str, Any],
     automatic_learning_authorized: bool,
+    artifact_manifest: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     code_checks = {
         "release_version_bound_to_self_test": self_test.get("version") == VERSION,
@@ -12156,10 +12257,13 @@ def build_release_preflight(
     code_blockers = [name for name, passed in code_checks.items() if not passed]
     shadow_runtime_blockers = [name for name, passed in shadow_runtime_checks.items() if not passed]
     code_ready = not code_blockers
+    artifact_audit = audit_release_artifact_manifest(artifact_manifest or {})
+    deployment_artifact_ready = artifact_audit.get("deployment_artifact_ready") is True
     shadow_runtime_ready = code_ready and not shadow_runtime_blockers
-    production_activation_ready = shadow_runtime_ready and automatic_learning_authorized
+    production_activation_ready = code_ready and deployment_artifact_ready and shadow_runtime_ready and automatic_learning_authorized
     status = (
         "production_activation_ready" if production_activation_ready else
+        "code_ready_artifact_unbound" if code_ready and not deployment_artifact_ready else
         "shadow_runtime_ready_learning_blocked" if shadow_runtime_ready else
         "code_ready_runtime_blocked" if code_ready else
         "code_not_ready"
@@ -12167,10 +12271,12 @@ def build_release_preflight(
     return {
         "schema": "release_preflight_v1", "version": VERSION, "status": status,
         "code_release_ready": code_ready,
+        "deployment_artifact_ready": deployment_artifact_ready,
         "shadow_runtime_ready": shadow_runtime_ready,
         "automatic_learning_runtime_ready": bool(automatic_learning_authorized),
         "production_activation_ready": production_activation_ready,
         "code_checks": code_checks, "code_blockers": code_blockers,
+        "artifact_manifest_audit": artifact_audit,
         "shadow_runtime_checks": shadow_runtime_checks,
         "shadow_runtime_blockers": shadow_runtime_blockers,
         "external_runtime_gaps_do_not_fail_code_release": True,
@@ -12233,7 +12339,10 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
     shadow_usable = not blockers
     controlled_decision_candidate = shadow_usable and operations["calibration"].get("sample_ready") is True
     operating_mode = "live_feed_shadow" if fixture_acceptance["shadow_path_validated"] else "manual_or_api_import_shadow"
-    release_preflight = build_release_preflight(checks, self_test, automatic_learning_authorized)
+    release_artifact_manifest = build_release_artifact_manifest(self_test, required_paths)
+    release_preflight = build_release_preflight(
+        checks, self_test, automatic_learning_authorized, release_artifact_manifest
+    )
     return {
         "version": VERSION, "release_channel": RELEASE_CHANNEL,
         "status": "shadow_usable" if shadow_usable else "not_ready",
@@ -12251,6 +12360,7 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
             "not_authorized": ["real_money_betting", "automatic_recommendations_without_fresh_verified_data"],
         },
         "checks": checks, "blockers": blockers, "warnings": warnings,
+        "release_artifact_manifest": release_artifact_manifest,
         "release_preflight": release_preflight,
         "operations_status": operations.get("status"),
         "calibration_sample": operations.get("calibration"),
