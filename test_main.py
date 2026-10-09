@@ -4206,6 +4206,37 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(row["fundamentals_status"], "data_missing")
         self.assertFalse(result["historical_odds_requested"])
 
+    def test_the_odds_api_watchlist_catalog_includes_lower_divisions_and_excludes_youth(self):
+        now = datetime(2026, 10, 9, 7, 0, tzinfo=timezone.utc)
+        store = {"fixtures": {}}
+        catalog = [
+            {"key": "soccer_test_second_division", "group": "Soccer", "title": "Test Second Division", "active": True},
+            {"key": "soccer_test_u21", "group": "Soccer", "title": "Test U21 League", "active": True},
+            {"key": "basketball_test", "group": "Basketball", "title": "Basketball Test", "active": True},
+        ]
+
+        def caller(path, params):
+            self.assertEqual(path, "/sports/soccer_test_second_division/events")
+            return {"ok": True, "status_code": 200, "data": [{
+                "id": "lower-inside",
+                "commence_time": (now + timedelta(hours=8)).isoformat(),
+                "home_team": "Lower A", "away_team": "Lower B",
+            }]}
+
+        with patch.object(main, "THE_ODDS_API_KEY", "configured"):
+            result = main.discover_the_odds_api_watchlist(
+                now, store_override=store, api_caller=caller, persist=False,
+                sport_catalog_rows=catalog,
+            )
+        self.assertEqual(result["sport_catalog_status"], "injected")
+        self.assertEqual(result["sport_key_count"], 1)
+        self.assertEqual(result["discovered_count"], 1)
+        row = store["the_odds_api_watchlist"]["odds-watch-lower-inside"]
+        self.assertIsNone(row["league_id"])
+        self.assertEqual(row["league"], "Test Second Division")
+        self.assertEqual(row["competition_type"], "official_senior_competition")
+        self.assertFalse(row["model_learning_effect"])
+
     def test_the_odds_api_watchlist_daily_discovery_is_idempotent(self):
         now = datetime(2026, 10, 9, 7, 0, tzinfo=timezone.utc)
         run_id = "odds-watchlist-20261009-1430"
@@ -4552,41 +4583,51 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "learning_disposition": disposition,
         }
 
-    def test_learning_freeze_requires_verified_top_flight_scope_and_prematch_time(self):
+    def test_learning_freeze_allows_verified_lower_tier_and_requires_prematch_time(self):
         payload = self.learning_payload()
-        payload["scope"]["tier"] = 2
-        with self.assertRaises(main.HTTPException) as wrong_tier:
-            main.freeze_learning_sample(payload, now_ts=900)
-        self.assertEqual(wrong_tier.exception.status_code, 422)
-        self.assertIn("tier_one_required", wrong_tier.exception.detail["reasons"])
+        payload["scope"].update({
+            "competition_id": 999001,
+            "competition_name": "Verified Second Division",
+            "country": "Testland",
+            "tier": 2,
+            "verification_status": "provider_verified",
+            "verification_refs": [{"source": "api_football", "id": "league:999001:season:2026"}],
+        })
+        frozen = main.freeze_learning_sample(payload, now_ts=900)
+        self.assertEqual(frozen["scope"]["tier"], 2)
+        self.assertFalse(frozen["scope"]["cross_competition_pooling_allowed"])
 
         late = self.learning_payload(captured_at=1000, kickoff_at=1000)
         with self.assertRaises(main.HTTPException) as after_kickoff:
             main.freeze_learning_sample(late, now_ts=1000)
         self.assertEqual(after_kickoff.exception.status_code, 409)
 
-    def test_learning_scope_requires_explicit_major_league_registry_membership(self):
+    def test_learning_scope_uses_verified_competition_metadata_not_tier_allowlist(self):
         unverified = self.learning_payload()["scope"]
         unverified["competition_id"] = 999999
         unverified["competition_name"] = "Unregistered Premier"
         audit = main.audit_learning_scope(unverified)
         self.assertFalse(audit["eligible"])
-        self.assertIn("competition_not_in_major_learning_registry", audit["reasons"])
+        self.assertIn("verified_competition_metadata_required", audit["reasons"])
         self.assertEqual(audit["learning_eligibility"], "MODEL_LEARNING_EXCLUDED")
         self.assertEqual(audit["allowed_modes"], ["MARKET_LANGUAGE_ONLY", "SETTLEMENT_ONLY"])
 
         unverified["verification_status"] = "verified"
         unverified["verification_refs"] = [{"source": "league_organizer", "url": "https://example.test/competition"}]
         evidenced = main.audit_learning_scope(unverified)
-        self.assertFalse(evidenced["eligible"])
-        self.assertIn("competition_not_in_major_learning_registry", evidenced["reasons"])
-        self.assertEqual(evidenced["normalized"]["verification_method"], "not_in_major_learning_registry")
+        self.assertTrue(evidenced["eligible"])
+        self.assertEqual(evidenced["normalized"]["verification_method"], "verified_external_competition_metadata")
+        self.assertFalse(evidenced["normalized"]["cross_competition_pooling_allowed"])
 
         finland = self.learning_payload()["scope"]
-        finland.update({"competition_id": 244, "competition_name": "Finland Veikkausliiga", "country": "Finland"})
+        finland.update({
+            "competition_id": 244, "competition_name": "Finland Veikkausliiga", "country": "Finland",
+            "verification_status": "provider_verified",
+            "verification_refs": [{"source": "api_football", "id": "league:244:season:2026"}],
+        })
         finland_audit = main.audit_learning_scope(finland)
-        self.assertFalse(finland_audit["eligible"])
-        self.assertEqual(finland_audit["allowed_modes"], ["MARKET_LANGUAGE_ONLY", "SETTLEMENT_ONLY"])
+        self.assertTrue(finland_audit["eligible"])
+        self.assertEqual(finland_audit["allowed_modes"], ["AUTOMATIC_MODEL_LEARNING"])
 
         mismatch = self.learning_payload()["scope"]
         mismatch["competition_name"] = "UEFA Champions League"
@@ -4598,18 +4639,19 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(manifest["version"], main.LEARNING_MAJOR_LEAGUES_VERSION)
         self.assertEqual(manifest["league_count"], len(main.LEARNING_MAJOR_LEAGUES))
         self.assertEqual(len(manifest["registry_hash"]), 64)
-        self.assertTrue(manifest["requires_explicit_user_confirmation_for_changes"])
+        self.assertFalse(manifest["requires_explicit_user_confirmation_for_changes"])
+        self.assertIsNone(manifest["tier_restriction"])
         self.assertEqual(audit["normalized"]["major_league_registry_hash"], manifest["registry_hash"])
 
-    def learning_fixture_row(self, fixture_id, league_id, kickoff_at, status="NS"):
+    def learning_fixture_row(self, fixture_id, league_id, kickoff_at, status="NS", league_name="League"):
         return {
             "fixture": {"id": fixture_id, "timestamp": kickoff_at, "date": main.datetime.fromtimestamp(kickoff_at, tz=main.timezone.utc).isoformat(), "status": {"short": status}},
-            "league": {"id": league_id, "name": "League", "country": "Country", "season": 2026, "round": "Regular Season - 1"},
+            "league": {"id": league_id, "name": league_name, "country": "Country", "season": 2026, "round": "Regular Season - 1"},
             "teams": {"home": {"id": fixture_id * 10, "name": "Home"}, "away": {"id": fixture_id * 10 + 1, "name": "Away"}},
             "goals": {"home": None, "away": None},
         }
 
-    def test_learning_discovery_excludes_continental_live_and_outside_horizon(self):
+    def test_learning_discovery_includes_continental_and_excludes_live_and_outside_horizon(self):
         now_ts = 100000
         rows = [
             self.learning_fixture_row(1, 39, now_ts + 3600),
@@ -4618,27 +4660,39 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             self.learning_fixture_row(4, 39, now_ts + 25 * 3600),
         ]
         discovery = main.discover_learning_fixtures(now_ts=now_ts, fixture_rows=rows)
-        self.assertEqual(discovery["candidate_count"], 1)
-        self.assertEqual(discovery["candidates"][0]["fixture_id"], 1)
-        self.assertTrue(discovery["candidates"][0]["learning_scope_verified"])
+        self.assertEqual(discovery["candidate_count"], 2)
+        self.assertEqual([row["fixture_id"] for row in discovery["candidates"]], [1, 2])
+        self.assertTrue(all(row["learning_scope_verified"] for row in discovery["candidates"]))
         self.assertEqual(discovery["candidates"][0]["scope"]["competition_type"], "domestic_league")
-        self.assertEqual(discovery["excluded_counts"]["competition_not_in_major_learning_registry"], 1)
+        self.assertEqual(discovery["candidates"][1]["scope"]["competition_type"], "continental_club")
         self.assertEqual(discovery["excluded_counts"]["fixture_not_not_started"], 1)
         self.assertEqual(discovery["excluded_counts"]["outside_learning_discovery_horizon"], 1)
 
-    def test_learning_discovery_excludes_non_major_top_flight_for_market_language_only(self):
+    def test_learning_discovery_includes_verified_non_major_competition(self):
         now_ts = 100000
         rows = [self.learning_fixture_row(2441, 244, now_ts + 3600)]
         discovery = main.discover_learning_fixtures(now_ts=now_ts, fixture_rows=rows)
+        self.assertEqual(discovery["candidate_count"], 1)
+        self.assertEqual(discovery["excluded_count"], 0)
+        self.assertEqual(discovery["observation_candidate_count"], 0)
+        candidate = discovery["candidates"][0]
+        self.assertEqual(candidate["fixture_id"], 2441)
+        self.assertEqual(candidate["scope"]["competition_type"], "official_senior_competition")
+        self.assertFalse(candidate["scope"]["cross_competition_pooling_allowed"])
+
+    def test_learning_discovery_keeps_youth_women_and_friendlies_out_of_model_learning(self):
+        now_ts = 100000
+        rows = [
+            self.learning_fixture_row(3001, 9001, now_ts + 3600, league_name="National U21 League"),
+            self.learning_fixture_row(3002, 9002, now_ts + 3600, league_name="Women's Premier League"),
+            self.learning_fixture_row(3003, 9003, now_ts + 3600, league_name="Club Friendlies"),
+        ]
+        discovery = main.discover_learning_fixtures(now_ts=now_ts, fixture_rows=rows)
         self.assertEqual(discovery["candidate_count"], 0)
-        self.assertEqual(discovery["excluded_count"], 1)
-        excluded = discovery["excluded_sample"][0]
-        self.assertEqual(excluded["learning_eligibility"], "MODEL_LEARNING_EXCLUDED")
-        self.assertEqual(excluded["allowed_modes"], ["MARKET_LANGUAGE_ONLY", "SETTLEMENT_ONLY"])
-        self.assertEqual(discovery["observation_candidate_count"], 1)
-        observation = discovery["observation_candidates"][0]
-        self.assertEqual(observation["fixture_id"], 2441)
-        self.assertEqual(observation["routing_reason"], "competition_not_in_major_learning_registry")
+        self.assertEqual(discovery["observation_candidate_count"], 3)
+        self.assertEqual(
+            discovery["excluded_counts"]["youth_women_friendly_or_amateur_competition_excluded"], 3,
+        )
 
     def test_non_major_observation_is_separate_from_learning_and_settles_without_model_effect(self):
         paths = {route.path for route in main.app.routes}
@@ -4678,7 +4732,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         with self.assertRaises(main.HTTPException) as blocked:
             main.freeze_market_language_observation(self.learning_payload(), now_ts=900)
         self.assertEqual(blocked.exception.status_code, 409)
-        self.assertEqual(blocked.exception.detail, "major_league_sample_requires_learning_pipeline")
+        self.assertEqual(blocked.exception.detail, "learning_eligible_sample_requires_learning_pipeline")
 
     def test_market_language_settlement_rejects_two_labels_from_same_authority(self):
         payload = self.learning_payload("cup-observe", captured_at=900, kickoff_at=1000)
@@ -5937,7 +5991,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(result["node_execution"]["status"], "blocked")
         self.assertEqual(result["node_execution"]["blockers"], ["persistent_backup_ready"])
 
-    def test_learning_cycle_routes_non_major_packets_to_isolated_observation_store(self):
+    def test_learning_cycle_admits_verified_non_major_packets_into_partitioned_learning(self):
         now_ts = 100000
         rows = [
             self.learning_fixture_row(73, 39, now_ts + 3600),
@@ -5954,13 +6008,13 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             {"apply": True, "run_id": "cycle-scope-gate", "auto_prepare_prematch": True},
             now_ts=now_ts, fixture_rows=rows, prematch_packet_builder=builder,
         )
-        self.assertEqual(result["frozen_count"], 1)
-        self.assertEqual(result["market_language_observation_frozen_count"], 1)
+        self.assertEqual(result["frozen_count"], 2)
+        self.assertEqual(result["market_language_observation_frozen_count"], 0)
         self.assertEqual(built, [73, 74])
         store = main.load_snapshot_store()
-        self.assertEqual(set(store["learning_frozen"]), {"73"})
-        self.assertEqual(set(store["market_language_frozen"]), {"74"})
-        self.assertNotIn("74", store["learning_frozen"])
+        self.assertEqual(set(store["learning_frozen"]), {"73", "74"})
+        self.assertNotIn("market_language_frozen", store)
+        self.assertFalse(store["learning_frozen"]["74"][0]["scope"]["cross_competition_pooling_allowed"])
 
     def test_node_executor_advances_only_previously_admitted_fixture(self):
         kickoff_at = 200000
