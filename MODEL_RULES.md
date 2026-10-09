@@ -18,6 +18,8 @@
 
 `PIT数据冻结 → 赛事/赛季/阶段识别 → Verified League DNA → 球队相对联赛残差 → 本场基本面链 → State Tree → 公平价格 → 盘口时间线 → 市场接受/拒绝 → 表达优化 → BET/WAIT/PASS`
 
+机器执行必须在读取盘口快照、生成市场候选或运行Expression Optimizer之前，完成并冻结赔率无关的基本面估计、概率、Pure Fundamental Script及基本面链审计。冻结使用`fundamental_first_freeze_v1`，并由`fundamental_first_pipeline_audit_v1`验证市场处理前后脚本哈希一致。基本面不足或污染时仍可输出盘口诊断，但固定为`diagnostic_only`并强制`PASS`，不得产生BET或WAIT表达。
+
 League DNA 是统一模型中的正式先验层，不是独立预测模型：
 
 - 每个联赛、赛季和竞赛阶段可以拥有不同的进球、大小球主线、让球深度、角球、节奏、主场、旅行、比赛状态弹性和市场微结构标签。
@@ -77,6 +79,8 @@ League DNA 是统一模型中的正式先验层，不是独立预测模型：
 
 机器输出必须把赔率路径字段固定标为`Capital Pressure Proxy`并设置`is_real_money=false`。真实资金字段使用独立的`real_money_data`对象；没有带来源、时间戳和字段定义的A级数据时，Money%、Bet%和成交额全部保持`data_missing/null`，不得从赔率变化补算。
 
+`Accepted Repricing`只描述资金压力与结构盘口同向时的市场响应，不是重定价成因证明。机器必须使用独立的`repricing_attribution_v1`记录成因状态：只有“通过审计的实质基本面版本变化”与“对应市场复核触发器”同时存在时，才可标记`fundamental_repricing_confirmed`；A级真实资金只能证明资金压力确实存在，不能单独证明盘口变化由该资金造成；其余情况必须保持`market_move_cause_unverified`、`likely_information_driven_unconfirmed`或`data_missing`。市场接受、真实资金和基本面调整不得合并为同一个结论。
+
 A级真实资金包固定使用`real_money_v1`：必须绑定比赛ID、注册来源域名及允许的来源类型、可定位HTTP证据、已核实来源权威和方法、赛前`observed_at`、市场与具体盘口档位。Money%或Bet%必须覆盖该市场全部选项、各项为0至100且总和在容差内闭合；成交额如存在必须同时带非负数值和币种。跨比赛、过期、开赛后、未来时间、盘口档位不匹配或未注册来源不得参与方向判断。合格资金证据必须保存`evidence_hash`，且只提供资金压力，盘口响应仍由独立赔率时间线决定。
 
 最终决策必须保存Home、Away、Over、Under四个方向的压力代理、盘口响应、接受度和证据依据。`Resistance`或`Rejected`不能覆盖Core并自动反向；系统只能在相同赛前剧本内切换到通过正EV、Script Coverage和风险门禁的更低阻力表达，否则输出`WAIT`或`PASS`。只有`BET`可以进入组合，`WAIT/PASS`在赛后不得按实际下注结算输赢。
@@ -90,6 +94,18 @@ A级真实资金包固定使用`real_money_v1`：必须绑定比赛ID、注册�
 ## 四 最优表达与执行
 
 方向正确不等于表达正确。系统必须横向比较同一剧本下的 1X2、不同 AH 档位、不同 O/U 档位、TT 和 BTTS。
+
+跨场排序必须冻结`prematch_priority_vector_v1`，只允许使用赛前证据，并采用不设赛后拟合权重的字典序：基本面准入、基本面完整度、阵容可信度、剧本覆盖、盘口接受度、Edge、EV。基本面字段永远先于盘口和价格字段；赛果、结算、命中率、收益及赛后事件不得进入排序或改写历史名次。比赛参与排序与具体盘口表达排序必须分别保存，不能用某个高赔率表达抬高整场比赛的优先级。
+
+普通组合评估必须把上述两层排序冻结为带内容哈希的`prematch_priority_board_v1`；自动学习周期必须冻结`learning_prematch_priority_board_v1`并绑定每场`freeze_id/freeze_hash`。高波动单关也必须服从同一基本面优先顺序，不得单独按EV或赔率排序。自动赛后`PriorityQuality`优先核对该场是否位于当时冻结的`core_top_three`及是否达到赛前B级门槛；缺失榜单或冻结评级时保持`data_missing/ungraded`，禁止根据赛果补排。
+
+只有赛前`execution_action=BET`且存在完整候选表达的比赛可以占用优先级名次。WAIT、PASS和缺失表达的记录必须随榜单冻结在`non_participating_records`中，但不得进入核心前三、挤压可执行比赛，也不得通过高波动单关通道绕过执行门禁。
+
+榜单完整性不得只依赖内容哈希。审计还必须核对名次连续且唯一、比赛榜与表达榜成员一致、冻结ID与冻结哈希完整、核心角色与名次一致、赛前时间有效、实际顺序能由冻结优先级向量重放，以及参与榜单的执行动作确为BET。重新计算哈希不能使语义错误合法化。
+
+任一已持久化学习榜单未通过哈希或语义审计时，自动赛后证据复盘必须全局失败关闭，不得把损坏榜单解释为“榜单缺失”并退回旧评级路径。修复或恢复有效事实库前，该轮PriorityQuality不得生成有效标签。
+
+`2.19.8`及以后生成的可执行冻结必须绑定有效优先级榜；缺失时`match_selection_quality`固定为`data_missing`，不得仅凭赛前字母评级判为通过。只有旧版本历史冻结允许兼容评级路径。Learning Card必须保存榜单ID、榜单哈希、冻结名次、角色及核心名次数，便于后续校准重放。
 
 综合执行评分以 Core、EV、Confidence、Script Coverage、Market Fit 和 Expression Risk 为主。MSCB 只作为低权重纠偏层，负向调整空间大于正向调整空间；它可以降级、等待、放弃或切换表达，但不能把负 EV 变成正 EV。
 
@@ -198,3 +214,5 @@ A级真实资金包固定使用`real_money_v1`：必须绑定比赛ID、注册�
 - 大型联赛冻结样本超过36小时自动赛后窗口后不得静默删除或用赛后信息重建赛前版本。系统必须进入人工恢复队列；受保护恢复接口只允许重新采集事实，随后仍按哈希绑定复盘流程处理。
 - 独立概率输入不完整、来源时间不合格、哈希不可重放或基本面链仍不足时，保留明确的`data_missing`及`PASS`。安全PASS仍可作为数据完整度样本审计，但不能被解释为已完成方向选择。
 - 前向Champion/Challenger/模块消融运行只能接收重放审计为`ready`的冻结样本。内部运行请求必须绑定`probability_replay_hash`；返回的Champion概率必须逐项等于冻结Poisson基线，Challenger和消融才允许作为同一PIT输入上的比较输出。缺少重放契约或擅自改写Champion基线时，样本不得锁定或进入Promotion。
+- 无人值守激活必须生成`automatic_learning_activation_plan_v1`。计划固定覆盖主数据源、赔率源、受保护访问、持久化与备份、单写者、工作线程、联赛注册表、节点恢复和14:30调度门禁，并逐项保存责任方、依赖、下一动作和验证方式。计划只用于审计，不得配置密钥、调用供应商、启动线程或绕过失败门禁；哈希正确但责任、动作或门禁顺序被改写时同样无效。
+- `automatic_learning_activation_plan_v1`未通过时，`automatic_learning_execution_gate_v1`必须同时阻止14:30学习周期和固定节点学习执行器的全部写入，不得生成空的“已完成”日运行记录。独立的The Odds API观察名单发现与已登记盘口节点采集可以继续，但保持`MODEL_LEARNING_EXCLUDED`，不得借此推进冻结、Learning Card、Hypothesis或Champion。
