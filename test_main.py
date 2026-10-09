@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import main
@@ -12,6 +13,14 @@ import main
 
 def api_football_odds(bookmakers):
     return {"data": {"response": [{"update": "2026-09-29T00:00:00Z", "bookmakers": bookmakers}]}}
+
+
+def ready_automatic_learning_runtime():
+    checks = {name: True for name in main.AUTOMATIC_LEARNING_REQUIRED_GATES}
+    report = {"status": "ready", "ready": True, "checks": checks, "blockers": []}
+    report["activation_plan"] = main.build_automatic_learning_activation_plan(report)
+    report["activation_authorized"] = True
+    return report
 
 
 class ShadowV4UpgradeTests(unittest.TestCase):
@@ -1772,6 +1781,39 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIsNone(result["recommendation_tiers"]["first_choice_high_consistency"])
         self.assertEqual(result["recommendation_tiers"]["high_variance_single"]["selection"], "home")
 
+    def test_high_variance_singles_are_also_ranked_fundamentals_first(self):
+        def row(fixture, completeness, ev):
+            candidate = {
+                "market": "1x2", "selection": "home", "price": 2.0,
+                "script_coverage": .6, "edge": .05, "ev": ev,
+            }
+            return {
+                "fixture": fixture,
+                "evaluation": {
+                    "fundamental_chain_audit": {"decision_eligible": True, "completeness_score": completeness},
+                    "decision_layer": {
+                        "lineup_confidence": .8,
+                        "recommendation_tiers": {"high_variance_single": candidate},
+                    },
+                },
+            }
+        result = main.build_portfolio([row("market-led", .6, .40), row("fundamental-led", .9, .05)])
+        self.assertEqual([item["fixture"] for item in result["high_variance_singles"]], ["fundamental-led", "market-led"])
+        self.assertTrue(all(item["priority_basis"]["outcome_fields_used"] is False for item in result["high_variance_singles"]))
+
+    def test_high_variance_single_cannot_bypass_wait_execution_gate(self):
+        candidate = {"market": "1x2", "selection": "home", "price": 2.0, "script_coverage": .6, "edge": .05, "ev": .5}
+        rows = [{
+            "fixture": "wait-only",
+            "evaluation": {"decision_layer": {
+                "execution_action": "WAIT",
+                "recommendation_tiers": {"high_variance_single": candidate},
+            }},
+        }]
+        result = main.build_portfolio(rows)
+        self.assertEqual(result["high_variance_singles"], [])
+        self.assertEqual(result["portfolio_decision"], "PASS")
+
     def test_portfolio_builds_two_tiers_without_correlated_duplicate_legs(self):
         def row(fixture, group, coverage, price, second_price=None):
             first = {"market": "1x2", "selection": "home", "line": None, "price": price, "script_coverage": coverage, "edge": .06, "ev": .08}
@@ -1819,6 +1861,143 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(ranking[0]["match_label"], "Home 0 vs Away 0")
         self.assertEqual(ranking[0]["selection_label"], "under 2.5")
         self.assertEqual(ranking[0]["display_text"], "Home 0 vs Away 0 · under 2.5")
+
+    def test_portfolio_priority_is_fundamentals_first_before_market_return(self):
+        def row(fixture, completeness, coverage, ev):
+            candidate = {
+                "market": "over_under", "selection": "over", "line": 2.5,
+                "price": 1.9, "script_coverage": coverage, "edge": .06, "ev": ev,
+            }
+            return {
+                "fixture": fixture, "correlation_group": fixture,
+                "evaluation": {
+                    "fundamental_chain_audit": {
+                        "decision_eligible": True, "completeness_score": completeness,
+                    },
+                    "decision_layer": {
+                        "execution_action": "BET", "lineup_confidence": .9,
+                        "recommendation_tiers": {"first_choice_high_consistency": candidate},
+                    },
+                },
+            }
+        rows = [
+            row("market-led", .65, .95, .30),
+            row("fundamental-led", .95, .75, .06),
+        ]
+        combination = main.build_portfolio(rows, 2)["first_choice_combination"]
+        self.assertEqual([item["fixture"] for item in combination["priority_ranking"]], ["fundamental-led", "market-led"])
+        self.assertEqual(combination["priority_policy"]["schema"], "prematch_priority_vector_v1")
+        self.assertFalse(combination["priority_policy"]["outcome_fields_used"])
+
+    def test_portfolio_priority_ignores_result_and_settlement_fields(self):
+        candidate = {
+            "market": "1x2", "selection": "home", "price": 1.8,
+            "script_coverage": .8, "edge": .06, "ev": .08,
+        }
+        def row(fixture, result):
+            return {
+                "fixture": fixture, "correlation_group": fixture,
+                "result": result, "settlement": {"status": "win" if result else "loss"},
+                "evaluation": {
+                    "fundamental_chain_audit": {"decision_eligible": True, "completeness_score": .8},
+                    "decision_layer": {
+                        "execution_action": "BET", "lineup_confidence": .8,
+                        "recommendation_tiers": {"first_choice_high_consistency": candidate},
+                    },
+                },
+            }
+        rows = [row("b-fixture", True), row("a-fixture", False)]
+        ranking = main.build_portfolio(rows, 2)["first_choice_combination"]["priority_ranking"]
+        self.assertEqual([item["fixture"] for item in ranking], ["a-fixture", "b-fixture"])
+        self.assertTrue(all(item["priority_basis"]["outcome_fields_used"] is False for item in ranking))
+        self.assertTrue(all(item["priority_basis"]["result_backfit_allowed"] is False for item in ranking))
+
+    def test_portfolio_priority_separates_match_and_expression_dimensions(self):
+        candidate = {
+            "market": "over_under", "selection": "under", "line": 2.5, "price": 1.9,
+            "script_coverage": .82, "edge": .05, "ev": .07,
+            "market_language": {"market_acceptance": "Partial"},
+        }
+        rows = [{
+            "fixture": str(index), "correlation_group": str(index),
+            "evaluation": {
+                "fundamental_chain_audit": {"decision_eligible": True, "completeness_score": .9 - index * .1},
+                "decision_layer": {"lineup_confidence": .85, "recommendation_tiers": {"first_choice_high_consistency": candidate}},
+            },
+        } for index in range(2)]
+        basis = main.build_portfolio(rows, 2)["first_choice_combination"]["priority_ranking"][0]["priority_basis"]
+        self.assertEqual(set(basis["match_priority"]), {"fundamental_decision_eligible", "fundamental_completeness", "lineup_confidence"})
+        self.assertEqual(set(basis["expression_priority"]), {"script_coverage", "market_acceptance", "market_acceptance_rank", "edge", "ev"})
+        self.assertTrue(basis["fundamental_decision_eligible"])
+
+    def test_portfolio_run_freezes_hashed_priority_board_and_detects_tampering(self):
+        def row(fixture, completeness, coverage):
+            candidate = {
+                "market": "1x2", "selection": "home", "price": 1.8,
+                "script_coverage": coverage, "edge": .06, "ev": .08,
+            }
+            return {
+                "fixture": fixture, "correlation_group": fixture,
+                "evaluation": {
+                    "fundamental_chain_audit": {"decision_eligible": True, "completeness_score": completeness},
+                    "fundamental_freeze": {"freeze_hash": f"freeze-{fixture}", "script_hash": f"script-{fixture}"},
+                    "decision_layer": {"lineup_confidence": .8, "recommendation_tiers": {"first_choice_high_consistency": candidate}},
+                },
+            }
+        rows = [row("lower-fundamental", .7, .95), row("higher-fundamental", .9, .7)]
+        portfolio = main.build_portfolio(rows, 2)
+        record = main.save_portfolio_run(
+            "priority-board", [row["fixture"] for row in rows], portfolio, 2, ["test"], "T-1h",
+            priority_evidence=main._portfolio_priority_evidence(rows),
+        )
+        board = record["priority_board"]
+        self.assertEqual(board["schema"], "prematch_priority_board_v1")
+        self.assertEqual([row["fixture"] for row in board["match_priority_ranking"]], ["higher-fundamental", "lower-fundamental"])
+        self.assertEqual(board["expression_priority_rankings"]["first_choice"][0]["fixture"], "higher-fundamental")
+        self.assertFalse(board["outcome_fields_used"])
+        self.assertEqual(record["priority_board_audit"]["status"], "passed")
+        semantic_tamper = copy.deepcopy(board)
+        semantic_tamper["match_priority_ranking"][0]["rank"] = 99
+        semantic_tamper["board_hash"] = main._content_hash({
+            key: value for key, value in semantic_tamper.items() if key not in {"board_hash", "immutable"}
+        })
+        semantic_audit = main.audit_portfolio_priority_board(semantic_tamper)
+        self.assertTrue(semantic_audit["hash_valid"])
+        self.assertEqual(semantic_audit["status"], "failed")
+        self.assertIn("priority_board_match_ranks_not_contiguous", semantic_audit["issues"])
+        board["match_priority_ranking"][0]["rank"] = 99
+        self.assertEqual(main.audit_portfolio_priority_board(board)["status"], "failed")
+        self.assertIn("priority_board_hash_invalid", main.audit_portfolio_priority_board(board)["issues"])
+
+    def test_portfolio_run_rejects_invalid_board_and_history_reaudits_stored_board(self):
+        candidate = {"market": "1x2", "selection": "home", "price": 1.8, "script_coverage": .8, "edge": .05, "ev": .07}
+        rows = [{
+            "fixture": fixture, "correlation_group": fixture,
+            "evaluation": {
+                "fundamental_chain_audit": {"decision_eligible": True, "completeness_score": completeness},
+                "decision_layer": {"execution_action": "BET", "lineup_confidence": .8, "recommendation_tiers": {"first_choice_high_consistency": candidate}},
+            },
+        } for fixture, completeness in (("audit-a", .9), ("audit-b", .8))]
+        portfolio = main.build_portfolio(rows, 2)
+        saved = main.save_portfolio_run("history-reaudit", ["audit-a", "audit-b"], portfolio, 2, [])
+        invalid = copy.deepcopy(saved["priority_board"])
+        invalid["match_priority_ranking"][0]["rank"] = 99
+        invalid["board_hash"] = main._content_hash({
+            key: value for key, value in invalid.items() if key not in {"board_hash", "immutable"}
+        })
+        self.assertTrue(main.audit_portfolio_priority_board(invalid)["hash_valid"])
+        with patch.object(main, "build_portfolio_priority_board", return_value=invalid):
+            with self.assertRaises(main.HTTPException) as rejected:
+                main.save_portfolio_run("invalid-new-run", ["audit-a", "audit-b"], portfolio, 2, [])
+        self.assertEqual(rejected.exception.status_code, 422)
+        self.assertNotIn("invalid-new-run", main.load_snapshot_store().get("portfolio_runs", {}))
+        store = main.load_snapshot_store()
+        store["portfolio_runs"]["history-reaudit"][0]["priority_board"] = invalid
+        store["portfolio_runs"]["history-reaudit"][0]["priority_board_audit"] = {"status": "passed"}
+        main.write_snapshot_store(store)
+        reaudited = main.get_portfolio_runs("history-reaudit")[0]
+        self.assertEqual(reaudited["priority_board_audit"]["status"], "failed")
+        self.assertIn("priority_board_match_ranks_not_contiguous", reaudited["priority_board_audit"]["issues"])
 
     def test_portfolio_selection_labels_cover_btts_and_handicap(self):
         self.assertEqual(main.portfolio_selection_label({"market": "btts", "selection": "yes"}), "BTTS yes")
@@ -2909,6 +3088,69 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertIn("persistent_store_configured", blocked["blockers"])
         self.assertIn("persistent_backup_ready", blocked["blockers"])
         self.assertIn("auto_snapshot_worker_alive", blocked["blockers"])
+        self.assertEqual(blocked["activation_plan"]["schema"], "automatic_learning_activation_plan_v1")
+        self.assertTrue(blocked["activation_plan"]["audit"]["valid"])
+        self.assertFalse(blocked["activation_plan"]["activation_allowed"])
+
+    def test_automatic_learning_activation_plan_is_deterministic_and_semantically_tamper_evident(self):
+        checks = {name: True for name in main.AUTOMATIC_LEARNING_REQUIRED_GATES}
+        checks["api_football_authenticated"] = False
+        checks["persistent_backup_ready"] = False
+        readiness = {"status": "not_ready", "checks": checks}
+        first = main.build_automatic_learning_activation_plan(readiness)
+        second = main.build_automatic_learning_activation_plan(readiness)
+        self.assertEqual(first["plan_hash"], second["plan_hash"])
+        self.assertEqual(first["blockers"], ["api_football_authenticated", "persistent_backup_ready"])
+        self.assertTrue(first["external_change_required"])
+        self.assertTrue(first["operator_action_required"])
+        self.assertFalse(first["code_change_required"])
+        self.assertFalse(first["automatic_mutation_allowed"])
+        self.assertTrue(first["audit"]["valid"])
+        self.assertFalse(first["audit"]["secrets_exposed"])
+
+        tampered = copy.deepcopy(first)
+        tampered["gates"][0]["owner"] = "attacker"
+        tampered["plan_hash"] = main._content_hash(
+            main._automatic_learning_activation_plan_hash_content(tampered)
+        )
+        audit = main.audit_automatic_learning_activation_plan(tampered)
+        self.assertTrue(audit["hash_valid"])
+        self.assertFalse(audit["valid"])
+        self.assertIn("gate_definition_mismatch:api_football_configured:owner", audit["semantic_issues"])
+
+        secret_injected = {**first, "audit": {"api_key": "must-never-appear"}}
+        secret_audit = main.audit_automatic_learning_activation_plan(secret_injected)
+        self.assertFalse(secret_audit["valid"])
+        self.assertTrue(secret_audit["secrets_exposed"])
+        self.assertIn("audit.api_key", secret_audit["sensitive_field_paths"])
+
+        all_ready = main.build_automatic_learning_activation_plan({"checks": {
+            name: True for name in main.AUTOMATIC_LEARNING_REQUIRED_GATES
+        }})
+        self.assertTrue(all_ready["activation_allowed"])
+        self.assertTrue(all_ready["automatic_mutation_allowed"])
+        self.assertEqual(all_ready["blockers"], [])
+
+    def test_env_example_is_secret_free_and_covers_unattended_activation_configuration(self):
+        env_path = Path(main.__file__).with_name(".env.example")
+        self.assertTrue(env_path.is_file())
+        values = {}
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+        for secret_name in (
+            "API_FOOTBALL_KEY", "THE_ODDS_API_KEY", "SHADOW_ACCESS_TOKEN",
+            "THESTATS_API_KEY", "NAMI_API_SECRET", "ISPORTS_API_KEY", "SPORTRADAR_API_KEY",
+        ):
+            self.assertIn(secret_name, values)
+            self.assertEqual(values[secret_name], "")
+        self.assertEqual(values["UVICORN_WORKERS"], "1")
+        self.assertEqual(values["AUTO_SNAPSHOT_ENABLED"], "false")
+        self.assertEqual(values["RELEASE_COMMIT_SHA"], "")
+        self.assertNotIn("/data/", values["SNAPSHOT_STORE_PATH"])
 
     def test_automatic_learning_schedule_health_uses_persisted_daily_run(self):
         before_due = int(datetime(2026, 10, 8, 6, 29, tzinfo=timezone.utc).timestamp())
@@ -3011,6 +3253,10 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "version": main.VERSION, "checks": {
                 "fundamental_first_pipeline_passes": True,
                 "fundamental_freeze_tamper_rejected": True,
+                "portfolio_priority_board_tamper_rejected": True,
+                "learning_priority_board_tamper_rejected": True,
+                "activation_plan_semantic_tamper_rejected": True,
+                "automatic_learning_execution_gate_fail_closed": True,
                 "accepted_repricing_does_not_claim_causation": True,
             },
         }
@@ -5310,6 +5556,12 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         store = main.load_snapshot_store()
         self.assertIn("72", store["learning_frozen"])
         self.assertIn("cycle-20261008-a", store["learning_runs"])
+        self.assertIn("cycle-20261008-a", store["learning_priority_boards"])
+        self.assertEqual(first["priority_board_action"], "frozen")
+        self.assertEqual(first["learning_priority_board"]["match_priority_ranking"], [])
+        self.assertEqual(first["learning_priority_board"]["non_participating_records"][0]["execution_action"], "PASS")
+        self.assertFalse(first["learning_priority_board"]["outcome_fields_used"])
+        self.assertEqual(main.audit_learning_priority_board(first["learning_priority_board"])["status"], "passed")
         persisted_run = store["learning_runs"]["cycle-20261008-a"]
         self.assertTrue(persisted_run["immutable"])
         self.assertEqual(persisted_run["run_hash"], main._content_hash(main.learning_run_hash_content(persisted_run)))
@@ -5328,6 +5580,91 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             main.run_learning_cycle(payload, now_ts=now_ts, fixture_rows=[fixture_row], prematch_packet_builder=builder)
         self.assertEqual(invalid_run.exception.status_code, 409)
         self.assertEqual(invalid_run.exception.detail, "learning_run_integrity_invalid")
+
+    def test_learning_cycle_reuses_priority_board_after_crash_before_run_ledger(self):
+        now_ts = 120000
+        fixture_row = self.learning_fixture_row(729, 39, now_ts + 3600)
+        payload = {"apply": True, "run_id": "priority-crash-replay"}
+        first = main.run_learning_cycle(
+            payload, now_ts=now_ts, fixture_rows=[fixture_row],
+            prematch_packet_builder=lambda fixture_id: self.learning_prematch_packet(fixture_id, now_ts),
+        )
+        first_hash = first["learning_priority_board"]["board_hash"]
+        store = main.load_snapshot_store()
+        store["learning_runs"].pop("priority-crash-replay")
+        main.write_snapshot_store(store)
+        replay = main.run_learning_cycle(
+            payload, now_ts=now_ts + 1, fixture_rows=[fixture_row],
+            prematch_packet_builder=Mock(side_effect=AssertionError("same node must not rebuild")),
+        )
+        self.assertEqual(replay["priority_board_action"], "unchanged")
+        self.assertEqual(replay["learning_priority_board"]["board_hash"], first_hash)
+        self.assertNotIn("action", replay["learning_priority_board"])
+        self.assertTrue(main.learning_run_record_integrity(replay)["valid"])
+
+    def test_learning_priority_board_freezes_match_before_expression_ranking(self):
+        def frozen(fixture, completeness, coverage, ev):
+            return {
+                "fixture": fixture, "freeze_id": f"{fixture}:v1", "content_hash": f"hash-{fixture}",
+                "captured_at": 1000, "data_cutoff_at": 1000, "kickoff_at": 5000,
+                "analysis": {"analysis_node": "T-1h"},
+                "decision": {
+                    "decision": "BET", "execution_action": "BET", "lineup_confidence": .85,
+                    "match_rating": "B+",
+                    "fundamental_chain_audit": {"decision_eligible": True, "completeness_score": completeness},
+                    "selected_expression": {
+                        "market": "over_under", "selection": "over", "line": 2.5, "price": 1.9,
+                        "script_coverage": coverage, "edge": .06, "ev": ev,
+                    },
+                },
+            }
+        board = main.build_learning_priority_board("board-test", [
+            frozen("market-led", .7, .95, .30), frozen("fundamental-led", .95, .7, .05),
+        ], 1100)
+        self.assertEqual([row["fixture"] for row in board["match_priority_ranking"]], ["fundamental-led", "market-led"])
+        self.assertEqual(board["match_priority_ranking"][0]["role"], "core_top_three")
+        self.assertFalse(board["result_backfit_allowed"])
+        self.assertEqual(main.audit_learning_priority_board(board)["status"], "passed")
+        saved = main.persist_learning_priority_board(board)
+        self.assertEqual(saved["action"], "frozen")
+        self.assertEqual(main._learning_priority_context(main.load_snapshot_store(), {
+            "fixture": "fundamental-led", "freeze_id": "fundamental-led:v1",
+        })["rank"], 1)
+        semantic_tamper = copy.deepcopy(board)
+        semantic_tamper["match_priority_ranking"][0]["execution_action"] = "WAIT"
+        semantic_tamper["board_hash"] = main._content_hash({
+            key: value for key, value in semantic_tamper.items() if key not in {"board_hash", "immutable", "action"}
+        })
+        semantic_audit = main.audit_learning_priority_board(semantic_tamper)
+        self.assertTrue(semantic_audit["hash_valid"])
+        self.assertEqual(semantic_audit["status"], "failed")
+        self.assertIn("learning_priority_non_bet_ranked", semantic_audit["issues"])
+        board["match_priority_ranking"][0]["rank"] = 9
+        self.assertEqual(main.audit_learning_priority_board(board)["status"], "failed")
+
+    def test_learning_priority_board_report_is_bounded_and_hash_audited(self):
+        for index in range(3):
+            freeze = {
+                "fixture": f"report-{index}", "freeze_id": f"report-{index}:v1", "content_hash": f"hash-{index}",
+                "captured_at": 100 + index, "data_cutoff_at": 100 + index, "kickoff_at": 1000,
+                "analysis": {"analysis_node": "T-1h"},
+                "decision": {
+                    "decision": "PASS", "execution_action": "PASS", "lineup_confidence": .8,
+                    "fundamental_chain_audit": {"decision_eligible": True, "completeness_score": .8},
+                },
+            }
+            main.persist_learning_priority_board(main.build_learning_priority_board(f"report-board-{index}", [freeze], 200 + index))
+        report = main.learning_priority_board_report(limit=2)
+        self.assertEqual(report["count"], 3)
+        self.assertEqual(report["returned_count"], 2)
+        self.assertTrue(report["truncated"])
+        self.assertTrue(all(row["audit"]["status"] == "passed" for row in report["boards"]))
+        exact = main.learning_priority_board_report("report-board-1")
+        self.assertEqual(exact["board"]["board_id"], "report-board-1")
+        self.assertEqual(exact["audit"]["status"], "passed")
+        with self.assertRaises(main.HTTPException) as bad_limit:
+            main.learning_priority_board_report(limit=51)
+        self.assertEqual(bad_limit.exception.status_code, 400)
 
     def test_learning_cycle_creates_one_version_per_due_clock_node(self):
         kickoff_at = 200000
@@ -5460,7 +5797,8 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "postmatch_fact_results": [{"action": "facts_collected"}],
             "postmatch_review_draft_results": [],
         }
-        with patch.object(main, "run_learning_cycle", return_value=cycle_result) as runner:
+        with patch.object(main, "run_learning_cycle", return_value=cycle_result) as runner, \
+             patch.object(main, "automatic_learning_runtime_readiness", return_value=ready_automatic_learning_runtime()):
             idle = main.auto_learning_daily_cycle(before_due, [])
             result = main.auto_learning_daily_cycle(due, [])
         self.assertEqual(idle["status"], "not_due")
@@ -5480,13 +5818,31 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "review_draft_count": 0,
             "execution_order": ["past_36h_postmatch", "future_24h_prematch"],
         }
-        with patch.object(main, "run_learning_cycle", return_value=cycle_result) as runner:
+        with patch.object(main, "run_learning_cycle", return_value=cycle_result) as runner, \
+             patch.object(main, "automatic_learning_runtime_readiness", return_value=ready_automatic_learning_runtime()):
             result = main.auto_learning_daily_cycle(late, [])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["run_id"], "daily-20261008-1430")
         self.assertEqual(result["scheduled_at"], int(datetime(2026, 10, 8, 6, 30, tzinfo=timezone.utc).timestamp()))
         self.assertEqual(result["trigger_delay_seconds"], 5 * 3600 + 15 * 60)
         runner.assert_called_once()
+
+    def test_auto_learning_daily_cycle_fails_closed_before_any_write_when_runtime_is_not_ready(self):
+        due = datetime(2026, 10, 8, 6, 30, tzinfo=timezone.utc)
+        blocked = main.automatic_learning_runtime_readiness(
+            store_integrity={"operational": True, "recovery_ready": False}, worker_alive=False,
+        )
+        with patch.object(main, "run_learning_cycle") as runner, \
+             patch.object(main, "automatic_learning_runtime_readiness", return_value=blocked):
+            result = main.auto_learning_daily_cycle(due, [])
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "automatic_learning_activation_gate_not_ready")
+        self.assertFalse(result["learning_run_persisted"])
+        self.assertFalse(result["automatic_mutation_performed"])
+        self.assertEqual(result["activation_plan_audit"], "passed")
+        self.assertTrue(result["blockers"])
+        runner.assert_not_called()
+        self.assertEqual(main.load_snapshot_store().get("learning_runs") or {}, {})
 
     def test_snapshot_worker_enters_daily_learning_before_future_fixture_collection(self):
         due = datetime(2026, 10, 8, 6, 30, tzinfo=timezone.utc)
@@ -5506,6 +5862,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             return {"advanced_count": 0, "discovery_performed": False}
 
         with patch.object(main, "auto_learning_daily_cycle", side_effect=daily), \
+             patch.object(main, "automatic_learning_runtime_readiness", return_value=ready_automatic_learning_runtime()), \
              patch.object(main, "discover_the_odds_api_watchlist", return_value={"status": "completed"}), \
              patch.object(main, "auto_collect_the_odds_api_due_stages", return_value={"status": "not_due"}), \
              patch.object(main, "API_FOOTBALL_STARTUP_PROBE", {"status": "completed", "authenticated": True}), \
@@ -5532,6 +5889,53 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         targets.assert_not_called()
         self.assertEqual(result["api_football_due_collection"]["status"], "skipped")
         self.assertEqual(result["api_football_due_collection"]["reason"], "api_football_not_authenticated")
+
+    def test_snapshot_cycle_blocks_learning_mutations_but_keeps_independent_odds_collection(self):
+        due = datetime(2026, 10, 8, 6, 30, tzinfo=timezone.utc)
+        blocked = main.automatic_learning_runtime_readiness(
+            store_integrity={"operational": True, "recovery_ready": False}, worker_alive=False,
+        )
+        with patch.object(main, "automatic_learning_runtime_readiness", return_value=blocked), \
+             patch.object(main, "discover_the_odds_api_watchlist", return_value={"status": "completed"}) as discovery, \
+             patch.object(main, "auto_collect_the_odds_api_due_stages", return_value={"status": "completed", "due_count": 1}) as odds, \
+             patch.object(main, "run_learning_node_executor") as node_executor, \
+             patch.object(main, "target_fixtures_for_date") as api_football_discovery:
+            result = main.auto_snapshot_cycle(due)
+        discovery.assert_called_once_with(due)
+        odds.assert_called_once_with(due)
+        node_executor.assert_not_called()
+        api_football_discovery.assert_not_called()
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["node_execution"]["status"], "blocked")
+        self.assertFalse(result["node_execution"]["automatic_mutation_performed"])
+        self.assertEqual(result["node_execution"]["activation_plan_audit"], "passed")
+
+    def test_snapshot_cycle_rechecks_activation_before_each_learning_mutation_boundary(self):
+        due = datetime(2026, 10, 8, 6, 30, tzinfo=timezone.utc)
+        ready = ready_automatic_learning_runtime()
+        blocked = copy.deepcopy(ready)
+        blocked["ready"] = False
+        blocked["blockers"] = ["persistent_backup_ready"]
+        blocked_checks = {name: True for name in main.AUTOMATIC_LEARNING_REQUIRED_GATES}
+        blocked_checks["persistent_backup_ready"] = False
+        blocked["activation_plan"] = main.build_automatic_learning_activation_plan({"checks": blocked_checks})
+        cycle_result = {
+            "frozen_count": 0, "settled_count": 0, "rejected_count": 0,
+            "execution_order": ["past_36h_postmatch", "future_24h_prematch"],
+        }
+        with patch.object(main, "automatic_learning_runtime_readiness", side_effect=[ready, blocked]) as readiness, \
+             patch.object(main, "run_learning_cycle", return_value=cycle_result) as daily_runner, \
+             patch.object(main, "discover_the_odds_api_watchlist", return_value={"status": "completed"}), \
+             patch.object(main, "auto_collect_the_odds_api_due_stages", return_value={"status": "not_due"}), \
+             patch.object(main, "API_FOOTBALL_STARTUP_PROBE", {"status": "completed", "authenticated": False}), \
+             patch.object(main, "run_learning_node_executor") as node_executor:
+            result = main.auto_snapshot_cycle(due)
+        self.assertEqual(readiness.call_count, 2)
+        daily_runner.assert_called_once()
+        node_executor.assert_not_called()
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["node_execution"]["status"], "blocked")
+        self.assertEqual(result["node_execution"]["blockers"], ["persistent_backup_ready"])
 
     def test_learning_cycle_routes_non_major_packets_to_isolated_observation_store(self):
         now_ts = 100000
@@ -5580,6 +5984,10 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         )
         self.assertEqual(result["advanced_count"], 1)
         self.assertEqual(result["results"][0]["analysis_node"], "T-6h")
+        self.assertEqual(result["learning_priority_board"]["action"], "frozen")
+        self.assertEqual(result["learning_priority_board"]["match_priority_ranking"], [])
+        self.assertEqual(result["learning_priority_board"]["non_participating_records"][0]["freeze_id"], result["results"][0]["freeze_id"])
+        self.assertEqual(main.audit_learning_priority_board(result["learning_priority_board"])["status"], "passed")
         self.assertFalse(result["discovery_performed"])
         self.assertFalse(result["postmatch_learning_performed"])
         self.assertEqual(len(main.load_snapshot_store()["learning_frozen"]["760"]), 2)
@@ -5590,6 +5998,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         )
         self.assertEqual(repeat["advanced_count"], 0)
         self.assertEqual(repeat["plan"]["due_count"], 0)
+        self.assertEqual(repeat["learning_priority_board"]["action"], "skipped")
 
     def test_daily_governance_admits_before_first_node_then_executor_freezes_at_t12(self):
         kickoff_at = 300000
@@ -5701,6 +6110,41 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             operations = main.operations_status_report(now_ts=now_ts + 200)
         self.assertIn("learning_admission_expired_without_freeze", [row["code"] for row in operations["alerts"]])
         self.assertEqual(operations["status"], "blocked")
+
+    def test_learning_data_health_flags_missing_and_tampered_priority_boards(self):
+        now_ts = 100000
+        kickoff_at = now_ts + 3600
+        fixture_row = self.learning_fixture_row(799, 39, kickoff_at)
+        candidate = main.discover_learning_fixtures(now_ts=now_ts, fixture_rows=[fixture_row])["candidates"][0]
+        main.admit_learning_candidate(candidate, now_ts=now_ts)
+        payload = self.learning_payload("799", now_ts, kickoff_at)
+        payload["decision"] = {
+            "decision": "BET", "execution_action": "BET", "lineup_confidence": .8, "match_rating": "B+",
+            "fundamental_chain_audit": {"decision_eligible": True, "completeness_score": .8},
+            "selected_expression": {"market": "1x2", "selection": "home", "price": 2.0, "script_coverage": .8, "edge": .05, "ev": .08},
+        }
+        frozen = main.freeze_learning_sample(payload, now_ts=now_ts)
+        missing = main.automatic_learning_data_health(now_ts=now_ts + 1)
+        self.assertEqual(missing["status"], "warning")
+        self.assertEqual(missing["unranked_active_freeze_count"], 1)
+        saved_board = main.build_learning_priority_board("priority-health", [frozen], now_ts + 2)
+        main.persist_learning_priority_board(saved_board)
+        healthy = main.automatic_learning_data_health(now_ts=now_ts + 2)
+        self.assertEqual(healthy["invalid_learning_priority_board_count"], 0)
+        self.assertEqual(healthy["unranked_active_freeze_count"], 0)
+        saved_board["match_priority_ranking"][0]["rank"] = 99
+        saved_board["board_hash"] = main._content_hash({
+            key: value for key, value in saved_board.items() if key not in {"board_hash", "immutable", "action"}
+        })
+        store = main.load_snapshot_store()
+        store["learning_priority_boards"] = {"priority-health": saved_board}
+        main.write_snapshot_store(store)
+        tampered = main.automatic_learning_data_health(now_ts=now_ts + 3)
+        self.assertEqual(tampered["status"], "critical")
+        self.assertEqual(tampered["invalid_learning_priority_board_count"], 1)
+        with patch.object(main, "AUTO_SNAPSHOT_ENABLED", False):
+            operations = main.operations_status_report(now_ts=now_ts + 3)
+        self.assertIn("learning_priority_board_integrity_invalid", [row["code"] for row in operations["alerts"]])
 
     def test_postmatch_recovery_queue_keeps_expired_automatic_window_recoverable(self):
         frozen = main.freeze_learning_sample(
@@ -6047,6 +6491,8 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "selected_expression": {"market": "over_under", "selection": "under", "line": 2.75, "price": 1.91},
         }
         frozen = main.freeze_learning_sample(payload, now_ts=900)
+        priority_board = main.build_learning_priority_board("review-priority-8044", [frozen], 901)
+        main.persist_learning_priority_board(priority_board)
         self.save_learning_t1h_reference(
             "8044", 1000, frozen["decision"]["selected_expression"], 1.80,
         )
@@ -6059,6 +6505,9 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(completed["process_classification"], "DATA_INSUFFICIENT")
         self.assertEqual(completed["review"]["match_selection_quality"]["status"], "passed")
         self.assertEqual(completed["review"]["match_selection_quality"]["required_minimum_rating"], "B")
+        self.assertTrue(completed["review"]["match_selection_quality"]["priority_board_used"])
+        self.assertEqual(completed["review"]["match_selection_quality"]["frozen_priority_rank"], 1)
+        self.assertEqual(completed["review"]["match_selection_quality"]["priority_board_hash"], priority_board["board_hash"])
         self.assertFalse(completed["review"]["match_selection_quality"]["rating_derived_from_result"])
         self.assertEqual(completed["review"]["price_execution_audit"]["status"], "passed")
         self.assertEqual(completed["review"]["price_execution_audit"]["reference_stage"], "T-1h")
@@ -6074,9 +6523,29 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(card["sample_eligibility"]["eligible"])
         self.assertTrue(card["sample_eligibility"]["priority_calibration_eligible"])
         self.assertTrue(card["sample_eligibility"]["selection_calibration_eligible"])
+        self.assertTrue(card["priority_quality"]["priority_board_used"])
+        self.assertEqual(card["priority_quality"]["priority_board_hash"], priority_board["board_hash"])
+        self.assertEqual(card["priority_quality"]["frozen_priority_rank"], 1)
         calibration = main.learning_quality_calibration_report(minimum_samples=2)
         self.assertEqual(calibration["calibration_group_count"], 2)
         self.assertTrue(all(row["eligible_sample_count"] == 1 for row in calibration["groups"]))
+
+        no_board_payload = copy.deepcopy(payload)
+        no_board_payload["fixture"] = "8045"
+        no_board_freeze = main.freeze_learning_sample(no_board_payload, now_ts=900)
+        self.save_learning_t1h_reference(
+            "8045", 1000, no_board_freeze["decision"]["selected_expression"], 1.80,
+        )
+        main.collect_learning_postmatch_facts(
+            no_board_freeze["freeze_id"], now_ts=9000,
+            fact_fetcher=lambda _: self.verified_event_fact_packet(1, 0),
+        )
+        main.build_learning_postmatch_review_draft(no_board_freeze["freeze_id"], now_ts=9001)
+        no_board_review = main.complete_automatic_learning_postmatch_review(no_board_freeze["freeze_id"], now_ts=9002)
+        self.assertEqual(no_board_review["review"]["match_selection_quality"]["status"], "data_missing")
+        self.assertTrue(no_board_review["review"]["match_selection_quality"]["priority_board_required"])
+        self.assertFalse(no_board_review["review"]["match_selection_quality"]["priority_board_used"])
+        self.assertIn("legacy rating fallback is forbidden", no_board_review["review"]["match_selection_quality"]["reason"])
 
     def test_automatic_match_threshold_uses_only_explicit_letter_grades(self):
         self.assertTrue(main._learning_match_rating_at_least_b("A-"))
@@ -6084,6 +6553,24 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(main._learning_match_rating_at_least_b("C"))
         self.assertIsNone(main._learning_match_rating_at_least_b(7.5))
         self.assertIsNone(main._learning_match_rating_at_least_b("7.5/10"))
+
+    def test_automatic_review_fails_closed_on_semantically_invalid_priority_board(self):
+        frozen = main.freeze_learning_sample(self.learning_payload("priority-gate", 900, 1000), now_ts=900)
+        board = main.build_learning_priority_board("invalid-review-board", [frozen], 901)
+        board["non_participating_records"][0]["reason"] = "forged_reason"
+        board["board_hash"] = main._content_hash({
+            key: value for key, value in board.items() if key not in {"board_hash", "immutable", "action"}
+        })
+        self.assertTrue(main.audit_learning_priority_board(board)["hash_valid"])
+        self.assertEqual(main.audit_learning_priority_board(board)["status"], "failed")
+        store = main.load_snapshot_store()
+        store["learning_priority_boards"] = {"invalid-review-board": board}
+        main.write_snapshot_store(store)
+        with self.assertRaises(main.HTTPException) as blocked:
+            main.complete_automatic_learning_postmatch_review(frozen["freeze_id"], now_ts=9000)
+        self.assertEqual(blocked.exception.status_code, 409)
+        self.assertEqual(blocked.exception.detail["error"], "learning_priority_board_integrity_invalid")
+        self.assertFalse(blocked.exception.detail["automatic_review_allowed"])
 
     def test_fact_verification_counts_only_matching_result_evidence(self):
         frozen = main.freeze_learning_sample(self.learning_payload("805", 900, 1000), now_ts=900)

@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.19.6"
+VERSION = "2.19.10"
 RELEASE_CHANNEL = "shadow-usable"
 RELEASE_SOURCE_REVISION = os.getenv("RELEASE_COMMIT_SHA", "").strip().lower()
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
@@ -243,7 +243,7 @@ LEARNING_NODE_RETRY_MAX_SECONDS = max(
     min(int(os.getenv("LEARNING_NODE_RETRY_MAX_SECONDS", "3600")), 12 * 3600),
 )
 LEARNING_NODE_ATTEMPT_RETENTION = max(100, min(int(os.getenv("LEARNING_NODE_ATTEMPT_RETENTION", "5000")), 50000))
-LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-09-v2.19.6").strip() or "MODEL_RULES.md@2026-10-09-v2.19.6"
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-10-v2.19.10").strip() or "MODEL_RULES.md@2026-10-10-v2.19.10"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -4927,15 +4927,79 @@ def portfolio_selection_label(candidate: Dict[str, Any]) -> str:
     return ":".join(str(value) for value in (market, selection) if value)
 
 
+def _portfolio_prematch_priority(row: Dict[str, Any], tier: str) -> Dict[str, Any]:
+    """Build an outcome-blind, fundamentals-first cross-match ordering vector."""
+    evaluation = row.get("evaluation") if isinstance(row.get("evaluation"), dict) else {}
+    decision = evaluation.get("decision_layer") if isinstance(evaluation.get("decision_layer"), dict) else {}
+    tiers = decision.get("recommendation_tiers") if isinstance(decision.get("recommendation_tiers"), dict) else {}
+    candidate = tiers.get(tier) if isinstance(tiers.get(tier), dict) else {}
+    fundamental = evaluation.get("fundamental_chain_audit") if isinstance(evaluation.get("fundamental_chain_audit"), dict) else {}
+    fundamental_eligible = fundamental.get("decision_eligible") is True
+    fundamental_completeness = as_float(fundamental.get("completeness_score"))
+    lineup_confidence = as_float(decision.get("lineup_confidence"))
+    script_coverage = as_float(candidate.get("script_coverage"))
+    acceptance = get_nested(candidate, ["market_language", "market_acceptance"])
+    if acceptance is None:
+        acceptance = get_nested(decision, ["market_language", "selected_acceptance"])
+    acceptance_rank = {
+        "Accepted": 4, "Partial": 3, "data_missing": 2,
+        "Resistance": 1, "Rejected": 0,
+    }.get(str(acceptance or "data_missing"), 2)
+    edge = as_float(candidate.get("edge"))
+    ev = as_float(candidate.get("ev"))
+    # Lexicographic ordering intentionally avoids inventing postmatch-fitted weights.
+    # Fundamental eligibility/completeness and lineup certainty always precede
+    # script/market/value fields. No result, settlement, score or hit-rate field
+    # is read by this function.
+    sort_key = (
+        -int(fundamental_eligible),
+        -(fundamental_completeness if fundamental_completeness is not None else -1.0),
+        -(lineup_confidence if lineup_confidence is not None else -1.0),
+        -(script_coverage if script_coverage is not None else -1.0),
+        -acceptance_rank,
+        -(edge if edge is not None else -999.0),
+        -(ev if ev is not None else -999.0),
+        str(row.get("fixture") or ""),
+    )
+    return {
+        "schema": "prematch_priority_vector_v1",
+        "match_priority": {
+            "fundamental_decision_eligible": fundamental_eligible,
+            "fundamental_completeness": fundamental_completeness,
+            "lineup_confidence": lineup_confidence,
+        },
+        "expression_priority": {
+            "script_coverage": script_coverage,
+            "market_acceptance": acceptance or "data_missing",
+            "market_acceptance_rank": acceptance_rank,
+            "edge": edge,
+            "ev": ev,
+        },
+        "fundamental_decision_eligible": fundamental_eligible,
+        "fundamental_completeness": fundamental_completeness,
+        "lineup_confidence": lineup_confidence,
+        "script_coverage": script_coverage,
+        "market_acceptance": acceptance or "data_missing",
+        "market_acceptance_rank": acceptance_rank,
+        "edge": edge,
+        "ev": ev,
+        "comparison_order": [
+            "fundamental_decision_eligible", "fundamental_completeness",
+            "lineup_confidence", "script_coverage", "market_acceptance",
+            "edge", "ev", "fixture_stable_tiebreak",
+        ],
+        "outcome_fields_used": False,
+        "result_backfit_allowed": False,
+        "sort_key": sort_key,
+    }
+
+
 def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int, allow_fallback: bool = False, risk_preference: str = "balanced") -> Dict[str, Any]:
     candidates = []
     excluded = []
     seen_groups = set()
     upgraded = False
-    ordered = sorted(rows, key=lambda row: (
-        as_float(get_nested(row, ["evaluation", "decision_layer", "recommendation_tiers", tier, "script_coverage"])) or -1,
-        as_float(get_nested(row, ["evaluation", "decision_layer", "recommendation_tiers", tier, "ev"])) or -999,
-    ), reverse=True)
+    ordered = sorted(rows, key=lambda row: _portfolio_prematch_priority(row, tier)["sort_key"])
     for row in ordered:
         execution_action = get_nested(row, ["evaluation", "decision_layer", "execution_action"])
         if execution_action is None:
@@ -4972,6 +5036,10 @@ def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int,
             "death_path": decision_layer_result.get("death_path") or [],
             **candidate,
         }
+        priority_tier = tier if source_tier == tier else "first_choice_high_consistency"
+        priority_basis = _portfolio_prematch_priority(row, priority_tier)
+        priority_basis.pop("sort_key", None)
+        enriched["priority_basis"] = priority_basis
         enriched["selection_label"] = portfolio_selection_label(enriched)
         enriched["display_text"] = f"{match_label} · {enriched['selection_label']}"
         candidates.append(enriched)
@@ -5040,6 +5108,7 @@ def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int,
             "rank": index,
             "role": "core_top_three" if index <= 3 else "optional_extension",
             **{key: candidate.get(key) for key in ("fixture", "match_label", "market", "selection", "selection_label", "display_text", "line", "price", "script_coverage", "edge", "ev")},
+            "priority_basis": candidate.get("priority_basis"),
         }
         for index, candidate in enumerate(candidates, start=1)
     ]
@@ -5053,6 +5122,13 @@ def _combination_from_rows(rows: List[Dict[str, Any]], tier: str, max_legs: int,
         "optional_extension_count": max(0, len(priority_ranking) - 3),
         "selection_audit": {"selected": candidates, "excluded": excluded},
         "selection_guidance": "ranks 1-3 form the core priority set; rank 4+ are optional extensions with materially higher variance",
+        "priority_policy": {
+            "schema": "prematch_priority_vector_v1",
+            "order": ["fundamental eligibility", "fundamental completeness", "lineup confidence", "script coverage", "market acceptance", "edge", "EV"],
+            "outcome_fields_used": False,
+            "result_backfit_allowed": False,
+            "rule": "cross-match order is frozen from prematch evidence; settlement never reorders the board",
+        },
         "independence_assumption": "screened by correlation_group; residual correlation is not modeled",
         "combined_ev": recommended["estimated_combined_ev"],
         "combined_ev_status": "estimated_under_independence" if isinstance(recommended["estimated_combined_ev"], float) else "data_missing",
@@ -5164,7 +5240,492 @@ def _portfolio_change_drivers(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return drivers
 
 
-def save_portfolio_run(portfolio_id: str, fixtures: List[str], portfolio: Dict[str, Any], max_legs: int, trigger_reasons: List[str], stage: str = "manual", change_drivers: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def _portfolio_priority_evidence(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Bind a priority board to the exact prematch evidence available at evaluation time."""
+    evidence = []
+    for row in rows:
+        evaluation = row.get("evaluation") if isinstance(row.get("evaluation"), dict) else {}
+        decision = evaluation.get("decision_layer") if isinstance(evaluation.get("decision_layer"), dict) else {}
+        market_binding = decision.get("market_evidence_binding") if isinstance(decision.get("market_evidence_binding"), dict) else {}
+        freeze = evaluation.get("fundamental_freeze") if isinstance(evaluation.get("fundamental_freeze"), dict) else {}
+        evidence.append({
+            "fixture": row.get("fixture"),
+            "fundamental_freeze_hash": freeze.get("freeze_hash"),
+            "fundamental_script_hash": freeze.get("script_hash"),
+            "fundamental_version": get_nested(evaluation, ["fundamental_version", "version_number"]),
+            "probability_replay_hash": decision.get("probability_replay_hash"),
+            "market_stage": market_binding.get("stage"),
+            "market_snapshot_at": market_binding.get("snapshot_at"),
+            "market_source_content_hash": market_binding.get("source_content_hash"),
+            "current_unpersisted_quote_used": market_binding.get("current_unpersisted_quote_used") is True,
+        })
+    return evidence
+
+
+def build_portfolio_priority_board(
+    portfolio: Dict[str, Any], evidence_bindings: Optional[List[Dict[str, Any]]],
+    stage: str, created_at: int,
+) -> Dict[str, Any]:
+    """Create a result-blind immutable board with match and expression ranks separated."""
+    tiers = {
+        "first_choice": get_nested(portfolio, ["first_choice_combination", "priority_ranking"], []) or [],
+        "second_choice": get_nested(portfolio, ["second_choice_combination", "priority_ranking"], []) or [],
+    }
+    candidates_by_fixture: Dict[str, Dict[str, Any]] = {}
+    for tier_name in ("first_choice", "second_choice"):
+        for row in tiers[tier_name]:
+            fixture = str(row.get("fixture") or "").strip()
+            if not fixture or fixture in candidates_by_fixture:
+                continue
+            basis = row.get("priority_basis") if isinstance(row.get("priority_basis"), dict) else {}
+            match_priority = basis.get("match_priority") if isinstance(basis.get("match_priority"), dict) else {
+                key: basis.get(key) for key in ("fundamental_decision_eligible", "fundamental_completeness", "lineup_confidence")
+            }
+            candidates_by_fixture[fixture] = {
+                "fixture": fixture, "match_label": row.get("match_label"),
+                "match_priority": match_priority,
+            }
+
+    def match_sort_key(row: Dict[str, Any]) -> tuple:
+        priority = row.get("match_priority") or {}
+        eligible = priority.get("fundamental_decision_eligible") is True
+        completeness = as_float(priority.get("fundamental_completeness"))
+        confidence = as_float(priority.get("lineup_confidence"))
+        return (
+            -int(eligible),
+            -(completeness if completeness is not None else -1.0),
+            -(confidence if confidence is not None else -1.0),
+            row.get("fixture") or "",
+        )
+
+    match_ranking = []
+    for rank, row in enumerate(sorted(candidates_by_fixture.values(), key=match_sort_key), start=1):
+        match_ranking.append({"rank": rank, **row})
+    expression_rankings = {}
+    for tier_name, rows in tiers.items():
+        expression_rankings[tier_name] = [
+            {
+                "rank": index,
+                **{key: row.get(key) for key in (
+                    "fixture", "match_label", "market", "selection", "selection_label",
+                    "line", "price", "role",
+                )},
+                "expression_priority": get_nested(row, ["priority_basis", "expression_priority"], {
+                    key: get_nested(row, ["priority_basis", key]) for key in (
+                        "script_coverage", "market_acceptance", "market_acceptance_rank", "edge", "ev",
+                    )
+                }),
+            }
+            for index, row in enumerate(rows, start=1)
+        ]
+    immutable_content = {
+        "schema": "prematch_priority_board_v1",
+        "created_at": int(created_at),
+        "stage": stage,
+        "match_priority_ranking": match_ranking,
+        "expression_priority_rankings": expression_rankings,
+        "evidence_bindings": evidence_bindings or [],
+        "comparison_policy": {
+            "match_order": ["fundamental eligibility", "fundamental completeness", "lineup confidence"],
+            "expression_order": ["script coverage", "market acceptance", "edge", "EV"],
+            "match_priority_precedes_expression_priority": True,
+        },
+        "outcome_fields_used": False,
+        "result_backfit_allowed": False,
+    }
+    return {**immutable_content, "board_hash": _content_hash(immutable_content), "immutable": True}
+
+
+def _priority_match_sort_key(fixture: str, priority: Dict[str, Any]) -> tuple:
+    eligible = priority.get("fundamental_decision_eligible") is True
+    completeness = as_float(priority.get("fundamental_completeness"))
+    confidence = as_float(priority.get("lineup_confidence"))
+    return (
+        -int(eligible),
+        -(completeness if completeness is not None else -1.0),
+        -(confidence if confidence is not None else -1.0),
+        str(fixture or ""),
+    )
+
+
+def _priority_combined_sort_key(fixture: str, match_priority: Dict[str, Any], expression_priority: Dict[str, Any]) -> tuple:
+    acceptance_rank = as_float(expression_priority.get("market_acceptance_rank"))
+    coverage = as_float(expression_priority.get("script_coverage"))
+    edge = as_float(expression_priority.get("edge"))
+    ev = as_float(expression_priority.get("ev"))
+    return (
+        *_priority_match_sort_key(fixture, match_priority)[:-1],
+        -(coverage if coverage is not None else -1.0),
+        -(acceptance_rank if acceptance_rank is not None else 2.0),
+        -(edge if edge is not None else -999.0),
+        -(ev if ev is not None else -999.0),
+        str(fixture or ""),
+    )
+
+
+def audit_portfolio_priority_board(board: Any) -> Dict[str, Any]:
+    if not isinstance(board, dict):
+        return {"status": "failed", "hash_valid": False, "issues": ["priority_board_missing"]}
+    expected = str(board.get("board_hash") or "")
+    immutable_content = {key: value for key, value in board.items() if key not in {"board_hash", "immutable"}}
+    issues = []
+    hash_valid = bool(expected and hmac.compare_digest(expected, _content_hash(immutable_content)))
+    if board.get("schema") != "prematch_priority_board_v1":
+        issues.append("priority_board_schema_invalid")
+    if not hash_valid:
+        issues.append("priority_board_hash_invalid")
+    if board.get("outcome_fields_used") is not False or board.get("result_backfit_allowed") is not False:
+        issues.append("priority_board_outcome_isolation_invalid")
+    match_rows = board.get("match_priority_ranking")
+    expression_groups = board.get("expression_priority_rankings")
+    if not isinstance(match_rows, list):
+        issues.append("priority_board_match_ranking_invalid")
+        match_rows = []
+    if not isinstance(expression_groups, dict):
+        issues.append("priority_board_expression_rankings_invalid")
+        expression_groups = {}
+    match_fixtures = [str(row.get("fixture") or "") for row in match_rows if isinstance(row, dict)]
+    if [row.get("rank") for row in match_rows if isinstance(row, dict)] != list(range(1, len(match_rows) + 1)):
+        issues.append("priority_board_match_ranks_not_contiguous")
+    if any(not fixture for fixture in match_fixtures) or len(match_fixtures) != len(set(match_fixtures)):
+        issues.append("priority_board_match_fixtures_not_unique")
+    match_priority = {
+        str(row.get("fixture") or ""): row.get("match_priority")
+        for row in match_rows if isinstance(row, dict) and isinstance(row.get("match_priority"), dict)
+    }
+    expected_match_order = sorted(
+        match_fixtures,
+        key=lambda fixture: _priority_match_sort_key(fixture, match_priority.get(fixture) or {}),
+    )
+    if match_fixtures != expected_match_order:
+        issues.append("priority_board_match_order_invalid")
+    for tier, rows in expression_groups.items():
+        if not isinstance(rows, list):
+            issues.append(f"priority_board_{tier}_ranking_invalid")
+            continue
+        fixtures = [str(row.get("fixture") or "") for row in rows if isinstance(row, dict)]
+        if [row.get("rank") for row in rows if isinstance(row, dict)] != list(range(1, len(rows) + 1)):
+            issues.append(f"priority_board_{tier}_ranks_not_contiguous")
+        if any(not fixture for fixture in fixtures) or len(fixtures) != len(set(fixtures)):
+            issues.append(f"priority_board_{tier}_fixtures_not_unique")
+        if any(fixture not in set(match_fixtures) for fixture in fixtures):
+            issues.append(f"priority_board_{tier}_fixture_missing_match_rank")
+        expected_fixtures = sorted(
+            fixtures,
+            key=lambda fixture: _priority_combined_sort_key(
+                fixture, match_priority.get(fixture) or {},
+                next((row.get("expression_priority") or {} for row in rows if isinstance(row, dict) and str(row.get("fixture") or "") == fixture), {}),
+            ),
+        )
+        if fixtures != expected_fixtures:
+            issues.append(f"priority_board_{tier}_order_invalid")
+    if any(row.get("current_unpersisted_quote_used") is True for row in (board.get("evidence_bindings") or []) if isinstance(row, dict)):
+        issues.append("priority_board_unpersisted_quote_binding_forbidden")
+    return {"status": "passed" if not issues else "failed", "hash_valid": hash_valid, "issues": issues}
+
+
+def _learning_priority_candidate(decision: Dict[str, Any]) -> Dict[str, Any]:
+    tiers = decision.get("recommendation_tiers") if isinstance(decision.get("recommendation_tiers"), dict) else {}
+    for candidate in (
+        decision.get("selected_expression"), decision.get("best_market"),
+        tiers.get("first_choice_high_consistency"), tiers.get("second_choice_higher_return"),
+    ):
+        if isinstance(candidate, dict):
+            return candidate
+    return {}
+
+
+def _learning_freeze_priority_row(freeze: Dict[str, Any]) -> Dict[str, Any]:
+    fixture = str(freeze.get("fixture") or "")
+    analysis = freeze.get("analysis") if isinstance(freeze.get("analysis"), dict) else {}
+    decision = freeze.get("decision") if isinstance(freeze.get("decision"), dict) else {}
+    candidate = _learning_priority_candidate(decision)
+    chain_audit = decision.get("fundamental_chain_audit") if isinstance(decision.get("fundamental_chain_audit"), dict) else {}
+    if not chain_audit:
+        fundamental = analysis.get("fundamental_chain") if isinstance(analysis.get("fundamental_chain"), dict) else {}
+        chain_audit = audit_fundamental_chain(fundamental, now_ts=int(freeze.get("data_cutoff_at") or freeze.get("captured_at") or time.time()))
+    synthetic = {
+        "fixture": fixture,
+        "evaluation": {
+            "fundamental_chain_audit": chain_audit,
+            "decision_layer": {
+                **decision,
+                "recommendation_tiers": {"first_choice_high_consistency": candidate},
+            },
+        },
+    }
+    vector = _portfolio_prematch_priority(synthetic, "first_choice_high_consistency")
+    sort_key = vector.pop("sort_key")
+    execution_action = decision.get("execution_action") or decision.get("decision")
+    return {
+        "fixture": fixture,
+        "freeze_id": freeze.get("freeze_id"),
+        "freeze_hash": freeze.get("content_hash"),
+        "captured_at": freeze.get("captured_at"),
+        "kickoff_at": freeze.get("kickoff_at"),
+        "analysis_node": analysis.get("analysis_node"),
+        "match_rating": _learning_frozen_rating(decision, "match_rating"),
+        "execution_action": execution_action,
+        "participation_eligible": execution_action == "BET" and bool(candidate),
+        "market": candidate.get("market"), "selection": candidate.get("selection"),
+        "line": candidate.get("line"), "price": candidate.get("price"),
+        "priority_basis": vector,
+        "sort_key": sort_key,
+    }
+
+
+def build_learning_priority_board(board_id: str, freezes: List[Dict[str, Any]], created_at: int) -> Dict[str, Any]:
+    """Freeze one cross-match board from PIT learning samples; realised outcomes are unavailable by contract."""
+    latest_by_fixture: Dict[str, Dict[str, Any]] = {}
+    for freeze in freezes:
+        if not isinstance(freeze, dict):
+            continue
+        fixture = str(freeze.get("fixture") or "").strip()
+        captured_at = int(freeze.get("captured_at") or freeze.get("data_cutoff_at") or 0)
+        kickoff_at = int(freeze.get("kickoff_at") or 0)
+        if not fixture or captured_at > int(created_at) or kickoff_at <= int(created_at):
+            continue
+        existing = latest_by_fixture.get(fixture)
+        if not existing or captured_at > int(existing.get("captured_at") or existing.get("data_cutoff_at") or 0):
+            latest_by_fixture[fixture] = freeze
+    priority_rows = [_learning_freeze_priority_row(freeze) for freeze in latest_by_fixture.values()]
+    participating_rows = [row for row in priority_rows if row.get("participation_eligible") is True]
+    non_participating_rows = [row for row in priority_rows if row.get("participation_eligible") is not True]
+
+    def match_key(row: Dict[str, Any]) -> tuple:
+        match = get_nested(row, ["priority_basis", "match_priority"], {}) or {}
+        eligible = match.get("fundamental_decision_eligible") is True
+        completeness = as_float(match.get("fundamental_completeness"))
+        confidence = as_float(match.get("lineup_confidence"))
+        return (-int(eligible), -(completeness if completeness is not None else -1.0), -(confidence if confidence is not None else -1.0), row["fixture"])
+
+    match_rows = sorted(participating_rows, key=match_key)
+    expression_rows = sorted(participating_rows, key=lambda row: row["sort_key"])
+    match_ranking = [
+        {
+            "rank": index, "role": "core_top_three" if index <= 3 else "optional_extension",
+            **{key: row.get(key) for key in ("fixture", "freeze_id", "freeze_hash", "captured_at", "kickoff_at", "analysis_node", "match_rating", "execution_action")},
+            "match_priority": get_nested(row, ["priority_basis", "match_priority"], {}),
+        }
+        for index, row in enumerate(match_rows, start=1)
+    ]
+    expression_ranking = [
+        {
+            "rank": index,
+            **{key: row.get(key) for key in ("fixture", "freeze_id", "freeze_hash", "market", "selection", "line", "price")},
+            "expression_priority": get_nested(row, ["priority_basis", "expression_priority"], {}),
+        }
+        for index, row in enumerate(expression_rows, start=1)
+    ]
+    non_participating = [
+        {
+            **{key: row.get(key) for key in ("fixture", "freeze_id", "freeze_hash", "captured_at", "kickoff_at", "analysis_node", "match_rating", "execution_action")},
+            "reason": "execution_action_not_bet" if row.get("execution_action") != "BET" else "actionable_expression_missing",
+        }
+        for row in sorted(non_participating_rows, key=lambda row: row.get("fixture") or "")
+    ]
+    immutable_content = {
+        "schema": "learning_prematch_priority_board_v1",
+        "board_id": board_id,
+        "created_at": int(created_at),
+        "match_priority_ranking": match_ranking,
+        "expression_priority_ranking": expression_ranking,
+        "non_participating_records": non_participating,
+        "comparison_policy": {
+            "match_order": ["fundamental eligibility", "fundamental completeness", "lineup confidence"],
+            "expression_order": ["script coverage", "market acceptance", "edge", "EV"],
+            "core_priority_count": min(3, len(match_ranking)),
+        },
+        "outcome_fields_used": False,
+        "result_backfit_allowed": False,
+    }
+    return {**immutable_content, "board_hash": _content_hash(immutable_content), "immutable": True}
+
+
+def audit_learning_priority_board(board: Any) -> Dict[str, Any]:
+    if not isinstance(board, dict):
+        return {"status": "failed", "hash_valid": False, "issues": ["learning_priority_board_missing"]}
+    expected = str(board.get("board_hash") or "")
+    content = {key: value for key, value in board.items() if key not in {"board_hash", "immutable", "action"}}
+    issues = []
+    hash_valid = bool(expected and hmac.compare_digest(expected, _content_hash(content)))
+    if board.get("schema") != "learning_prematch_priority_board_v1":
+        issues.append("learning_priority_board_schema_invalid")
+    if not hash_valid:
+        issues.append("learning_priority_board_hash_invalid")
+    if board.get("outcome_fields_used") is not False or board.get("result_backfit_allowed") is not False:
+        issues.append("learning_priority_board_outcome_isolation_invalid")
+    board_id = str(board.get("board_id") or "")
+    if not board_id or len(board_id) > 100 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in board_id):
+        issues.append("learning_priority_board_id_invalid")
+    match_rows = board.get("match_priority_ranking")
+    expression_rows = board.get("expression_priority_ranking")
+    non_participating = board.get("non_participating_records")
+    if not isinstance(match_rows, list):
+        issues.append("learning_priority_match_ranking_invalid")
+        match_rows = []
+    if not isinstance(expression_rows, list):
+        issues.append("learning_priority_expression_ranking_invalid")
+        expression_rows = []
+    if not isinstance(non_participating, list):
+        issues.append("learning_priority_non_participating_invalid")
+        non_participating = []
+    if [row.get("rank") for row in match_rows if isinstance(row, dict)] != list(range(1, len(match_rows) + 1)):
+        issues.append("learning_priority_match_ranks_not_contiguous")
+    if [row.get("rank") for row in expression_rows if isinstance(row, dict)] != list(range(1, len(expression_rows) + 1)):
+        issues.append("learning_priority_expression_ranks_not_contiguous")
+    match_keys = [
+        (str(row.get("fixture") or ""), str(row.get("freeze_id") or ""), str(row.get("freeze_hash") or ""))
+        for row in match_rows if isinstance(row, dict)
+    ]
+    expression_keys = [
+        (str(row.get("fixture") or ""), str(row.get("freeze_id") or ""), str(row.get("freeze_hash") or ""))
+        for row in expression_rows if isinstance(row, dict)
+    ]
+    non_participating_keys = [
+        (str(row.get("fixture") or ""), str(row.get("freeze_id") or ""), str(row.get("freeze_hash") or ""))
+        for row in non_participating if isinstance(row, dict)
+    ]
+    if any(not all(key) for key in match_keys + expression_keys + non_participating_keys):
+        issues.append("learning_priority_freeze_binding_incomplete")
+    if len(match_keys) != len(set(match_keys)) or len(expression_keys) != len(set(expression_keys)) or len(non_participating_keys) != len(set(non_participating_keys)):
+        issues.append("learning_priority_freeze_binding_not_unique")
+    if set(match_keys) != set(expression_keys):
+        issues.append("learning_priority_match_expression_membership_mismatch")
+    if set(match_keys) & set(non_participating_keys):
+        issues.append("learning_priority_participation_sets_overlap")
+    all_fixture_ids = [key[0] for key in match_keys + non_participating_keys]
+    if len(all_fixture_ids) != len(set(all_fixture_ids)):
+        issues.append("learning_priority_fixture_not_unique_across_participation_sets")
+    core_count = get_nested(board, ["comparison_policy", "core_priority_count"])
+    if core_count != min(3, len(match_rows)):
+        issues.append("learning_priority_core_count_invalid")
+    for index, row in enumerate(match_rows, start=1):
+        if not isinstance(row, dict):
+            issues.append("learning_priority_match_row_invalid")
+            continue
+        expected_role = "core_top_three" if index <= 3 else "optional_extension"
+        if row.get("role") != expected_role:
+            issues.append("learning_priority_match_role_invalid")
+        if row.get("execution_action") != "BET":
+            issues.append("learning_priority_non_bet_ranked")
+        captured_at = int(row.get("captured_at") or 0)
+        kickoff_at = int(row.get("kickoff_at") or 0)
+        if captured_at <= 0 or kickoff_at <= captured_at or int(board.get("created_at") or 0) >= kickoff_at:
+            issues.append("learning_priority_prematch_timing_invalid")
+    for row in non_participating:
+        if not isinstance(row, dict):
+            issues.append("learning_priority_non_participating_row_invalid")
+            continue
+        action = row.get("execution_action")
+        reason = row.get("reason")
+        if (action == "BET" and reason != "actionable_expression_missing") or (action != "BET" and reason != "execution_action_not_bet"):
+            issues.append("learning_priority_non_participating_reason_invalid")
+        captured_at = int(row.get("captured_at") or 0)
+        kickoff_at = int(row.get("kickoff_at") or 0)
+        if captured_at <= 0 or kickoff_at <= captured_at or int(board.get("created_at") or 0) >= kickoff_at:
+            issues.append("learning_priority_prematch_timing_invalid")
+    match_priority_by_key = {
+        key: row.get("match_priority") or {}
+        for key, row in zip(match_keys, match_rows) if isinstance(row, dict)
+    }
+    expression_priority_by_key = {
+        key: row.get("expression_priority") or {}
+        for key, row in zip(expression_keys, expression_rows) if isinstance(row, dict)
+    }
+    expected_match_keys = sorted(match_keys, key=lambda key: _priority_match_sort_key(key[0], match_priority_by_key.get(key) or {}))
+    if match_keys != expected_match_keys:
+        issues.append("learning_priority_match_order_invalid")
+    expected_expression_keys = sorted(
+        expression_keys,
+        key=lambda key: _priority_combined_sort_key(
+            key[0], match_priority_by_key.get(key) or {}, expression_priority_by_key.get(key) or {},
+        ),
+    )
+    if expression_keys != expected_expression_keys:
+        issues.append("learning_priority_expression_order_invalid")
+    return {"status": "passed" if not issues else "failed", "hash_valid": hash_valid, "issues": list(dict.fromkeys(issues))}
+
+
+def persist_learning_priority_board(board: Dict[str, Any]) -> Dict[str, Any]:
+    audit = audit_learning_priority_board(board)
+    if audit.get("status") != "passed":
+        raise HTTPException(status_code=422, detail={"error": "learning_priority_board_invalid", "audit": audit})
+    board_id = str(board.get("board_id") or "").strip()
+    if not board_id:
+        raise HTTPException(status_code=400, detail="learning_priority_board_id_required")
+    with SNAPSHOT_STORE_LOCK:
+        store = load_snapshot_store()
+        boards = store.setdefault("learning_priority_boards", {})
+        existing = boards.get(board_id)
+        if existing:
+            if existing.get("board_hash") == board.get("board_hash"):
+                return {**existing, "action": "unchanged"}
+            raise HTTPException(status_code=409, detail="learning_priority_board_id_already_recorded")
+        boards[board_id] = board
+        store["version"] = VERSION
+        write_snapshot_store(store)
+        return {**board, "action": "frozen"}
+
+
+def _learning_priority_context(store: Dict[str, Any], freeze: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    fixture = str(freeze.get("fixture") or "")
+    freeze_id = str(freeze.get("freeze_id") or "")
+    candidates = []
+    for board in (store.get("learning_priority_boards") or {}).values():
+        if audit_learning_priority_board(board).get("status") != "passed":
+            continue
+        row = next((item for item in board.get("match_priority_ranking") or [] if str(item.get("fixture") or "") == fixture and str(item.get("freeze_id") or "") == freeze_id), None)
+        if row:
+            candidates.append({"board": board, "row": row})
+    if not candidates:
+        return None
+    selected = max(candidates, key=lambda item: int(item["board"].get("created_at") or 0))
+    return {
+        "board_id": selected["board"].get("board_id"),
+        "board_hash": selected["board"].get("board_hash"),
+        "rank": selected["row"].get("rank"),
+        "role": selected["row"].get("role"),
+        "core_priority_count": get_nested(selected, ["board", "comparison_policy", "core_priority_count"]),
+    }
+
+
+def learning_priority_board_report(board_id: Optional[str] = None, limit: int = 20) -> Dict[str, Any]:
+    """Return bounded, hash-audited priority boards from the local immutable store."""
+    try:
+        parsed_limit = int(limit)
+    except (TypeError, ValueError):
+        parsed_limit = 0
+    if isinstance(limit, bool) or not 1 <= parsed_limit <= 50:
+        raise HTTPException(status_code=400, detail="limit_must_be_between_1_and_50")
+    board_id = str(board_id or "").strip() or None
+    if board_id and (len(board_id) > 100 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in board_id)):
+        raise HTTPException(status_code=400, detail="priority_board_id_must_use_1_to_100_safe_characters")
+    boards = load_snapshot_store().get("learning_priority_boards") or {}
+    if board_id:
+        board = boards.get(board_id)
+        if not isinstance(board, dict):
+            raise HTTPException(status_code=404, detail="learning_priority_board_not_found")
+        return {
+            "version": VERSION, "board_id": board_id, "board": board,
+            "audit": audit_learning_priority_board(board),
+            "outcome_fields_used": False, "result_backfit_allowed": False,
+        }
+    rows = sorted(
+        (row for row in boards.values() if isinstance(row, dict)),
+        key=lambda row: (int(row.get("created_at") or 0), str(row.get("board_id") or "")),
+        reverse=True,
+    )
+    selected = rows[:parsed_limit]
+    return {
+        "version": VERSION, "count": len(rows), "returned_count": len(selected),
+        "boards": [{**row, "audit": audit_learning_priority_board(row)} for row in selected],
+        "truncated": len(rows) > len(selected),
+        "outcome_fields_used": False, "result_backfit_allowed": False,
+    }
+
+
+def save_portfolio_run(portfolio_id: str, fixtures: List[str], portfolio: Dict[str, Any], max_legs: int, trigger_reasons: List[str], stage: str = "manual", change_drivers: Optional[List[Dict[str, Any]]] = None, priority_evidence: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     with SNAPSHOT_STORE_LOCK:
         store = load_snapshot_store()
         runs = store.setdefault("portfolio_runs", {}).setdefault(portfolio_id, [])
@@ -5172,8 +5733,16 @@ def save_portfolio_run(portfolio_id: str, fixtures: List[str], portfolio: Dict[s
         previous_signature = (runs[-1].get("recommendation") if runs else None)
         transition = _portfolio_transition(previous_signature, signature)
         next_version = max((int(run.get("version_number") or 0) for run in runs), default=0) + 1
+        created_at = int(time.time())
+        priority_board = build_portfolio_priority_board(portfolio, priority_evidence, stage, created_at)
+        priority_board_audit = audit_portfolio_priority_board(priority_board)
+        if priority_board_audit.get("status") != "passed":
+            raise HTTPException(status_code=422, detail={
+                "error": "portfolio_priority_board_invalid",
+                "audit": priority_board_audit,
+            })
         record = {
-            "version_number": next_version, "created_at": int(time.time()), "portfolio_id": portfolio_id,
+            "version_number": next_version, "created_at": created_at, "portfolio_id": portfolio_id,
             "fixtures": fixtures, "risk_preference": portfolio.get("risk_preference"), "max_legs": max_legs,
             "stage": stage,
             "trigger_reasons": trigger_reasons or ["portfolio_evaluation"],
@@ -5182,6 +5751,8 @@ def save_portfolio_run(portfolio_id: str, fixtures: List[str], portfolio: Dict[s
             "transition": transition,
             "change_drivers": change_drivers or [],
             "portfolio_decision": portfolio.get("portfolio_decision"),
+            "priority_board": priority_board,
+            "priority_board_audit": priority_board_audit,
         }
         runs.append(record)
         store["portfolio_runs"][portfolio_id] = runs[-PORTFOLIO_RUN_RETENTION:]
@@ -5191,7 +5762,10 @@ def save_portfolio_run(portfolio_id: str, fixtures: List[str], portfolio: Dict[s
 
 
 def get_portfolio_runs(portfolio_id: str) -> List[Dict[str, Any]]:
-    return list(load_snapshot_store().get("portfolio_runs", {}).get(portfolio_id, []))
+    rows = copy.deepcopy(load_snapshot_store().get("portfolio_runs", {}).get(portfolio_id, []))
+    for row in rows:
+        row["priority_board_audit"] = audit_portfolio_priority_board(row.get("priority_board"))
+    return rows
 
 
 def portfolio_run_timeline(runs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -5216,10 +5790,17 @@ def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6, ri
     valid_rows = [row for row in evaluation_rows if row.get("fixture") and isinstance(row.get("evaluation"), dict)]
     high_variance = []
     for row in valid_rows:
+        execution_action = get_nested(row, ["evaluation", "decision_layer", "execution_action"])
+        if execution_action is not None and execution_action != "BET":
+            continue
         candidate = get_nested(row, ["evaluation", "decision_layer", "recommendation_tiers", "high_variance_single"])
         if candidate:
-            high_variance.append({"fixture": row["fixture"], **candidate})
-    high_variance.sort(key=lambda row: (row.get("ev", -999), row.get("edge", -999)), reverse=True)
+            priority = _portfolio_prematch_priority(row, "high_variance_single")
+            sort_key = priority.pop("sort_key")
+            high_variance.append({"fixture": row["fixture"], **candidate, "priority_basis": priority, "_sort_key": sort_key})
+    high_variance.sort(key=lambda row: row["_sort_key"])
+    for row in high_variance:
+        row.pop("_sort_key", None)
     first = _combination_from_rows(valid_rows, "first_choice_high_consistency", max_legs, risk_preference=risk_preference)
     second = _combination_from_rows(valid_rows, "second_choice_higher_return", max_legs, allow_fallback=True, risk_preference=risk_preference)
     risk_adjusted = _risk_adjusted_combination(first, second, risk_preference)
@@ -5235,7 +5816,7 @@ def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6, ri
 
 @app.get("/")
 def root():
-    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/store-health", "/shadow/store-recovery-preview", "/shadow/store-recover", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}", "/shadow/market-language/freeze", "/shadow/market-language/collect-facts", "/shadow/market-language/settlement-plan", "/shadow/market-language/settle", "/shadow/market-language/status", "/shadow/learning/registry", "/shadow/learning/node-plan", "/shadow/learning/node-run", "/shadow/learning/data-health", "/shadow/learning/postmatch-recovery", "/shadow/learning/collect-facts", "/shadow/learning/cycle-plan", "/shadow/learning/run", "/shadow/learning/review-queue", "/shadow/learning/review-draft", "/shadow/learning/complete-review", "/shadow/learning/quality-cards/refresh", "/shadow/learning/quality-calibration", "/shadow/learning/research-proposals", "/shadow/learning/research-proposals/refresh", "/shadow/learning/validation-queue", "/shadow/learning/freeze", "/shadow/learning/settle", "/shadow/learning/hypotheses", "/shadow/learning/hypotheses/{id}/shadow-lock", "/shadow/learning/hypotheses/{id}/promotion-evidence", "/shadow/learning/league-dna", "/shadow/learning/league-dna/{tag_id}/activation-candidate", "/shadow/learning/league-dna/{tag_id}/confirm", "/shadow/learning/selection-quality", "/shadow/learning/status"]}
+    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/store-health", "/shadow/store-recovery-preview", "/shadow/store-recover", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}", "/shadow/market-language/freeze", "/shadow/market-language/collect-facts", "/shadow/market-language/settlement-plan", "/shadow/market-language/settle", "/shadow/market-language/status", "/shadow/learning/registry", "/shadow/learning/activation-plan", "/shadow/learning/node-plan", "/shadow/learning/node-run", "/shadow/learning/priority-boards", "/shadow/learning/data-health", "/shadow/learning/postmatch-recovery", "/shadow/learning/collect-facts", "/shadow/learning/cycle-plan", "/shadow/learning/run", "/shadow/learning/review-queue", "/shadow/learning/review-draft", "/shadow/learning/complete-review", "/shadow/learning/quality-cards/refresh", "/shadow/learning/quality-calibration", "/shadow/learning/research-proposals", "/shadow/learning/research-proposals/refresh", "/shadow/learning/validation-queue", "/shadow/learning/freeze", "/shadow/learning/settle", "/shadow/learning/hypotheses", "/shadow/learning/hypotheses/{id}/shadow-lock", "/shadow/learning/hypotheses/{id}/promotion-evidence", "/shadow/learning/league-dna", "/shadow/learning/league-dna/{tag_id}/activation-candidate", "/shadow/learning/league-dna/{tag_id}/confirm", "/shadow/learning/selection-quality", "/shadow/learning/status"]}
 
 
 @app.get("/health")
@@ -6687,6 +7268,32 @@ def run_learning_node_executor(
                 "reason": "prematch_node_packet_build_failed", "error_type": type(exc).__name__,
                 "execution_key": execution_key, "attempt_count": claim.get("attempt_count"),
             })
+    node_priority_board = {
+        "schema": "learning_prematch_priority_board_v1", "action": "skipped",
+        "reason": "no_learning_node_advanced", "outcome_fields_used": False,
+        "result_backfit_allowed": False,
+    }
+    if apply_changes and any(row.get("action") in {"frozen", "unchanged"} for row in results):
+        priority_store = load_snapshot_store()
+        active_freezes = []
+        active_fixture_ids = set((priority_store.get("learning_admissions") or {})) | set((priority_store.get("learning_frozen") or {}))
+        for fixture in active_fixture_ids:
+            admission = (priority_store.get("learning_admissions") or {}).get(str(fixture)) or {}
+            latest = max(
+                (row for row in ((priority_store.get("learning_frozen") or {}).get(str(fixture)) or []) if isinstance(row, dict)),
+                key=lambda row: int(row.get("version_number") or 0), default=None,
+            )
+            kickoff_at = int(admission.get("kickoff_at") or (latest or {}).get("kickoff_at") or 0)
+            if latest and kickoff_at > now_ts:
+                active_freezes.append(latest)
+        board_identity = [
+            {"fixture": row.get("fixture"), "freeze_id": row.get("freeze_id"), "freeze_hash": row.get("content_hash")}
+            for row in sorted(active_freezes, key=lambda row: str(row.get("fixture") or ""))
+        ]
+        board_id = f"node-{now_ts}-{_content_hash(board_identity)[:16]}"
+        candidate_board = build_learning_priority_board(board_id, active_freezes, now_ts)
+        if candidate_board.get("match_priority_ranking") or candidate_board.get("non_participating_records"):
+            node_priority_board = persist_learning_priority_board(candidate_board)
     return {
         "version": VERSION,
         "generated_at": now_ts,
@@ -6696,6 +7303,7 @@ def run_learning_node_executor(
         "unchanged_count": sum(row.get("action") == "unchanged" for row in results),
         "lease_skipped_count": sum(row.get("action") == "skipped" for row in results),
         "rejected_count": sum(row.get("action") == "rejected" for row in results),
+        "learning_priority_board": node_priority_board,
         "discovery_performed": False,
         "postmatch_learning_performed": False,
         "automatic_champion_change": False,
@@ -6804,12 +7412,28 @@ def automatic_learning_data_health(
         row.get("status") == "running" and int(row.get("lease_expires_at") or 0) <= now_ts
         and row.get("execution_key") in active_execution_keys for row in attempt_rows
     )
+    priority_boards = [row for row in (store.get("learning_priority_boards") or {}).values() if isinstance(row, dict)]
+    invalid_priority_board_count = sum(
+        audit_learning_priority_board(board).get("status") != "passed" for board in priority_boards
+    )
+    unranked_active_freeze_count = 0
+    for fixture, admission in admissions.items():
+        if not isinstance(admission, dict) or int(admission.get("kickoff_at") or 0) <= now_ts:
+            continue
+        latest = max(
+            (row for row in (frozen.get(str(fixture)) or []) if isinstance(row, dict)),
+            key=lambda row: int(row.get("version_number") or 0), default=None,
+        )
+        latest_decision = (latest or {}).get("decision") if isinstance((latest or {}).get("decision"), dict) else {}
+        execution_action = latest_decision.get("execution_action") or latest_decision.get("decision")
+        if latest and execution_action == "BET" and _learning_priority_context(store, latest) is None:
+            unranked_active_freeze_count += 1
     observation_plan = market_language_settlement_plan(now_ts=now_ts, store_override=store)
     observation_due_count = observation_plan["due_count"]
     postmatch_recovery = learning_postmatch_recovery_queue(now_ts=now_ts, store_override=store)
     postmatch_overdue_count = postmatch_recovery["manual_recovery_required_count"]
-    critical = expired_unfrozen_count > 0
-    warning = overdue_node_count > 0 or postmatch_overdue_count > 0 or unresolved_failed_attempt_count > 0 or stale_lease_count > 0
+    critical = expired_unfrozen_count > 0 or invalid_priority_board_count > 0
+    warning = overdue_node_count > 0 or postmatch_overdue_count > 0 or unresolved_failed_attempt_count > 0 or stale_lease_count > 0 or unranked_active_freeze_count > 0
     return {
         "version": VERSION, "generated_at": now_ts,
         "status": "critical" if critical else ("warning" if warning else "healthy"),
@@ -6828,6 +7452,9 @@ def automatic_learning_data_health(
         "node_attempt_status_counts": attempt_status_counts,
         "unresolved_failed_node_attempt_count": unresolved_failed_attempt_count,
         "stale_node_lease_count": stale_lease_count,
+        "learning_priority_board_count": len(priority_boards),
+        "invalid_learning_priority_board_count": invalid_priority_board_count,
+        "unranked_active_freeze_count": unranked_active_freeze_count,
         "market_language_settlement_due_count": observation_due_count,
         "market_language_settlement_ready_count": observation_plan["settlement_ready_count"],
         "records": records[:100], "records_truncated": len(records) > 100,
@@ -7843,6 +8470,17 @@ def complete_automatic_learning_postmatch_review(freeze_id: Any, now_ts: Optiona
     freeze_id = str(freeze_id or "").strip()
     now_ts = int(now_ts or time.time())
     store = load_snapshot_store()
+    invalid_priority_board_ids = sorted(
+        str(board_id) for board_id, board in (store.get("learning_priority_boards") or {}).items()
+        if audit_learning_priority_board(board).get("status") != "passed"
+    )
+    if invalid_priority_board_ids:
+        raise HTTPException(status_code=409, detail={
+            "error": "learning_priority_board_integrity_invalid",
+            "board_ids": invalid_priority_board_ids[:20],
+            "board_ids_truncated": len(invalid_priority_board_ids) > 20,
+            "automatic_review_allowed": False,
+        })
     freeze = _learning_freeze_by_id(store, freeze_id)
     facts = max(
         ((store.get("learning_postmatch_facts") or {}).get(freeze_id) or []),
@@ -7864,12 +8502,31 @@ def complete_automatic_learning_postmatch_review(freeze_id: Any, now_ts: Optiona
     is_pass = str(frozen_decision.get("decision") or "").upper() == "PASS"
     frozen_match_rating = _learning_frozen_rating(frozen_decision, "match_rating")
     rating_at_least_b = _learning_match_rating_at_least_b(frozen_match_rating)
+    priority_context = _learning_priority_context(store, freeze)
+    priority_board_required = version_at_least(get_nested(freeze, ["versions", "service"]), (2, 19, 8))
+    priority_rank = int((priority_context or {}).get("rank") or 0)
+    priority_core_count = int((priority_context or {}).get("core_priority_count") or 0)
     if is_pass and bool(frozen_decision.get("pass_reasons")):
         match_status = "passed"
         match_reason = "The frozen safe PASS has explicit reasons and is auditable without consulting the final score."
+    elif priority_context and decision_contract.get("decision_eligible") is True and rating_at_least_b is True and 0 < priority_rank <= priority_core_count:
+        match_status = "passed"
+        match_reason = "The actionable match was frozen inside the preregistered core priority set using prematch-only fundamentals-first ordering."
+    elif priority_context and decision_contract.get("decision_eligible") is True and priority_rank > priority_core_count:
+        match_status = "failed"
+        match_reason = "The actionable match was outside the frozen core priority set; settlement was not consulted."
+    elif priority_context and decision_contract.get("decision_eligible") is True and rating_at_least_b is False:
+        match_status = "failed"
+        match_reason = "The actionable match was below the preregistered B threshold on the frozen priority board."
+    elif priority_context and decision_contract.get("decision_eligible") is True:
+        match_status = "data_missing"
+        match_reason = "The frozen priority board is valid, but the actionable match has no parseable frozen B-or-better rating."
+    elif priority_board_required and decision_contract.get("decision_eligible") is True:
+        match_status = "data_missing"
+        match_reason = "This v2.19.8-or-later actionable freeze has no valid prematch priority-board binding; legacy rating fallback is forbidden."
     elif decision_contract.get("decision_eligible") is True and rating_at_least_b is True:
         match_status = "passed"
-        match_reason = "The actionable decision satisfied the frozen contract and the preregistered B-or-better match threshold."
+        match_reason = "The actionable decision satisfied the frozen B-or-better threshold; no cycle priority board exists for this legacy or manual freeze."
     elif decision_contract.get("decision_eligible") is True and rating_at_least_b is False:
         match_status = "failed"
         match_reason = "The actionable decision was taken below the preregistered B match threshold."
@@ -7931,8 +8588,15 @@ def complete_automatic_learning_postmatch_review(freeze_id: Any, now_ts: Optiona
             "reason": match_reason,
             "frozen_match_rating": frozen_match_rating,
             "required_minimum_rating": "B",
+            "priority_board_id": (priority_context or {}).get("board_id"),
+            "priority_board_hash": (priority_context or {}).get("board_hash"),
+            "frozen_priority_rank": (priority_context or {}).get("rank"),
+            "frozen_priority_role": (priority_context or {}).get("role"),
+            "core_priority_count": (priority_context or {}).get("core_priority_count"),
+            "priority_board_used": priority_context is not None,
+            "priority_board_required": priority_board_required,
             "rating_derived_from_result": False,
-            "evidence_refs": [freeze_ref] if match_status in {"passed", "failed"} else [],
+            "evidence_refs": [freeze_ref, f"priority-board:{priority_context.get('board_hash')}"] if priority_context and match_status in {"passed", "failed"} else ([freeze_ref] if match_status in {"passed", "failed"} else []),
         },
         "state_tree_coverage": {
             "status": state_status, "reason": state_reason,
@@ -8363,6 +9027,7 @@ def run_learning_cycle(
                 "status_code": exc.status_code, "reason": exc.detail,
             })
     freeze_results = []
+    priority_freezes = []
     builder = prematch_packet_builder or build_shadow_ai_packet
     for candidate in prematch_plan.get("discovery", {}).get("candidates") or []:
         fixture = str(candidate.get("fixture_id") or "")
@@ -8386,6 +9051,7 @@ def run_learning_cycle(
         try:
             freeze_payload = build_learning_freeze_payload(candidate, packet, now_ts=now_ts)
             if not apply_changes:
+                priority_freezes.append(freeze_payload)
                 freeze_results.append({
                     "fixture": fixture, "action": "would_reanalyze" if candidate.get("already_frozen") else "would_freeze",
                     "analysis_node": get_nested(freeze_payload, ["analysis", "analysis_node"]),
@@ -8396,6 +9062,7 @@ def run_learning_cycle(
                 })
                 continue
             record = freeze_learning_sample(freeze_payload, now_ts=now_ts)
+            priority_freezes.append(record)
             freeze_results.append({
                 "fixture": fixture, "freeze_id": record.get("freeze_id"), "action": record.get("action"),
                 "analysis_node": get_nested(record, ["analysis", "analysis_node"]),
@@ -8407,6 +9074,41 @@ def run_learning_cycle(
             })
         except HTTPException as exc:
             freeze_results.append({"fixture": fixture, "action": "rejected", "status_code": exc.status_code, "reason": exc.detail})
+    candidate_fixtures = {
+        str(row.get("fixture_id") or "")
+        for row in (prematch_plan.get("discovery", {}).get("candidates") or [])
+        if str(row.get("fixture_id") or "")
+    }
+    priority_store = load_snapshot_store()
+    for fixture in sorted(candidate_fixtures):
+        latest = max(
+            (row for row in ((priority_store.get("learning_frozen") or {}).get(fixture) or []) if isinstance(row, dict)),
+            key=lambda row: int(row.get("version_number") or 0), default=None,
+        )
+        if latest:
+            priority_freezes.append(latest)
+    priority_board_id = supplied_run_id or f"preview-{now_ts}"
+    learning_priority_board = build_learning_priority_board(priority_board_id, priority_freezes, now_ts)
+    existing_priority_board = (priority_store.get("learning_priority_boards") or {}).get(priority_board_id) if apply_changes else None
+    if isinstance(existing_priority_board, dict):
+        existing_priority_audit = audit_learning_priority_board(existing_priority_board)
+        if existing_priority_audit.get("status") != "passed":
+            raise HTTPException(status_code=409, detail="existing_learning_priority_board_integrity_invalid")
+        learning_priority_board_result = {**existing_priority_board, "action": "unchanged"}
+    elif learning_priority_board.get("match_priority_ranking") or learning_priority_board.get("non_participating_records"):
+        if apply_changes:
+            learning_priority_board_result = persist_learning_priority_board(learning_priority_board)
+        else:
+            learning_priority_board_result = {**learning_priority_board, "action": "would_freeze"}
+    else:
+        learning_priority_board_result = {
+            "schema": "learning_prematch_priority_board_v1", "board_id": priority_board_id,
+            "created_at": now_ts, "action": "skipped", "reason": "no_active_prematch_learning_freezes",
+            "outcome_fields_used": False, "result_backfit_allowed": False,
+        }
+    learning_priority_board_contract = {
+        key: value for key, value in learning_priority_board_result.items() if key != "action"
+    }
     if auto_prepare or not apply_changes:
         observation_routing = route_market_language_observations(
             prematch_plan.get("discovery") or {},
@@ -8476,6 +9178,7 @@ def run_learning_cycle(
         "hypothesis_registration_results": hypothesis_registration_results,
         "learning_admission_results": admission_results,
         "freeze_results": freeze_results,
+        "learning_priority_board": learning_priority_board_contract,
         "market_language_observation_results": observation_routing.get("results") or [],
         "shadow_lock_results": shadow_lock_results,
         "forward_validation_queue": forward_validation_queue,
@@ -8493,6 +9196,8 @@ def run_learning_cycle(
         "settled_count": sum(row.get("action") == "settled" for row in settlement_results + review_completion_results),
         "admitted_count": sum(row.get("action") == "admitted" for row in admission_results),
         "frozen_count": sum(row.get("action") == "frozen" for row in freeze_results),
+        "priority_board_frozen_count": int(learning_priority_board_result.get("action") == "frozen"),
+        "priority_board_action": learning_priority_board_result.get("action"),
         "market_language_observation_frozen_count": observation_routing.get("frozen_count", 0),
         "market_language_postmatch_fact_collected_count": sum(
             row.get("action") == "facts_collected" for row in observation_fact_results
@@ -11226,6 +11931,12 @@ def _learning_quality_card_candidate(freeze: Dict[str, Any], postmatch: Dict[str
             **priority_quality, "source_section": "match_selection_quality",
             "rating_available": match_rating is not None,
             "label_derived_before_outcome": outcome_independence_attested,
+            "priority_board_id": get_nested(review, ["match_selection_quality", "priority_board_id"]),
+            "priority_board_hash": get_nested(review, ["match_selection_quality", "priority_board_hash"]),
+            "frozen_priority_rank": get_nested(review, ["match_selection_quality", "frozen_priority_rank"]),
+            "frozen_priority_role": get_nested(review, ["match_selection_quality", "frozen_priority_role"]),
+            "core_priority_count": get_nested(review, ["match_selection_quality", "core_priority_count"]),
+            "priority_board_used": get_nested(review, ["match_selection_quality", "priority_board_used"]) is True,
         },
         "selection_quality": {
             **selection_quality, "source_sections": ["expression_audit", "price_execution_audit"],
@@ -11660,6 +12371,263 @@ def learning_research_proposal_report() -> Dict[str, Any]:
     }
 
 
+AUTOMATIC_LEARNING_GATE_DEFINITIONS = {
+    "api_football_configured": {
+        "category": "external_configuration", "owner": "operator",
+        "action": "configure_primary_fixture_provider",
+        "verification": "runtime readiness reports api_football_configured=true",
+        "depends_on": [], "requires_external_change": True, "requires_sensitive_value": True,
+    },
+    "api_football_authenticated": {
+        "category": "external_provider", "owner": "operator_and_provider",
+        "action": "complete_primary_provider_authentication_probe",
+        "verification": "startup probe reports authenticated=true",
+        "depends_on": ["api_football_configured"], "requires_external_change": True, "requires_sensitive_value": False,
+    },
+    "the_odds_api_configured": {
+        "category": "external_configuration", "owner": "operator",
+        "action": "configure_odds_timeline_provider",
+        "verification": "runtime readiness reports the_odds_api_configured=true",
+        "depends_on": [], "requires_external_change": True, "requires_sensitive_value": True,
+    },
+    "protected_api_configured": {
+        "category": "security_configuration", "owner": "operator",
+        "action": "configure_protected_shadow_access",
+        "verification": "runtime readiness reports protected_api_configured=true",
+        "depends_on": [], "requires_external_change": False, "requires_sensitive_value": True,
+    },
+    "persistent_store_configured": {
+        "category": "persistence_configuration", "owner": "operator",
+        "action": "mount_and_select_persistent_data_path",
+        "verification": "runtime readiness reports persistent_store_configured=true",
+        "depends_on": [], "requires_external_change": False, "requires_sensitive_value": False,
+    },
+    "persistent_store_operational": {
+        "category": "persistence_runtime", "owner": "runtime",
+        "action": "initialize_or_recover_primary_snapshot_store",
+        "verification": "store integrity reports operational=true",
+        "depends_on": ["persistent_store_configured"], "requires_external_change": False, "requires_sensitive_value": False,
+    },
+    "persistent_backup_ready": {
+        "category": "persistence_runtime", "owner": "runtime",
+        "action": "create_and_verify_snapshot_backup",
+        "verification": "store integrity reports recovery_ready=true",
+        "depends_on": ["persistent_store_operational"], "requires_external_change": False, "requires_sensitive_value": False,
+    },
+    "persistent_store_single_writer": {
+        "category": "deployment_configuration", "owner": "operator",
+        "action": "enforce_single_writer_process",
+        "verification": "runtime readiness reports persistent_store_single_writer=true",
+        "depends_on": [], "requires_external_change": False, "requires_sensitive_value": False,
+    },
+    "auto_snapshot_enabled": {
+        "category": "scheduler_configuration", "owner": "operator",
+        "action": "enable_automatic_snapshot_scheduler",
+        "verification": "runtime readiness reports auto_snapshot_enabled=true",
+        "depends_on": [], "requires_external_change": False, "requires_sensitive_value": False,
+    },
+    "auto_snapshot_worker_alive": {
+        "category": "scheduler_runtime", "owner": "runtime",
+        "action": "start_or_restart_snapshot_worker",
+        "verification": "runtime readiness reports auto_snapshot_worker_alive=true",
+        "depends_on": ["auto_snapshot_enabled", "persistent_store_operational"], "requires_external_change": False, "requires_sensitive_value": False,
+    },
+    "major_league_registry_configured": {
+        "category": "code_contract", "owner": "code",
+        "action": "restore_approved_major_league_registry",
+        "verification": "runtime readiness reports major_league_registry_configured=true",
+        "depends_on": [], "requires_external_change": False, "requires_sensitive_value": False,
+    },
+    "major_league_registry_versioned": {
+        "category": "code_contract", "owner": "code",
+        "action": "restore_versioned_registry_manifest",
+        "verification": "registry manifest has a version and content hash",
+        "depends_on": ["major_league_registry_configured"], "requires_external_change": False, "requires_sensitive_value": False,
+    },
+    "node_execution_recovery_configured": {
+        "category": "code_contract", "owner": "code",
+        "action": "restore_bounded_node_lease_and_retry_contract",
+        "verification": "runtime readiness reports node_execution_recovery_configured=true",
+        "depends_on": [], "requires_external_change": False, "requires_sensitive_value": False,
+    },
+    "daily_schedule_configured": {
+        "category": "code_contract", "owner": "code",
+        "action": "restore_daily_1430_schedule_contract",
+        "verification": "runtime readiness reports daily_schedule_configured=true",
+        "depends_on": [], "requires_external_change": False, "requires_sensitive_value": False,
+    },
+}
+AUTOMATIC_LEARNING_REQUIRED_GATES = tuple(AUTOMATIC_LEARNING_GATE_DEFINITIONS)
+
+
+def _automatic_learning_activation_plan_hash_content(plan: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: plan.get(key) for key in (
+            "schema", "version", "readiness_status", "activation_allowed", "gates", "blockers",
+            "external_change_required", "operator_action_required", "code_change_required",
+            "automatic_mutation_allowed",
+        )
+    }
+
+
+def audit_automatic_learning_activation_plan(plan: Any) -> Dict[str, Any]:
+    row = plan if isinstance(plan, dict) else {}
+    sensitive_names = {"api_key", "secret", "token", "password", "credential", "authorization", "cookie"}
+
+    def sensitive_paths(value: Any, path: str = "") -> List[str]:
+        found = []
+        if isinstance(value, dict):
+            for key, child in value.items():
+                key_text = str(key).lower()
+                child_path = f"{path}.{key}" if path else str(key)
+                if key_text in sensitive_names or any(key_text.endswith(f"_{name}") for name in sensitive_names):
+                    found.append(child_path)
+                found.extend(sensitive_paths(child, child_path))
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                found.extend(sensitive_paths(child, f"{path}[{index}]"))
+        return found
+
+    exposed_paths = sensitive_paths(row)
+    gates = row.get("gates") if isinstance(row.get("gates"), list) else []
+    observed_names = [str(gate.get("gate") or "") for gate in gates if isinstance(gate, dict)]
+    blockers = [str(value) for value in (row.get("blockers") or [])]
+    expected_blockers = [
+        str(gate.get("gate")) for gate in gates
+        if isinstance(gate, dict) and gate.get("passed") is not True
+    ]
+    semantic_issues = []
+    allowed_top_level = {
+        "schema", "version", "readiness_status", "activation_allowed", "gates", "blockers",
+        "external_change_required", "operator_action_required", "code_change_required",
+        "automatic_mutation_allowed", "plan_hash", "immutable", "audit", "policy",
+    }
+    unexpected_top_level = sorted(set(row) - allowed_top_level)
+    if unexpected_top_level:
+        semantic_issues.append("unexpected_top_level_fields:" + ",".join(unexpected_top_level))
+    if row.get("schema") != "automatic_learning_activation_plan_v1":
+        semantic_issues.append("schema_invalid")
+    if row.get("version") != VERSION:
+        semantic_issues.append("version_mismatch")
+    if row.get("immutable") is not True:
+        semantic_issues.append("immutable_marker_missing")
+    if exposed_paths:
+        semantic_issues.append("sensitive_fields_present")
+    if observed_names != list(AUTOMATIC_LEARNING_REQUIRED_GATES):
+        semantic_issues.append("required_gate_order_or_membership_invalid")
+    if blockers != expected_blockers:
+        semantic_issues.append("blocker_list_does_not_match_failed_gates")
+    for gate in gates:
+        if not isinstance(gate, dict):
+            semantic_issues.append("gate_record_must_be_an_object")
+            continue
+        allowed_gate_fields = {
+            "gate", "passed", "blocking", "category", "owner", "depends_on",
+            "requires_external_change", "requires_sensitive_value", "next_action", "verification",
+        }
+        unexpected_gate_fields = sorted(set(gate) - allowed_gate_fields)
+        if unexpected_gate_fields:
+            semantic_issues.append(
+                f"unexpected_gate_fields:{gate.get('gate')}:" + ",".join(unexpected_gate_fields)
+            )
+        name = str(gate.get("gate") or "")
+        definition = AUTOMATIC_LEARNING_GATE_DEFINITIONS.get(name)
+        if not definition:
+            semantic_issues.append(f"unknown_gate:{name}")
+            continue
+        for field in (
+            "category", "owner", "depends_on", "requires_external_change", "requires_sensitive_value",
+        ):
+            if gate.get(field) != definition.get(field):
+                semantic_issues.append(f"gate_definition_mismatch:{name}:{field}")
+        expected_action = None if gate.get("passed") is True else definition["action"]
+        expected_verification = None if gate.get("passed") is True else definition["verification"]
+        if gate.get("blocking") is not (gate.get("passed") is not True):
+            semantic_issues.append(f"gate_blocking_state_mismatch:{name}")
+        if gate.get("next_action") != expected_action:
+            semantic_issues.append(f"gate_action_mismatch:{name}")
+        if gate.get("verification") != expected_verification:
+            semantic_issues.append(f"gate_verification_mismatch:{name}")
+    expected_hash = _content_hash(_automatic_learning_activation_plan_hash_content(row)) if row else ""
+    hash_valid = bool(row.get("plan_hash")) and hmac.compare_digest(str(row.get("plan_hash")), expected_hash)
+    if not hash_valid:
+        semantic_issues.append("plan_hash_invalid")
+    activation_allowed = not expected_blockers
+    expected_external = any(
+        gate.get("requires_external_change") is True for gate in gates
+        if isinstance(gate, dict) and gate.get("passed") is not True
+    )
+    expected_operator = any(
+        gate.get("owner") in {"operator", "operator_and_provider"} for gate in gates
+        if isinstance(gate, dict) and gate.get("passed") is not True
+    )
+    expected_code = any(
+        gate.get("owner") == "code" for gate in gates
+        if isinstance(gate, dict) and gate.get("passed") is not True
+    )
+    if row.get("readiness_status") != ("ready" if activation_allowed else "not_ready"):
+        semantic_issues.append("readiness_status_inconsistent")
+    if row.get("activation_allowed") is not activation_allowed:
+        semantic_issues.append("activation_allowed_inconsistent")
+    if row.get("automatic_mutation_allowed") is not activation_allowed:
+        semantic_issues.append("automatic_mutation_allowed_inconsistent")
+    if row.get("external_change_required") is not expected_external:
+        semantic_issues.append("external_change_required_inconsistent")
+    if row.get("operator_action_required") is not expected_operator:
+        semantic_issues.append("operator_action_required_inconsistent")
+    if row.get("code_change_required") is not expected_code:
+        semantic_issues.append("code_change_required_inconsistent")
+    issues = list(dict.fromkeys(semantic_issues))
+    return {
+        "schema": "automatic_learning_activation_plan_audit_v1",
+        "status": "passed" if not issues else "failed",
+        "valid": not issues,
+        "hash_valid": hash_valid,
+        "semantic_issues": issues,
+        "expected_plan_hash": expected_hash or None,
+        "observed_plan_hash": row.get("plan_hash"),
+        "secrets_exposed": bool(exposed_paths),
+        "sensitive_field_paths": exposed_paths,
+    }
+
+
+def build_automatic_learning_activation_plan(readiness: Dict[str, Any]) -> Dict[str, Any]:
+    """Turn runtime gates into a deterministic, secret-free and tamper-evident activation plan."""
+    checks = readiness.get("checks") if isinstance(readiness.get("checks"), dict) else {}
+    gates = []
+    for name, definition in AUTOMATIC_LEARNING_GATE_DEFINITIONS.items():
+        passed = checks.get(name) is True
+        gates.append({
+            "gate": name, "passed": passed, "blocking": not passed,
+            "category": definition["category"], "owner": definition["owner"],
+            "depends_on": list(definition["depends_on"]),
+            "requires_external_change": definition["requires_external_change"],
+            "requires_sensitive_value": definition["requires_sensitive_value"],
+            "next_action": None if passed else definition["action"],
+            "verification": None if passed else definition["verification"],
+        })
+    blockers = [gate["gate"] for gate in gates if gate["blocking"]]
+    failed = [gate for gate in gates if gate["blocking"]]
+    content = {
+        "schema": "automatic_learning_activation_plan_v1",
+        "version": VERSION,
+        "readiness_status": "ready" if not blockers else "not_ready",
+        "activation_allowed": not blockers,
+        "gates": gates,
+        "blockers": blockers,
+        "external_change_required": any(gate["requires_external_change"] for gate in failed),
+        "operator_action_required": any(gate["owner"] in {"operator", "operator_and_provider"} for gate in failed),
+        "code_change_required": any(gate["owner"] == "code" for gate in failed),
+        "automatic_mutation_allowed": not blockers,
+    }
+    plan = {**content, "plan_hash": _content_hash(content), "immutable": True}
+    audit = audit_automatic_learning_activation_plan(plan)
+    return {
+        **plan, "audit": audit,
+        "policy": "the plan may describe blocked gates but cannot bypass them, expose credentials, start workers, call providers or activate learning",
+    }
+
+
 def automatic_learning_runtime_readiness(
     store_integrity: Optional[Dict[str, Any]] = None,
     worker_alive: Optional[bool] = None,
@@ -11689,16 +12657,8 @@ def automatic_learning_runtime_readiness(
         ),
         "daily_schedule_configured": True,
     }
-    required = (
-        "api_football_configured", "api_football_authenticated", "the_odds_api_configured",
-        "protected_api_configured", "persistent_store_configured",
-        "persistent_store_operational", "persistent_backup_ready", "persistent_store_single_writer",
-        "auto_snapshot_enabled", "auto_snapshot_worker_alive",
-        "major_league_registry_configured", "major_league_registry_versioned",
-        "node_execution_recovery_configured", "daily_schedule_configured",
-    )
-    blockers = [name for name in required if checks.get(name) is not True]
-    return {
+    blockers = [name for name in AUTOMATIC_LEARNING_REQUIRED_GATES if checks.get(name) is not True]
+    report = {
         "status": "ready" if not blockers else "not_ready",
         "ready": not blockers,
         "checks": checks,
@@ -11731,6 +12691,25 @@ def automatic_learning_runtime_readiness(
         "secrets_exposed": False,
         "policy": "automatic learning is authorized only when every provider, persistence, worker and security gate is ready",
     }
+    report["activation_plan"] = build_automatic_learning_activation_plan(report)
+    report["activation_authorized"] = bool(
+        report["ready"] is True
+        and report["activation_plan"]["audit"]["valid"] is True
+        and report["activation_plan"]["activation_allowed"] is True
+    )
+    return report
+
+
+def automatic_learning_activation_authorized(readiness: Any) -> bool:
+    row = readiness if isinstance(readiness, dict) else {}
+    plan = row.get("activation_plan") if isinstance(row.get("activation_plan"), dict) else {}
+    audit = audit_automatic_learning_activation_plan(plan)
+    return bool(
+        row.get("ready") is True
+        and not row.get("blockers")
+        and plan.get("activation_allowed") is True
+        and audit.get("valid") is True
+    )
 
 
 LEARNING_RUN_HASH_FIELDS = (
@@ -11739,7 +12718,7 @@ LEARNING_RUN_HASH_FIELDS = (
     "market_language_postmatch_fact_results",
     "postmatch_review_draft_results", "review_completion_results", "quality_card_results",
     "forward_validation_evidence_results", "promotion_candidate_results", "research_proposal_results",
-    "hypothesis_registration_results", "learning_admission_results", "freeze_results",
+    "hypothesis_registration_results", "learning_admission_results", "freeze_results", "learning_priority_board",
     "market_language_observation_results", "shadow_lock_results", "forward_validation_queue",
     "automatic_hypothesis_registration", "automatic_hypothesis_registration_policy",
     "automatic_champion_change", "automatic_promotion_candidate_creation",
@@ -12010,6 +12989,16 @@ def operations_status_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
             "severity": "warning", "code": "learning_node_lease_stale",
             "count": learning_data_health.get("stale_node_lease_count"),
         })
+    if learning_data_health.get("invalid_learning_priority_board_count", 0) > 0:
+        alerts.append({
+            "severity": "critical", "code": "learning_priority_board_integrity_invalid",
+            "count": learning_data_health.get("invalid_learning_priority_board_count"),
+        })
+    if learning_data_health.get("unranked_active_freeze_count", 0) > 0:
+        alerts.append({
+            "severity": "warning", "code": "learning_freeze_missing_priority_board",
+            "count": learning_data_health.get("unranked_active_freeze_count"),
+        })
     if learning_data_health.get("postmatch_overdue_count", 0) > 0:
         alerts.append({
             "severity": "warning", "code": "learning_postmatch_manual_recovery_required",
@@ -12108,6 +13097,63 @@ def release_candidate_self_test() -> Dict[str, Any]:
         {"status": "proxy_available", "is_real_money": False},
         "Accepted Repricing",
     )
+    priority_candidate = {
+        "market": "1x2", "selection": "home", "price": 2.0,
+        "script_coverage": .8, "edge": .05, "ev": .08,
+    }
+    priority_rows = [{
+        "fixture": "release-priority-a", "correlation_group": "release-priority-a",
+        "evaluation": {
+            "fundamental_chain_audit": {"decision_eligible": True, "completeness_score": .9},
+            "decision_layer": {"lineup_confidence": .9, "recommendation_tiers": {"first_choice_high_consistency": priority_candidate}},
+        },
+    }, {
+        "fixture": "release-priority-b", "correlation_group": "release-priority-b",
+        "evaluation": {
+            "fundamental_chain_audit": {"decision_eligible": True, "completeness_score": .8},
+            "decision_layer": {"lineup_confidence": .8, "recommendation_tiers": {"first_choice_high_consistency": priority_candidate}},
+        },
+    }]
+    priority_portfolio = build_portfolio(priority_rows, 2)
+    priority_board = build_portfolio_priority_board(priority_portfolio, _portfolio_priority_evidence(priority_rows), "T-1h", 1000)
+    tampered_priority_board = copy.deepcopy(priority_board)
+    tampered_priority_board["match_priority_ranking"][0]["rank"] = 99
+    tampered_priority_board["board_hash"] = _content_hash({
+        key: value for key, value in tampered_priority_board.items() if key not in {"board_hash", "immutable"}
+    })
+    learning_priority_board = build_learning_priority_board("release-learning-priority", [{
+        "fixture": "release-learning-a", "freeze_id": "release-learning-a:v1", "content_hash": "release-freeze-hash",
+        "captured_at": 900, "data_cutoff_at": 900, "kickoff_at": 1100,
+        "analysis": {"analysis_node": "T-1h"},
+        "decision": {
+            "decision": "BET", "execution_action": "BET", "lineup_confidence": .9, "match_rating": "B+",
+            "fundamental_chain_audit": {"decision_eligible": True, "completeness_score": .9},
+            "selected_expression": priority_candidate,
+        },
+    }], 1000)
+    tampered_learning_priority_board = copy.deepcopy(learning_priority_board)
+    tampered_learning_priority_board["match_priority_ranking"][0]["execution_action"] = "WAIT"
+    tampered_learning_priority_board["board_hash"] = _content_hash({
+        key: value for key, value in tampered_learning_priority_board.items() if key not in {"board_hash", "immutable", "action"}
+    })
+    activation_plan = build_automatic_learning_activation_plan({
+        "checks": {name: True for name in AUTOMATIC_LEARNING_REQUIRED_GATES},
+    })
+    tampered_activation_plan = copy.deepcopy(activation_plan)
+    tampered_activation_plan["gates"][0]["owner"] = "unknown"
+    tampered_activation_plan["plan_hash"] = _content_hash(
+        _automatic_learning_activation_plan_hash_content(tampered_activation_plan)
+    )
+    ready_runtime = {
+        "status": "ready", "ready": True, "blockers": [],
+        "activation_plan": activation_plan,
+    }
+    blocked_runtime = copy.deepcopy(ready_runtime)
+    blocked_runtime["ready"] = False
+    blocked_runtime["blockers"] = ["persistent_backup_ready"]
+    blocked_checks = {name: True for name in AUTOMATIC_LEARNING_REQUIRED_GATES}
+    blocked_checks["persistent_backup_ready"] = False
+    blocked_runtime["activation_plan"] = build_automatic_learning_activation_plan({"checks": blocked_checks})
     checks = {
         "missing_data_returns_pass": safe_pass.get("decision") == "PASS",
         "pass_output_contract_complete": safe_pass_audit.get("decision_eligible") is True,
@@ -12116,6 +13162,22 @@ def release_candidate_self_test() -> Dict[str, Any]:
         "fundamental_first_freeze_hash_valid": fundamental_freeze.get("script_hash_valid") is True,
         "fundamental_first_pipeline_passes": fundamental_pipeline.get("status") == "passed",
         "fundamental_freeze_tamper_rejected": tampered_pipeline.get("status") == "failed",
+        "portfolio_priority_board_tamper_rejected": (
+            audit_portfolio_priority_board(tampered_priority_board).get("status") == "failed"
+            and audit_portfolio_priority_board(tampered_priority_board).get("hash_valid") is True
+        ),
+        "learning_priority_board_tamper_rejected": (
+            audit_learning_priority_board(tampered_learning_priority_board).get("status") == "failed"
+            and audit_learning_priority_board(tampered_learning_priority_board).get("hash_valid") is True
+        ),
+        "activation_plan_semantic_tamper_rejected": (
+            audit_automatic_learning_activation_plan(tampered_activation_plan).get("status") == "failed"
+            and audit_automatic_learning_activation_plan(tampered_activation_plan).get("hash_valid") is True
+        ),
+        "automatic_learning_execution_gate_fail_closed": (
+            automatic_learning_activation_authorized(ready_runtime) is True
+            and automatic_learning_activation_authorized(blocked_runtime) is False
+        ),
         "accepted_repricing_does_not_claim_causation": (
             repricing.get("status") == "market_move_cause_unverified"
             and repricing.get("market_response_is_cause_evidence") is False
@@ -12129,7 +13191,7 @@ def release_candidate_self_test() -> Dict[str, Any]:
         "actionable_selection": actionable.get("decision"),
         "fundamental_first_pipeline": fundamental_pipeline,
         "repricing_attribution": repricing,
-        "policy": "release requires safe PASS, complete actionable output, immutable fundamental-first execution, and non-causal market-response language",
+        "policy": "release requires safe PASS, complete actionable output, immutable fundamental-first execution and priority boards, a tamper-evident activation plan, and non-causal market-response language",
     }
 
 
@@ -12180,7 +13242,9 @@ def audit_release_artifact_manifest(manifest: Any, expected_revision: Optional[s
         "required_contracts_complete": set(row.get("required_contract_schemas") or []) == {
             "repricing_attribution_v1", "fundamental_first_freeze_v1",
             "fundamental_first_pipeline_audit_v1", "release_preflight_v1",
-            "release_artifact_manifest_v1",
+            "prematch_priority_vector_v1", "prematch_priority_board_v1",
+            "learning_prematch_priority_board_v1", "release_artifact_manifest_v1",
+            "automatic_learning_activation_plan_v1", "automatic_learning_execution_gate_v1",
         },
         "required_endpoints_bound": isinstance(row.get("required_release_endpoints"), list) and bool(row.get("required_release_endpoints")),
         "self_test_hash_bound": bool(row.get("self_test_hash")),
@@ -12216,7 +13280,9 @@ def build_release_artifact_manifest(
         "required_contract_schemas": sorted([
             "repricing_attribution_v1", "fundamental_first_freeze_v1",
             "fundamental_first_pipeline_audit_v1", "release_preflight_v1",
-            "release_artifact_manifest_v1",
+            "prematch_priority_vector_v1", "prematch_priority_board_v1",
+            "learning_prematch_priority_board_v1", "release_artifact_manifest_v1",
+            "automatic_learning_activation_plan_v1", "automatic_learning_execution_gate_v1",
         ]),
         "required_release_endpoints": sorted(str(path) for path in (required_paths or [])),
         "self_test_hash": _content_hash({"version": self_test.get("version"), "checks": self_test.get("checks")}),
@@ -12244,6 +13310,10 @@ def build_release_preflight(
         "internal_decision_contract_self_test": checks.get("internal_decision_contract_self_test") is True,
         "fundamental_first_contract": get_nested(self_test, ["checks", "fundamental_first_pipeline_passes"]) is True,
         "fundamental_freeze_tamper_rejected": get_nested(self_test, ["checks", "fundamental_freeze_tamper_rejected"]) is True,
+        "portfolio_priority_board_tamper_rejected": get_nested(self_test, ["checks", "portfolio_priority_board_tamper_rejected"]) is True,
+        "learning_priority_board_tamper_rejected": get_nested(self_test, ["checks", "learning_priority_board_tamper_rejected"]) is True,
+        "activation_plan_semantic_tamper_rejected": get_nested(self_test, ["checks", "activation_plan_semantic_tamper_rejected"]) is True,
+        "automatic_learning_execution_gate_fail_closed": get_nested(self_test, ["checks", "automatic_learning_execution_gate_fail_closed"]) is True,
         "repricing_causation_contract": get_nested(self_test, ["checks", "accepted_repricing_does_not_claim_causation"]) is True,
         "opening_requires_verified_source": checks.get("opening_requires_verified_source") is True,
         "missing_history_never_backfilled": checks.get("missing_history_never_backfilled") is True,
@@ -12296,7 +13366,7 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
     if not isinstance(automatic_learning_schedule, dict):
         automatic_learning_schedule = automatic_learning_schedule_health(now_ts=now_ts)
     automatic_learning_authorized = (
-        automatic_learning.get("ready") is True
+        automatic_learning_activation_authorized(automatic_learning)
         and automatic_learning_schedule.get("healthy") is True
         and operations.get("status") != "blocked"
         and get_nested(operations, ["automatic_learning_data_health", "status"]) != "critical"
@@ -12306,8 +13376,8 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         "/shadow/readiness/{fixture}", "/shadow/calibration/lock", "/shadow/calibration/settle",
         "/shadow/calibration/report", "/shadow/operations/status", "/shadow/import-prematch-packets",
         "/shadow/store-health", "/shadow/store-recovery-preview", "/shadow/store-recover",
-        "/shadow/learning/registry", "/shadow/learning/node-plan", "/shadow/learning/node-run",
-        "/shadow/learning/data-health", "/shadow/market-language/status",
+        "/shadow/learning/registry", "/shadow/learning/activation-plan", "/shadow/learning/node-plan", "/shadow/learning/node-run",
+        "/shadow/learning/priority-boards", "/shadow/learning/data-health", "/shadow/market-language/status",
         "/shadow/learning/postmatch-recovery", "/shadow/learning/collect-facts",
         "/shadow/market-language/collect-facts", "/shadow/market-language/settlement-plan",
         "/shadow/model/prematch-evaluate", "/shadow/release-acceptance",
@@ -12366,6 +13436,7 @@ def release_acceptance_report(now_ts: Optional[int] = None) -> Dict[str, Any]:
         "calibration_sample": operations.get("calibration"),
         "fixture_acceptance": fixture_acceptance,
         "automatic_learning_runtime": automatic_learning,
+        "automatic_learning_activation_plan": automatic_learning.get("activation_plan"),
         "automatic_learning_schedule": automatic_learning_schedule,
         "release_candidate_self_test": self_test,
         "per_fixture_gate": "/shadow/readiness/{fixture} must return decision_ready before any recommendation is considered",
@@ -12579,7 +13650,10 @@ async def shadow_portfolio_evaluate(request: Request, token: Optional[str] = Non
         evaluation = evaluate_imported_prematch(match, persist_version=True)
         rows.append({"fixture": evaluation["fixture"], "match": evaluation.get("match"), "correlation_group": match.get("correlation_group") or evaluation["fixture"], "evaluation": evaluation})
     portfolio = build_portfolio(rows, max_legs, risk_preference)
-    portfolio_run = save_portfolio_run(portfolio_id, fixtures, portfolio, max_legs, trigger_reasons, stage, _portfolio_change_drivers(rows))
+    portfolio_run = save_portfolio_run(
+        portfolio_id, fixtures, portfolio, max_legs, trigger_reasons, stage,
+        _portfolio_change_drivers(rows), _portfolio_priority_evidence(rows),
+    )
     return JSONResponse({"ok": True, "version": VERSION, "portfolio_id": portfolio_id, "evaluations": rows, "portfolio": portfolio, "portfolio_run": portfolio_run})
 
 
@@ -12741,6 +13815,17 @@ def shadow_market_language_status(now_ts: Optional[int] = None, token: Optional[
 def shadow_learning_registry(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
     return JSONResponse({"ok": True, "registry": learning_major_league_registry_manifest()})
+
+
+@app.get("/shadow/learning/activation-plan")
+def shadow_learning_activation_plan(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    readiness = automatic_learning_runtime_readiness()
+    return JSONResponse({
+        "ok": True, "version": VERSION,
+        "readiness_status": readiness["status"],
+        "activation_plan": readiness["activation_plan"],
+    })
 
 
 @app.get("/shadow/learning/node-plan")
@@ -12937,6 +14022,12 @@ def shadow_learning_quality_calibration(minimum_samples: Optional[int] = None, t
     if minimum_samples is not None and not 2 <= minimum_samples <= 10000:
         raise HTTPException(status_code=400, detail="minimum_samples_must_be_between_2_and_10000")
     return JSONResponse({"ok": True, "quality_calibration": learning_quality_calibration_report(minimum_samples)})
+
+
+@app.get("/shadow/learning/priority-boards")
+def shadow_learning_priority_boards(board_id: Optional[str] = None, limit: int = 20, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_learning_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    return JSONResponse({"ok": True, "priority_boards": learning_priority_board_report(board_id, limit)})
 
 
 @app.post("/shadow/learning/quality-cards/refresh")
@@ -13503,7 +14594,10 @@ def auto_collect_the_odds_api_due_stages(
     }
 
 
-def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def auto_learning_daily_cycle(
+    now: datetime,
+    fixture_rows: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     """Run once after 14:30 Asia/Shanghai; a late worker poll catches up the same day."""
     now = now.astimezone(timezone.utc)
     local_now = now.astimezone(ZoneInfo("Asia/Shanghai"))
@@ -13541,6 +14635,23 @@ def auto_learning_daily_cycle(now: datetime, fixture_rows: Optional[List[Dict[st
             "hypothesis_registered_count": existing.get("hypothesis_registered_count"),
             "forward_validation_evidence_recorded_count": existing.get("forward_validation_evidence_recorded_count"),
             "promotion_candidate_created_count": existing.get("promotion_candidate_created_count"),
+        }
+    # Never accept a caller-supplied readiness object here. The unattended writer
+    # must re-evaluate its own live environment immediately before mutation.
+    readiness = automatic_learning_runtime_readiness()
+    if not automatic_learning_activation_authorized(readiness):
+        plan = readiness.get("activation_plan") if isinstance(readiness.get("activation_plan"), dict) else {}
+        return {
+            "schema": "automatic_learning_execution_gate_v1",
+            "target": "daily_1430_learning_cycle",
+            "status": "blocked", "at": now_ts, "run_id": run_id,
+            "scheduled_at": scheduled_at, "trigger_delay_seconds": trigger_delay_seconds,
+            "reason": "automatic_learning_activation_gate_not_ready",
+            "blockers": list(readiness.get("blockers") or []),
+            "activation_plan_hash": plan.get("plan_hash"),
+            "activation_plan_audit": get_nested(plan, ["audit", "status"]),
+            "learning_run_persisted": False,
+            "automatic_mutation_performed": False,
         }
     try:
         result = run_learning_cycle(
@@ -13663,7 +14774,23 @@ def auto_snapshot_cycle(now: Optional[datetime] = None) -> Dict[str, Any]:
                             print("[AUTO_SNAPSHOT] fixture failed: " + str(exc))
         except Exception as exc:
             print("[AUTO_SNAPSHOT] date failed: " + date_str + " " + str(exc))
-    node_result = run_learning_node_executor(now_ts=int(now.timestamp()), apply_changes=True)
+    # Re-evaluate immediately before the second mutation boundary; do not reuse
+    # a readiness snapshot captured before provider collection or the daily run.
+    runtime_readiness = automatic_learning_runtime_readiness()
+    if automatic_learning_activation_authorized(runtime_readiness):
+        node_result = run_learning_node_executor(now_ts=int(now.timestamp()), apply_changes=True)
+    else:
+        activation_plan = runtime_readiness.get("activation_plan") or {}
+        node_result = {
+            "schema": "automatic_learning_execution_gate_v1",
+            "target": "fixed_node_learning_executor",
+            "status": "blocked", "advanced_count": 0, "discovery_performed": False,
+            "reason": "automatic_learning_activation_gate_not_ready",
+            "blockers": list(runtime_readiness.get("blockers") or []),
+            "activation_plan_hash": activation_plan.get("plan_hash"),
+            "activation_plan_audit": get_nested(activation_plan, ["audit", "status"]),
+            "automatic_mutation_performed": False,
+        }
     api_football_due_collection = {
         "status": "completed" if api_football_authenticated else "skipped",
         "authenticated": api_football_authenticated,
