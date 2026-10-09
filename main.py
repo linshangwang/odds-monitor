@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.19.10"
+VERSION = "2.19.11"
 RELEASE_CHANNEL = "shadow-usable"
 RELEASE_SOURCE_REVISION = os.getenv("RELEASE_COMMIT_SHA", "").strip().lower()
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
@@ -190,12 +190,12 @@ DEFAULT_TARGET_LEAGUES: Dict[int, str] = {
     203: "Turkey Super Lig",
     848: "UEFA Conference League",
 }
-# Curated major-league learning scope is intentionally separate from the
-# broader analysis target list above. Being a domestic tier-one league is only
-# a necessary condition: competitions outside this explicit user-approved
-# allowlist remain available for ordinary analysis and market-language
-# settlement, but can never enter model learning automatically.
-LEARNING_MAJOR_LEAGUES_VERSION = os.getenv("LEARNING_MAJOR_LEAGUES_VERSION", "2026-10-08-v1").strip() or "2026-10-08-v1"
+# This curated registry is an identity anchor, not an automatic-learning
+# allowlist. Automatic selection is competition-tier agnostic from v2.19.11:
+# any verified men's senior professional competition may be admitted when the
+# fixture and evidence gates pass. The registry still supplies canonical
+# names for the best-known competitions and keeps historical records stable.
+LEARNING_MAJOR_LEAGUES_VERSION = os.getenv("LEARNING_MAJOR_LEAGUES_VERSION", "2026-10-10-v2").strip() or "2026-10-10-v2"
 LEARNING_MAJOR_LEAGUES: Dict[int, Dict[str, str]] = {
     39: {"name": "England Premier League", "country": "England"},
     61: {"name": "France Ligue 1", "country": "France"},
@@ -212,9 +212,10 @@ LEARNING_MAJOR_LEAGUES: Dict[int, Dict[str, str]] = {
     203: {"name": "Turkey Super Lig", "country": "Turkey"},
     253: {"name": "USA Major League Soccer", "country": "USA"},
 }
-# Explicit cross-provider registry for odds-only fixture discovery. The
-# registry is deliberately coupled to the user-approved major-league pool:
-# unmapped or newly added competitions cannot enter the watchlist silently.
+# Stable cross-provider anchors for odds-only fixture discovery. Production
+# discovery also reads The Odds API active Soccer catalog so lower divisions,
+# cups and official national-team competitions are not silently omitted. These
+# anchors remain the deterministic fallback when the catalog is unavailable.
 THE_ODDS_API_MAJOR_LEAGUE_SPORT_KEYS: Dict[int, str] = {
     39: "soccer_epl",
     61: "soccer_france_ligue_one",
@@ -232,8 +233,18 @@ THE_ODDS_API_MAJOR_LEAGUE_SPORT_KEYS: Dict[int, str] = {
     253: "soccer_usa_mls",
 }
 # Backward-compatible alias. New code and external contracts should use the
-# major-league name because domestic tier one alone is not sufficient.
+# major-league name only as a canonical identity anchor.
 LEARNING_TOP_FLIGHT_LEAGUES = LEARNING_MAJOR_LEAGUES
+LEARNING_SCOPE_POLICY_VERSION = "verified-mens-senior-professional-all-competitions@2026-10-10-v1"
+LEARNING_SUPPORTED_COMPETITION_TYPES = {
+    "domestic_league", "domestic_cup", "continental_club",
+    "national_team", "official_senior_competition",
+}
+LEARNING_SCOPE_EXCLUDED_NAME_TOKENS = (
+    "women", "women's", "womens", "ladies", "girls", "femin", "femen",
+    "youth", "academy", "reserve", "reserves", "friendly", "friendlies",
+    "amateur", "u17", "u18", "u19", "u20", "u21", "u23",
+)
 LEARNING_DISCOVERY_HORIZON_HOURS = max(1, min(int(os.getenv("LEARNING_DISCOVERY_HORIZON_HOURS", "24")), 72))
 LEARNING_POSTMATCH_LOOKBACK_HOURS = max(1, min(int(os.getenv("LEARNING_POSTMATCH_LOOKBACK_HOURS", "36")), 168))
 LEARNING_NODE_LEASE_SECONDS = max(60, min(int(os.getenv("LEARNING_NODE_LEASE_SECONDS", "900")), 3600))
@@ -243,7 +254,7 @@ LEARNING_NODE_RETRY_MAX_SECONDS = max(
     min(int(os.getenv("LEARNING_NODE_RETRY_MAX_SECONDS", "3600")), 12 * 3600),
 )
 LEARNING_NODE_ATTEMPT_RETENTION = max(100, min(int(os.getenv("LEARNING_NODE_ATTEMPT_RETENTION", "5000")), 50000))
-LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-10-v2.19.10").strip() or "MODEL_RULES.md@2026-10-10-v2.19.10"
+LEARNING_RULES_VERSION = os.getenv("LEARNING_RULES_VERSION", "MODEL_RULES.md@2026-10-10-v2.19.11").strip() or "MODEL_RULES.md@2026-10-10-v2.19.11"
 raw_target = os.getenv("TARGET_LEAGUE_IDS", "")
 TARGET_LEAGUE_IDS = {int(x.strip()) for x in raw_target.split(",") if x.strip().isdigit()} if raw_target.strip() else set(DEFAULT_TARGET_LEAGUES.keys())
 raw_nami_target = os.getenv("NAMI_TARGET_COMPETITION_IDS", "")
@@ -6352,20 +6363,79 @@ def learning_major_league_registry_manifest() -> Dict[str, Any]:
     immutable_content = {
         "version": LEARNING_MAJOR_LEAGUES_VERSION,
         "leagues": leagues,
-        "admission_policy": "explicit_user_approved_major_domestic_top_flights_only",
+        "admission_policy": "canonical_identity_anchor_not_learning_allowlist",
+        "scope_policy_version": LEARNING_SCOPE_POLICY_VERSION,
+        "supported_competition_types": sorted(LEARNING_SUPPORTED_COMPETITION_TYPES),
     }
     return {
         **immutable_content,
         "registry_hash": _content_hash(immutable_content),
         "league_count": len(leagues),
         "historical_reclassification_allowed": False,
-        "external_evidence_can_self_admit": False,
-        "requires_explicit_user_confirmation_for_changes": True,
+        "external_evidence_can_self_admit": True,
+        "requires_explicit_user_confirmation_for_changes": False,
+        "tier_restriction": None,
+    }
+
+
+def _learning_scope_name_exclusion(competition_name: Any) -> Optional[str]:
+    normalized = normalize_fixture_identity_name(competition_name)
+    compact = normalized.replace("-", " ").replace("_", " ")
+    for token in LEARNING_SCOPE_EXCLUDED_NAME_TOKENS:
+        if token in compact:
+            return token
+    return None
+
+
+def infer_learning_competition_type(competition_id: Any, competition_name: Any) -> str:
+    try:
+        competition_id = int(competition_id)
+    except (TypeError, ValueError):
+        competition_id = None
+    name = normalize_fixture_identity_name(competition_name)
+    if competition_id in {2, 3, 848}:
+        return "continental_club"
+    if competition_id == 5:
+        return "national_team"
+    if any(token in name for token in ("champions league", "europa league", "conference league", "libertadores", "sudamericana", "afc champions")):
+        return "continental_club"
+    if any(token in name for token in ("nations league", "world cup", "euro qualification", "qualifiers")):
+        return "national_team"
+    if any(token in name for token in (" cup", "copa ", "coupe ", "pokal", "trophy", "super cup")):
+        return "domestic_cup"
+    if competition_id in LEARNING_MAJOR_LEAGUES:
+        return "domestic_league"
+    return "official_senior_competition"
+
+
+def learning_scope_from_fixture_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
+    competition_id = summary.get("league_id")
+    registry = LEARNING_MAJOR_LEAGUES.get(competition_id)
+    competition_name = str((registry or {}).get("name") or summary.get("league") or "").strip()
+    country = str((registry or {}).get("country") or summary.get("country") or "").strip()
+    season = str(summary.get("season") or "").strip()
+    return {
+        "competition_id": competition_id,
+        "competition_name": competition_name,
+        "country": country,
+        "competition_type": infer_learning_competition_type(competition_id, competition_name),
+        "tier": 1 if registry else None,
+        "gender": "men",
+        "professional": True,
+        "team_level": "first_team",
+        "season": season,
+        "phase": str(summary.get("league_round") or "unknown"),
+        "format_version": "api_football_fixture_catalog_v1",
+        "verification_status": "curated_registry" if registry else "provider_verified",
+        "verification_refs": [{
+            "source": "api_football",
+            "id": f"league:{competition_id}:season:{season}",
+        }],
     }
 
 
 def audit_learning_scope(scope: Any) -> Dict[str, Any]:
-    """Admit only user-approved major men's professional domestic top flights."""
+    """Admit verified men's senior professional competitions regardless of tier."""
     scope = scope if isinstance(scope, dict) else {}
     reasons = []
     competition_type = str(scope.get("competition_type") or "").strip().lower()
@@ -6388,10 +6458,10 @@ def audit_learning_scope(scope: Any) -> Dict[str, Any]:
         and str(ref.get("source") or "").strip()
         and str(ref.get("url") or ref.get("id") or ref.get("title") or "").strip()
     ]
-    if competition_type != "domestic_league":
-        reasons.append("domestic_league_required")
-    if tier != 1:
-        reasons.append("tier_one_required")
+    if competition_type not in LEARNING_SUPPORTED_COMPETITION_TYPES:
+        reasons.append("supported_official_competition_type_required")
+    if tier is not None and tier < 1:
+        reasons.append("competition_tier_invalid")
     if gender not in ("men", "male"):
         reasons.append("mens_competition_required")
     if scope.get("professional") is not True:
@@ -6402,6 +6472,11 @@ def audit_learning_scope(scope: Any) -> Dict[str, Any]:
         reasons.append("competition_name_required")
     if not str(scope.get("season") or "").strip():
         reasons.append("season_required")
+    if competition_id is None:
+        reasons.append("competition_id_required")
+    excluded_name_token = _learning_scope_name_exclusion(scope.get("competition_name"))
+    if excluded_name_token:
+        reasons.append("youth_women_friendly_or_amateur_competition_excluded")
     if registry:
         supplied_name = normalize_fixture_identity_name(scope.get("competition_name"))
         registered_name = normalize_fixture_identity_name(registry.get("name"))
@@ -6411,11 +6486,23 @@ def audit_learning_scope(scope: Any) -> Dict[str, Any]:
         registered_country = normalize_fixture_identity_name(registry.get("country"))
         if supplied_country and supplied_country != registered_country:
             reasons.append("competition_country_registry_mismatch")
-        verification_method = "curated_major_top_flight_registry"
+        if tier not in (None, 1):
+            reasons.append("competition_tier_registry_mismatch")
+        verification_method = "curated_competition_identity_registry"
     else:
-        verification_method = "not_in_major_learning_registry"
-        reasons.append("competition_not_in_major_learning_registry")
+        verification_method = "verified_external_competition_metadata"
+        if str(scope.get("verification_status") or "").strip().lower() not in {"verified", "provider_verified"}:
+            reasons.append("verified_competition_metadata_required")
+        if not valid_verification_refs:
+            reasons.append("competition_verification_reference_required")
     eligible = not reasons
+    competition_partition = _content_hash({
+        "competition_id": competition_id,
+        "competition_name": str(scope.get("competition_name") or "").strip(),
+        "country": str(scope.get("country") or (registry or {}).get("country") or "").strip(),
+        "competition_type": competition_type,
+        "season": str(scope.get("season") or "").strip(),
+    })
     return {
         "eligible": eligible,
         "learning_eligibility": "MODEL_LEARNING_ELIGIBLE" if eligible else "MODEL_LEARNING_EXCLUDED",
@@ -6433,17 +6520,21 @@ def audit_learning_scope(scope: Any) -> Dict[str, Any]:
             "season": str(scope.get("season") or "").strip(),
             "phase": str(scope.get("phase") or "unknown").strip(),
             "format_version": str(scope.get("format_version") or "unknown").strip(),
+            "verification_status": str(scope.get("verification_status") or "").strip().lower() or None,
             "verification_method": verification_method,
             "verification_refs": valid_verification_refs[:10],
+            "scope_policy_version": LEARNING_SCOPE_POLICY_VERSION,
+            "competition_partition": competition_partition,
+            "cross_competition_pooling_allowed": False,
             "major_league_registry_version": registry_manifest["version"],
             "major_league_registry_hash": registry_manifest["registry_hash"],
         },
-        "policy": "only the explicit user-approved major domestic top-flight registry is model-learning eligible; external tier evidence cannot self-admit a competition",
+        "policy": "competition tier is not an admission criterion; verified men's senior professional fixtures may learn, while competition-specific effects remain partitioned",
     }
 
 
 def discover_learning_fixtures(now_ts: Optional[int] = None, fixture_rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    """Discover only registry-verified domestic top-flight fixtures in the next horizon."""
+    """Discover verified men's senior professional fixtures in the next horizon."""
     now_ts = int(now_ts or time.time())
     horizon_ts = now_ts + LEARNING_DISCOVERY_HORIZON_HOURS * 3600
     source_audit = []
@@ -6471,9 +6562,9 @@ def discover_learning_fixtures(now_ts: Optional[int] = None, fixture_rows: Optio
         league_id = summary.get("league_id")
         kickoff = fixture_datetime_utc(summary)
         reason = None
-        if league_id not in LEARNING_MAJOR_LEAGUES:
-            reason = "competition_not_in_major_learning_registry"
-        elif summary.get("status") != "NS":
+        scope = learning_scope_from_fixture_summary(summary)
+        scope_audit = audit_learning_scope(scope)
+        if summary.get("status") != "NS":
             reason = "fixture_not_not_started"
         elif not fixture_id or not kickoff:
             reason = "fixture_identity_or_kickoff_missing"
@@ -6481,12 +6572,15 @@ def discover_learning_fixtures(now_ts: Optional[int] = None, fixture_rows: Optio
             reason = "outside_learning_discovery_horizon"
         elif str(fixture_id) in seen:
             reason = "duplicate_fixture"
+        elif not scope_audit["eligible"]:
+            reason = scope_audit["reasons"][0] if scope_audit["reasons"] else "competition_scope_not_eligible"
         if reason:
             excluded_row = {"fixture_id": fixture_id, "league_id": league_id, "reason": reason}
-            if reason == "competition_not_in_major_learning_registry":
+            if reason in set(scope_audit.get("reasons") or []):
                 excluded_row.update({
                     "learning_eligibility": "MODEL_LEARNING_EXCLUDED",
                     "allowed_modes": ["MARKET_LANGUAGE_ONLY", "SETTLEMENT_ONLY"],
+                    "scope_reasons": scope_audit.get("reasons") or [],
                 })
                 if (
                     fixture_id and kickoff and summary.get("status") == "NS"
@@ -6496,19 +6590,7 @@ def discover_learning_fixtures(now_ts: Optional[int] = None, fixture_rows: Optio
                     seen.add(str(fixture_id))
                     observation_candidates.append({
                         **summary,
-                        "scope": {
-                            "competition_id": league_id,
-                            "competition_name": str(summary.get("league") or "Unknown competition"),
-                            "country": str(summary.get("country") or ""),
-                            "competition_type": "unclassified_non_learning_competition",
-                            "tier": None,
-                            "gender": "men",
-                            "professional": True,
-                            "team_level": "first_team",
-                            "season": str(summary.get("season") or ""),
-                            "phase": str(summary.get("league_round") or "unknown"),
-                            "verification_status": "identification_only",
-                        },
+                        "scope": scope,
                         "learning_eligibility": "MODEL_LEARNING_EXCLUDED",
                         "allowed_modes": ["MARKET_LANGUAGE_ONLY", "SETTLEMENT_ONLY"],
                         "routing_reason": reason,
@@ -6516,18 +6598,11 @@ def discover_learning_fixtures(now_ts: Optional[int] = None, fixture_rows: Optio
             excluded.append(excluded_row)
             continue
         seen.add(str(fixture_id))
-        registry = LEARNING_MAJOR_LEAGUES[league_id]
         candidates.append({
             **summary,
-            "scope": {
-                "competition_id": league_id, "competition_name": registry["name"],
-                "country": registry["country"], "competition_type": "domestic_league",
-                "tier": 1, "gender": "men", "professional": True,
-                "team_level": "first_team", "season": str(summary.get("season") or ""),
-                "phase": str(summary.get("league_round") or "unknown"),
-                "verification_status": "verified",
-            },
+            "scope": scope_audit["normalized"],
             "learning_scope_verified": True,
+            "learning_scope_policy_version": LEARNING_SCOPE_POLICY_VERSION,
             "major_league_registry_version": registry_manifest["version"],
             "major_league_registry_hash": registry_manifest["registry_hash"],
         })
@@ -6549,7 +6624,8 @@ def discover_learning_fixtures(now_ts: Optional[int] = None, fixture_rows: Optio
             "registry_hash": registry_manifest["registry_hash"],
             "league_count": registry_manifest["league_count"],
         },
-        "policy": "only user-approved major men's professional domestic tier-one first-team leagues are eligible; non-registry competitions are market-language/settlement only",
+        "scope_policy_version": LEARNING_SCOPE_POLICY_VERSION,
+        "policy": "selection is not limited by league tier; verified men's senior professional fixtures are admitted and competition-specific learning is partitioned",
     }
 
 
@@ -6579,7 +6655,7 @@ def admit_learning_candidate(candidate: Dict[str, Any], now_ts: Optional[int] = 
         raise HTTPException(status_code=409, detail="learning_admission_requires_not_started_fixture")
     scope_audit = audit_learning_scope(candidate.get("scope"))
     if not scope_audit["eligible"]:
-        raise HTTPException(status_code=422, detail={"error": "major_league_scope_not_eligible", "reasons": scope_audit["reasons"]})
+        raise HTTPException(status_code=422, detail={"error": "competition_scope_not_eligible", "reasons": scope_audit["reasons"]})
     registry = learning_major_league_registry_manifest()
     immutable_content = {
         "fixture": fixture,
@@ -7136,7 +7212,7 @@ def learning_node_execution_plan(now_ts: Optional[int] = None, store_override: O
         scope_audit = audit_learning_scope(admission.get("scope") or (latest or {}).get("scope"))
         if not scope_audit["eligible"]:
             skipped.append({
-                "fixture": str(fixture), "reason": "major_league_registry_no_longer_eligible",
+                "fixture": str(fixture), "reason": "competition_scope_no_longer_eligible",
                 "scope_reasons": scope_audit["reasons"],
             })
             continue
@@ -9334,7 +9410,7 @@ def freeze_market_language_observation(payload: Dict[str, Any], now_ts: Optional
         raise HTTPException(status_code=400, detail="fixture_required")
     scope_audit = audit_learning_scope(payload.get("scope"))
     if scope_audit["eligible"]:
-        raise HTTPException(status_code=409, detail="major_league_sample_requires_learning_pipeline")
+        raise HTTPException(status_code=409, detail="learning_eligible_sample_requires_learning_pipeline")
     captured_at = _parse_timestamp(payload.get("captured_at")) or int(now_ts or time.time())
     data_cutoff_at = _parse_timestamp(payload.get("data_cutoff_at")) or captured_at
     kickoff_at = _parse_timestamp(payload.get("kickoff_at"))
@@ -9777,7 +9853,7 @@ def freeze_learning_sample(payload: Dict[str, Any], now_ts: Optional[int] = None
         raise HTTPException(status_code=400, detail="fixture_required")
     scope_audit = audit_learning_scope(payload.get("scope"))
     if not scope_audit["eligible"]:
-        raise HTTPException(status_code=422, detail={"error": "top_flight_scope_not_verified", "reasons": scope_audit["reasons"]})
+        raise HTTPException(status_code=422, detail={"error": "competition_scope_not_verified", "reasons": scope_audit["reasons"]})
     captured_at = _parse_timestamp(payload.get("captured_at")) or int(now_ts or time.time())
     data_cutoff_at = _parse_timestamp(payload.get("data_cutoff_at")) or captured_at
     kickoff_at = _parse_timestamp(payload.get("kickoff_at"))
@@ -14335,8 +14411,9 @@ def discover_the_odds_api_watchlist(
     store_override: Optional[Dict[str, Any]] = None,
     api_caller: Optional[Any] = None,
     persist: bool = True,
+    sport_catalog_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Discover the next 24h major-league events without admitting model samples.
+    """Discover the next 24h active Soccer events without admitting model samples.
 
     Discovery is idempotent per Shanghai calendar day after 14:30. It stores
     provider identity only; it neither creates a fundamental packet nor a
@@ -14425,19 +14502,43 @@ def discover_the_odds_api_watchlist(
     discovered_ids = []
     rejected_count = 0
     failed_sport_keys = set((prior or {}).get("failed_sport_keys") or []) if isinstance(prior, dict) else set()
-    league_items = [
-        (league_id, sport_key) for league_id, sport_key in THE_ODDS_API_MAJOR_LEAGUE_SPORT_KEYS.items()
-        if not failed_sport_keys or sport_key in failed_sport_keys
-    ]
-    for league_id, sport_key in league_items:
-        league = LEARNING_MAJOR_LEAGUES.get(league_id)
-        if not league:
-            rejected_count += 1
-            continue
+    catalog_status = "injected" if sport_catalog_rows is not None else "fallback_static"
+    catalog_rows = [row for row in (sport_catalog_rows or []) if isinstance(row, dict)]
+    if sport_catalog_rows is None and api_caller is None:
+        catalog_response = caller("/sports", {"all": "false"})
+        if isinstance(catalog_response, dict) and catalog_response.get("ok") and isinstance(catalog_response.get("data"), list):
+            catalog_rows = [row for row in catalog_response["data"] if isinstance(row, dict)]
+            catalog_status = "provider_catalog"
+        else:
+            catalog_status = "provider_catalog_unavailable_fallback_static"
+    reverse_anchor = {sport_key: league_id for league_id, sport_key in THE_ODDS_API_MAJOR_LEAGUE_SPORT_KEYS.items()}
+    league_items: List[Tuple[Optional[int], str, str]] = []
+    if catalog_rows:
+        for row in catalog_rows:
+            sport_key = str(row.get("key") or "").strip().lower()
+            title = str(row.get("title") or row.get("description") or sport_key).strip()
+            group = str(row.get("group") or "").strip().lower()
+            if (
+                not sport_key.startswith("soccer_")
+                or (group and group != "soccer")
+                or row.get("active") is False
+                or _learning_scope_name_exclusion(title)
+            ):
+                continue
+            league_items.append((reverse_anchor.get(sport_key), sport_key, title))
+    else:
+        league_items = [
+            (league_id, sport_key, LEARNING_MAJOR_LEAGUES.get(league_id, {}).get("name") or sport_key)
+            for league_id, sport_key in THE_ODDS_API_MAJOR_LEAGUE_SPORT_KEYS.items()
+        ]
+    league_items = [item for item in league_items if not failed_sport_keys or item[1] in failed_sport_keys]
+    league_items = sorted({item[1]: item for item in league_items}.values(), key=lambda item: item[1])
+    for league_id, sport_key, catalog_title in league_items:
+        league = LEARNING_MAJOR_LEAGUES.get(league_id) or {"name": catalog_title, "country": ""}
         response = caller(f"/sports/{sport_key}/events", params)
         rows = response.get("data") if isinstance(response, dict) and isinstance(response.get("data"), list) else []
         request_audit.append({
-            "league_id": league_id, "sport_key": sport_key,
+            "league_id": league_id, "sport_key": sport_key, "competition": league["name"],
             "ok": bool(response.get("ok")) if isinstance(response, dict) else False,
             "status_code": response.get("status_code") if isinstance(response, dict) else None,
             "returned_count": len(rows),
@@ -14469,6 +14570,8 @@ def discover_the_odds_api_watchlist(
                 "league_id": league_id,
                 "league": league["name"],
                 "country": league["country"],
+                "competition_type": infer_learning_competition_type(league_id, league["name"]),
+                "scope_policy_version": LEARNING_SCOPE_POLICY_VERSION,
                 "provider_fixture_ids": {"the_odds_api": event_id},
                 "match": {
                     "kickoff_utc": datetime.fromtimestamp(kickoff_ts, tz=timezone.utc).isoformat(),
@@ -14497,6 +14600,7 @@ def discover_the_odds_api_watchlist(
         "attempt_count": attempt_count,
         "request_count": int((prior or {}).get("request_count") or 0) + len(request_audit),
         "failed_request_count": failed_count, "failed_sport_keys": current_failed_sport_keys,
+        "sport_catalog_status": catalog_status, "sport_key_count": len(league_items),
         "next_retry_at": now_ts + retry_seconds if failed_count and attempt_count < THE_ODDS_API_DISCOVERY_MAX_ATTEMPTS else None,
         "discovered_count": len(all_discovered), "rejected_count": int((prior or {}).get("rejected_count") or 0) + rejected_count,
         "discovered_fixtures": all_discovered, "request_audit": request_audit,
