@@ -779,6 +779,8 @@ V2.19.1 为每日选场增加有界失败恢复和运维可见性。单个联赛
 
 V2.19.2 严格隔离两套赔率时间轴：每日自动选场产生的学习观察项只推进 Opening、T-12h、T-6h、T-1h，其中 Opening 仍必须来自真实开盘证据且不会自动回填；T-24h、T-3h、T-30m、Closing 只保留给普通赛前分析或已经转入正式外部赛前包的比赛。观察项过期后转入有界审计归档，保存可用、`data_missing`和未观测节点，不再直接删除历史证据。
 
+V2.19.11 将自动选场从“顶级联赛白名单”改为“经验证的男子成年职业正式赛事”。低级别联赛、国内杯赛、洲际俱乐部赛事和正式国家队赛事不再因级别被排除；青年、女子、友谊赛和业余赛事仍只进入盘口观察/兑现通道。每个正式学习样本新增赛事/赛季分区哈希并固定`cross_competition_pooling_allowed=false`，禁止跨赛事无差别迁移结论。The Odds API每日观察名单可读取活动Soccer目录，不再只查询原14个锚点联赛；盘口观察仍须经过身份与基本面核验后才能产生学习效力。
+
 V2.19.3 新增`repricing_attribution_v1`：市场接受度、A级真实资金压力和盘口变化成因分别输出。`Accepted Repricing`只代表市场响应；A级Money%/Bet%只证明资金压力存在；只有通过审计的实质基本面版本变化与对应市场复核触发器同时存在，才确认`fundamental_repricing_confirmed`。该版本不改变模型概率、门槛、方向或Expression Optimizer排序。
 
 V2.19.4 将“基本面先行”落实为代码执行门禁。完整赛前评估先生成赔率无关估计、模型概率、Pure Fundamental Script和基本面链审计，再冻结`fundamental_first_freeze_v1`，之后才允许读取盘口和运行Expression Optimizer。`fundamental_first_pipeline_audit_v1`校验市场处理前后脚本哈希不变；基本面不足或污染时，盘口输出只能用于`diagnostic_only`并强制PASS。
