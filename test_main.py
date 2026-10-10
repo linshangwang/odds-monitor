@@ -3727,6 +3727,8 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         def caller(path, params):
             self.assertTrue(path.startswith("/sports/"))
             self.assertIn("commenceTimeFrom", params)
+            self.assertEqual(params["commenceTimeFrom"], "2026-10-09T07:00:00Z")
+            self.assertEqual(params["commenceTimeTo"], "2026-10-10T07:00:00Z")
             if "soccer_norway_eliteserien" not in path:
                 return {"ok": True, "status_code": 200, "data": []}
             return {"ok": True, "status_code": 200, "data": [
@@ -3841,6 +3843,31 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(latest["quota_remaining"], "17083")
         self.assertEqual(latest["quota_used"], "2917")
         self.assertEqual(latest["quota_last"], "0")
+
+    def test_the_odds_api_watchlist_recovers_invalid_fractional_time_format(self):
+        now = datetime(2026, 10, 9, 7, 0, 0, 123456, tzinfo=timezone.utc)
+        run_id = "odds-watchlist-20261009-1430"
+        store = {"fixtures": {}, "the_odds_api_discovery_runs": {run_id: {
+            "run_id": run_id, "status": "degraded", "attempt_count": 5,
+            "failed_request_count": 1, "failed_sport_keys": ["soccer_epl"],
+            "request_audit": [{
+                "sport_key": "soccer_epl", "error_category": "request_or_sport_key_rejected",
+                "provider_error_code": "INVALID_COMMENCE_TIME_FROM",
+            }],
+        }}}
+
+        def caller(path, params):
+            self.assertEqual(params["commenceTimeFrom"], "2026-10-09T07:00:00Z")
+            self.assertNotIn(".", params["commenceTimeFrom"])
+            return {"ok": True, "status_code": 200, "data": []}
+
+        with patch.object(main, "THE_ODDS_API_KEY", "configured"):
+            recovered = main.discover_the_odds_api_watchlist(
+                now, store_override=store, api_caller=caller, persist=False,
+            )
+        self.assertEqual(recovered["status"], "completed")
+        self.assertTrue(recovered["request_format_recovery_retry"])
+        self.assertEqual(recovered["request_time_format"], "seconds_z_v1")
 
     def test_the_odds_api_watchlist_prunes_expired_rows_and_exposes_compact_health(self):
         now_ts = int(datetime(2026, 10, 9, 7, 0, tzinfo=timezone.utc).timestamp())

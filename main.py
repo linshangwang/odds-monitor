@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.19.4"
+VERSION = "2.19.5"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -12931,6 +12931,16 @@ def discover_the_odds_api_watchlist(
         }
     prior_attempt_count = int((prior or {}).get("attempt_count") or 0) if isinstance(prior, dict) else 0
     prior_request_audit = list((prior or {}).get("request_audit") or []) if isinstance(prior, dict) else []
+    prior_provider_error_codes = {
+        str((row or {}).get("provider_error_code") or "").strip()
+        for row in prior_request_audit if isinstance(row, dict)
+    } - {""}
+    format_recovery = bool(
+        prior_status == "degraded"
+        and prior_attempt_count >= THE_ODDS_API_DISCOVERY_MAX_ATTEMPTS
+        and prior_provider_error_codes == {"INVALID_COMMENCE_TIME_FROM"}
+        and (prior or {}).get("request_time_format") != "seconds_z_v1"
+    )
     legacy_recovery = bool(
         prior_status == "degraded"
         and prior_attempt_count >= THE_ODDS_API_DISCOVERY_MAX_ATTEMPTS
@@ -12940,7 +12950,7 @@ def discover_the_odds_api_watchlist(
             for row in prior_request_audit if isinstance(row, dict)
         )
     )
-    if isinstance(prior, dict) and prior_status == "degraded" and not force_retry and not legacy_recovery:
+    if isinstance(prior, dict) and prior_status == "degraded" and not force_retry and not legacy_recovery and not format_recovery:
         next_retry_at = int(prior.get("next_retry_at") or 0)
         if prior_attempt_count >= THE_ODDS_API_DISCOVERY_MAX_ATTEMPTS:
             persist_pruning_if_needed()
@@ -12962,8 +12972,8 @@ def discover_the_odds_api_watchlist(
     horizon_end = now + timedelta(hours=LEARNING_DISCOVERY_HORIZON_HOURS)
     params = {
         "dateFormat": "iso",
-        "commenceTimeFrom": now.isoformat().replace("+00:00", "Z"),
-        "commenceTimeTo": horizon_end.isoformat().replace("+00:00", "Z"),
+        "commenceTimeFrom": now.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "commenceTimeTo": horizon_end.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     }
     request_audit: List[Dict[str, Any]] = []
     discovered_ids = []
@@ -13046,6 +13056,7 @@ def discover_the_odds_api_watchlist(
         "at": now_ts, "horizon_end": int(horizon_end.timestamp()),
         "attempt_count": attempt_count,
         "forced_retry": bool(force_retry), "legacy_recovery_retry": legacy_recovery,
+        "request_format_recovery_retry": format_recovery, "request_time_format": "seconds_z_v1",
         "request_count": int((prior or {}).get("request_count") or 0) + len(request_audit),
         "failed_request_count": failed_count, "failed_sport_keys": current_failed_sport_keys,
         "next_retry_at": now_ts + retry_seconds if failed_count and attempt_count < THE_ODDS_API_DISCOVERY_MAX_ATTEMPTS else None,
