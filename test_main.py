@@ -2798,6 +2798,36 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "invalid_persisted_run",
         )
 
+    def test_public_learning_health_exposes_counts_and_lane_blockers_without_secrets(self):
+        now_ts = int(datetime(2026, 10, 8, 7, 0, tzinfo=timezone.utc).timestamp())
+        run_id = "daily-20261008-1430"
+        content = main.learning_run_hash_content({
+            "run_id": run_id, "started_at": now_ts - 120,
+            "execution_order": ["past_36h_postmatch", "future_24h_prematch"],
+            "automatic_champion_change": False,
+        })
+        record = {
+            **content, "immutable": True, "run_hash": main._content_hash(content),
+            "admitted_count": 2, "frozen_count": 1,
+            "market_language_observation_frozen_count": 3,
+            "review_draft_count": 1, "promotion_candidate_created_count": 0,
+        }
+        store = {
+            "learning_runs": {run_id: record},
+            "the_odds_api_watchlist": {"one": {"expires_at": now_ts + 3600}},
+        }
+        probe = {"authenticated": False, "provider_error_code": "INVALID_API_KEY"}
+        with patch.object(main, "load_snapshot_store", return_value=store), \
+             patch.object(main, "API_FOOTBALL_STARTUP_PROBE", probe), \
+             patch.object(main, "THE_ODDS_API_KEY", "private-odds-key"):
+            result = main.automatic_learning_public_health(now_ts=now_ts)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["counts"]["admitted"], 2)
+        self.assertEqual(result["market_observation_lane"], "ready")
+        self.assertEqual(result["formal_fundamental_lane"], "blocked")
+        self.assertIn("api_football_not_authenticated", result["blockers"])
+        self.assertNotIn("private-odds-key", str(result))
+
     def test_fixture_acceptance_requires_a_real_ready_fixture(self):
         reports = {
             "a": {"fixture": "a", "status": "not_ready", "latest_stage": "Opening", "market_blockers": ["line_movement:data_missing"], "decision_blockers": []},
@@ -3976,6 +4006,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             result = main.api_football_capability_check()
         self.assertFalse(result["authenticated"])
         self.assertEqual(result["error_category"], "credential_rejected")
+        self.assertEqual(result["provider_error_code"], "MISSING_API_KEY")
         self.assertNotIn("private-key", str(result))
 
     def learning_payload(self, fixture="learn-1", captured_at=900, kickoff_at=1000, analysis=None):

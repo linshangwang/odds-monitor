@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.19.5"
+VERSION = "2.19.6"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -148,7 +148,7 @@ API_FOOTBALL_STARTUP_PROBE_STARTED = False
 API_FOOTBALL_STARTUP_PROBE: Dict[str, Any] = {"status": "not_started", "authenticated": False}
 SNAPSHOT_STORE_LOCK = threading.RLock()
 
-API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
 API_FOOTBALL_BASE_URL = os.getenv("API_FOOTBALL_BASE_URL", "https://v3.football.api-sports.io").rstrip("/")
 THESTATS_API_KEY = os.getenv("THESTATS_API_KEY", "")
 THESTATS_BASE_URL = os.getenv("THESTATS_BASE_URL", "https://api.thestatsapi.com/api").rstrip("/")
@@ -422,10 +422,19 @@ def api_football_capability_check() -> Dict[str, Any]:
         category = "quota_or_rate_limit"
     else:
         category = "upstream_error"
+    if "invalid api key" in error_text or "invalid application key" in error_text:
+        provider_error_code = "INVALID_API_KEY"
+    elif "missing application key" in error_text:
+        provider_error_code = "MISSING_API_KEY"
+    elif category == "quota_or_rate_limit":
+        provider_error_code = "QUOTA_OR_RATE_LIMIT"
+    else:
+        provider_error_code = None
     return {
         "status": "completed", "checked_at": int(time.time()),
         "configured": True, "authenticated": result.get("ok") is True,
         "status_code": result.get("status_code"), "error_category": category,
+        "provider_error_code": provider_error_code,
     }
 
 
@@ -5007,6 +5016,52 @@ def root():
     return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/the-odds-api/watchlist-discover", "/shadow/import-status", "/shadow/data-source-health", "/shadow/store-health", "/shadow/store-recovery-preview", "/shadow/store-recover", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}", "/shadow/market-language/freeze", "/shadow/market-language/collect-facts", "/shadow/market-language/settlement-plan", "/shadow/market-language/settle", "/shadow/market-language/status", "/shadow/learning/registry", "/shadow/learning/node-plan", "/shadow/learning/node-run", "/shadow/learning/data-health", "/shadow/learning/postmatch-recovery", "/shadow/learning/collect-facts", "/shadow/learning/cycle-plan", "/shadow/learning/run", "/shadow/learning/review-queue", "/shadow/learning/review-draft", "/shadow/learning/complete-review", "/shadow/learning/quality-cards/refresh", "/shadow/learning/quality-calibration", "/shadow/learning/research-proposals", "/shadow/learning/research-proposals/refresh", "/shadow/learning/validation-queue", "/shadow/learning/freeze", "/shadow/learning/settle", "/shadow/learning/hypotheses", "/shadow/learning/hypotheses/{id}/shadow-lock", "/shadow/learning/hypotheses/{id}/promotion-evidence", "/shadow/learning/league-dna", "/shadow/learning/league-dna/{tag_id}/activation-candidate", "/shadow/learning/league-dna/{tag_id}/confirm", "/shadow/learning/selection-quality", "/shadow/learning/status"]}
 
 
+def automatic_learning_public_health(now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Expose a secret-free daily learning summary without requiring the admin token."""
+    now_ts = int(now_ts or time.time())
+    try:
+        store = load_snapshot_store()
+        schedule = automatic_learning_schedule_health(now_ts=now_ts, store_override=store)
+    except SnapshotStoreReadError:
+        return {
+            "status": "store_unavailable", "run_id": None,
+            "formal_fundamental_lane": "blocked", "market_observation_lane": "blocked",
+            "blockers": ["snapshot_store_unavailable"], "secrets_exposed": False,
+        }
+    run_id = schedule.get("run_id")
+    record = (store.get("learning_runs") or {}).get(run_id) if run_id else None
+    record = record if isinstance(record, dict) else {}
+    formal_ready = API_FOOTBALL_STARTUP_PROBE.get("authenticated") is True and bool(THE_ODDS_API_KEY)
+    watchlist_rows = [row for row in (store.get("the_odds_api_watchlist") or {}).values() if isinstance(row, dict)]
+    active_watchlist_count = sum((_parse_timestamp(row.get("expires_at")) or 0) >= now_ts for row in watchlist_rows)
+    market_ready = bool(THE_ODDS_API_KEY) and active_watchlist_count > 0
+    blockers = []
+    if API_FOOTBALL_STARTUP_PROBE.get("authenticated") is not True:
+        blockers.append("api_football_not_authenticated")
+    if not THE_ODDS_API_KEY:
+        blockers.append("the_odds_api_not_configured")
+    if schedule.get("healthy") is not True:
+        blockers.append("daily_run_not_healthy")
+    return {
+        "status": schedule.get("status"), "healthy": schedule.get("healthy"),
+        "run_id": run_id, "scheduled_at": schedule.get("scheduled_at"),
+        "started_at": schedule.get("started_at"),
+        "formal_fundamental_lane": "ready" if formal_ready else "blocked",
+        "market_observation_lane": "ready" if market_ready else "blocked",
+        "active_market_watchlist_count": active_watchlist_count,
+        "counts": {
+            "admitted": int(record.get("admitted_count") or 0),
+            "frozen": int(record.get("frozen_count") or 0),
+            "market_observations_frozen": int(record.get("market_language_observation_frozen_count") or 0),
+            "postmatch_facts": len(record.get("postmatch_fact_results") or []),
+            "review_drafts": int(record.get("review_draft_count") or 0),
+            "promotion_candidates": int(record.get("promotion_candidate_created_count") or 0),
+        },
+        "blockers": blockers, "automatic_champion_change": False,
+        "manual_analysis_included": False, "secrets_exposed": False,
+    }
+
+
 @app.get("/health")
 def health():
     route = market_data_route_report()
@@ -5016,7 +5071,7 @@ def health():
         "fresh_fixture_count": get_nested(route, ["pang", "fresh_fixture_count"], 0),
         "missing_action": route.get("missing_action"),
     }
-    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "the_odds_api_base_url": THE_ODDS_API_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "api_football_startup_probe": API_FOOTBALL_STARTUP_PROBE, "has_thestats_key": bool(THESTATS_API_KEY), "thestats_fixture_day_cache_ttl_seconds": THESTATS_FIXTURE_DAY_CACHE_TTL_SECONDS, "thestats_fixture_day_cache_entries": len(THESTATS_FIXTURE_DAY_CACHE), "has_the_odds_api_key": bool(THE_ODDS_API_KEY), "the_odds_api_watchlist": the_odds_api_watchlist_health(), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "nami_odds_startup_probe": NAMI_ODDS_STARTUP_PROBE, "nami_odds_probe_ttl_seconds": NAMI_ODDS_PROBE_TTL_SECONDS, "market_data_route": route_summary, "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "snapshot_store_writer_workers": SNAPSHOT_STORE_WRITER_WORKERS, "snapshot_store_single_writer_required": True, "snapshot_store_warn_bytes": SNAPSHOT_STORE_WARN_BYTES, "snapshot_store_max_decompressed_bytes": SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES, "fundamental_version_retention": FUNDAMENTAL_VERSION_RETENTION, "portfolio_run_retention": PORTFOLIO_RUN_RETENTION, "external_data_stale_seconds": EXTERNAL_DATA_STALE_SECONDS, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}, "auto_provider_reconciliation": AUTO_RECONCILIATION_LAST_RESULT}
+    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "the_odds_api_base_url": THE_ODDS_API_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "api_football_startup_probe": API_FOOTBALL_STARTUP_PROBE, "has_thestats_key": bool(THESTATS_API_KEY), "thestats_fixture_day_cache_ttl_seconds": THESTATS_FIXTURE_DAY_CACHE_TTL_SECONDS, "thestats_fixture_day_cache_entries": len(THESTATS_FIXTURE_DAY_CACHE), "has_the_odds_api_key": bool(THE_ODDS_API_KEY), "the_odds_api_watchlist": the_odds_api_watchlist_health(), "automatic_learning": automatic_learning_public_health(), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "nami_odds_startup_probe": NAMI_ODDS_STARTUP_PROBE, "nami_odds_probe_ttl_seconds": NAMI_ODDS_PROBE_TTL_SECONDS, "market_data_route": route_summary, "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "snapshot_store_writer_workers": SNAPSHOT_STORE_WRITER_WORKERS, "snapshot_store_single_writer_required": True, "snapshot_store_warn_bytes": SNAPSHOT_STORE_WARN_BYTES, "snapshot_store_max_decompressed_bytes": SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES, "fundamental_version_retention": FUNDAMENTAL_VERSION_RETENTION, "portfolio_run_retention": PORTFOLIO_RUN_RETENTION, "external_data_stale_seconds": EXTERNAL_DATA_STALE_SECONDS, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}, "auto_provider_reconciliation": AUTO_RECONCILIATION_LAST_RESULT}
 
 
 @app.get("/shadow/nami-capabilities")
