@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.19.2"
+VERSION = "2.19.3"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -482,17 +482,29 @@ def call_the_odds_api(path: str, params: Optional[Dict[str, Any]] = None) -> Dic
         resp = requests.get(url, params=query, timeout=REQUEST_TIMEOUT)
         payload = safe_json_response(resp)
         business_error = root_business_error(payload, "the_odds_api")
+        error_text = json.dumps(payload, ensure_ascii=False).lower() if business_error else ""
+        if resp.status_code in (401, 403) or any(token in error_text for token in ("api key", "apikey", "unauthorized", "credential")):
+            error_category = "credential_rejected"
+        elif resp.status_code == 429 or any(token in error_text for token in ("quota", "rate limit", "usage limit")):
+            error_category = "quota_or_rate_limit"
+        elif resp.status_code in (400, 404, 422):
+            error_category = "request_or_sport_key_rejected"
+        elif not resp.ok or business_error:
+            error_category = "provider_error"
+        else:
+            error_category = None
         return {
             "ok": bool(resp.ok and not business_error),
             "status_code": resp.status_code,
             "data": payload,
             "error": business_error,
+            "error_category": error_category,
             "quota_remaining": resp.headers.get("x-requests-remaining"),
             "quota_used": resp.headers.get("x-requests-used"),
             "quota_last": resp.headers.get("x-requests-last"),
         }
     except requests.RequestException as exc:
-        return {"ok": False, "error": type(exc).__name__}
+        return {"ok": False, "error": type(exc).__name__, "error_category": "network_or_timeout"}
 
 
 def call_nami(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -4985,7 +4997,7 @@ def build_portfolio(evaluation_rows: List[Dict[str, Any]], max_legs: int = 6, ri
 
 @app.get("/")
 def root():
-    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/import-status", "/shadow/data-source-health", "/shadow/store-health", "/shadow/store-recovery-preview", "/shadow/store-recover", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}", "/shadow/market-language/freeze", "/shadow/market-language/collect-facts", "/shadow/market-language/settlement-plan", "/shadow/market-language/settle", "/shadow/market-language/status", "/shadow/learning/registry", "/shadow/learning/node-plan", "/shadow/learning/node-run", "/shadow/learning/data-health", "/shadow/learning/postmatch-recovery", "/shadow/learning/collect-facts", "/shadow/learning/cycle-plan", "/shadow/learning/run", "/shadow/learning/review-queue", "/shadow/learning/review-draft", "/shadow/learning/complete-review", "/shadow/learning/quality-cards/refresh", "/shadow/learning/quality-calibration", "/shadow/learning/research-proposals", "/shadow/learning/research-proposals/refresh", "/shadow/learning/validation-queue", "/shadow/learning/freeze", "/shadow/learning/settle", "/shadow/learning/hypotheses", "/shadow/learning/hypotheses/{id}/shadow-lock", "/shadow/learning/hypotheses/{id}/promotion-evidence", "/shadow/learning/league-dna", "/shadow/learning/league-dna/{tag_id}/activation-candidate", "/shadow/learning/league-dna/{tag_id}/confirm", "/shadow/learning/selection-quality", "/shadow/learning/status"]}
+    return {"service": "football-shadow-data-service", "version": VERSION, "main_endpoints": ["/shadow/target-fixtures", "/shadow/analyze-fixture", "/shadow/tracking-plan", "/shadow/snapshot", "/shadow/snapshots", "/shadow/ai-packet", "/shadow/import-prematch-packets", "/shadow/the-odds-api/collect-timeline", "/shadow/the-odds-api/watchlist-discover", "/shadow/import-status", "/shadow/data-source-health", "/shadow/store-health", "/shadow/store-recovery-preview", "/shadow/store-recover", "/shadow/nami-odds-capabilities", "/shadow/model/poisson", "/shadow/model/fundamental-xg", "/shadow/model/prematch-evaluate", "/shadow/portfolio/evaluate", "/shadow/imported-prematch/{fixture}", "/shadow/market-language/freeze", "/shadow/market-language/collect-facts", "/shadow/market-language/settlement-plan", "/shadow/market-language/settle", "/shadow/market-language/status", "/shadow/learning/registry", "/shadow/learning/node-plan", "/shadow/learning/node-run", "/shadow/learning/data-health", "/shadow/learning/postmatch-recovery", "/shadow/learning/collect-facts", "/shadow/learning/cycle-plan", "/shadow/learning/run", "/shadow/learning/review-queue", "/shadow/learning/review-draft", "/shadow/learning/complete-review", "/shadow/learning/quality-cards/refresh", "/shadow/learning/quality-calibration", "/shadow/learning/research-proposals", "/shadow/learning/research-proposals/refresh", "/shadow/learning/validation-queue", "/shadow/learning/freeze", "/shadow/learning/settle", "/shadow/learning/hypotheses", "/shadow/learning/hypotheses/{id}/shadow-lock", "/shadow/learning/hypotheses/{id}/promotion-evidence", "/shadow/learning/league-dna", "/shadow/learning/league-dna/{tag_id}/activation-candidate", "/shadow/learning/league-dna/{tag_id}/confirm", "/shadow/learning/selection-quality", "/shadow/learning/status"]}
 
 
 @app.get("/health")
@@ -5044,6 +5056,26 @@ async def shadow_the_odds_api_collect_timeline(request: Request, token: Optional
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=400, detail="invalid_json_body") from exc
     return JSONResponse(collect_the_odds_api_timeline(payload))
+
+
+@app.post("/shadow/the-odds-api/watchlist-discover")
+async def shadow_the_odds_api_watchlist_discover(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    """Run or recover the zero-credit upcoming-event discovery pass."""
+    require_paid_odds_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    body = await request.body()
+    if len(body) > 16 * 1024:
+        raise HTTPException(status_code=413, detail="request_body_too_large")
+    try:
+        payload = json.loads(body.decode("utf-8")) if body else {}
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="invalid_json") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="request_body_must_be_an_object")
+    force_retry = payload.get("force_retry", False)
+    if not isinstance(force_retry, bool):
+        raise HTTPException(status_code=400, detail="force_retry_must_be_boolean")
+    result = discover_the_odds_api_watchlist(force_retry=force_retry)
+    return JSONResponse({"ok": result.get("status") in {"completed", "already_completed"}, "discovery": result})
 
 def sportradar_live_selfcheck() -> Dict[str, Any]:
     if not SPORTRADAR_API_KEY:
@@ -12783,11 +12815,25 @@ def the_odds_api_watchlist_health(
     expired_count = len(rows) - active_count
     runs = [row for row in (store.get("the_odds_api_discovery_runs") or {}).values() if isinstance(row, dict)]
     latest = max(runs, key=lambda row: int(row.get("at") or 0), default=None)
+    latest_request_rows = list((latest or {}).get("request_audit") or []) if isinstance(latest, dict) else []
+    latest_error_categories: Dict[str, int] = {}
+    for request_row in latest_request_rows:
+        category = str((request_row or {}).get("error_category") or "").strip()
+        if category:
+            latest_error_categories[category] = latest_error_categories.get(category, 0) + 1
+    latest_quota_row = next(
+        (row for row in reversed(latest_request_rows) if any(row.get(key) is not None for key in ("quota_remaining", "quota_used", "quota_last"))),
+        {},
+    )
     latest_summary = None if latest is None else {
         "run_id": latest.get("run_id"), "status": latest.get("status"),
         "at": latest.get("at"), "attempt_count": latest.get("attempt_count", 1),
         "discovered_count": latest.get("discovered_count", 0),
         "failed_request_count": latest.get("failed_request_count", 0),
+        "error_category_counts": latest_error_categories,
+        "quota_remaining": latest_quota_row.get("quota_remaining"),
+        "quota_used": latest_quota_row.get("quota_used"),
+        "quota_last": latest_quota_row.get("quota_last"),
         "next_retry_at": latest.get("next_retry_at"),
     }
     return {
@@ -12805,6 +12851,7 @@ def discover_the_odds_api_watchlist(
     store_override: Optional[Dict[str, Any]] = None,
     api_caller: Optional[Any] = None,
     persist: bool = True,
+    force_retry: bool = False,
 ) -> Dict[str, Any]:
     """Discover the next 24h major-league events without admitting model samples.
 
@@ -12857,7 +12904,7 @@ def discover_the_odds_api_watchlist(
 
     prior = (store.get("the_odds_api_discovery_runs") or {}).get(run_id)
     prior_status = str((prior or {}).get("status") or "completed") if isinstance(prior, dict) else None
-    if isinstance(prior, dict) and prior_status == "completed":
+    if isinstance(prior, dict) and prior_status == "completed" and not force_retry:
         persist_pruning_if_needed()
         return {
             "status": "already_completed", "run_id": run_id, "at": now_ts,
@@ -12866,7 +12913,14 @@ def discover_the_odds_api_watchlist(
             "archived_count": len(expired_fixtures), "pruned_count": len(expired_fixtures),
         }
     prior_attempt_count = int((prior or {}).get("attempt_count") or 0) if isinstance(prior, dict) else 0
-    if isinstance(prior, dict) and prior_status == "degraded":
+    prior_request_audit = list((prior or {}).get("request_audit") or []) if isinstance(prior, dict) else []
+    legacy_recovery = bool(
+        prior_status == "degraded"
+        and prior_attempt_count >= THE_ODDS_API_DISCOVERY_MAX_ATTEMPTS
+        and prior_request_audit
+        and not any((row or {}).get("error_category") for row in prior_request_audit if isinstance(row, dict))
+    )
+    if isinstance(prior, dict) and prior_status == "degraded" and not force_retry and not legacy_recovery:
         next_retry_at = int(prior.get("next_retry_at") or 0)
         if prior_attempt_count >= THE_ODDS_API_DISCOVERY_MAX_ATTEMPTS:
             persist_pruning_if_needed()
@@ -12910,6 +12964,10 @@ def discover_the_odds_api_watchlist(
             "league_id": league_id, "sport_key": sport_key,
             "ok": bool(response.get("ok")) if isinstance(response, dict) else False,
             "status_code": response.get("status_code") if isinstance(response, dict) else None,
+            "error_category": response.get("error_category") if isinstance(response, dict) else "invalid_response",
+            "quota_remaining": response.get("quota_remaining") if isinstance(response, dict) else None,
+            "quota_used": response.get("quota_used") if isinstance(response, dict) else None,
+            "quota_last": response.get("quota_last") if isinstance(response, dict) else None,
             "returned_count": len(rows),
         })
         if not isinstance(response, dict) or not response.get("ok"):
@@ -12965,6 +13023,7 @@ def discover_the_odds_api_watchlist(
         "status": "completed" if failed_count == 0 else "degraded",
         "at": now_ts, "horizon_end": int(horizon_end.timestamp()),
         "attempt_count": attempt_count,
+        "forced_retry": bool(force_retry), "legacy_recovery_retry": legacy_recovery,
         "request_count": int((prior or {}).get("request_count") or 0) + len(request_audit),
         "failed_request_count": failed_count, "failed_sport_keys": current_failed_sport_keys,
         "next_retry_at": now_ts + retry_seconds if failed_count and attempt_count < THE_ODDS_API_DISCOVERY_MAX_ATTEMPTS else None,

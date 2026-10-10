@@ -3784,6 +3784,61 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         retry_caller.assert_called_once()
         self.assertIn("soccer_norway_eliteserien", retry_caller.call_args.args[0])
 
+    def test_the_odds_api_watchlist_automatically_retries_one_legacy_exhausted_run(self):
+        now = datetime(2026, 10, 9, 7, 0, tzinfo=timezone.utc)
+        run_id = "odds-watchlist-20261009-1430"
+        store = {"fixtures": {}, "the_odds_api_discovery_runs": {run_id: {
+            "run_id": run_id, "status": "degraded", "attempt_count": 3,
+            "failed_request_count": 1, "failed_sport_keys": ["soccer_epl"],
+            "next_retry_at": None, "request_count": 3,
+            "request_audit": [{"sport_key": "soccer_epl", "ok": False, "status_code": 401}],
+        }}}
+        caller = Mock(return_value={
+            "ok": True, "status_code": 200, "data": [],
+            "quota_remaining": "17083", "quota_used": "2917", "quota_last": "0",
+        })
+        with patch.object(main, "THE_ODDS_API_KEY", "configured"):
+            recovered = main.discover_the_odds_api_watchlist(
+                now, store_override=store, api_caller=caller, persist=False,
+            )
+        self.assertEqual(recovered["status"], "completed")
+        self.assertTrue(recovered["legacy_recovery_retry"])
+        self.assertEqual(recovered["attempt_count"], 4)
+        caller.assert_called_once()
+
+    def test_the_odds_api_watchlist_force_retry_and_safe_health_diagnostics(self):
+        now = datetime(2026, 10, 9, 7, 0, tzinfo=timezone.utc)
+        run_id = "odds-watchlist-20261009-1430"
+        store = {"fixtures": {}, "the_odds_api_discovery_runs": {run_id: {
+            "run_id": run_id, "status": "degraded", "at": int(now.timestamp()),
+            "attempt_count": 3, "failed_request_count": 1,
+            "failed_sport_keys": ["soccer_epl"], "next_retry_at": None,
+            "request_count": 3,
+            "request_audit": [{"sport_key": "soccer_epl", "error_category": "credential_rejected"}],
+        }}}
+        caller = Mock(return_value={
+            "ok": False, "status_code": 401, "data": {},
+            "error_category": "credential_rejected",
+            "quota_remaining": "17083", "quota_used": "2917", "quota_last": "0",
+        })
+        with patch.object(main, "THE_ODDS_API_KEY", "configured"):
+            blocked = main.discover_the_odds_api_watchlist(
+                now, store_override=store, api_caller=caller, persist=False,
+            )
+            retried = main.discover_the_odds_api_watchlist(
+                now, store_override=store, api_caller=caller, persist=False, force_retry=True,
+            )
+        self.assertEqual(blocked["status"], "retry_exhausted")
+        self.assertEqual(retried["status"], "degraded")
+        self.assertTrue(retried["forced_retry"])
+        caller.assert_called_once()
+        health = main.the_odds_api_watchlist_health(now_ts=int(now.timestamp()), store_override=store)
+        latest = health["latest_run"]
+        self.assertEqual(latest["error_category_counts"], {"credential_rejected": 1})
+        self.assertEqual(latest["quota_remaining"], "17083")
+        self.assertEqual(latest["quota_used"], "2917")
+        self.assertEqual(latest["quota_last"], "0")
+
     def test_the_odds_api_watchlist_prunes_expired_rows_and_exposes_compact_health(self):
         now_ts = int(datetime(2026, 10, 9, 7, 0, tzinfo=timezone.utc).timestamp())
         run_id = "odds-watchlist-20261009-1430"
