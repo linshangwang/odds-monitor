@@ -3814,7 +3814,10 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             "attempt_count": 3, "failed_request_count": 1,
             "failed_sport_keys": ["soccer_epl"], "next_retry_at": None,
             "request_count": 3,
-            "request_audit": [{"sport_key": "soccer_epl", "error_category": "credential_rejected"}],
+            "request_audit": [{
+                "sport_key": "soccer_epl", "error_category": "credential_rejected",
+                "provider_error_code": "INVALID_KEY", "provider_error_detail": "API key rejected",
+            }],
         }}}
         caller = Mock(return_value={
             "ok": False, "status_code": 401, "data": {},

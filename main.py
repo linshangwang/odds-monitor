@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.19.3"
+VERSION = "2.19.4"
 RELEASE_CHANNEL = "shadow-usable"
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -152,7 +152,7 @@ API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
 API_FOOTBALL_BASE_URL = os.getenv("API_FOOTBALL_BASE_URL", "https://v3.football.api-sports.io").rstrip("/")
 THESTATS_API_KEY = os.getenv("THESTATS_API_KEY", "")
 THESTATS_BASE_URL = os.getenv("THESTATS_BASE_URL", "https://api.thestatsapi.com/api").rstrip("/")
-THE_ODDS_API_KEY = os.getenv("THE_ODDS_API_KEY", "")
+THE_ODDS_API_KEY = os.getenv("THE_ODDS_API_KEY", "").strip()
 THE_ODDS_API_BASE_URL = os.getenv("THE_ODDS_API_BASE_URL", "https://api.the-odds-api.com/v4").rstrip("/")
 THE_ODDS_API_REGIONS = os.getenv("THE_ODDS_API_REGIONS", "fi,eu")
 THE_ODDS_API_BOOKMAKERS = os.getenv("THE_ODDS_API_BOOKMAKERS", "")
@@ -482,7 +482,12 @@ def call_the_odds_api(path: str, params: Optional[Dict[str, Any]] = None) -> Dic
         resp = requests.get(url, params=query, timeout=REQUEST_TIMEOUT)
         payload = safe_json_response(resp)
         business_error = root_business_error(payload, "the_odds_api")
-        error_text = json.dumps(payload, ensure_ascii=False).lower() if business_error else ""
+        error_text = json.dumps(payload, ensure_ascii=False).lower() if business_error or not resp.ok else ""
+        provider_error_code = None
+        provider_error_detail = None
+        if isinstance(payload, dict) and (business_error or not resp.ok):
+            provider_error_code = str(payload.get("error_code") or payload.get("code") or "").strip() or None
+            provider_error_detail = mask_secret(str(payload.get("message") or payload.get("error") or "").strip())[:240] or None
         if resp.status_code in (401, 403) or any(token in error_text for token in ("api key", "apikey", "unauthorized", "credential")):
             error_category = "credential_rejected"
         elif resp.status_code == 429 or any(token in error_text for token in ("quota", "rate limit", "usage limit")):
@@ -499,6 +504,8 @@ def call_the_odds_api(path: str, params: Optional[Dict[str, Any]] = None) -> Dic
             "data": payload,
             "error": business_error,
             "error_category": error_category,
+            "provider_error_code": provider_error_code,
+            "provider_error_detail": provider_error_detail,
             "quota_remaining": resp.headers.get("x-requests-remaining"),
             "quota_used": resp.headers.get("x-requests-used"),
             "quota_last": resp.headers.get("x-requests-last"),
@@ -12817,10 +12824,18 @@ def the_odds_api_watchlist_health(
     latest = max(runs, key=lambda row: int(row.get("at") or 0), default=None)
     latest_request_rows = list((latest or {}).get("request_audit") or []) if isinstance(latest, dict) else []
     latest_error_categories: Dict[str, int] = {}
+    latest_provider_error_codes: Dict[str, int] = {}
+    latest_provider_error_details: Dict[str, int] = {}
     for request_row in latest_request_rows:
         category = str((request_row or {}).get("error_category") or "").strip()
         if category:
             latest_error_categories[category] = latest_error_categories.get(category, 0) + 1
+        provider_code = str((request_row or {}).get("provider_error_code") or "").strip()
+        if provider_code:
+            latest_provider_error_codes[provider_code] = latest_provider_error_codes.get(provider_code, 0) + 1
+        provider_detail = str((request_row or {}).get("provider_error_detail") or "").strip()
+        if provider_detail:
+            latest_provider_error_details[provider_detail] = latest_provider_error_details.get(provider_detail, 0) + 1
     latest_quota_row = next(
         (row for row in reversed(latest_request_rows) if any(row.get(key) is not None for key in ("quota_remaining", "quota_used", "quota_last"))),
         {},
@@ -12831,6 +12846,8 @@ def the_odds_api_watchlist_health(
         "discovered_count": latest.get("discovered_count", 0),
         "failed_request_count": latest.get("failed_request_count", 0),
         "error_category_counts": latest_error_categories,
+        "provider_error_code_counts": latest_provider_error_codes,
+        "provider_error_detail_counts": latest_provider_error_details,
         "quota_remaining": latest_quota_row.get("quota_remaining"),
         "quota_used": latest_quota_row.get("quota_used"),
         "quota_last": latest_quota_row.get("quota_last"),
@@ -12918,7 +12935,10 @@ def discover_the_odds_api_watchlist(
         prior_status == "degraded"
         and prior_attempt_count >= THE_ODDS_API_DISCOVERY_MAX_ATTEMPTS
         and prior_request_audit
-        and not any((row or {}).get("error_category") for row in prior_request_audit if isinstance(row, dict))
+        and not any(
+            (row or {}).get("provider_error_code") or (row or {}).get("provider_error_detail")
+            for row in prior_request_audit if isinstance(row, dict)
+        )
     )
     if isinstance(prior, dict) and prior_status == "degraded" and not force_retry and not legacy_recovery:
         next_retry_at = int(prior.get("next_retry_at") or 0)
@@ -12965,6 +12985,8 @@ def discover_the_odds_api_watchlist(
             "ok": bool(response.get("ok")) if isinstance(response, dict) else False,
             "status_code": response.get("status_code") if isinstance(response, dict) else None,
             "error_category": response.get("error_category") if isinstance(response, dict) else "invalid_response",
+            "provider_error_code": response.get("provider_error_code") if isinstance(response, dict) else None,
+            "provider_error_detail": response.get("provider_error_detail") if isinstance(response, dict) else None,
             "quota_remaining": response.get("quota_remaining") if isinstance(response, dict) else None,
             "quota_used": response.get("quota_used") if isinstance(response, dict) else None,
             "quota_last": response.get("quota_last") if isinstance(response, dict) else None,
