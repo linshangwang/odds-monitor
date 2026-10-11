@@ -8,6 +8,18 @@
 - [AUTO_LEARNING_TASK.md](AUTO_LEARNING_TASK.md)
 - [LEAGUE_DNA.md](LEAGUE_DNA.md)
 
+## 供应商用量闸门（v2.20）
+
+- 外部赛程观察名单负责发现比赛；API-Football不做逐场或全日高频轮询。
+- 自动学习按北京时间每两小时合并一批，默认起点为01:30，窗口采用`(批次起点, 批次起点+2小时]`。例如13:30一次处理14:00、15:00、15:30，15:30一次处理16:00、17:00、17:30；边界比赛只进入前一批。
+- API-Football与The Odds API自动采集每批每场只执行一次，每批最多50场，不追T-1h或T-30m。早期赔率节点缺失不排除比赛，保存当前可得盘口并标记时间线不完整；完整历史时间线只能通过受保护的显式任务补抓。
+- 相同赛程、积分榜、近期状态、球队统计、伤停和阵容请求按端点TTL复用。
+- 赛前不再请求尚未产生的比赛事件、赛中统计和球员比赛统计。
+- API-Football达到每日请求预算或供应商保留额度后自动熔断。
+- The Odds API达到每日额度预算或最低剩余额度后自动熔断。
+- `/api-football/live`、`/api-football/fixtures`与`/shadow/provider-usage`均要求Shadow令牌。
+- `/health`只展示脱敏的进程内用量；最终账单仍以供应商后台为准。
+
 这是一个 Railway 可部署的 FastAPI 项目，用来测试：
 
 1. API-Football / API-SPORTS 的实时比赛、事件、技术统计接口
@@ -38,7 +50,7 @@ uvicorn main:app --reload
 
 ```text
 API_FOOTBALL_KEY=你的 API-Football / API-SPORTS key
-API_FOOTBALL_BASE_URL=https://v3.football.api-sports.io
+API_FOOTBALL_BASE_URL=https://api-football.5dollarfootballapi.com
 THE_ODDS_API_KEY=你的 The Odds API key
 THE_ODDS_API_BASE_URL=https://api.the-odds-api.com/v4
 SHADOW_ACCESS_TOKEN=单独生成的长随机访问令牌
@@ -648,6 +660,50 @@ POST 支持 `Content-Encoding: gzip`，可直接发送压缩 JSON，
 公式为 `球队进攻率 × 对手防守率 ÷ 联赛场景基准 × 调整系数`。调整系数限制在
 0.8–1.2；支持 xG 或进球率，但进球率会获得较低的数据质量权重。该接口只生成
 概率并固定返回 PASS，必须绑定新鲜比赛和完整决策字段后才能进入最终推荐。
+
+V2.19.13 为完整赛前分析增加 `prematch_quality_profile_v1`。调用
+`/shadow/model/prematch-evaluate` 时可以提交赔率无关的 `quality_metrics`：联赛主客场
+xG基准、双方对应场景xG/xGA、可选npxG、单次射门xG及门将PSxG-GA。系统会生成以
+100为联赛基准的进攻质量、防守压制、机会质量和独立门将指数，并把真实xG/xGA
+直接送入既有λ估计器。指数只使用可用比率的透明几何平均，不施加隐藏方向权重；
+门将指数在v1单独展示，不自动改写λ。质量画像与Pure Fundamental Script一同冻结，
+禁止从赔率反推，缺失或过期必须标记`data_missing`。本模块当前只服务人工赛前分析，
+固定`shadow_learning_effect=false`，不会写入Shadow学习、自动调权或Champion晋级证据。
+
+```json
+{
+  "fixture": "MATCH_UUID",
+  "lineup_confidence": 0.85,
+  "quality_metrics": {
+    "observed_at": "2026-10-10T12:00:00Z",
+    "provenance": {"source": "licensed_xg_feed", "uses_market_odds": false},
+    "league": {
+      "home_xg_for_per90": 1.50,
+      "away_xg_for_per90": 1.20,
+      "home_npxg_for_per90": 1.35,
+      "away_npxg_for_per90": 1.05,
+      "home_xg_per_shot": 0.11,
+      "away_xg_per_shot": 0.10,
+      "sample_size": 100
+    },
+    "home": {
+      "xg_for_per90": 1.80,
+      "xg_against_per90": 0.90,
+      "npxg_for_per90": 1.60,
+      "npxg_against_per90": 0.80,
+      "xg_per_shot_for": 0.12,
+      "xg_per_shot_against": 0.08,
+      "goalkeeper_psxg_minus_ga_per90": 0.10,
+      "sample_size": 10
+    },
+    "away": {
+      "xg_for_per90": 1.00,
+      "xg_against_per90": 1.50,
+      "sample_size": 10
+    }
+  }
+}
+```
 
 `/shadow/model/prematch-evaluate` 将已导入比赛的最新真实盘口与独立基本面模型绑定，依次执行
 基本面 xG、Poisson 概率、市场去水概率、Edge/EV 和最终风险门槛。它不使用赔率生成或修改

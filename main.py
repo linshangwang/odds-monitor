@@ -25,7 +25,7 @@ from the_odds_api_provider import collect_historical_timeline
 
 load_dotenv()
 
-VERSION = "2.19.12"
+VERSION = "2.20.0"
 RELEASE_CHANNEL = "shadow-usable"
 RELEASE_SOURCE_REVISION = os.getenv("RELEASE_COMMIT_SHA", "").strip().lower()
 PROVIDER_RECONCILIATION_SCHEMA_VERSION = 2
@@ -44,6 +44,10 @@ EXTERNAL_DATA_STALE_SECONDS = max(60, int(os.getenv("EXTERNAL_DATA_STALE_SECONDS
 FUNDAMENTAL_VERSION_RETENTION = max(10, min(int(os.getenv("FUNDAMENTAL_VERSION_RETENTION", "100")), 1000))
 PORTFOLIO_RUN_RETENTION = max(10, min(int(os.getenv("PORTFOLIO_RUN_RETENTION", "100")), 1000))
 MAX_IMPORT_DECOMPRESSED_BYTES = 150 * 1024 * 1024
+PREMATCH_QUALITY_MAX_AGE_SECONDS = max(
+    3600,
+    int(os.getenv("PREMATCH_QUALITY_MAX_AGE_SECONDS", str(14 * 24 * 3600))),
+)
 
 
 def bounded_gzip_decompress(raw: bytes, max_bytes: int) -> bytes:
@@ -89,6 +93,22 @@ AUTO_SNAPSHOT_ENABLED = os.getenv("AUTO_SNAPSHOT_ENABLED", "true").lower() in ("
 AUTO_SNAPSHOT_POLL_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_POLL_SECONDS", "300")))
 AUTO_SNAPSHOT_WINDOW_SECONDS = max(60, int(os.getenv("AUTO_SNAPSHOT_WINDOW_SECONDS", "600")))
 AUTO_SNAPSHOT_DAYS_AHEAD = max(1, int(os.getenv("AUTO_SNAPSHOT_DAYS_AHEAD", "2")))
+API_FOOTBALL_DAILY_REQUEST_BUDGET = max(1, int(os.getenv("API_FOOTBALL_DAILY_REQUEST_BUDGET", "1800")))
+API_FOOTBALL_MIN_PROVIDER_REMAINING = max(0, int(os.getenv("API_FOOTBALL_MIN_PROVIDER_REMAINING", "200")))
+API_FOOTBALL_AUTO_MAX_FIXTURES = max(1, min(int(os.getenv("API_FOOTBALL_AUTO_MAX_FIXTURES", "50")), 200))
+API_FOOTBALL_AUTO_HORIZON_HOURS = max(1, min(int(os.getenv("API_FOOTBALL_AUTO_HORIZON_HOURS", "8")), 48))
+API_FOOTBALL_AUTO_CAPTURE_STAGES = {
+    stage.strip() for stage in os.getenv("API_FOOTBALL_AUTO_CAPTURE_STAGES", "T-3h").split(",") if stage.strip()
+}
+AUTO_LEARNING_BATCH_INTERVAL_MINUTES = max(30, min(int(os.getenv("AUTO_LEARNING_BATCH_INTERVAL_MINUTES", "120")), 720))
+AUTO_LEARNING_BATCH_ANCHOR_HOUR = max(0, min(int(os.getenv("AUTO_LEARNING_BATCH_ANCHOR_HOUR", "1")), 23))
+AUTO_LEARNING_BATCH_ANCHOR_MINUTE = max(0, min(int(os.getenv("AUTO_LEARNING_BATCH_ANCHOR_MINUTE", "30")), 59))
+API_FOOTBALL_CACHE_DEFAULT_SECONDS = max(30, int(os.getenv("API_FOOTBALL_CACHE_DEFAULT_SECONDS", "900")))
+THE_ODDS_API_DAILY_CREDIT_BUDGET = max(1, int(os.getenv("THE_ODDS_API_DAILY_CREDIT_BUDGET", "600")))
+THE_ODDS_API_MIN_REMAINING = max(0, int(os.getenv("THE_ODDS_API_MIN_REMAINING", "1000")))
+THE_ODDS_API_AUTO_CAPTURE_STAGES = {
+    stage.strip() for stage in os.getenv("THE_ODDS_API_AUTO_CAPTURE_STAGES", "T-3h").split(",") if stage.strip()
+}
 AUTO_SNAPSHOT_THREAD_STARTED = False
 AUTO_SNAPSHOT_THREAD: Optional[threading.Thread] = None
 AUTO_SNAPSHOT_LAST_CYCLE_AT: Optional[int] = None
@@ -147,10 +167,18 @@ LEARNING_ABLATION_INTERVENTIONS = {
 API_FOOTBALL_RATE_LIMIT_UNTIL = 0
 API_FOOTBALL_STARTUP_PROBE_STARTED = False
 API_FOOTBALL_STARTUP_PROBE: Dict[str, Any] = {"status": "not_started", "authenticated": False}
+PROVIDER_USAGE_LOCK = threading.RLock()
+PROVIDER_USAGE_DAY = ""
+PROVIDER_USAGE: Dict[str, int] = {"api_football_requests": 0, "the_odds_api_credits": 0}
+PROVIDER_LAST_REMAINING: Dict[str, Optional[int]] = {"api_football": None, "the_odds_api": None}
+API_FOOTBALL_RESPONSE_CACHE: Dict[str, Tuple[int, Dict[str, Any]]] = {}
 SNAPSHOT_STORE_LOCK = threading.RLock()
 
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
-API_FOOTBALL_BASE_URL = os.getenv("API_FOOTBALL_BASE_URL", "https://v3.football.api-sports.io").rstrip("/")
+API_FOOTBALL_BASE_URL = os.getenv(
+    "API_FOOTBALL_BASE_URL",
+    "https://api-football.5dollarfootballapi.com",
+).rstrip("/")
 THESTATS_API_KEY = os.getenv("THESTATS_API_KEY", "")
 THESTATS_BASE_URL = os.getenv("THESTATS_BASE_URL", "https://api.thestatsapi.com/api").rstrip("/")
 THE_ODDS_API_KEY = os.getenv("THE_ODDS_API_KEY", "")
@@ -392,6 +420,102 @@ def nami_business_error(payload: Any) -> Optional[str]:
     return None
 
 
+def _provider_usage_today(now_ts: Optional[int] = None) -> Dict[str, int]:
+    """Return restart-safe provider usage with a Shanghai-calendar reset."""
+    global PROVIDER_USAGE_DAY, PROVIDER_USAGE
+    day = datetime.fromtimestamp(int(now_ts or time.time()), tz=timezone.utc).astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    with PROVIDER_USAGE_LOCK:
+        if not PROVIDER_USAGE_DAY:
+            try:
+                usage_path = Path(SNAPSHOT_STORE_PATH).with_name("provider_usage.json")
+                saved = json.loads(usage_path.read_text(encoding="utf-8")) if usage_path.exists() else {}
+                if saved.get("date") == day:
+                    PROVIDER_USAGE_DAY = day
+                    PROVIDER_USAGE = {
+                        "api_football_requests": max(0, int(saved.get("api_football_requests") or 0)),
+                        "the_odds_api_credits": max(0, int(saved.get("the_odds_api_credits") or 0)),
+                    }
+                    PROVIDER_LAST_REMAINING["api_football"] = _int_header(saved.get("api_football_provider_remaining"))
+                    PROVIDER_LAST_REMAINING["the_odds_api"] = _int_header(saved.get("the_odds_api_provider_remaining"))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+        if PROVIDER_USAGE_DAY != day:
+            PROVIDER_USAGE_DAY = day
+            PROVIDER_USAGE = {"api_football_requests": 0, "the_odds_api_credits": 0}
+            PROVIDER_LAST_REMAINING["api_football"] = None
+            PROVIDER_LAST_REMAINING["the_odds_api"] = None
+            API_FOOTBALL_RESPONSE_CACHE.clear()
+        return dict(PROVIDER_USAGE)
+
+
+def _persist_provider_usage_locked() -> None:
+    """Persist counters atomically; callers must hold PROVIDER_USAGE_LOCK."""
+    try:
+        usage_path = Path(SNAPSHOT_STORE_PATH).with_name("provider_usage.json")
+        usage_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = usage_path.with_suffix(usage_path.suffix + ".tmp")
+        payload = {
+            "schema": "provider_usage_v1", "date": PROVIDER_USAGE_DAY,
+            **PROVIDER_USAGE,
+            "api_football_provider_remaining": PROVIDER_LAST_REMAINING["api_football"],
+            "the_odds_api_provider_remaining": PROVIDER_LAST_REMAINING["the_odds_api"],
+            "updated_at": int(time.time()),
+        }
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        temp_path.replace(usage_path)
+    except OSError as exc:
+        print("[PROVIDER_USAGE] persist failed: " + type(exc).__name__)
+
+
+def _int_header(value: Any) -> Optional[int]:
+    try:
+        return int(str(value)) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _api_football_cache_ttl(path: str, params: Dict[str, Any]) -> int:
+    if path == "/status":
+        return 300
+    if path == "/fixtures" and params.get("id"):
+        return 6 * 3600
+    if path == "/fixtures" and params.get("date"):
+        return 30 * 60
+    if path in {"/standings", "/teams/statistics", "/fixtures/headtohead"}:
+        return 6 * 3600
+    if path == "/fixtures" and (params.get("team") or params.get("last")):
+        return 6 * 3600
+    if path == "/predictions":
+        return 3600
+    if path == "/injuries":
+        return 15 * 60
+    if path == "/fixtures/lineups":
+        return 5 * 60
+    if path == "/odds":
+        return 120
+    return API_FOOTBALL_CACHE_DEFAULT_SECONDS
+
+
+def provider_usage_health() -> Dict[str, Any]:
+    usage = _provider_usage_today()
+    return {
+        "date": PROVIDER_USAGE_DAY,
+        "api_football": {
+            "requests": usage["api_football_requests"],
+            "daily_budget": API_FOOTBALL_DAILY_REQUEST_BUDGET,
+            "remaining_budget": max(0, API_FOOTBALL_DAILY_REQUEST_BUDGET - usage["api_football_requests"]),
+            "provider_remaining": PROVIDER_LAST_REMAINING["api_football"],
+            "cache_entries": len(API_FOOTBALL_RESPONSE_CACHE),
+        },
+        "the_odds_api": {
+            "credits": usage["the_odds_api_credits"],
+            "daily_budget": THE_ODDS_API_DAILY_CREDIT_BUDGET,
+            "remaining_budget": max(0, THE_ODDS_API_DAILY_CREDIT_BUDGET - usage["the_odds_api_credits"]),
+            "provider_remaining": PROVIDER_LAST_REMAINING["the_odds_api"],
+        },
+    }
+
+
 def call_api_football(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     global API_FOOTBALL_RATE_LIMIT_UNTIL
     if not API_FOOTBALL_KEY:
@@ -401,19 +525,44 @@ def call_api_football(path: str, params: Optional[Dict[str, Any]] = None) -> Dic
         return {"ok": False, "status_code": 429, "error": "api_football_rate_limit_cooldown", "retry_after_seconds": API_FOOTBALL_RATE_LIMIT_UNTIL - now_ts}
     if not path.startswith("/"):
         path = "/" + path
+    query = dict(params or {})
+    usage = _provider_usage_today(now_ts)
+    key_fingerprint = hashlib.sha256(API_FOOTBALL_KEY.encode("utf-8")).hexdigest()[:12]
+    cache_key = json.dumps([key_fingerprint, path, sorted((str(k), str(v)) for k, v in query.items())], ensure_ascii=False)
+    cached = API_FOOTBALL_RESPONSE_CACHE.get(cache_key)
+    if cached and cached[0] >= now_ts:
+        result = copy.deepcopy(cached[1])
+        result["cache_hit"] = True
+        return result
+    provider_remaining = PROVIDER_LAST_REMAINING.get("api_football")
+    if usage["api_football_requests"] >= API_FOOTBALL_DAILY_REQUEST_BUDGET:
+        return {"ok": False, "status_code": 429, "error": "api_football_daily_budget_exhausted", "budget_blocked": True}
+    if provider_remaining is not None and provider_remaining <= API_FOOTBALL_MIN_PROVIDER_REMAINING:
+        return {"ok": False, "status_code": 429, "error": "api_football_provider_reserve_reached", "budget_blocked": True}
     url = f"{API_FOOTBALL_BASE_URL}{path}"
     headers = {"x-apisports-key": API_FOOTBALL_KEY, "Accept": "application/json"}
     try:
-        resp = requests.get(url, params=params or {}, headers=headers, timeout=REQUEST_TIMEOUT)
+        with PROVIDER_USAGE_LOCK:
+            PROVIDER_USAGE["api_football_requests"] += 1
+            _persist_provider_usage_locked()
+        resp = requests.get(url, params=query, headers=headers, timeout=REQUEST_TIMEOUT)
         payload = safe_json_response(resp)
         business_error = api_football_business_error(payload)
+        remaining = _int_header(resp.headers.get("x-ratelimit-requests-remaining"))
+        if remaining is not None:
+            with PROVIDER_USAGE_LOCK:
+                PROVIDER_LAST_REMAINING["api_football"] = remaining
+                _persist_provider_usage_locked()
         if resp.status_code == 429:
             API_FOOTBALL_RATE_LIMIT_UNTIL = int(time.time()) + 3600
             print("[API_FOOTBALL] 429 received; cooldown_seconds=3600")
         elif business_error and any(word in str((payload or {}).get("errors", "")).lower() for word in ("limit", "quota", "rate")):
             API_FOOTBALL_RATE_LIMIT_UNTIL = int(time.time()) + 3600
             print("[API_FOOTBALL] business rate-limit received; cooldown_seconds=3600")
-        return {"ok": bool(resp.ok and not business_error), "status_code": resp.status_code, "request_url": mask_secret(resp.url), "data": payload, "error": business_error}
+        result = {"ok": bool(resp.ok and not business_error), "status_code": resp.status_code, "request_url": mask_secret(resp.url), "data": payload, "error": business_error, "provider_remaining": remaining, "cache_hit": False}
+        ttl = _api_football_cache_ttl(path, query) if result["ok"] else min(900, API_FOOTBALL_CACHE_DEFAULT_SECONDS)
+        API_FOOTBALL_RESPONSE_CACHE[cache_key] = (now_ts + ttl, copy.deepcopy(result))
+        return result
     except requests.RequestException as exc:
         return {"ok": False, "error": mask_secret(str(exc)), "request_url": mask_secret(url)}
 
@@ -486,6 +635,13 @@ def call_the_odds_api(path: str, params: Optional[Dict[str, Any]] = None) -> Dic
     if not path.startswith("/"):
         path = "/" + path
 
+    usage = _provider_usage_today()
+    provider_remaining = PROVIDER_LAST_REMAINING.get("the_odds_api")
+    if usage["the_odds_api_credits"] >= THE_ODDS_API_DAILY_CREDIT_BUDGET:
+        return {"ok": False, "status_code": 429, "error": "the_odds_api_daily_budget_exhausted", "error_category": "local_budget", "budget_blocked": True}
+    if provider_remaining is not None and provider_remaining <= THE_ODDS_API_MIN_REMAINING:
+        return {"ok": False, "status_code": 429, "error": "the_odds_api_provider_reserve_reached", "error_category": "local_budget", "budget_blocked": True}
+
     url = f"{THE_ODDS_API_BASE_URL}{path}"
     query = dict(params or {})
     query["apiKey"] = THE_ODDS_API_KEY
@@ -494,6 +650,13 @@ def call_the_odds_api(path: str, params: Optional[Dict[str, Any]] = None) -> Dic
         resp = requests.get(url, params=query, timeout=REQUEST_TIMEOUT)
         payload = safe_json_response(resp)
         business_error = root_business_error(payload, "the_odds_api")
+        quota_last = _int_header(resp.headers.get("x-requests-last")) or 0
+        quota_remaining = _int_header(resp.headers.get("x-requests-remaining"))
+        with PROVIDER_USAGE_LOCK:
+            PROVIDER_USAGE["the_odds_api_credits"] += max(0, quota_last)
+            if quota_remaining is not None:
+                PROVIDER_LAST_REMAINING["the_odds_api"] = quota_remaining
+            _persist_provider_usage_locked()
         error_text = json.dumps(payload, ensure_ascii=False).lower() if business_error else ""
         if resp.status_code in (401, 403) or any(token in error_text for token in ("api key", "apikey", "unauthorized", "credential")):
             error_category = "credential_rejected"
@@ -514,6 +677,7 @@ def call_the_odds_api(path: str, params: Optional[Dict[str, Any]] = None) -> Dic
             "quota_remaining": resp.headers.get("x-requests-remaining"),
             "quota_used": resp.headers.get("x-requests-used"),
             "quota_last": resp.headers.get("x-requests-last"),
+            "daily_credits": _provider_usage_today()["the_odds_api_credits"],
         }
     except requests.RequestException as exc:
         return {"ok": False, "error": type(exc).__name__, "error_category": "network_or_timeout"}
@@ -1397,7 +1561,14 @@ def collect_prematch_data(fixture_id: int, include_raw: bool = False) -> Dict[st
     if ctx.get("error"):
         return {"ok": False, **ctx}
     home_id, away_id, league_id, season = ctx.get("home_id"), ctx.get("away_id"), ctx.get("league_id"), ctx.get("season")
-    calls: Dict[str, Dict[str, Any]] = {"predictions": call_api_football("/predictions", {"fixture": fixture_id}), "odds_prematch": call_api_football("/odds", {"fixture": fixture_id}), "injuries": call_api_football("/injuries", {"fixture": fixture_id}), "lineups": call_api_football("/fixtures/lineups", {"fixture": fixture_id}), "events": call_api_football("/fixtures/events", {"fixture": fixture_id}), "statistics": call_api_football("/fixtures/statistics", {"fixture": fixture_id}), "players": call_api_football("/fixtures/players", {"fixture": fixture_id})}
+    # Prematch collection deliberately excludes events/statistics/players. Those
+    # endpoints are empty before kickoff and belong to the postmatch fact lane.
+    calls: Dict[str, Dict[str, Any]] = {
+        "predictions": call_api_football("/predictions", {"fixture": fixture_id}),
+        "odds_prematch": call_api_football("/odds", {"fixture": fixture_id}),
+        "injuries": call_api_football("/injuries", {"fixture": fixture_id}),
+        "lineups": call_api_football("/fixtures/lineups", {"fixture": fixture_id}),
+    }
     if home_id and away_id:
         calls["head_to_head_last_10"] = call_api_football("/fixtures/headtohead", {"h2h": f"{home_id}-{away_id}", "last": 10})
     if home_id:
@@ -4148,6 +4319,202 @@ def poisson_probability_model(home_expected_goals: Any, away_expected_goals: Any
     }
 
 
+def _quality_index(ratios: List[float]) -> Optional[float]:
+    """Return a transparent 100-baseline geometric index from positive ratios."""
+    usable = [float(value) for value in ratios if value is not None and value > 0]
+    if not usable:
+        return None
+    geometric_mean = math.exp(sum(math.log(value) for value in usable) / len(usable))
+    return round(max(50.0, min(150.0, geometric_mean * 100.0)), 2)
+
+
+def build_prematch_quality_profile(payload: Dict[str, Any], now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Validate odds-independent xG quality evidence for the manual prematch lane.
+
+    The profile drives the existing xG estimator through venue-split xG/xGA.  The
+    derived 100-baseline quality indices are descriptive and auditable; they are
+    deliberately excluded from automatic learning, Shadow promotion and hidden
+    weight adjustments.
+    """
+    raw = payload.get("quality_metrics")
+    if raw in (None, {}):
+        return {
+            "schema": "prematch_quality_profile_v1",
+            "status": "data_missing",
+            "decision_eligible": False,
+            "blockers": ["quality_metrics_missing"],
+            "shadow_learning_effect": False,
+        }
+    if not isinstance(raw, dict):
+        return {
+            "schema": "prematch_quality_profile_v1",
+            "status": "invalid",
+            "decision_eligible": False,
+            "blockers": ["quality_metrics_must_be_object"],
+            "shadow_learning_effect": False,
+        }
+
+    now_ts = int(time.time()) if now_ts is None else int(now_ts)
+    provenance = raw.get("provenance") if isinstance(raw.get("provenance"), dict) else {}
+    observed_raw = raw.get("observed_at") or raw.get("as_of")
+    observed_at = _parse_timestamp(observed_raw)
+    league = raw.get("league") if isinstance(raw.get("league"), dict) else {}
+    teams = {
+        side: raw.get(side) if isinstance(raw.get(side), dict) else {}
+        for side in ("home", "away")
+    }
+    blockers: List[str] = []
+    if not provenance.get("source"):
+        blockers.append("quality_source_missing")
+    if provenance.get("uses_market_odds") is not False:
+        blockers.append("quality_source_must_be_odds_independent")
+    if observed_at is None:
+        blockers.append("quality_observed_at_missing_or_invalid")
+    elif observed_at > now_ts + 300:
+        blockers.append("quality_observed_at_in_future")
+    elif now_ts - observed_at > PREMATCH_QUALITY_MAX_AGE_SECONDS:
+        blockers.append("quality_metrics_stale")
+
+    required_league = {
+        "home_xg_for_per90": as_float(league.get("home_xg_for_per90")),
+        "away_xg_for_per90": as_float(league.get("away_xg_for_per90")),
+        "sample_size": as_float(league.get("sample_size")),
+    }
+    for field in ("home_xg_for_per90", "away_xg_for_per90"):
+        value = required_league[field]
+        if value is None or not 0.1 <= value <= 5.0:
+            blockers.append(f"league_{field}_out_of_range")
+    if required_league["sample_size"] is None or not 10 <= required_league["sample_size"] <= 5000:
+        blockers.append("league_sample_size_out_of_range")
+
+    normalized_teams: Dict[str, Dict[str, Any]] = {}
+    for side, team in teams.items():
+        normalized = {
+            "xg_for_per90": as_float(team.get("xg_for_per90")),
+            "xg_against_per90": as_float(team.get("xg_against_per90")),
+            "npxg_for_per90": as_float(team.get("npxg_for_per90")),
+            "npxg_against_per90": as_float(team.get("npxg_against_per90")),
+            "xg_per_shot_for": as_float(team.get("xg_per_shot_for")),
+            "xg_per_shot_against": as_float(team.get("xg_per_shot_against")),
+            "goalkeeper_psxg_minus_ga_per90": as_float(team.get("goalkeeper_psxg_minus_ga_per90")),
+            "sample_size": as_float(team.get("sample_size")),
+        }
+        for field in ("xg_for_per90", "xg_against_per90"):
+            value = normalized[field]
+            if value is None or not 0.05 <= value <= 6.0:
+                blockers.append(f"{side}_{field}_out_of_range")
+        if normalized["sample_size"] is None or not 1 <= normalized["sample_size"] <= 100:
+            blockers.append(f"{side}_sample_size_out_of_range")
+        for field in ("npxg_for_per90", "npxg_against_per90"):
+            value = normalized[field]
+            if value is not None and not 0.0 <= value <= 6.0:
+                blockers.append(f"{side}_{field}_out_of_range")
+        for field in ("xg_per_shot_for", "xg_per_shot_against"):
+            value = normalized[field]
+            if value is not None and not 0.01 <= value <= 1.0:
+                blockers.append(f"{side}_{field}_out_of_range")
+        goalkeeper = normalized["goalkeeper_psxg_minus_ga_per90"]
+        if goalkeeper is not None and not -2.0 <= goalkeeper <= 2.0:
+            blockers.append(f"{side}_goalkeeper_psxg_minus_ga_per90_out_of_range")
+        normalized_teams[side] = normalized
+
+    optional_league = {
+        key: as_float(league.get(key))
+        for key in (
+            "home_npxg_for_per90", "away_npxg_for_per90",
+            "home_xg_per_shot", "away_xg_per_shot",
+        )
+    }
+    for field, value in optional_league.items():
+        if value is not None and not 0.01 <= value <= 6.0:
+            blockers.append(f"league_{field}_out_of_range")
+    if blockers:
+        return {
+            "schema": "prematch_quality_profile_v1",
+            "status": "invalid",
+            "decision_eligible": False,
+            "blockers": list(dict.fromkeys(blockers)),
+            "observed_at": observed_raw,
+            "provenance": provenance,
+            "shadow_learning_effect": False,
+        }
+
+    home, away = normalized_teams["home"], normalized_teams["away"]
+    league_home = required_league["home_xg_for_per90"]
+    league_away = required_league["away_xg_for_per90"]
+
+    def side_profile(side: str, team: Dict[str, Any]) -> Dict[str, Any]:
+        scoring_baseline = league_home if side == "home" else league_away
+        conceding_baseline = league_away if side == "home" else league_home
+        attack_components = [team["xg_for_per90"] / scoring_baseline]
+        defense_components = [conceding_baseline / team["xg_against_per90"]]
+        npxg_baseline = optional_league.get(f"{side}_npxg_for_per90")
+        shot_baseline = optional_league.get(f"{side}_xg_per_shot")
+        if team["npxg_for_per90"] is not None and npxg_baseline:
+            attack_components.append(team["npxg_for_per90"] / npxg_baseline)
+        if team["xg_per_shot_for"] is not None and shot_baseline:
+            attack_components.append(team["xg_per_shot_for"] / shot_baseline)
+        if team["xg_per_shot_against"] is not None and shot_baseline:
+            defense_components.append(shot_baseline / team["xg_per_shot_against"])
+        goalkeeper = team["goalkeeper_psxg_minus_ga_per90"]
+        goalkeeper_index = None
+        if goalkeeper is not None:
+            goalkeeper_index = round(max(50.0, min(150.0, 100.0 * (1.0 + goalkeeper / max(team["xg_against_per90"], 0.5)))), 2)
+        return {
+            "attack_quality_index": _quality_index(attack_components),
+            "defense_quality_index": _quality_index(defense_components),
+            "goalkeeper_quality_index": goalkeeper_index,
+            "xg_for_per90": team["xg_for_per90"],
+            "xg_against_per90": team["xg_against_per90"],
+            "npxg_for_per90": team["npxg_for_per90"],
+            "npxg_against_per90": team["npxg_against_per90"],
+            "xg_per_shot_for": team["xg_per_shot_for"],
+            "xg_per_shot_against": team["xg_per_shot_against"],
+            "goalkeeper_psxg_minus_ga_per90": goalkeeper,
+            "sample_size": int(team["sample_size"]),
+            "index_baseline": 100,
+        }
+
+    lineup_confidence = as_float(payload.get("lineup_confidence"))
+    model_inputs = {
+        "league_home_rate": round(league_home, 6),
+        "league_away_rate": round(league_away, 6),
+        "home_attack_rate": round(home["xg_for_per90"], 6),
+        "home_defense_rate": round(home["xg_against_per90"], 6),
+        "away_attack_rate": round(away["xg_for_per90"], 6),
+        "away_defense_rate": round(away["xg_against_per90"], 6),
+        "home_sample_size": int(home["sample_size"]),
+        "away_sample_size": int(away["sample_size"]),
+        "league_sample_size": int(required_league["sample_size"]),
+        "metric_type": "xg",
+        "home_adjustment": as_float(payload.get("home_adjustment", 1.0)),
+        "away_adjustment": as_float(payload.get("away_adjustment", 1.0)),
+        "lineup_confidence": lineup_confidence,
+        "provenance": {
+            **provenance,
+            "uses_market_odds": False,
+            "quality_profile_schema": "prematch_quality_profile_v1",
+        },
+    }
+    profile = {
+        "schema": "prematch_quality_profile_v1",
+        "status": "ready",
+        "decision_eligible": True,
+        "observed_at": observed_raw,
+        "provenance": provenance,
+        "league": {**required_league, **optional_league},
+        "home": side_profile("home", home),
+        "away": side_profile("away", away),
+        "model_inputs": model_inputs,
+        "index_method": "100-baseline geometric mean of available odds-independent xG ratios; 50..150 display cap",
+        "model_effect": "venue-split xG/xGA feed the prematch lambda estimator; descriptive indices do not apply hidden weights",
+        "goalkeeper_policy": "reported separately; no automatic lambda adjustment in v1",
+        "shadow_learning_effect": False,
+    }
+    profile["profile_hash"] = _content_hash({key: value for key, value in profile.items() if key != "profile_hash"})
+    return profile
+
+
 def fundamental_expected_goals(inputs: Dict[str, Any]) -> Dict[str, Any]:
     required_rates = ["league_home_rate", "league_away_rate", "home_attack_rate", "home_defense_rate", "away_attack_rate", "away_defense_rate"]
     rates = {key: as_float(inputs.get(key)) for key in required_rates}
@@ -4389,7 +4756,12 @@ def decision_layer(market_snapshot: Dict[str, Any], model_probabilities: Optiona
     }
 
 
-def _fundamental_evaluation_script(payload: Dict[str, Any], estimator: Dict[str, Any], model: Dict[str, Any]) -> Dict[str, Any]:
+def _fundamental_evaluation_script(
+    payload: Dict[str, Any],
+    estimator: Dict[str, Any],
+    model: Dict[str, Any],
+    quality_profile: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     supplied_chain = payload.get("fundamental_chain") if isinstance(payload.get("fundamental_chain"), dict) else {}
     chain = {
         key: supplied_chain.get(key) if isinstance(supplied_chain.get(key), dict)
@@ -4401,11 +4773,16 @@ def _fundamental_evaluation_script(payload: Dict[str, Any], estimator: Dict[str,
         "estimator_method": estimator.get("method"), "estimator_inputs": estimator.get("inputs"),
         "expected_goals": estimator.get("expected_goals"), "model_method": model.get("method"),
         "model_probability": get_nested(model, ["probabilities", "1x2"]),
+        "quality_profile": quality_profile or {
+            "schema": "prematch_quality_profile_v1", "status": "data_missing",
+            "decision_eligible": False, "shadow_learning_effect": False,
+        },
     }
     return {
         "schema": "prematch_fundamental_evaluation_v1", "odds_independent": True,
         "generated_at": int(time.time()), "chain_order": FUNDAMENTAL_CHAIN, "chain": chain,
         "estimator": {"method": estimator.get("method"), "inputs": estimator.get("inputs"), "expected_goals": estimator.get("expected_goals"), "confidence": estimator.get("confidence"), "audit": estimator.get("audit")},
+        "quality_profile": independent_content["quality_profile"],
         "model": {"method": model.get("method"), "model_hash": model.get("model_hash"), "probabilities": model.get("probabilities")},
         "content_hash": _content_hash(independent_content),
     }
@@ -4602,6 +4979,10 @@ def freeze_fundamental_stage(
         "expected_goals": get_nested(script, ["estimator", "expected_goals"]),
         "model_method": get_nested(script, ["model", "method"]),
         "model_probability": get_nested(script, ["model", "probabilities", "1x2"]),
+        "quality_profile": script.get("quality_profile") or {
+            "schema": "prematch_quality_profile_v1", "status": "data_missing",
+            "decision_eligible": False, "shadow_learning_effect": False,
+        },
     })
     script_hash_valid = bool(script_hash and script_hash == recomputed_script_hash)
     estimator_independent = estimator.get("uses_market_odds") is False
@@ -4841,15 +5222,20 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
     lineup_audit = audit_lineup_confidence(metadata.get("lineup_history"), payload.get("lineup_confidence"))
     effective_payload = dict(payload)
     effective_payload["lineup_confidence"] = lineup_audit.get("effective_confidence")
+    evaluation_cutoff = int(time.time())
+    quality_profile = build_prematch_quality_profile(effective_payload, now_ts=evaluation_cutoff)
+    if quality_profile.get("status") == "invalid":
+        raise HTTPException(status_code=422, detail={"error": "prematch_quality_profile_invalid", "audit": quality_profile})
+    if quality_profile.get("decision_eligible") is True:
+        effective_payload.update(quality_profile["model_inputs"])
     estimator = fundamental_expected_goals(effective_payload)
     if not estimator.get("ok"):
         raise HTTPException(status_code=422, detail=estimator)
     xg = estimator["expected_goals"]
-    model = poisson_probability_model(xg["home"], xg["away"], estimator["confidence"], payload.get("provenance"))
+    model = poisson_probability_model(xg["home"], xg["away"], estimator["confidence"], effective_payload.get("provenance"))
     if estimator.get("status") != "ready":
         model["status"] = "insufficient_confidence"
-    evaluation_cutoff = int(time.time())
-    script = _fundamental_evaluation_script(effective_payload, estimator, model)
+    script = _fundamental_evaluation_script(effective_payload, estimator, model, quality_profile)
     chain_audit = audit_fundamental_chain(script, now_ts=evaluation_cutoff)
     fundamental_freeze = freeze_fundamental_stage(
         fixture, script, chain_audit, estimator, model, evaluation_cutoff
@@ -4926,6 +5312,7 @@ def evaluate_imported_prematch(payload: Dict[str, Any], persist_version: bool = 
     resolved_revalidations = resolve_revalidation_tasks(fixture, version_record, model_market_divergence["triggered"], (latest or {}).get("stage")) if version_record and trigger.get("triggered") and chain_audit.get("decision_eligible") else 0
     return {
         "ok": True, "version": VERSION, "fixture": fixture, "match": metadata.get("match"), "estimator": estimator, "model": model,
+        "quality_profile": quality_profile,
         "decision_layer": decision, "decision_summary": build_decision_summary(decision, chain_audit, model),
         "fundamental_chain_audit": chain_audit, "fundamental_freeze": fundamental_freeze,
         "fundamental_first_pipeline_audit": pipeline_order_audit, "fundamental_version": version_record,
@@ -5851,13 +6238,19 @@ def health():
         "fresh_fixture_count": get_nested(route, ["pang", "fresh_fixture_count"], 0),
         "missing_action": route.get("missing_action"),
     }
-    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "the_odds_api_base_url": THE_ODDS_API_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "api_football_startup_probe": API_FOOTBALL_STARTUP_PROBE, "has_thestats_key": bool(THESTATS_API_KEY), "thestats_fixture_day_cache_ttl_seconds": THESTATS_FIXTURE_DAY_CACHE_TTL_SECONDS, "thestats_fixture_day_cache_entries": len(THESTATS_FIXTURE_DAY_CACHE), "has_the_odds_api_key": bool(THE_ODDS_API_KEY), "the_odds_api_watchlist": the_odds_api_watchlist_health(), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "nami_odds_startup_probe": NAMI_ODDS_STARTUP_PROBE, "nami_odds_probe_ttl_seconds": NAMI_ODDS_PROBE_TTL_SECONDS, "market_data_route": route_summary, "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "snapshot_store_writer_workers": SNAPSHOT_STORE_WRITER_WORKERS, "snapshot_store_single_writer_required": True, "snapshot_store_warn_bytes": SNAPSHOT_STORE_WARN_BYTES, "snapshot_store_max_decompressed_bytes": SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES, "fundamental_version_retention": FUNDAMENTAL_VERSION_RETENTION, "portfolio_run_retention": PORTFOLIO_RUN_RETENTION, "external_data_stale_seconds": EXTERNAL_DATA_STALE_SECONDS, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}, "auto_provider_reconciliation": AUTO_RECONCILIATION_LAST_RESULT}
+    return {"ok": True, "timestamp": int(time.time()), "version": VERSION, "api_football_base_url": API_FOOTBALL_BASE_URL, "thestats_base_url": THESTATS_BASE_URL, "the_odds_api_base_url": THE_ODDS_API_BASE_URL, "nami_base_url": NAMI_API_BASE_URL, "has_api_football_key": bool(API_FOOTBALL_KEY), "api_football_startup_probe": API_FOOTBALL_STARTUP_PROBE, "provider_usage": provider_usage_health(), "has_thestats_key": bool(THESTATS_API_KEY), "thestats_fixture_day_cache_ttl_seconds": THESTATS_FIXTURE_DAY_CACHE_TTL_SECONDS, "thestats_fixture_day_cache_entries": len(THESTATS_FIXTURE_DAY_CACHE), "has_the_odds_api_key": bool(THE_ODDS_API_KEY), "the_odds_api_watchlist": the_odds_api_watchlist_health(), "has_nami_credentials": bool(NAMI_API_USER and NAMI_API_SECRET), "nami_optional": True, "nami_failure_policy": "continue_without_nami", "nami_odds_startup_probe": NAMI_ODDS_STARTUP_PROBE, "nami_odds_probe_ttl_seconds": NAMI_ODDS_PROBE_TTL_SECONDS, "market_data_route": route_summary, "shadow_token_enabled": bool(SHADOW_ACCESS_TOKEN), "auto_fetch_date": AUTO_FETCH_DATE, "auto_fetch_fixture_id": AUTO_FETCH_FIXTURE_ID, "snapshot_store_path": SNAPSHOT_STORE_PATH, "snapshot_store_gzip": SNAPSHOT_STORE_GZIP, "snapshot_store_writer_workers": SNAPSHOT_STORE_WRITER_WORKERS, "snapshot_store_single_writer_required": True, "snapshot_store_warn_bytes": SNAPSHOT_STORE_WARN_BYTES, "snapshot_store_max_decompressed_bytes": SNAPSHOT_STORE_MAX_DECOMPRESSED_BYTES, "fundamental_version_retention": FUNDAMENTAL_VERSION_RETENTION, "portfolio_run_retention": PORTFOLIO_RUN_RETENTION, "external_data_stale_seconds": EXTERNAL_DATA_STALE_SECONDS, "tracking_stages": STAGE_ORDER, "target_leagues": {str(k): v for k, v in DEFAULT_TARGET_LEAGUES.items() if k in TARGET_LEAGUE_IDS}, "auto_provider_reconciliation": AUTO_RECONCILIATION_LAST_RESULT}
 
 
 @app.get("/shadow/nami-capabilities")
 def shadow_nami_capabilities(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     require_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token))
     return JSONResponse(nami_capability_check())
+
+
+@app.get("/shadow/provider-usage")
+def shadow_provider_usage(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_configured_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token), "shadow_access_token_required_for_provider_usage")
+    return JSONResponse({"ok": True, "version": VERSION, "usage": provider_usage_health()})
 
 
 @app.get("/shadow/nami-odds-capabilities")
@@ -5867,12 +6260,14 @@ def shadow_nami_odds_capabilities(token: Optional[str] = None, authorization: Op
 
 
 @app.get("/api-football/live")
-def api_football_live():
+def api_football_live(token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_configured_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token), "shadow_access_token_required_for_api_football")
     return JSONResponse(call_api_football("/fixtures", {"live": "all"}))
 
 
 @app.get("/api-football/fixtures")
-def api_football_fixtures(date: str, timezone_name: str = Query("Asia/Shanghai", alias="timezone")):
+def api_football_fixtures(date: str, timezone_name: str = Query("Asia/Shanghai", alias="timezone"), token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    require_configured_shadow_token(resolve_shadow_token(token, authorization, x_shadow_token), "shadow_access_token_required_for_api_football")
     return JSONResponse(call_api_football("/fixtures", {"date": date, "timezone": timezone_name}))
 
 
@@ -13169,6 +13564,7 @@ def fixture_acceptance_summary(fixture_ids: Optional[List[Any]] = None, now_ts: 
 
 
 def release_candidate_self_test() -> Dict[str, Any]:
+    self_test_now = int(time.time())
     safe_pass = decision_layer(empty_market_snapshot())
     safe_pass_audit = audit_decision_output(safe_pass)
     actionable_market = empty_market_snapshot()
@@ -13192,7 +13588,19 @@ def release_candidate_self_test() -> Dict[str, Any]:
         "method": "independent_poisson", "model_hash": "release-self-test-model",
         "probabilities": {"1x2": {"home": .48, "draw": .28, "away": .24}},
     }
-    fundamental_script = _fundamental_evaluation_script({"fixture": "release-self-test"}, estimator, model)
+    quality_profile = build_prematch_quality_profile({
+        "lineup_confidence": .9,
+        "quality_metrics": {
+            "observed_at": self_test_now,
+            "provenance": {"source": "release_self_test_xg", "uses_market_odds": False},
+            "league": {"home_xg_for_per90": 1.5, "away_xg_for_per90": 1.2, "sample_size": 100},
+            "home": {"xg_for_per90": 1.6, "xg_against_per90": 1.0, "sample_size": 10},
+            "away": {"xg_for_per90": 1.1, "xg_against_per90": 1.4, "sample_size": 10},
+        },
+    }, now_ts=self_test_now)
+    fundamental_script = _fundamental_evaluation_script(
+        {"fixture": "release-self-test"}, estimator, model, quality_profile
+    )
     fundamental_audit = audit_fundamental_chain(fundamental_script)
     fundamental_freeze = freeze_fundamental_stage(
         "release-self-test", fundamental_script, fundamental_audit, estimator, model, int(time.time())
@@ -13267,6 +13675,11 @@ def release_candidate_self_test() -> Dict[str, Any]:
         "pass_output_contract_complete": safe_pass_audit.get("decision_eligible") is True,
         "eligible_data_returns_actionable": actionable.get("decision") != "PASS",
         "actionable_output_contract_complete": actionable_audit.get("decision_eligible") is True,
+        "prematch_quality_profile_ready_and_shadow_isolated": (
+            quality_profile.get("status") == "ready"
+            and quality_profile.get("decision_eligible") is True
+            and quality_profile.get("shadow_learning_effect") is False
+        ),
         "fundamental_first_freeze_hash_valid": fundamental_freeze.get("script_hash_valid") is True,
         "fundamental_first_pipeline_passes": fundamental_pipeline.get("status") == "passed",
         "fundamental_freeze_tamper_rejected": tampered_pipeline.get("status") == "failed",
@@ -13348,7 +13761,7 @@ def audit_release_artifact_manifest(manifest: Any, expected_revision: Optional[s
         "source_revision_bound": revision_valid,
         "source_revision_matches_expected": expected is None or revision == expected,
         "required_contracts_complete": set(row.get("required_contract_schemas") or []) == {
-            "repricing_attribution_v1", "fundamental_first_freeze_v1",
+            "repricing_attribution_v1", "prematch_quality_profile_v1", "fundamental_first_freeze_v1",
             "fundamental_first_pipeline_audit_v1", "release_preflight_v1",
             "prematch_priority_vector_v1", "prematch_priority_board_v1",
             "learning_prematch_priority_board_v1", "release_artifact_manifest_v1",
@@ -13386,7 +13799,7 @@ def build_release_artifact_manifest(
         "source_revision": revision,
         "rules_version": LEARNING_RULES_VERSION,
         "required_contract_schemas": sorted([
-            "repricing_attribution_v1", "fundamental_first_freeze_v1",
+            "repricing_attribution_v1", "prematch_quality_profile_v1", "fundamental_first_freeze_v1",
             "fundamental_first_pipeline_audit_v1", "release_preflight_v1",
             "prematch_priority_vector_v1", "prematch_priority_board_v1",
             "learning_prematch_priority_board_v1", "release_artifact_manifest_v1",
@@ -13416,6 +13829,7 @@ def build_release_preflight(
         "release_version_bound_to_self_test": self_test.get("version") == VERSION,
         "required_release_endpoints_present": checks.get("required_release_endpoints_present") is True,
         "internal_decision_contract_self_test": checks.get("internal_decision_contract_self_test") is True,
+        "prematch_quality_profile_contract": get_nested(self_test, ["checks", "prematch_quality_profile_ready_and_shadow_isolated"]) is True,
         "fundamental_first_contract": get_nested(self_test, ["checks", "fundamental_first_pipeline_passes"]) is True,
         "fundamental_freeze_tamper_rejected": get_nested(self_test, ["checks", "fundamental_freeze_tamper_rejected"]) is True,
         "portfolio_priority_board_tamper_rejected": get_nested(self_test, ["checks", "portfolio_priority_board_tamper_rejected"]) is True,
@@ -14400,7 +14814,10 @@ def completed_auto_snapshot_stages(history: List[Dict[str, Any]]) -> set:
         row.get("stage") for row in history
         if row.get("stage") in PREMATCH_STAGE_ORDER
         and row.get("import_status") != "data_missing"
-        and bool(get_nested(row, ["market_snapshot", "available"]))
+        and (
+            bool(get_nested(row, ["market_snapshot", "available"]))
+            or row.get("automatic_capture") is True
+        )
         and get_nested(row, ["stage_timing_audit", "status"]) != "invalid"
         and get_nested(row, ["sequence_timing_audit", "status"]) != "invalid"
     }
@@ -14688,6 +15105,9 @@ def auto_collect_the_odds_api_due_stages(
     external_rows = store.get("external_prematch") or {}
     watchlist_keys = set(watchlist_rows)
     external_keys = set(external_rows)
+    batch_window = automatic_learning_batch_window(now)
+    batch_start = batch_window["start_utc"]
+    batch_end = batch_window["end_utc"]
     tracked = dict(watchlist_rows)
     tracked.update(external_rows)
     for fixture, metadata in tracked.items():
@@ -14703,12 +15123,18 @@ def auto_collect_the_odds_api_due_stages(
             results.append({"fixture": str(fixture), "status": "skipped", "reason": "incomplete_or_non_prematch_provider_identity"})
             continue
         kickoff = datetime.fromtimestamp(kickoff_ts, tz=timezone.utc)
+        watchlist_only = fixture in watchlist_keys and fixture not in external_keys
+        if watchlist_only and not (batch_start < kickoff <= batch_end):
+            continue
         recorded = {
             row.get("stage") for row in ((store.get("fixtures") or {}).get(str(fixture)) or [])
             if isinstance(row, dict) and row.get("stage") in PREMATCH_STAGE_ORDER
         }
+        # Discovery-only watchlist rows are collected once in the active two-hour
+        # batch. Explicitly imported analysis fixtures preserve their full timeline.
+        # Explicitly imported analysis fixtures preserve their full timeline.
         allowed_stage_keys = (
-            set(LEARNING_PREMATCH_STAGE_ORDER)
+            set(THE_ODDS_API_AUTO_CAPTURE_STAGES)
             if fixture in watchlist_keys and fixture not in external_keys
             else set(PREMATCH_STAGE_ORDER)
         )
@@ -14717,7 +15143,13 @@ def auto_collect_the_odds_api_due_stages(
             if stage.get("key") not in {"Opening", "FT"}
             and stage.get("key") in allowed_stage_keys
             and stage.get("key") not in recorded
-            and auto_snapshot_stage_due(now, kickoff, stage)
+            and (
+                auto_snapshot_stage_due(now, kickoff, stage)
+                or (
+                    stage.get("key") in THE_ODDS_API_AUTO_CAPTURE_STAGES
+                    and kickoff + stage["offset"] <= now < kickoff
+                )
+            )
         ]
         if not due_stages:
             continue
@@ -14732,6 +15164,7 @@ def auto_collect_the_odds_api_due_stages(
             "requested_stages": due_stages, "only_missing": True,
             "retry_data_missing": False, "persist": True,
             "the_odds_api_event_id": event_id,
+            "automatic_batch": automatic_learning_batch_window_payload(batch_window) if watchlist_only else None,
         }
         try:
             outcome = collect(payload)
@@ -14748,6 +15181,7 @@ def auto_collect_the_odds_api_due_stages(
         "status": "completed" if due_count else "not_due", "at": int(now.timestamp()),
         "due_count": due_count, "collected_count": collected_count,
         "failed_count": failed_count, "results": results,
+        "batch": automatic_learning_batch_window_payload(batch_window),
     }
 
 
@@ -14871,53 +15305,144 @@ def auto_learning_daily_cycle(
         }
 
 
+def automatic_learning_batch_window(now: datetime) -> Dict[str, Any]:
+    """Return the current Shanghai-time rolling batch window.
+
+    With the defaults, batches start at 01:30, 03:30, ... 13:30, 15:30 and
+    cover fixtures in ``(start, start + 2h]``. This assigns a boundary fixture
+    to the earlier batch exactly once (for example, 15:30 belongs to 13:30).
+    """
+    now = now.astimezone(timezone.utc)
+    tz = ZoneInfo(AUTO_FETCH_TIMEZONE)
+    local_now = now.astimezone(tz)
+    anchor = local_now.replace(
+        hour=AUTO_LEARNING_BATCH_ANCHOR_HOUR,
+        minute=AUTO_LEARNING_BATCH_ANCHOR_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    if local_now < anchor:
+        anchor -= timedelta(days=1)
+    interval = timedelta(minutes=AUTO_LEARNING_BATCH_INTERVAL_MINUTES)
+    elapsed_seconds = max(0.0, (local_now - anchor).total_seconds())
+    interval_count = int(elapsed_seconds // interval.total_seconds())
+    start_local = anchor + interval_count * interval
+    end_local = start_local + interval
+    return {
+        "start_utc": start_local.astimezone(timezone.utc),
+        "end_utc": end_local.astimezone(timezone.utc),
+        "start_local": start_local,
+        "end_local": end_local,
+        "interval_minutes": AUTO_LEARNING_BATCH_INTERVAL_MINUTES,
+        "batch_id": start_local.strftime("%Y%m%dT%H%M%z"),
+    }
+
+
+def automatic_learning_batch_window_payload(window: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "batch_id": window["batch_id"],
+        "start_utc": window["start_utc"].isoformat(),
+        "end_utc": window["end_utc"].isoformat(),
+        "start_local": window["start_local"].isoformat(),
+        "end_local": window["end_local"].isoformat(),
+        "interval_minutes": window["interval_minutes"],
+        "boundary_rule": "start_exclusive_end_inclusive",
+    }
+
+
+def externally_discovered_due_dates(now: datetime) -> List[str]:
+    """Return dates containing externally discovered fixtures in this batch."""
+    try:
+        store = load_snapshot_store()
+    except SnapshotStoreReadError:
+        return []
+    tracked: Dict[str, Any] = {}
+    tracked.update(store.get("the_odds_api_watchlist") or {})
+    tracked.update(store.get("external_prematch") or {})
+    window = automatic_learning_batch_window(now)
+    batch_start = window["start_utc"]
+    batch_end = window["end_utc"]
+    due_dates = set()
+    for metadata in tracked.values():
+        if not isinstance(metadata, dict):
+            continue
+        match = metadata.get("match") if isinstance(metadata.get("match"), dict) else metadata
+        kickoff_ts = _parse_timestamp(
+            match.get("kickoff_utc") or match.get("date") or match.get("kickoff_at") or metadata.get("kickoff_utc")
+        )
+        if not kickoff_ts:
+            continue
+        kickoff = datetime.fromtimestamp(kickoff_ts, tz=timezone.utc)
+        if batch_start < kickoff <= batch_end and now < kickoff:
+            due_dates.add(kickoff.astimezone(ZoneInfo(AUTO_FETCH_TIMEZONE)).date().isoformat())
+    return sorted(due_dates)
+
+
 def auto_snapshot_cycle(now: Optional[datetime] = None) -> Dict[str, Any]:
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     learning_result = auto_learning_daily_cycle(now)
     the_odds_api_discovery = discover_the_odds_api_watchlist(now)
     the_odds_api_due_collection = auto_collect_the_odds_api_due_stages(now)
     api_football_authenticated = API_FOOTBALL_STARTUP_PROBE.get("authenticated") is True
-    dates = sorted({(now + timedelta(days=i)).astimezone(ZoneInfo(AUTO_FETCH_TIMEZONE)).date().isoformat() for i in range(AUTO_SNAPSHOT_DAYS_AHEAD + 1)}) if api_football_authenticated else []
+    batch_window = automatic_learning_batch_window(now)
+    batch_start = batch_window["start_utc"]
+    batch_end = batch_window["end_utc"]
+    dates = externally_discovered_due_dates(now) if api_football_authenticated else []
+    auto_fixture_count = 0
     for date_str in dates:
+        if auto_fixture_count >= API_FOOTBALL_AUTO_MAX_FIXTURES:
+            break
         try:
             fixtures = target_fixtures_for_date(date_str, AUTO_FETCH_TIMEZONE)
             for fx in fixtures.get("fixtures", []):
+                if auto_fixture_count >= API_FOOTBALL_AUTO_MAX_FIXTURES:
+                    break
                 if fx.get("status") != "NS" or not fx.get("fixture_id"):
                     continue
                 kickoff = fixture_datetime_utc(fx)
-                if not kickoff:
+                if not kickoff or not (batch_start < kickoff <= batch_end) or not now < kickoff:
                     continue
+                auto_fixture_count += 1
                 history = get_fixture_snapshots(int(fx["fixture_id"]))
                 saved_stages = completed_auto_snapshot_stages(history)
                 for stage in TRACKING_STAGES:
                     key = stage["key"]
-                    if key == "FT" or key in saved_stages:
+                    if key not in API_FOOTBALL_AUTO_CAPTURE_STAGES or key in saved_stages:
                         continue
                     due = kickoff + stage["offset"]
-                    if auto_snapshot_stage_due(now, kickoff, stage):
+                    on_time = auto_snapshot_stage_due(now, kickoff, stage)
+                    late_discovery = not on_time and due <= now < kickoff
+                    if on_time or late_discovery:
                         try:
                             data = collect_stage_snapshot_data(int(fx["fixture_id"]), key)
                             if not data.get("ok"):
                                 print("[AUTO_SNAPSHOT] skipped invalid collection " + json.dumps({"fixture": fx["fixture_id"], "stage": key, "reason": data.get("error")}, ensure_ascii=False))
                                 continue
                             odds_cov = get_nested(data, ["coverage", "odds_prematch"], {}) or {}
-                            if not odds_cov.get("ok") or not odds_cov.get("has_data"):
-                                print("[AUTO_SNAPSHOT] skipped missing odds " + json.dumps({"fixture": fx["fixture_id"], "stage": key, "status_code": odds_cov.get("status_code")}, ensure_ascii=False))
-                                continue
+                            market_data_partial = not odds_cov.get("ok") or not odds_cov.get("has_data")
                             history = get_fixture_snapshots(int(fx["fixture_id"]))
                             market_snapshot = get_nested(data, ["structured_inputs", "odds_market_snapshot"], empty_market_snapshot())
                             dynamics = compare_market_snapshots(history, market_snapshot, key)
                             versions = get_fundamental_versions(int(fx["fixture_id"]))
                             previous_version = versions[-1] if versions else None
                             trigger = get_nested(dynamics, ["revalidation_trigger"], {}) or {}
-                            full_data = collect_prematch_data(int(fx["fixture_id"]), include_raw=False) if (not versions or trigger.get("triggered") or key in ("T-1h", "T-30m", "Closing")) else None
+                            full_data = collect_prematch_data(int(fx["fixture_id"]), include_raw=False)
                             script = pure_fundamental_script(full_data) if full_data else get_nested(previous_version or {}, ["script"], {})
                             fundamental_version = save_fundamental_version(int(fx["fixture_id"]), script, {"stage": key, **trigger}, previous_version) if full_data else previous_version
                             classification = classify_market_move_details(dynamics, previous_version, script)
                             dynamics["classification"] = classification["classification"]
                             dynamics["classification_audit"] = classification
                             snapshot_at = int(time.time())
-                            record = {"version": VERSION, "fixture": int(fx["fixture_id"]), "stage": key, "requested_stage": "auto", "snapshot_at": snapshot_at, "fixture_info": data.get("fixture"), "data_quality": data.get("data_quality"), "coverage": data.get("coverage"), "market_snapshot": market_snapshot, "market_dynamics": dynamics, "team_news_snapshot": team_news_snapshot(data, key), "pure_fundamental_script_hash": script.get("content_hash"), "fundamental_version_number": (fundamental_version or {}).get("version_number"), "shadow_summary": data.get("shadow_summary"), "stage_timing_audit": audit_stage_timing(key, snapshot_at, fx.get("date") or get_nested(data, ["fixture", "date"]))}
+                            timing_audit = audit_stage_timing(key, snapshot_at, fx.get("date") or get_nested(data, ["fixture", "date"]))
+                            if late_discovery:
+                                timing_audit = {
+                                    **timing_audit,
+                                    "status": "late_discovery_accepted",
+                                    "decision_eligible": True,
+                                    "reason": "fixture_discovered_after_target_node_before_kickoff",
+                                    "timeline_completeness": "partial",
+                                }
+                            record = {"version": VERSION, "fixture": int(fx["fixture_id"]), "stage": key, "requested_stage": "auto", "automatic_capture": True, "automatic_batch": automatic_learning_batch_window_payload(batch_window), "late_discovery": late_discovery, "market_data_status": "partial" if market_data_partial else "available", "snapshot_at": snapshot_at, "fixture_info": data.get("fixture"), "data_quality": data.get("data_quality"), "coverage": data.get("coverage"), "market_snapshot": market_snapshot, "market_dynamics": dynamics, "team_news_snapshot": team_news_snapshot(data, key), "pure_fundamental_script_hash": script.get("content_hash"), "fundamental_version_number": (fundamental_version or {}).get("version_number"), "shadow_summary": data.get("shadow_summary"), "stage_timing_audit": timing_audit}
                             saved = save_snapshot(record)
                             saved_stages.add(key)
                             if saved.get("revalidation_task_created"):
@@ -14952,6 +15477,13 @@ def auto_snapshot_cycle(now: Optional[datetime] = None) -> Dict[str, Any]:
         "status": "completed" if api_football_authenticated else "skipped",
         "authenticated": api_football_authenticated,
         "reason": None if api_football_authenticated else "api_football_not_authenticated",
+        "fixture_count": auto_fixture_count,
+        "fixture_limit": API_FOOTBALL_AUTO_MAX_FIXTURES,
+        "horizon_hours": API_FOOTBALL_AUTO_HORIZON_HOURS,
+        "capture_stages": sorted(API_FOOTBALL_AUTO_CAPTURE_STAGES),
+        "externally_triggered_dates": dates,
+        "batch": automatic_learning_batch_window_payload(batch_window),
+        "usage": provider_usage_health()["api_football"],
     }
     combined = {
         **learning_result, "node_execution": node_result,

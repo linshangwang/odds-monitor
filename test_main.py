@@ -29,10 +29,15 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         main.SNAPSHOT_STORE_PATH = os.path.join(self.tmp.name, "store.json")
         main.THESTATS_FIXTURE_DAY_CACHE.clear()
+        main.API_FOOTBALL_RESPONSE_CACHE.clear()
+        main.PROVIDER_USAGE_DAY = ""
+        main.PROVIDER_USAGE = {"api_football_requests": 0, "the_odds_api_credits": 0}
+        main.PROVIDER_LAST_REMAINING = {"api_football": None, "the_odds_api": None}
 
     def tearDown(self):
         main.SNAPSHOT_STORE_PATH = self.old_store
         main.THESTATS_FIXTURE_DAY_CACHE.clear()
+        main.API_FOOTBALL_RESPONSE_CACHE.clear()
         self.tmp.cleanup()
 
     def test_bounded_gzip_decompression_rejects_expansion_over_limit(self):
@@ -352,6 +357,48 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             self.assertFalse(main.coverage_summary(result)["has_data"])
         finally:
             main.API_FOOTBALL_KEY, main.API_FOOTBALL_RATE_LIMIT_UNTIL = original_key, original_cooldown
+
+    def test_api_football_cache_and_daily_budget_prevent_duplicate_network_calls(self):
+        original_key, original_budget = main.API_FOOTBALL_KEY, main.API_FOOTBALL_DAILY_REQUEST_BUDGET
+        main.API_FOOTBALL_KEY, main.API_FOOTBALL_DAILY_REQUEST_BUDGET = "configured-cache-key", 1
+        response = unittest.mock.Mock()
+        response.ok, response.status_code, response.url = True, 200, "https://example.test/fixtures"
+        response.headers = {"x-ratelimit-requests-remaining": "999"}
+        response.json.return_value = {"errors": {}, "response": [{"fixture": {"id": 1}}]}
+        try:
+            with patch("main.requests.get", return_value=response) as get:
+                first = main.call_api_football("/fixtures", {"id": 1})
+                second = main.call_api_football("/fixtures", {"id": 1})
+                blocked = main.call_api_football("/fixtures", {"id": 2})
+            self.assertTrue(first["ok"])
+            self.assertTrue(second["cache_hit"])
+            self.assertEqual(get.call_count, 1)
+            self.assertTrue(blocked["budget_blocked"])
+        finally:
+            main.API_FOOTBALL_KEY, main.API_FOOTBALL_DAILY_REQUEST_BUDGET = original_key, original_budget
+
+    def test_external_watchlist_opens_api_football_gate_for_current_two_hour_batch(self):
+        # 13:30 Shanghai batch covers (13:30, 15:30].
+        now = datetime(2026, 10, 11, 5, 30, tzinfo=timezone.utc)
+        store = {"the_odds_api_watchlist": {
+            "event-1400": {"match": {"kickoff_utc": datetime(2026, 10, 11, 6, 0, tzinfo=timezone.utc).isoformat()}},
+            "event-1500": {"match": {"kickoff_utc": datetime(2026, 10, 11, 7, 0, tzinfo=timezone.utc).isoformat()}},
+            "event-1530": {"match": {"kickoff_utc": datetime(2026, 10, 11, 7, 30, tzinfo=timezone.utc).isoformat()}},
+            "event-1600": {"match": {"kickoff_utc": datetime(2026, 10, 11, 8, 0, tzinfo=timezone.utc).isoformat()}},
+        }}
+        with patch.object(main, "load_snapshot_store", return_value=store):
+            due = main.externally_discovered_due_dates(now)
+            before = main.externally_discovered_due_dates(now - timedelta(minutes=30))
+            next_batch = main.externally_discovered_due_dates(now + timedelta(hours=2))
+        self.assertEqual(due, ["2026-10-11"])
+        self.assertEqual(before, [])
+        self.assertEqual(next_batch, ["2026-10-11"])
+
+    def test_automatic_learning_batch_window_uses_shanghai_half_past_anchor(self):
+        now = datetime(2026, 10, 11, 5, 45, tzinfo=timezone.utc)
+        window = main.automatic_learning_batch_window(now)
+        self.assertEqual(window["start_local"].strftime("%H:%M"), "13:30")
+        self.assertEqual(window["end_local"].strftime("%H:%M"), "15:30")
 
     def test_other_providers_reject_explicit_http_200_business_errors(self):
         original_stats, original_odds = main.THESTATS_API_KEY, main.THE_ODDS_API_KEY
@@ -2241,6 +2288,78 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("home_adjustment_out_of_range", result["errors"])
 
+    def test_prematch_quality_profile_builds_xg_attack_defense_and_goalkeeper_indices(self):
+        payload = {
+            "lineup_confidence": .85,
+            "quality_metrics": {
+                "observed_at": 1000,
+                "provenance": {"source": "licensed_xg_feed", "uses_market_odds": False},
+                "league": {
+                    "home_xg_for_per90": 1.50, "away_xg_for_per90": 1.20,
+                    "home_npxg_for_per90": 1.35, "away_npxg_for_per90": 1.05,
+                    "home_xg_per_shot": .11, "away_xg_per_shot": .10,
+                    "sample_size": 100,
+                },
+                "home": {
+                    "xg_for_per90": 1.80, "xg_against_per90": .90,
+                    "npxg_for_per90": 1.60, "npxg_against_per90": .80,
+                    "xg_per_shot_for": .12, "xg_per_shot_against": .08,
+                    "goalkeeper_psxg_minus_ga_per90": .10, "sample_size": 10,
+                },
+                "away": {
+                    "xg_for_per90": 1.00, "xg_against_per90": 1.50,
+                    "npxg_for_per90": .90, "npxg_against_per90": 1.35,
+                    "xg_per_shot_for": .09, "xg_per_shot_against": .13,
+                    "goalkeeper_psxg_minus_ga_per90": -.10, "sample_size": 10,
+                },
+            },
+        }
+        profile = main.build_prematch_quality_profile(payload, now_ts=1100)
+        self.assertEqual(profile["status"], "ready")
+        self.assertTrue(profile["decision_eligible"])
+        self.assertGreater(profile["home"]["attack_quality_index"], 100)
+        self.assertGreater(profile["home"]["defense_quality_index"], 100)
+        self.assertGreater(profile["home"]["goalkeeper_quality_index"], 100)
+        self.assertLess(profile["away"]["attack_quality_index"], 100)
+        self.assertEqual(profile["model_inputs"]["metric_type"], "xg")
+        self.assertEqual(profile["model_inputs"]["home_attack_rate"], 1.8)
+        self.assertFalse(profile["shadow_learning_effect"])
+
+    def test_prematch_quality_profile_rejects_market_derived_xg(self):
+        profile = main.build_prematch_quality_profile({
+            "quality_metrics": {
+                "observed_at": 1000,
+                "provenance": {"source": "bookmaker_implied_xg", "uses_market_odds": True},
+                "league": {"home_xg_for_per90": 1.5, "away_xg_for_per90": 1.2, "sample_size": 100},
+                "home": {"xg_for_per90": 1.8, "xg_against_per90": 1.0, "sample_size": 10},
+                "away": {"xg_for_per90": 1.1, "xg_against_per90": 1.4, "sample_size": 10},
+            }
+        }, now_ts=1100)
+        self.assertEqual(profile["status"], "invalid")
+        self.assertIn("quality_source_must_be_odds_independent", profile["blockers"])
+
+    def test_complete_prematch_pipeline_uses_quality_profile_xg_inputs(self):
+        main.import_prematch_packet(self.prematch_packet())
+        latest = max(row.get("snapshot_at") or 0 for row in main.get_fixture_snapshots("uuid-1") if row.get("import_status") == "available")
+        payload = {
+            "fixture": "uuid-1", "lineup_confidence": .85,
+            "quality_metrics": {
+                "observed_at": latest,
+                "provenance": {"source": "licensed_xg_feed", "uses_market_odds": False},
+                "league": {"home_xg_for_per90": 1.5, "away_xg_for_per90": 1.2, "sample_size": 100},
+                "home": {"xg_for_per90": 1.8, "xg_against_per90": 1.0, "sample_size": 10},
+                "away": {"xg_for_per90": 1.1, "xg_against_per90": 1.5, "sample_size": 10},
+            },
+            "script_coverage": {"home": .8, "draw": .4, "away": .3},
+            "crowding": .3, "death_path": [],
+        }
+        with patch("main.time.time", return_value=latest + 60):
+            result = main.evaluate_imported_prematch(payload, persist_version=False)
+        self.assertEqual(result["quality_profile"]["status"], "ready")
+        self.assertEqual(result["estimator"]["inputs"]["metric_type"], "xg")
+        self.assertEqual(result["fundamental_freeze"]["script_hash_valid"], True)
+        self.assertFalse(result["quality_profile"]["shadow_learning_effect"])
+
     def test_complete_prematch_pipeline_binds_fresh_market_and_versions_fundamentals(self):
         main.import_prematch_packet(self.prematch_packet())
         latest = max(row.get("snapshot_at") or 0 for row in main.get_fixture_snapshots("uuid-1") if row.get("import_status") == "available")
@@ -3251,6 +3370,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         }
         self_test = {
             "version": main.VERSION, "checks": {
+                "prematch_quality_profile_ready_and_shadow_isolated": True,
                 "fundamental_first_pipeline_passes": True,
                 "fundamental_freeze_tamper_rejected": True,
                 "portfolio_priority_board_tamper_rejected": True,
@@ -4351,7 +4471,7 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         self.assertEqual(health["learning_eligibility"], "MODEL_LEARNING_EXCLUDED")
 
     def test_the_odds_api_watchlist_fixture_reaches_due_collector_without_learning_admission(self):
-        kickoff = datetime(2026, 10, 10, 3, 0, tzinfo=timezone.utc)
+        kickoff = datetime(2026, 10, 10, 7, 30, tzinfo=timezone.utc)
         fixture = "odds-watch-event-3"
         store = {
             "fixtures": {},
@@ -4367,13 +4487,13 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         }
         collector = Mock(return_value={"ok": True, "request_count": 1, "persist_result": {"changed": True}})
         with patch.object(main, "THE_ODDS_API_KEY", "configured"):
-            result = main.auto_collect_the_odds_api_due_stages(kickoff - timedelta(hours=12), store_override=store, collector=collector)
+            result = main.auto_collect_the_odds_api_due_stages(datetime(2026, 10, 10, 5, 30, tzinfo=timezone.utc), store_override=store, collector=collector)
         self.assertEqual(result["collected_count"], 1)
-        self.assertEqual(collector.call_args.args[0]["requested_stages"], ["T-12h"])
+        self.assertEqual(collector.call_args.args[0]["requested_stages"], ["T-3h"])
         self.assertNotIn("learning_admissions", store)
 
-    def test_the_odds_api_watchlist_uses_only_four_node_learning_timeline(self):
-        kickoff = datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc)
+    def test_the_odds_api_watchlist_uses_only_single_batched_automatic_node(self):
+        kickoff = datetime(2026, 10, 10, 7, 30, tzinfo=timezone.utc)
         fixture = "odds-watch-learning-timeline"
         store = {
             "fixtures": {},
@@ -4388,12 +4508,12 @@ class ShadowV4UpgradeTests(unittest.TestCase):
         }
         collector = Mock(return_value={"ok": True, "request_count": 1, "persist_result": {"changed": True}})
         with patch.object(main, "THE_ODDS_API_KEY", "configured"):
-            t3 = main.auto_collect_the_odds_api_due_stages(kickoff - timedelta(hours=3), store_override=store, collector=collector)
-            t1 = main.auto_collect_the_odds_api_due_stages(kickoff - timedelta(hours=1), store_override=store, collector=collector)
-        self.assertEqual(t3["status"], "not_due")
-        self.assertEqual(t1["status"], "completed")
+            prior_batch = main.auto_collect_the_odds_api_due_stages(datetime(2026, 10, 10, 3, 30, tzinfo=timezone.utc), store_override=store, collector=collector)
+            active_batch = main.auto_collect_the_odds_api_due_stages(datetime(2026, 10, 10, 5, 30, tzinfo=timezone.utc), store_override=store, collector=collector)
+        self.assertEqual(prior_batch["status"], "not_due")
+        self.assertEqual(active_batch["status"], "completed")
         collector.assert_called_once()
-        self.assertEqual(collector.call_args.args[0]["requested_stages"], ["T-1h"])
+        self.assertEqual(collector.call_args.args[0]["requested_stages"], ["T-3h"])
 
     def test_manual_external_odds_fixture_retains_full_analysis_timeline(self):
         kickoff = datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc)

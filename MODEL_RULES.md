@@ -55,6 +55,31 @@ League DNA 是统一模型中的正式先验层，不是独立预测模型：
 
 `Result Utility → Tactical Risk Appetite → Rotation Quality → Execution Ability → Tactical Matchup → Game State Elasticity → First Goal State Transition → Open Game Beneficiary → Time Segment Strength → Goal Conversion`
 
+大型甲级赛事在取得合格数据时，赛前基本面必须优先使用`prematch_quality_profile_v1`：
+
+- 联赛主客场xG基准、双方对应场景xG/xGA进入本场λ与Poisson比分分布。
+- npxG、xG/shot用于区分机会数量和机会质量；门将PSxG-GA独立展示，不得与团队防守混为一个指标。
+- 进攻质量、防守质量及门将质量以联赛同赛季、同阶段、同主客场基准标准化；原始值、样本量、观测时间、来源和内容哈希必须随Pure Fundamental Script冻结。
+- xG来源必须与赔率独立。不得以盘口、赔率、市场概率或赛果反推xG/xGA。
+- 真实xG缺失时必须标记`data_missing`；实际进球/失球率只能以`metric_type=goals`降级使用，不得展示成真实xG。
+- 当前质量画像只进入人工赛前分析系统，固定`shadow_learning_effect=false`；在后续单独完成Shadow预登记、前向验证和用户确认前，不得自动学习、调权或产生Champion晋级效果。
+- 人工赛前分析中，xG数据族只作为低权重能力校验层，暂定占全模型5%至7%，不得在基本面评分、比分分布、剧本评级和最终排序中重复计权。五大联赛且来源、口径、样本完整时才允许接近上限；小联赛、杯赛、明显轮换或数据口径不一致时降至0%至3%或`data_missing`。
+- xG只用于校验机会创造和允许质量、修正优势幅度及总进球中枢。它不能替代Result Utility、比赛意图、阵容执行能力和State Tree，也不能单独把基本版方向反转为相反方向；冲突时优先降级、切换表达或`WAIT/PASS`。
+- 后续复盘重点检验该低权重模块对概率校准、剧本覆盖、跨场排序和选择方向的增量贡献。单场赛果、单轮命中率或赛后事件不得触发调权；任何比例修改必须基于预登记的多场前向样本、模块消融与反例，并在用户审核后从新版本向前生效。
+
+### xG双版本前向对照协议
+
+从本规则生效后的每轮人工赛前分析开始，对数据合格的比赛同时生成并在开赛前冻结两套输出：
+
+- `BASE_NO_XG`：不读取xG、xGA、npxG、xG/shot或PSxG衍生结论；保留比赛目的、战术意图、阵容、传统攻防、State Tree和盘口后验。它是当前正式基准版。
+- `XG_SHADOW`：使用与基准版完全相同的PIT数据、冻结时间、盘口快照和分析流程，只额外加入上述5%至7%的xG能力校验层。它是Shadow对照版，不自动改写正式选择。
+
+两版必须分别冻结：胜负倾向、让球覆盖、总进球中枢、BTTS/球队进球判断、综合过关首选与次选、单关首选与次选、参与评级、排序、WAIT/PASS及主要State Tree。报告还必须保存两版差异类型：`NO_CHANGE`、`CONFIDENCE_ONLY`、`RANK_CHANGE`、`EXPRESSION_CHANGE`或`DIRECTION_REVERSAL`，以及变化仅由哪些xG证据触发。
+
+赛后只比较xG的增量作用，不以最终比分直接判优。比较顺序固定为：赛前证据完整度、主要比赛剧本覆盖、机会质量过程、排序质量、表达质量、概率校准与价格质量；红牌、点球、乌龙、重大伤退和极端终结必须单独隔离。缺少任一赛前冻结版本时，该场不得进入xG增量评估。
+
+`XG_SHADOW`只有在预登记的多轮前向样本中稳定改善排序、表达或校准，同时未显著增加无依据的方向反转，并经用户审核后，才可提出权重或Champion修改候选。在此之前，无xG版仍为正式基准，xG版只提供并列参考。
+
 ## 三 盘口与资金语言
 
 盘口变化必须输出四项：
