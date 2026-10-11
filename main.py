@@ -174,7 +174,28 @@ PROVIDER_LAST_REMAINING: Dict[str, Optional[int]] = {"api_football": None, "the_
 API_FOOTBALL_RESPONSE_CACHE: Dict[str, Tuple[int, Dict[str, Any]]] = {}
 SNAPSHOT_STORE_LOCK = threading.RLock()
 
-API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
+
+def normalize_api_football_key(value: Any) -> str:
+    """Normalize common secret-store copy/paste wrappers without logging them."""
+    text = str(value or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1].strip()
+    if text.lower().startswith("bearer "):
+        text = text[7:].strip()
+    for separator in (":", "="):
+        if separator not in text:
+            continue
+        label, candidate = text.split(separator, 1)
+        normalized_label = label.strip().lower().replace("-", "_")
+        if normalized_label in {"api_football_key", "api_football", "x_apisports_key"}:
+            text = candidate.strip()
+            break
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1].strip()
+    return text
+
+
+API_FOOTBALL_KEY = normalize_api_football_key(os.getenv("API_FOOTBALL_KEY", ""))
 API_FOOTBALL_BASE_URL = os.getenv(
     "API_FOOTBALL_BASE_URL",
     "https://api-football.5dollarfootballapi.com",

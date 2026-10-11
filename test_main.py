@@ -46,6 +46,12 @@ class ShadowV4UpgradeTests(unittest.TestCase):
             main.bounded_gzip_decompress(encoded, 20)
         self.assertEqual(main.bounded_gzip_decompress(encoded, 100), b"x" * 100)
 
+    def test_api_football_key_normalization_accepts_secret_store_wrappers(self):
+        self.assertEqual(main.normalize_api_football_key('  "fb_live_example"  '), "fb_live_example")
+        self.assertEqual(main.normalize_api_football_key("Bearer fb_live_example"), "fb_live_example")
+        self.assertEqual(main.normalize_api_football_key("API-Football_key:fb_live_example"), "fb_live_example")
+        self.assertEqual(main.normalize_api_football_key("API_FOOTBALL_KEY='fb_live_example'"), "fb_live_example")
+
     def test_target_fixture_discovery_reports_missing_source_without_nami_id_fallback(self):
         original_api, original_user, original_secret = main.API_FOOTBALL_KEY, main.NAMI_API_USER, main.NAMI_API_SECRET
         main.API_FOOTBALL_KEY, main.NAMI_API_USER, main.NAMI_API_SECRET = "", "configured-user", "configured-secret"
