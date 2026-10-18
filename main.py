@@ -6316,6 +6316,34 @@ async def shadow_the_odds_api_collect_timeline(request: Request, token: Optional
     return JSONResponse(collect_the_odds_api_timeline(payload))
 
 
+@app.get("/shadow/the-odds-api/scores-by-id")
+def shadow_the_odds_api_scores_by_id(sport_key: str, event_id: str, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    """Read one soccer score source; qualification belongs to the frozen 04 review."""
+    require_paid_odds_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    sport = str(sport_key or "").strip().lower()
+    event = str(event_id or "").strip().lower()
+    if (
+        not sport.startswith("soccer_") or len(sport) > 64
+        or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789_" for char in sport)
+        or len(event) != 32 or any(char not in "0123456789abcdef" for char in event)
+    ):
+        raise HTTPException(status_code=422, detail="invalid_frozen_soccer_event_identity")
+    response = call_the_odds_api(
+        f"/sports/{sport}/scores", {"daysFrom": 3, "dateFormat": "iso", "eventIds": event},
+    )
+    return JSONResponse({
+        "ok": response.get("ok") is True,
+        "source": "the_odds_api", "component": "raw_result_only",
+        "requested_sport_key": sport, "requested_event_id": event,
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "status_code": response.get("status_code"),
+        "data": response.get("data"),
+        "error": response.get("error"),
+        "error_category": response.get("error_category"),
+        "freeze_identity_verified": False, "result_verified": False,
+    })
+
+
 @app.post("/shadow/the-odds-api/watchlist-discover")
 async def shadow_the_odds_api_watchlist_discover(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
     """Run or recover the zero-credit upcoming-event discovery pass."""
