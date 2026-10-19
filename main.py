@@ -106,6 +106,9 @@ AUTO_LEARNING_BATCH_ANCHOR_MINUTE = max(0, min(int(os.getenv("AUTO_LEARNING_BATC
 API_FOOTBALL_CACHE_DEFAULT_SECONDS = max(30, int(os.getenv("API_FOOTBALL_CACHE_DEFAULT_SECONDS", "900")))
 THE_ODDS_API_DAILY_CREDIT_BUDGET = max(1, int(os.getenv("THE_ODDS_API_DAILY_CREDIT_BUDGET", "600")))
 THE_ODDS_API_MIN_REMAINING = max(0, int(os.getenv("THE_ODDS_API_MIN_REMAINING", "1000")))
+THE_ODDS_API_ENFORCE_LOCAL_CREDIT_LIMITS = os.getenv(
+    "THE_ODDS_API_ENFORCE_LOCAL_CREDIT_LIMITS", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
 THE_ODDS_API_AUTO_CAPTURE_STAGES = {
     stage.strip() for stage in os.getenv("THE_ODDS_API_AUTO_CAPTURE_STAGES", "T-3h").split(",") if stage.strip()
 }
@@ -530,8 +533,9 @@ def provider_usage_health() -> Dict[str, Any]:
         },
         "the_odds_api": {
             "credits": usage["the_odds_api_credits"],
-            "daily_budget": THE_ODDS_API_DAILY_CREDIT_BUDGET,
-            "remaining_budget": max(0, THE_ODDS_API_DAILY_CREDIT_BUDGET - usage["the_odds_api_credits"]),
+            "local_credit_limits_enabled": THE_ODDS_API_ENFORCE_LOCAL_CREDIT_LIMITS,
+            "daily_budget": THE_ODDS_API_DAILY_CREDIT_BUDGET if THE_ODDS_API_ENFORCE_LOCAL_CREDIT_LIMITS else None,
+            "remaining_budget": max(0, THE_ODDS_API_DAILY_CREDIT_BUDGET - usage["the_odds_api_credits"]) if THE_ODDS_API_ENFORCE_LOCAL_CREDIT_LIMITS else None,
             "provider_remaining": PROVIDER_LAST_REMAINING["the_odds_api"],
         },
     }
@@ -658,9 +662,9 @@ def call_the_odds_api(path: str, params: Optional[Dict[str, Any]] = None) -> Dic
 
     usage = _provider_usage_today()
     provider_remaining = PROVIDER_LAST_REMAINING.get("the_odds_api")
-    if usage["the_odds_api_credits"] >= THE_ODDS_API_DAILY_CREDIT_BUDGET:
+    if THE_ODDS_API_ENFORCE_LOCAL_CREDIT_LIMITS and usage["the_odds_api_credits"] >= THE_ODDS_API_DAILY_CREDIT_BUDGET:
         return {"ok": False, "status_code": 429, "error": "the_odds_api_daily_budget_exhausted", "error_category": "local_budget", "budget_blocked": True}
-    if provider_remaining is not None and provider_remaining <= THE_ODDS_API_MIN_REMAINING:
+    if THE_ODDS_API_ENFORCE_LOCAL_CREDIT_LIMITS and provider_remaining is not None and provider_remaining <= THE_ODDS_API_MIN_REMAINING:
         return {"ok": False, "status_code": 429, "error": "the_odds_api_provider_reserve_reached", "error_category": "local_budget", "budget_blocked": True}
 
     url = f"{THE_ODDS_API_BASE_URL}{path}"
