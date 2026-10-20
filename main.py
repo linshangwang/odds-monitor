@@ -22,6 +22,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from the_odds_api_provider import collect_historical_timeline
+from kanpanwang_history import collect_08_history
 
 load_dotenv()
 
@@ -6318,6 +6319,26 @@ async def shadow_the_odds_api_collect_timeline(request: Request, token: Optional
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=400, detail="invalid_json_body") from exc
     return JSONResponse(collect_the_odds_api_timeline(payload))
+
+
+@app.post("/shadow/08/odds-history")
+async def shadow_08_odds_history(request: Request, token: Optional[str] = None, authorization: Optional[str] = Header(None), x_shadow_token: Optional[str] = Header(None)):
+    """Read-only four-market history for 08; never imports to 02 or freezes a pick."""
+    require_paid_odds_token(resolve_shadow_token(token, authorization, x_shadow_token))
+    if not THE_ODDS_API_KEY:
+        raise HTTPException(status_code=503, detail="the_odds_api_not_configured")
+    body = await request.body()
+    if len(body) > 16 * 1024:
+        raise HTTPException(status_code=413, detail="request_body_too_large")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="invalid_json_body") from exc
+    try:
+        result = collect_08_history(call_the_odds_api, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(result)
 
 
 @app.get("/shadow/the-odds-api/scores-by-id")
